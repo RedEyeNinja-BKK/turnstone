@@ -6230,6 +6230,20 @@ class MCPClientManager:
 
     # -- tool invocation -----------------------------------------------------
 
+    def _resolve_effective_timeout(self, server_name: str, timeout: int) -> int:
+        """Apply a per-server timeout override when configured.
+
+        The caller's timeout (normally the global ``tools.timeout``) is the
+        default; a server that declares its own ``timeout`` (e.g. an agent
+        gateway that legitimately runs for minutes) overrides it. Mirrors the
+        per-server ``timeout`` model of the MCP JSON/TOML config surfaces.
+        """
+        cfg = self._server_configs.get(server_name, {}) or {}
+        server_timeout = cfg.get("timeout")
+        if isinstance(server_timeout, int) and not isinstance(server_timeout, bool) and server_timeout > 0:
+            return server_timeout
+        return timeout
+
     def _cb_gate(self, server_name: str) -> None:
         """Check circuit breaker before dispatching to *server_name*.
 
@@ -6770,12 +6784,13 @@ class MCPClientManager:
             session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
 
+        eff_timeout = self._resolve_effective_timeout(server_name, timeout)
         future = asyncio.run_coroutine_threadsafe(
             self._static_session_op(server_name, session.call_tool(original_name, arguments)),
             self._loop,
         )
         try:
-            result = future.result(timeout=timeout)
+            result = future.result(timeout=eff_timeout)
         except concurrent.futures.TimeoutError:
             # Slow-but-alive, not dead. The static session is still connected
             # and the in-flight op keeps running server-side; ``future.cancel()``
@@ -8435,11 +8450,12 @@ class MCPClientManager:
             session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
 
+        eff_timeout = self._resolve_effective_timeout(server_name, timeout)
         future = asyncio.run_coroutine_threadsafe(
             self._static_session_op(server_name, session.read_resource(uri)), self._loop
         )
         try:
-            result = future.result(timeout=timeout)
+            result = future.result(timeout=eff_timeout)
         except concurrent.futures.TimeoutError:
             # Same policy as call_tool_sync: a client-side wait timeout against an
             # already-connected static session means the server is slow, not dead.
@@ -9034,6 +9050,9 @@ def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any
                 cfg["headers"] = json.loads(row.get("headers", "{}"))
             except (json.JSONDecodeError, TypeError):
                 cfg["headers"] = {}
+        timeout = row.get("timeout")
+        if isinstance(timeout, int) and not isinstance(timeout, bool) and timeout > 0:
+            cfg["timeout"] = timeout
         result[name] = cfg
     return result
 

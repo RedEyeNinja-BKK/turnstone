@@ -79,6 +79,7 @@ infrastructure failure (never a zero-quality score).
 | Symptom | Cause | Fix |
 |---|---|---|
 | "Installing TUI dependencies" loop / Chat banner won't load | npm workspace lock mismatch **or** sandbox `PrivateDevices` blocking PTY | Full root `npm install` once; remove `PrivateDevices` from the dashboard unit (PTY-needing) |
+| All agents fail to start after a host restart (`status=218/CAPABILITIES`) | systemd **user**-service drop-ins using settings user managers can't apply at boot: `CapabilityBoundingSet=`, `PrivateDevices`, `ProtectClock`, `ProtectKernelModules`, `ProtectKernelLogs` | Remove those 5 from `~/.config/systemd/user/*.service.d/`; keep the boot-safe set (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`, `ProtectKernelTunables`, `ProtectControlGroups`, `LockPersonality`, `RestrictRealtime`, `SystemCallArchitectures`, `RestrictAddressFamilies`, `MemoryMax`); validate from a clean login/start, not an in-session restart |
 | All cells INDETERMINATE with empty task | Task bodies not embedded (ID-only prompts) | Put real bodies in `TASK_BODIES` |
 | Arm-C review preflight fails | Coordinator re-verifies receipts via tool calls instead of finalizing | Scope prompt: "receipts are harness-verified; do NOT re-fetch" |
 | Evaluator INDETERMINATE ×all | Evaluator gateway auth missing | Provide `OPENAI_CATALOG_TOKEN` (or your gateway token) |

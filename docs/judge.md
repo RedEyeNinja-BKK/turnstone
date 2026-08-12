@@ -85,6 +85,12 @@ Requires the judge to be enabled. Auto-approved calls are tagged
 `smart_approval` in the dashboard and audit trail. Smart Approvals applies to
 the web and coordinator surfaces, not the interactive CLI.
 
+**`manual` tool-policy actions are never Smart-Approval eligible.** The manual
+policy early branch routes a winning `manual` invocation directly to a fresh
+human ApprovalCycle before Smart Approvals (or any other automatic approval
+mechanism) runs — see [Tool Policies](governance.md#tool-policies) for the full
+`manual` semantics including batch isolation and Approve + Always suppression.
+
 The judge is enabled by default. Disable `judge.enabled` in the admin Judge
 settings, or use `--no-judge` in the interactive CLI.
 

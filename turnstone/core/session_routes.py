@@ -814,7 +814,7 @@ def make_approve_handler(
     reachable by coord sessions spawning interactive children.
     """
     from turnstone.core.auth import require_any_permission
-    from turnstone.core.web_helpers import read_json_or_400
+    from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
     async def approve(request: Request) -> Response:
         import asyncio
@@ -926,6 +926,15 @@ def make_approve_handler(
                         {"error": "stale call_id", "current_call_id": primary},
                         status_code=409,
                     )
+        # Manual-policy cycles: an "Approve + Always" request must never
+        # persist.  The human decision still approves the exact current
+        # invocation once; the whitelist write below is skipped and the
+        # ``tool.manual_resolved`` audit records ``always_suppressed``.
+        manual_cycle = bool(
+            target_card
+            and any(it.get("approval_mode") == "manual" for it in target_card.get("items") or [])
+        )
+        resolving_user_id = auth_user_id(request)
         # Resolve FIRST, then whitelist: the "Approve + Always" names
         # must describe the cycle that actually resolved.  On the cycle
         # path the resolve is pinned to the lookup's cycle_id, so the
@@ -944,6 +953,7 @@ def make_approve_handler(
                         feedback,
                         always=always,
                         cycle_id=pinned_cycle_id,
+                        resolving_user_id=resolving_user_id,
                     )
                 elif body_call_id or body_cycle_id:
                     # Lookup matched a card that carries no cycle_id
@@ -955,6 +965,7 @@ def make_approve_handler(
                         always=always,
                         call_id=body_call_id or None,
                         cycle_id=body_cycle_id or None,
+                        resolving_user_id=resolving_user_id,
                     )
                 else:
                     # No selector AND nothing pending at lookup time:
@@ -969,6 +980,7 @@ def make_approve_handler(
                     always=always,
                     call_id=body_call_id or None,
                     cycle_id=body_cycle_id or None,
+                    resolving_user_id=resolving_user_id,
                 )
         except TypeError:
             # Pre-cycle SessionUI impls (external/custom) without the
@@ -979,6 +991,9 @@ def make_approve_handler(
             and approved
             and target_card
             and auto_approve_tools is not None
+            # Manual-policy cycles never persist an Always entry — the
+            # human's approval is once-only, bound to this exact call.
+            and not manual_cycle
             # Cycle-registry UIs: whitelist only when OUR resolve landed
             # on the pinned cycle (non-None return).  Stub/legacy UIs
             # (no registry) keep the unconditional legacy behavior —

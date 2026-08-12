@@ -18,6 +18,12 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **Large plain-text pastes become attachments.** Pasting text longer than the
+  fixed 2,000-character threshold stages `pasted-text.txt` across all five
+  attachment-capable create/send composers. Clipboard files retain priority,
+  text above the 512 KiB upload ceiling stays inline, identical synthesized
+  pastes collapse to one chip, and rejected attachment sends keep the staged
+  message and files so they can be corrected or retried.
 - **`server_parses_reasoning` model capability.** Declare it on a model
   definition whose backend segregates reasoning into its own channel (a
   vLLM launched with a reasoning parser, a commercial provider): the
@@ -152,6 +158,16 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **OpenAI SDK v3 and its HTTPX2 default transport are now supported (#1009).**
+  Chat Completions and Responses streams normalize native HTTPX2 connection
+  deaths through the same retry boundary as legacy HTTPX-backed providers,
+  including failures observed after safe cross-thread client closure during a
+  model-registry reload. The OpenAI v3 runtime escape hatch for explicitly
+  injected legacy HTTPX clients remains supported. OpenAI connections now
+  follow HTTPX2's operating-system trust store by default; deployments that
+  relied on a modified `certifi` bundle must install that CA in the system
+  store or set `SSL_CERT_FILE` / `SSL_CERT_DIR`.
+
 - **Log event rename: `drain_stream.post_finish_blip` is now
   `stream.post_finish_blip`; its `usage_captured` field is retained.** The
   single-shot drain normalizes mid-body transport deaths through the same
@@ -216,6 +232,16 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   current model.
 
 ### Fixed
+
+- **MCP servers may expose resources without resource templates, or templates
+  without concrete resources (#993).** The MCP handshake has one aggregate
+  `resources` capability, but implementations are not required to support both
+  list methods. An exact JSON-RPC `Method not found` response from either
+  method is now treated as an empty half-catalog during static and per-user
+  discovery and refresh, while every other error still fails closed. A failed
+  static registration also tears down its transport and publishes none of its
+  staged tools/resources/prompts, eliminating the live callable “ghost” tools
+  that could remain after the UI reported registration failure.
 
 - **A cancelled judge, guard, or compaction call can now stop before its
   request goes out (#972).** Previously it could not: `model_turn` refused

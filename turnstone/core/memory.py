@@ -855,13 +855,22 @@ def search_history_recent(limit: int = 20, *, user_id: str | None = None) -> lis
 # -- Structured memories -------------------------------------------------------
 
 
+def _require_memory_description(description: str) -> str:
+    """Return a normalized description or raise the public validation error."""
+    if not isinstance(description, str) or not (normalized := description.strip()):
+        raise ValueError("memory description is required and must be non-empty")
+    return normalized
+
+
 def save_structured_memory(
     name: str,
     content: str,
-    description: str | None = None,
+    description: str,
     mem_type: str | None = None,
     scope: str = "global",
     scope_id: str = "",
+    *,
+    require_active_project: bool = False,
 ) -> tuple[dict[str, str] | None, bool]:
     """Save a structured memory as a single atomic upsert by name+scope+scope_id.
 
@@ -871,21 +880,63 @@ def save_structured_memory(
     :meth:`StorageBackend.upsert_structured_memory`) -- no preceding read, no
     IntegrityError round-trip, no TOCTOU window.  ``(row, was_update)`` comes
     straight from that upsert (this passes a fresh ``memory_id``, so a differing
-    returned id means an existing row was updated in place).  A ``None``
-    description / ``mem_type`` means "leave unset" -- the column default applies
-    on insert and the stored value is kept on conflict.
+    returned id means an existing row was updated in place). ``description``
+    is required and must contain non-whitespace text for both inserts and
+    updates. A ``None`` ``mem_type`` keeps the stored value on an update and
+    uses the column default on insert.
     """
-    import uuid
-
-    name = normalize_key(name)
+    # Validate outside the best-effort storage boundary. Backend/driver
+    # ``ValueError`` instances remain operational failures; only this explicit
+    # caller-input check propagates.
+    normalized_description = _require_memory_description(description)
     try:
-        row, was_update = get_storage().upsert_structured_memory(
-            str(uuid.uuid4()), name, description, mem_type, scope, scope_id, content
+        return save_structured_memory_strict(
+            name,
+            content,
+            description=normalized_description,
+            mem_type=mem_type,
+            scope=scope,
+            scope_id=scope_id,
+            require_active_project=require_active_project,
         )
-        return (row, was_update) if row else (None, False)
     except Exception:
         log.warning("Failed to save structured memory name=%s", name, exc_info=True)
         return None, False
+
+
+def save_structured_memory_strict(
+    name: str,
+    content: str,
+    description: str,
+    mem_type: str | None = None,
+    scope: str = "global",
+    scope_id: str = "",
+    *,
+    require_active_project: bool = False,
+) -> tuple[dict[str, str], bool]:
+    """Strict structured-memory upsert for mutation-facing boundaries.
+
+    Unlike :func:`save_structured_memory`, storage failures propagate so an
+    API or tool cannot report a database outage as an ordinary failed/not-found
+    result. Best-effort internal callers keep using the facade.
+    """
+    import uuid
+
+    normalized = normalize_key(name)
+    normalized_description = _require_memory_description(description)
+    row, was_update = get_storage().upsert_structured_memory(
+        str(uuid.uuid4()),
+        normalized,
+        normalized_description,
+        mem_type,
+        scope,
+        scope_id,
+        content,
+        require_active_project=require_active_project,
+    )
+    if not row:
+        raise RuntimeError("structured memory upsert returned no row")
+    return row, was_update
 
 
 def get_structured_memory_by_name(
@@ -898,6 +949,13 @@ def get_structured_memory_by_name(
     except Exception:
         log.warning("Failed to get structured memory name=%s", name, exc_info=True)
         return None
+
+
+def get_structured_memory_by_name_strict(
+    name: str, scope: str = "global", scope_id: str = ""
+) -> dict[str, str] | None:
+    """Strict scoped-name lookup; storage failures propagate."""
+    return get_storage().get_structured_memory_by_name(normalize_key(name), scope, scope_id)
 
 
 def delete_structured_memory(name: str, scope: str = "global", scope_id: str = "") -> bool:
@@ -917,6 +975,36 @@ def delete_structured_memory_by_id(memory_id: str) -> bool:
     except Exception:
         log.warning("Failed to delete structured memory id=%s", memory_id, exc_info=True)
         return False
+
+
+def delete_structured_memory_returning_strict(
+    name: str, scope: str = "global", scope_id: str = ""
+) -> dict[str, str] | None:
+    """Atomically delete and return one scoped-name memory.
+
+    Storage failures propagate.  A ``None`` return therefore means only that
+    no matching row existed at the mutation point.
+    """
+    return get_storage().delete_structured_memory_returning(normalize_key(name), scope, scope_id)
+
+
+def delete_structured_memory_by_id_returning_strict(
+    memory_id: str,
+) -> dict[str, str] | None:
+    """Atomically delete and return one memory by id; failures propagate."""
+    return get_storage().delete_structured_memory_by_id_returning(memory_id)
+
+
+def find_structured_memory_scopes(
+    name: str,
+    scopes: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Find visible same-name scope pairs in one metadata-only query."""
+    try:
+        return get_storage().find_structured_memory_scopes(normalize_key(name), scopes)
+    except Exception:
+        log.warning("Failed to find structured memory scopes name=%s", name, exc_info=True)
+        return []
 
 
 def list_structured_memories(

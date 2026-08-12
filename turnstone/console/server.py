@@ -77,7 +77,10 @@ from turnstone.core.model_registry import (
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
 from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef
 from turnstone.core.rerank_calibrate import canonical_caps_value
-from turnstone.core.session_replay import session_replay_preamble
+from turnstone.core.session_replay import (
+    request_replay_project_name,
+    session_replay_preamble,
+)
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
     CoordOnlyVerbHandlers,
@@ -3688,20 +3691,15 @@ def _audit_retry_coordinator(
 def _coord_events_replay(
     ws: Workstream,
     ui: Any,
-    request: Request,  # noqa: ARG001 — coord replay doesn't need request context
+    request: Request,
 ) -> Iterable[dict[str, Any]]:
     """Initial SSE replay payload for coord ``events`` connections.
 
-    Yields, in order:
-
-    1. ``connected`` + optional ``status`` via the shared
-       :func:`turnstone.core.session_replay.session_replay_preamble`
-       so the dashboard's status bar populates before any live tick.
-       Same payload shape interactive uses.
-    2. Pending approval prompt (if any) and the cached LLM verdicts
-       that fired since it surfaced.  Without this replay a refresh
-       loses the judge chip on the pending approval until the
-       operator re-invokes the action.
+    Yields ``connected`` plus optional ``status``, then the pending approval
+    prompt (if any) and cached LLM verdicts that fired since it surfaced. The
+    shared handler resolves viewer-specific project metadata off-loop before
+    invoking this callback. Without the control replay a refresh loses the
+    judge chip until the operator re-invokes the action.
 
     Coord still skips conversation history — the dashboard fetches it
     via a separate ``GET /history`` endpoint and doesn't want a
@@ -3709,7 +3707,11 @@ def _coord_events_replay(
 
     Pure read — never mutates ``ui`` / ``ws`` / ``session``.
     """
-    yield from session_replay_preamble(ws.session, ui)
+    yield from session_replay_preamble(
+        ws.session,
+        ui,
+        project_name=request_replay_project_name(request),
+    )
 
     # EVERY live approval cycle replays (parallel task agents can have
     # several outstanding), each card followed once by the cached LLM
@@ -9545,11 +9547,13 @@ async def admin_delete_memory(request: Request) -> JSONResponse:
         return err
 
     memory_id = request.path_params["memory_id"]
-    existing = storage.get_structured_memory(memory_id)
+    try:
+        existing = storage.delete_structured_memory_by_id_returning(memory_id)
+    except Exception:
+        log.warning("memory.admin_delete_failed memory_id=%s", memory_id, exc_info=True)
+        return JSONResponse({"error": "Failed to delete memory"}, status_code=500)
     if not existing:
         return JSONResponse({"error": "Memory not found"}, status_code=404)
-
-    storage.delete_structured_memory_by_id(memory_id)
 
     audit_uid, ip = _audit_context(request)
     record_audit(

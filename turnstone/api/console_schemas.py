@@ -300,11 +300,23 @@ class ListOrgsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Governance: Tool Policies
+# ---------------------------------------------------------------------------
+
+# Canonical tool-policy action vocabulary. ``manual`` routes a winning
+# invocation directly to a fresh live human ApprovalCycle, bypassing every
+# automatic approval mechanism (see docs/governance.md). The tuple is the
+# single source of truth for both the schema Literal and route validation.
+TOOL_POLICY_ACTIONS: tuple[str, ...] = ("allow", "deny", "ask", "manual")
+ToolPolicyAction = Literal["allow", "deny", "ask", "manual"]
+
+
 class ToolPolicyInfo(BaseModel):
     policy_id: str
     name: str
     tool_pattern: str
-    action: str
+    action: ToolPolicyAction
     priority: int
     org_id: str
     enabled: bool
@@ -316,7 +328,7 @@ class ToolPolicyInfo(BaseModel):
 class CreateToolPolicyRequest(BaseModel):
     name: str
     tool_pattern: str
-    action: str  # allow, deny, ask, manual
+    action: ToolPolicyAction
     priority: int = 0
     org_id: str = ""
     enabled: bool = True
@@ -325,7 +337,7 @@ class CreateToolPolicyRequest(BaseModel):
 class UpdateToolPolicyRequest(BaseModel):
     name: str | None = None
     tool_pattern: str | None = None
-    action: str | None = None
+    action: ToolPolicyAction | None = None
     priority: int | None = None
     enabled: bool | None = None
 

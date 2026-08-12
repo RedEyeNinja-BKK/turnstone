@@ -40,6 +40,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from turnstone.api.console_schemas import TOOL_POLICY_ACTIONS
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
@@ -7733,9 +7734,9 @@ async def admin_create_policy(request: Request) -> JSONResponse:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not tool_pattern:
         return JSONResponse({"error": "tool_pattern is required"}, status_code=400)
-    if action not in ("allow", "deny", "ask"):
+    if action not in TOOL_POLICY_ACTIONS:
         return JSONResponse(
-            {"error": "action must be one of: allow, deny, ask"},
+            {"error": "action must be one of: allow, deny, ask, manual"},
             status_code=400,
         )
 

@@ -90,15 +90,26 @@ tool reach a fresh live human approval cycle before execution:
   executes nothing.
 - **Audit**: resolutions emit a `tool.manual_resolved` audit event carrying
   `approval_mode: "manual"`, the outcome (`approved` / `denied` / `timeout`),
-  the exact namespaced tool name, `call_id`, `cycle_id`, resolving `user_id`
-  (empty for timeout), `always_suppressed`, and a stable SHA-256 argument
-  digest of the exact prepared execution arguments. The `user_decision` field
-  on intent-verdict rows keeps its existing outcome vocabulary; the mode is
-  recorded orthogonally. Workstream-wide sweeps (Stop / cancel / session
-  close) emit the same event. The approval card shows the normal preview
-  (argument values truncated at 200 chars/key) plus the digest — full raw
-  arguments are deliberately not broadcast over SSE; the digest binds to the
-  full prepared execution arguments.
+  the exact namespaced tool name (`func_name`), the presentation
+  `approval_label` (non-authoritative), `call_id`, `cycle_id`, resolving
+  `user_id` (empty for timeout), `always_suppressed`, and a stable SHA-256
+  argument digest of the exact prepared execution arguments. The
+  `user_decision` field on intent-verdict rows keeps its existing outcome
+  vocabulary; the mode is recorded orthogonally. Workstream-wide sweeps
+  (Stop / cancel / session close) emit the same event. Audit emission is
+  **best-effort**, matching the `tool.auto_approved` precedent: the human
+  approval decision — not the audit row — is the authorization, so an
+  audit-write failure is logged at warning for reconciliation and never
+  breaks the tool-execution path. The approval card shows the normal
+  preview (argument values truncated at 200 chars/key) plus the digest —
+  full raw arguments are deliberately not broadcast over SSE.
+- **Argument digest**: `SHA-256(canonical JSON of the exact prepared
+  execution args)` with `sort_keys=True`, `ensure_ascii=False`,
+  `separators=(",", ":")`, UTF-8. It is byte-exact for MCP tools (`mcp_args`)
+  and the named native executors (`bash`, `write_file`, `edit_file`,
+  `memory`); for any other tool kind it binds to the prepared judge
+  projection, which is the only prepared argument representation available
+  at gate time (documented residual — the v1 protected surface is MCP-only).
 
 ### Skills
 

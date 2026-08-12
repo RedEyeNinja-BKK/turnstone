@@ -18,12 +18,14 @@ deterministically, regardless of gate-thread teardown timing.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from turnstone.core.session_ui_base import manual_arg_digest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -70,6 +72,15 @@ def _patch_policies(verdicts: dict[str, str]):
 
 def _new_ui() -> ConsoleCoordinatorUI:
     return ConsoleCoordinatorUI(ws_id="coord-1", user_id="u1")
+
+
+def _manual_audit_rows(storage: Any) -> list[dict[str, Any]]:
+    """Parse the ``tool.manual_resolved`` audit rows emitted to storage."""
+    return [
+        json.loads(c.kwargs["detail"])
+        for c in storage.record_audit_event.call_args_list
+        if c.kwargs.get("action") == "tool.manual_resolved"
+    ]
 
 
 def _wait_until_pending(ui: ConsoleCoordinatorUI, timeout: float = 5.0) -> None:
@@ -149,20 +160,20 @@ def test_manual_single_reaches_approval_cycle_and_approves() -> None:
     assert items[0].get("denied") is not True
     # No automatic approval state was created for the manual call.
     assert ui.serialize_recent_auto_approvals() == []
-    # Durable audit: tool.manual_resolved with the human actor.
-    calls = [
-        c
-        for c in storage.record_audit_event.call_args_list
-        if c.kwargs.get("action") == "tool.manual_resolved"
-    ]
-    assert calls, "expected a tool.manual_resolved audit row"
-    detail = calls[0].kwargs["detail"]
-    assert '"approval_mode": "manual"' in detail
-    assert '"decision": "approved"' in detail
-    assert MANUAL_TOOL in detail
-    assert '"user_id": "u-human"' in detail
-    assert '"always_suppressed": false' in detail
-    assert '"arg_digest": "' in detail
+    # Durable audit: tool.manual_resolved with the human actor and the full
+    # canonical field set (parsed, not substring-matched).
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["approval_mode"] == "manual"
+    assert row["decision"] == "approved"
+    assert row["tool_name"] == MANUAL_TOOL  # canonical namespaced identity
+    assert row["call_id"] == "c1"
+    assert row["cycle_id"]
+    assert row["user_id"] == "u-human"
+    assert row["always_suppressed"] is False
+    assert row["arg_digest"] == manual_arg_digest(items[0])  # exact SHA-256
+    assert row["timestamp"]
     # user_decision stays an outcome, never the mode.
     for c in storage.update_intent_verdict.call_args_list:
         assert c.kwargs.get("user_decision") != "manual"
@@ -182,13 +193,13 @@ def test_manual_deny_executes_nothing() -> None:
 
     assert result["approved"] is False
     assert items[0].get("denied") is True
-    detail = [
-        c.kwargs["detail"]
-        for c in storage.record_audit_event.call_args_list
-        if c.kwargs.get("action") == "tool.manual_resolved"
-    ][0]
-    assert '"decision": "denied"' in detail
-    assert '"user_id": "u1"' in detail
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "denied"
+    assert rows[0]["user_id"] == "u1"
+    assert rows[0]["tool_name"] == MANUAL_TOOL
+    assert rows[0]["call_id"] == "c1"
+    assert rows[0]["cycle_id"]
 
 
 def test_manual_timeout_denies_without_human_actor() -> None:
@@ -280,6 +291,33 @@ def test_manual_beats_matching_auto_approve_tools() -> None:
 
     assert result["approved"] is True  # only after a human resolved it
     tag_spy.assert_not_called()
+
+
+def test_manual_beats_skill_allowed_tools_populated_path() -> None:
+    """A skill-derived ``allowed_tools`` entry (populated exactly as
+    server.py wires skill session config: set + SKILL source map) must
+    not auto-approve a manual call — the manual early branch returns
+    before the auto_approve_tools subset check runs."""
+    from turnstone.core.session_ui_base import AutoApproveReason
+
+    ui = _new_ui()
+    # Mirror server.py's skill wiring: allowed_tools -> set + source map.
+    ui.auto_approve_tools = {MANUAL_TOOL}
+    ui._auto_approve_tools_source = {MANUAL_TOOL: AutoApproveReason.SKILL}
+    items = [_make_manual_item()]
+    storage = MagicMock()
+    with patch.object(ui, "_tag_auto_approved") as tag_spy:
+        result = _run_gate_with_resolution(
+            ui,
+            storage,
+            items,
+            verdicts={MANUAL_TOOL: "manual"},
+            approved=True,
+        )
+
+    assert result["approved"] is True  # only after a human resolved it
+    tag_spy.assert_not_called()
+    assert ui.serialize_recent_auto_approvals() == []
 
 
 # ---------------------------------------------------------------------------
@@ -409,12 +447,9 @@ def test_manual_always_true_is_suppressed_and_not_persisted() -> None:
     assert result["approved"] is True
     # The tool name was never added to the Always set.
     assert MANUAL_TOOL not in ui.auto_approve_tools
-    detail = [
-        c.kwargs["detail"]
-        for c in storage.record_audit_event.call_args_list
-        if c.kwargs.get("action") == "tool.manual_resolved"
-    ][0]
-    assert '"always_suppressed": true' in detail
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["always_suppressed"] is True
 
 
 def test_manual_always_false_records_false() -> None:
@@ -431,12 +466,9 @@ def test_manual_always_false_records_false() -> None:
     )
 
     assert result["approved"] is True
-    detail = [
-        c.kwargs["detail"]
-        for c in storage.record_audit_event.call_args_list
-        if c.kwargs.get("action") == "tool.manual_resolved"
-    ][0]
-    assert '"always_suppressed": false' in detail
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["always_suppressed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -495,17 +527,12 @@ def test_manual_sweep_resolution_emits_manual_audit() -> None:
     assert swept == 1
     assert result["approved"] is False
     assert items[0].get("denied") is True
-    calls = [
-        c
-        for c in storage.record_audit_event.call_args_list
-        if c.kwargs.get("action") == "tool.manual_resolved"
-    ]
-    assert calls, "expected a tool.manual_resolved audit row from the sweep"
-    detail = calls[0].kwargs["detail"]
-    assert '"approval_mode": "manual"' in detail
-    assert '"decision": "denied"' in detail
-    assert MANUAL_TOOL in detail
-    assert '"always_suppressed": false' in detail
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1, "expected a tool.manual_resolved audit row from the sweep"
+    assert rows[0]["approval_mode"] == "manual"
+    assert rows[0]["decision"] == "denied"
+    assert rows[0]["tool_name"] == MANUAL_TOOL
+    assert rows[0]["always_suppressed"] is False
 
 
 def test_manual_sweep_timeout_audit_has_no_human_actor() -> None:
@@ -532,13 +559,11 @@ def test_manual_sweep_timeout_audit_has_no_human_actor() -> None:
             t.join(timeout=5.0)
 
     assert result["approved"] is False
-    detail = [
-        c.kwargs["detail"]
-        for c in storage.record_audit_event.call_args_list
-        if c.kwargs.get("action") == "tool.manual_resolved"
-    ][0]
-    assert '"decision": "timeout"' in detail
-    assert '"user_id": ""' in detail
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "timeout"
+    assert rows[0]["user_id"] == ""  # no human actor on a timeout sweep
+    assert rows[0]["always_suppressed"] is False
 
 
 # ---------------------------------------------------------------------------

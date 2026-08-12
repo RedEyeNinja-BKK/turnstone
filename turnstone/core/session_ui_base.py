@@ -63,13 +63,21 @@ def canonical_args_json(args: dict[str, Any]) -> str:
 def manual_execution_args(item: dict[str, Any]) -> dict[str, Any]:
     """Derive the exact prepared execution-argument object for a prepared item.
 
-    For MCP tools this is the ``mcp_args`` dict consumed by
-    ``_exec_mcp_tool``.  For the core native mutators it is the explicit
-    subset of prepared item fields the executor reads.  Unknown kinds
-    fall back to the item's prepared ``func_args`` projection (the judge
-    lowering); the v1 protected surface is MCP-backed, so the digest is
-    exact there.  The digest never includes the card preview or any
-    truncated representation.
+    Exactness contract (what the digest binds to):
+
+    - MCP tools: the full ``mcp_args`` dict consumed by ``_exec_mcp_tool`` —
+      byte-exact.  This is the v1 protected surface.
+    - ``bash`` / ``write_file`` / ``edit_file`` / ``memory``: the explicit
+      subset of prepared item fields the executor reads — byte-exact.
+    - Any other tool kind: falls back to the prepared ``func_args`` projection
+      (the judge lowering).  This projection is the only prepared argument
+      representation that exists at gate time, but it is NOT guaranteed to be
+      the full executor argument set (e.g. some executors read additional
+      prepared fields).  The v1 deployment targets MCP tools exclusively, so
+      this residual does not affect the protected surface; it is documented
+      for any future expansion to native tools.
+
+    The digest never includes the card preview or any truncated representation.
     """
     if item.get("mcp_args") is not None:
         mcp_args = item["mcp_args"]
@@ -2296,14 +2304,12 @@ class SessionUIBase:
                             elif verdict == "manual":
                                 # Admin-defined ``manual`` rule: only a fresh
                                 # live human ApprovalCycle may execute this
-                                # invocation.  Tag the item with the mode plus
-                                # the digest of its exact prepared execution
-                                # args; the manual early branch below routes
-                                # the batch directly to the human gate and
-                                # makes the automatic approval pipeline
-                                # structurally unreachable for it.
+                                # invocation.  Tag the item with the mode; the
+                                # argument digest is computed AFTER batch
+                                # isolation succeeds (see the manual early
+                                # branch) so rejected mixed batches never pay
+                                # the canonicalization cost.
                                 it["_manual"] = True
-                                it["_manual_arg_digest"] = manual_arg_digest(it)
                                 still_pending.append(it)
                             else:
                                 still_pending.append(it)
@@ -2380,10 +2386,14 @@ class SessionUIBase:
                     it["denial_msg"] = f"Denied by user: {msg}"
                 self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
                 return False, msg
-            # Valid single-manual batch: route directly to a fresh
+            # Valid single-manual batch: compute the argument digest for the
+            # one executable manual call (after isolation, so rejected batches
+            # never pay the cost), then route directly to a fresh
             # ApprovalCycle through the same helper the ordinary terminal
             # human-prompt path uses (no duplicated approval machinery).
-            return self._run_manual_approval_cycle(
+            manual_item = manual_items[0]
+            manual_item["_manual_arg_digest"] = manual_arg_digest(manual_item)
+            return self._run_human_approval_cycle(
                 items,
                 pending=manual_items,
                 cancelled=_cancelled,
@@ -2487,7 +2497,7 @@ class SessionUIBase:
                 persist()
             return True, None
 
-        return self._run_manual_approval_cycle(
+        return self._run_human_approval_cycle(
             items,
             pending=pending,
             cancelled=_cancelled,
@@ -2495,7 +2505,7 @@ class SessionUIBase:
             judge_event=judge_event,
         )
 
-    def _run_manual_approval_cycle(
+    def _run_human_approval_cycle(
         self,
         items: list[dict[str, Any]],
         pending: list[dict[str, Any]],
@@ -2511,7 +2521,6 @@ class SessionUIBase:
         directly, bypassing every automatic approval mechanism).  There is
         exactly one implementation of the human gate — no duplicated
         approval system.
-
         Shared activity, mixed automatic bookkeeping, cycle registration,
         and the entire prompt bundle commit under ONE logical admission
         below; storage and metric callbacks run afterward so neither Stop

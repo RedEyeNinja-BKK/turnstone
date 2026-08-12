@@ -1451,9 +1451,23 @@ def make_cancel_handler(
             session.cancel()
         except Exception:
             log.debug("ws.cancel.session_failed ws=%s", ws_id[:8], exc_info=True)
+        # An authenticated user-initiated cancel is a human action: propagate
+        # the authenticated initiator into the workstream-wide approval sweep
+        # so manual-policy resolutions record source="human" with the real
+        # actor.  Never infer from workstream ownership.  Unauthenticated /
+        # internal/background cancel paths keep the default system sweep
+        # (empty actor, source="system").
+        from turnstone.core.web_helpers import auth_user_id
+
+        cancelling_user_id = auth_user_id(request)
         try:
             if hasattr(ui, "resolve_all_approvals"):
-                ui.resolve_all_approvals(False, "Cancelled by user")
+                ui.resolve_all_approvals(
+                    False,
+                    "Cancelled by user",
+                    resolving_user_id=cancelling_user_id or None,
+                    source="human" if cancelling_user_id else "system",
+                )
             elif (
                 hasattr(ui, "resolve_approval")
                 and getattr(ui, "_pending_approval", None) is not None

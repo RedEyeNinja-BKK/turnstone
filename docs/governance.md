@@ -98,18 +98,26 @@ tool reach a fresh live human approval cycle before execution:
 - **Audit**: resolutions emit a `tool.manual_resolved` audit event carrying
   `approval_mode: "manual"`, the outcome (`approved` / `denied` / `timeout`),
   the exact namespaced tool name (`func_name`), the presentation
-  `approval_label` (non-authoritative), `call_id`, `cycle_id`, resolving
-  `user_id` (empty for timeout), `always_suppressed`, and a stable SHA-256
-  argument digest of the exact prepared execution arguments. The
-  `user_decision` field on intent-verdict rows keeps its existing outcome
-  vocabulary; the mode is recorded orthogonally. Workstream-wide sweeps
-  (Stop / cancel / session close) emit the same event. Audit emission is
-  **best-effort**, matching the `tool.auto_approved` precedent: the human
-  approval decision — not the audit row — is the authorization, so an
-  audit-write failure is logged at warning for reconciliation and never
-  breaks the tool-execution path. The approval card shows the normal
-  preview (argument values truncated at 200 chars/key) plus the digest —
-  full raw arguments are deliberately not broadcast over SSE.
+  `approval_label` (non-authoritative), `call_id`, `cycle_id`, `user_id`,
+  `source`, `always_suppressed`, and a stable SHA-256 argument digest of the
+  exact prepared execution arguments. The `user_decision` field on
+  intent-verdict rows keeps its existing outcome vocabulary; the mode is
+  recorded orthogonally. Workstream-wide sweeps (Stop / cancel / session
+  close) emit the same event.
+  - **Human resolution**: a direct human approve/deny records
+    `source="human"` with the authenticated resolving `user_id`. An
+    authenticated user-initiated Cancel/Stop sweep records `source="human"`
+    with the authenticated initiating `user_id`.
+  - **System resolution**: a timeout records `source="system"` with an empty
+    human `user_id`. Automatic workstream close, recovery, and lifecycle /
+    system sweeps also record `source="system"` with an empty human `user_id`
+    — a human actor is never invented for an automatic resolution.
+  Audit emission is **best-effort**, matching the `tool.auto_approved`
+  precedent: the human approval decision — not the audit row — is the
+  authorization, so an audit-write failure is logged at warning for
+  reconciliation and never breaks the tool-execution path. The approval card
+  shows the normal preview (argument values truncated at 200 chars/key) plus
+  the digest — full raw arguments are deliberately not broadcast over SSE.
 - **Argument digest**: `SHA-256(canonical JSON of the exact prepared
   execution args)` with `sort_keys=True`, `ensure_ascii=False`,
   `separators=(",", ":")`, UTF-8. It is byte-exact for MCP tools (`mcp_args`)

@@ -636,6 +636,213 @@ def test_manual_sweep_timeout_audit_has_no_human_actor() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Production-path actor provenance (R1.1)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCancelSession:
+    """Minimal session stub with the cancel/close surface the teardown paths use."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.closed = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeWS:
+    """Minimal Workstream stub exposing what the cancel/cleanup handlers read."""
+
+    def __init__(self, ui: ConsoleCoordinatorUI) -> None:
+        self.session = _FakeCancelSession()
+        self.ui = ui
+        self._lock = threading.Lock()
+        self._worker_running = False
+        self.worker_thread = None
+        self._closed = False
+
+
+class _FakeManager:
+    def __init__(self, ws: _FakeWS) -> None:
+        self._ws = ws
+
+    def get(self, ws_id: str) -> _FakeWS | None:
+        return self._ws
+
+
+def _make_cancel_request(ws_id: str, user_id: str | None) -> Any:
+    """Build a starlette Request with the given authenticated user (or none)."""
+    from starlette.requests import Request
+
+    from turnstone.core.auth import AuthResult
+
+    class _AppState:
+        pass
+
+    class _App:
+        state = _AppState()
+
+    async def _empty_receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": f"/v1/api/workstreams/{ws_id}/cancel",
+        "path_params": {"ws_id": ws_id},
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 8090),
+        "scheme": "http",
+        "root_path": "",
+        "app": _App(),
+    }
+    req = Request(scope, receive=_empty_receive)
+    if user_id is not None:
+        req.state.auth_result = AuthResult(
+            user_id=user_id,
+            scopes=frozenset({"approve"}),
+            token_source="config",
+            permissions=frozenset({"approve"}),
+        )
+    return req
+
+
+def _run_cancel_handler(ws_id: str, request: Any, ws: _FakeWS) -> Any:
+    """Invoke the REAL production cancel handler (make_cancel_handler)."""
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr = _FakeManager(ws)
+    cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda req: (mgr, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+    )
+    handler = make_cancel_handler(cfg)
+    return handler(request)
+
+
+def test_cancel_handler_propagates_authenticated_actor() -> None:
+    """An authenticated user-initiated /cancel request propagates the
+    authenticated initiator into the manual sweep audit: the real cancel
+    handler (not a direct resolve_all_approvals call) drives resolution,
+    and tool.manual_resolved records source='human' + the request user."""
+    import asyncio
+
+    ui = _new_ui()
+    items = [_make_manual_item()]
+    storage = MagicMock()
+    ws = _FakeWS(ui)
+    result: dict[str, Any] = {}
+
+    def gate() -> None:
+        try:
+            with _patch_policies({MANUAL_TOOL: "manual"}):
+                result["approved"], result["err"] = ui.approve_tools(items)
+        except BaseException as exc:  # pragma: no cover - failure reporter
+            result["exc"] = repr(exc)
+
+    with _patch_storage(storage):
+        t = threading.Thread(target=gate, daemon=True)
+        t.start()
+        try:
+            _wait_until_pending(ui)
+            req = _make_cancel_request("coord-1", "u-human")
+            asyncio.run(_run_cancel_handler("coord-1", req, ws))
+        finally:
+            t.join(timeout=5.0)
+
+    assert ws.session.cancelled is True
+    assert result["approved"] is False
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "denied"
+    assert rows[0]["source"] == "human"
+    assert rows[0]["user_id"] == "u-human"
+
+
+def test_cancel_handler_unauthenticated_keeps_system_actor() -> None:
+    """An unauthenticated cancel request (or a path without proven actor)
+    keeps the system sweep: empty actor + source='system'."""
+    import asyncio
+
+    ui = _new_ui()
+    items = [_make_manual_item()]
+    storage = MagicMock()
+    ws = _FakeWS(ui)
+    result: dict[str, Any] = {}
+
+    def gate() -> None:
+        try:
+            with _patch_policies({MANUAL_TOOL: "manual"}):
+                result["approved"], result["err"] = ui.approve_tools(items)
+        except BaseException as exc:  # pragma: no cover - failure reporter
+            result["exc"] = repr(exc)
+
+    with _patch_storage(storage):
+        t = threading.Thread(target=gate, daemon=True)
+        t.start()
+        try:
+            _wait_until_pending(ui)
+            req = _make_cancel_request("coord-1", None)  # no authenticated actor
+            asyncio.run(_run_cancel_handler("coord-1", req, ws))
+        finally:
+            t.join(timeout=5.0)
+
+    assert result["approved"] is False
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "denied"
+    assert rows[0]["source"] == "system"
+    assert rows[0]["user_id"] == ""
+
+
+def test_cleanup_session_ui_system_sweep_has_no_human_actor() -> None:
+    """The production automatic teardown path (cleanup_session_ui, used by
+    workstream close/eviction/delete) resolves manual cycles with the
+    default system sweep: empty actor + source='system'."""
+    from turnstone.core.adapters._ui_cleanup import cleanup_session_ui
+
+    ui = _new_ui()
+    items = [_make_manual_item()]
+    storage = MagicMock()
+    ws = _FakeWS(ui)
+    result: dict[str, Any] = {}
+
+    def gate() -> None:
+        try:
+            with _patch_policies({MANUAL_TOOL: "manual"}):
+                result["approved"], result["err"] = ui.approve_tools(items)
+        except BaseException as exc:  # pragma: no cover - failure reporter
+            result["exc"] = repr(exc)
+
+    with _patch_storage(storage):
+        t = threading.Thread(target=gate, daemon=True)
+        t.start()
+        try:
+            _wait_until_pending(ui)
+            cleanup_session_ui(ws)  # type: ignore[arg-type]  # minimal fake ws
+        finally:
+            t.join(timeout=5.0)
+
+    assert ws._closed is True
+    assert ws.session.cancelled is True
+    assert result["approved"] is False
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "denied"
+    assert rows[0]["source"] == "system"
+    assert rows[0]["user_id"] == ""
+
+
+# ---------------------------------------------------------------------------
 # Non-manual regression
 # ---------------------------------------------------------------------------
 

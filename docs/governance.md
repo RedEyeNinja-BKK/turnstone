@@ -71,6 +71,13 @@ tool reach a fresh live human approval cycle before execution:
   action (`allow` / `deny` / `ask`) overrides it exactly as it would any other
   action — policy precedence remains administrative governance. Administrators
   can deliberately raise a policy above a `manual` rule.
+- **Scope boundary**: tool policies are evaluated on **prepared calls that
+  enter the approval gate** (`needs_approval=True`). Calls prepared as
+  `needs_approval=False` (read-only built-ins such as `read_file` / `search`,
+  and other pre-auto-approved paths) are **not** elevated to `manual` merely
+  because an admin policy exists. The invariant below applies once `manual`
+  is the winning result *for a prepared invocation that entered the gate*;
+  it does not claim `manual` re-classifies a pre-prepared no-approval call.
 - Once `manual` is the winning result for a prepared invocation, **no runtime
   automatic approval mechanism can satisfy it**: skill `allowed_tools`,
   workstream `auto_approve_tools`, stale "Approve + Always" entries, blanket

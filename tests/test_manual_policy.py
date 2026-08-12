@@ -167,6 +167,7 @@ def test_manual_single_reaches_approval_cycle_and_approves() -> None:
     row = rows[0]
     assert row["approval_mode"] == "manual"
     assert row["decision"] == "approved"
+    assert row["source"] == "human"  # direct human approve actor
     assert row["tool_name"] == MANUAL_TOOL  # canonical namespaced identity
     assert row["call_id"] == "c1"
     assert row["cycle_id"]
@@ -189,6 +190,7 @@ def test_manual_deny_executes_nothing() -> None:
         items,
         verdicts={MANUAL_TOOL: "manual"},
         approved=False,
+        resolving_user_id="u-human",
     )
 
     assert result["approved"] is False
@@ -196,7 +198,8 @@ def test_manual_deny_executes_nothing() -> None:
     rows = _manual_audit_rows(storage)
     assert len(rows) == 1
     assert rows[0]["decision"] == "denied"
-    assert rows[0]["user_id"] == "u1"
+    assert rows[0]["user_id"] == "u-human"  # direct human deny actor
+    assert rows[0]["source"] == "human"
     assert rows[0]["tool_name"] == MANUAL_TOOL
     assert rows[0]["call_id"] == "c1"
     assert rows[0]["cycle_id"]
@@ -218,13 +221,11 @@ def test_manual_timeout_denies_without_human_actor() -> None:
 
     assert result["approved"] is False
     assert items[0].get("denied") is True
-    detail = [
-        c.kwargs["detail"]
-        for c in storage.record_audit_event.call_args_list
-        if c.kwargs.get("action") == "tool.manual_resolved"
-    ][0]
-    assert '"decision": "timeout"' in detail
-    assert '"user_id": ""' in detail
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "timeout"
+    assert rows[0]["user_id"] == ""  # no human actor
+    assert rows[0]["source"] == "system"  # automatic timeout, no invented actor
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +388,15 @@ def test_batch_manual_plus_native_read_rejected() -> None:
 
 def test_batch_manual_plus_policy_allow_sibling_rejected_no_evidence() -> None:
     """A policy-``allow`` sibling in a manual batch is denied with the
-    batch and must not leave durable auto-approved evidence."""
+    batch and must not leave durable auto-approved evidence — and the
+    serialized tool_info event must NOT carry auto_approved=true for the
+    rejected sibling (staging fix)."""
     ui = _new_ui()
     items = [_make_manual_item("c1"), _make_item("c2", WRITE_TOOL)]
     storage = MagicMock()
     verdicts = {MANUAL_TOOL: "manual", WRITE_TOOL: "allow"}
+    captured: list[dict[str, Any]] = []
+    ui._enqueue = captured.append  # type: ignore[method-assign]
     with _patch_storage(storage), _patch_policies(verdicts):
         approved, err = ui.approve_tools(items)
 
@@ -402,6 +407,21 @@ def test_batch_manual_plus_policy_allow_sibling_rejected_no_evidence() -> None:
     # The allow sibling was never committed as auto-approved.
     assert ui.serialize_recent_auto_approvals() == []
     storage.create_intent_verdicts_bulk.assert_not_called()
+    # Serialized event assertion: the rejected allow sibling is denied and
+    # carries NO auto_approved=true (a call that never executed must not be
+    # serialized as approved).
+    infos = [e for e in captured if e.get("type") == "tool_info"]
+    assert infos, "expected a tool_info event for the rejected batch"
+    serialized = infos[0]["items"]
+    by_label = {it["approval_label"]: it for it in serialized}
+    assert WRITE_TOOL in by_label
+    allow_serialized = by_label[WRITE_TOOL]
+    assert allow_serialized.get("denied") is True or allow_serialized.get("error")
+    assert allow_serialized.get("auto_approved") is not True
+    assert "auto_approve_reason" not in allow_serialized
+    # The manual sibling is also denied with no auto-approved marker.
+    manual_serialized = by_label[MANUAL_TOOL]
+    assert manual_serialized.get("auto_approved") is not True
 
 
 def test_batch_manual_with_policy_deny_sibling_is_valid() -> None:
@@ -434,6 +454,8 @@ def test_manual_always_true_is_suppressed_and_not_persisted() -> None:
     ui = _new_ui()
     items = [_make_manual_item()]
     storage = MagicMock()
+    captured: list[dict[str, Any]] = []
+    ui._enqueue = captured.append  # type: ignore[method-assign]
     result = _run_gate_with_resolution(
         ui,
         storage,
@@ -450,6 +472,11 @@ def test_manual_always_true_is_suppressed_and_not_persisted() -> None:
     rows = _manual_audit_rows(storage)
     assert len(rows) == 1
     assert rows[0]["always_suppressed"] is True
+    # The published approval_resolved SSE/broadcast reports effective
+    # always=False even though the stale client requested always=True.
+    resolved = [e for e in captured if e.get("type") == "approval_resolved"]
+    assert resolved, "expected an approval_resolved event"
+    assert resolved[0].get("always") is False
 
 
 def test_manual_always_false_records_false() -> None:
@@ -533,6 +560,47 @@ def test_manual_sweep_resolution_emits_manual_audit() -> None:
     assert rows[0]["decision"] == "denied"
     assert rows[0]["tool_name"] == MANUAL_TOOL
     assert rows[0]["always_suppressed"] is False
+    # Automatic sweep (workstream close / recovery / system cancel): NO
+    # human actor — never attributed to the workstream owner.
+    assert rows[0]["user_id"] == ""
+    assert rows[0]["source"] == "system"
+
+
+def test_manual_human_initiated_sweep_propagates_actor() -> None:
+    """A user-initiated Stop/cancel sweep that can prove the authenticated
+    initiator propagates that actor with source='human'."""
+    ui = _new_ui()
+    items = [_make_manual_item()]
+    storage = MagicMock()
+    result: dict[str, Any] = {}
+
+    def gate() -> None:
+        try:
+            with _patch_policies({MANUAL_TOOL: "manual"}):
+                result["approved"], result["err"] = ui.approve_tools(items)
+        except BaseException as exc:  # pragma: no cover - failure reporter
+            result["exc"] = repr(exc)
+
+    with _patch_storage(storage):
+        t = threading.Thread(target=gate, daemon=True)
+        t.start()
+        try:
+            _wait_until_pending(ui)
+            ui.resolve_all_approvals(
+                False,
+                "Cancelled by user",
+                resolving_user_id="u-human",
+                source="human",
+            )
+        finally:
+            t.join(timeout=5.0)
+
+    assert result["approved"] is False
+    rows = _manual_audit_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "denied"
+    assert rows[0]["user_id"] == "u-human"  # proven human initiator
+    assert rows[0]["source"] == "human"
 
 
 def test_manual_sweep_timeout_audit_has_no_human_actor() -> None:
@@ -563,6 +631,7 @@ def test_manual_sweep_timeout_audit_has_no_human_actor() -> None:
     assert len(rows) == 1
     assert rows[0]["decision"] == "timeout"
     assert rows[0]["user_id"] == ""  # no human actor on a timeout sweep
+    assert rows[0]["source"] == "system"
     assert rows[0]["always_suppressed"] is False
 
 

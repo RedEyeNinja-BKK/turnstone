@@ -1871,6 +1871,16 @@ class SessionUIBase:
         method only echoes the intent on the SSE event so peer tabs
         can label their resolved-status pill correctly).
 
+        ``requested_always`` is the raw client intent and
+        ``effective_always`` is what actually happened.  For a manual
+        cycle the effective Always is ALWAYS ``False`` even when a
+        stale/malicious client requested ``True``: the human approval
+        authorizes the exact current call once, the tool name is never
+        persisted into ``auto_approve_tools``, and the published
+        ``approval_resolved`` event reports ``always=False``.
+        ``tool.manual_resolved`` records ``always_suppressed=True`` only
+        when an approved manual request actually asked for Always.
+
         ``timeout`` flips the persisted ``user_decision`` from
         ``"denied"`` to ``"timeout"`` so the audit trail can
         distinguish an active user denial from a passive
@@ -1890,6 +1900,12 @@ class SessionUIBase:
             cycle = self._select_cycle_locked(cycle_id=cycle_id, call_id=call_id)
         if cycle is None:
             return None
+        # Manual cycles: the human's approval authorizes the exact current
+        # call once.  A requested Always is suppressed server-side —
+        # effective_always is False even when the client requested True.
+        manual_cycle = any(it.get("_manual") for it in cycle.items)
+        effective_always = bool(always) and approved and not manual_cycle
+        always_suppressed = bool(always) and approved and manual_cycle
         if not self._begin_approval_admission(lambda: self._approval_cycle_owner_aborted(cycle)):
             return None
         pending: list[dict[str, Any]] | None = None
@@ -1913,7 +1929,7 @@ class SessionUIBase:
                     cycle,
                     approved=approved,
                     feedback=feedback,
-                    always=always,
+                    always=effective_always,
                 )
             except Exception:
                 # The decision is authoritative and the gate was awakened in
@@ -1937,8 +1953,9 @@ class SessionUIBase:
         self._emit_manual_resolutions(
             cycle,
             decision=decision_str,
-            always_suppressed=bool(always and approved),
+            always_suppressed=always_suppressed,
             resolving_user_id=resolving_user_id,
+            source="human" if resolving_user_id else "system",
         )
         return cycle.cycle_id
 
@@ -1949,16 +1966,22 @@ class SessionUIBase:
         decision: str,
         always_suppressed: bool,
         resolving_user_id: str | None = None,
+        source: str = "system",
     ) -> None:
         """Emit one ``tool.manual_resolved`` audit row per manual-policy call.
 
         ``decision`` keeps the existing outcome vocabulary (``approved`` /
         ``denied`` / ``timeout``); the event detail carries the orthogonal
-        approval mode (``approval_mode: "manual"``).  ``resolving_user_id``
-        is the resolving human for approve/deny; timeout has no human actor
-        (empty).  ``always_suppressed`` is true only when the incoming
-        request actually asked for Always AND an approval was given (a
-        denied/timeout request suppresses nothing).
+        approval mode (``approval_mode: "manual"``).
+
+        Actor attribution: ``resolving_user_id`` is the resolving human for
+        approve/deny (``source="human"``).  Timeout carries NO human actor.
+        Automatic lifecycle resolutions (workstream close / recovery /
+        system sweep) carry ``source="system"`` and NO human actor — they
+        must NEVER be attributed to ``self._user_id`` merely because that
+        user owns the workstream.  ``always_suppressed`` is true only when
+        the incoming request actually asked for Always AND an approval was
+        given (a denied/timeout request suppresses nothing).
 
         ``tool_name`` records the canonical namespaced executable identity
         (``func_name``), never the presentation label; ``approval_label`` is
@@ -1973,7 +1996,9 @@ class SessionUIBase:
         manual_items = [it for it in cycle.items if it.get("_manual")]
         if not manual_items:
             return
-        actor = "" if decision == "timeout" else (resolving_user_id or self._user_id or "")
+        actor = ""
+        if decision != "timeout":
+            actor = resolving_user_id or ""
         try:
             from datetime import UTC, datetime
 
@@ -1994,6 +2019,7 @@ class SessionUIBase:
                     {
                         "approval_mode": "manual",
                         "decision": decision,
+                        "source": source,
                         "tool_name": item.get("func_name", ""),
                         "approval_label": item.get("approval_label", ""),
                         "call_id": item.get("call_id", ""),
@@ -2013,6 +2039,8 @@ class SessionUIBase:
         feedback: str | None = None,
         *,
         timeout: bool = False,
+        resolving_user_id: str | None = None,
+        source: str = "system",
     ) -> int:
         """Resolve EVERY live cycle with one decision; returns the count.
 
@@ -2022,6 +2050,14 @@ class SessionUIBase:
         oldest-first so per-cycle bookkeeping (verdict stamps, SSE
         dismissals, per-cycle events) runs identically to a targeted
         resolution.
+
+        Actor attribution for manual resolutions: automatic lifecycle
+        sweeps (workstream close / recovery / system sweep) must NEVER be
+        attributed to ``self._user_id`` merely because that user owns the
+        workstream.  Pass ``resolving_user_id`` + ``source="human"`` only
+        when the calling path can prove an authenticated human initiator
+        (e.g. a user-initiated Stop/cancel endpoint); otherwise leave them
+        unset so the audit records ``source="system"`` with an empty actor.
 
         The admission barrier drains every bundle already linearized before
         the sweep, then atomically claims the eligible cycles. New admissions
@@ -2094,12 +2130,15 @@ class SessionUIBase:
             # recovery) resolves manual cycles too: emit the orthogonal
             # ``tool.manual_resolved`` audit so the forensic record is
             # complete on every resolution path.  Sweeps have no per-cycle
-            # human actor; timeout carries an empty actor.
+            # human actor unless the calling path proves an authenticated
+            # initiator; the source distinguishes human-initiated sweeps
+            # from automatic lifecycle ones.
             self._emit_manual_resolutions(
                 cycle,
                 decision=decision_str,
                 always_suppressed=False,
-                resolving_user_id=None,
+                resolving_user_id=resolving_user_id,
+                source=source,
             )
         return len(claimed)
 
@@ -2307,11 +2346,19 @@ class SessionUIBase:
                             elif verdict == "allow":
                                 # Admin-defined ``allow`` rule fires the
                                 # auto-approve gate without any UI prompt.
-                                # Tag for /dashboard visibility so the
-                                # operator can see which calls bypassed
-                                # the prompt and why.
-                                it["needs_approval"] = False
-                                self._tag_auto_approved([it], AutoApproveReason.POLICY)
+                                # STAGE the result — do NOT commit
+                                # auto-approved item state yet.  If a manual
+                                # sibling later rejects the whole batch, the
+                                # allow sibling must serialize denied WITHOUT
+                                # auto_approved=true (no durable evidence of
+                                # approval for a call that never executes).
+                                # Not added to ``still_pending``: the
+                                # ``not still_pending`` branch below commits
+                                # the staged allow when every item resolved
+                                # by policy (deny+allow), and the manual
+                                # early branch rejects the batch before any
+                                # commit when a manual item exists.
+                                it["_policy_allow"] = True
                             elif verdict == "manual":
                                 # Admin-defined ``manual`` rule: only a fresh
                                 # live human ApprovalCycle may execute this
@@ -2342,6 +2389,16 @@ class SessionUIBase:
                                 policy_deferred: list[Callable[[], None]] = []
 
                                 def _commit_policy_result() -> None:
+                                    # Commit the staged policy-allow siblings
+                                    # now: the whole batch resolved by policy
+                                    # (allow/deny) and is being blocked.  The
+                                    # allow siblings did execute past the gate
+                                    # in this path (they were policy-approved),
+                                    # so they are tagged and audited.
+                                    for it in items:
+                                        if it.get("_policy_allow"):
+                                            it["needs_approval"] = False
+                                            self._tag_auto_approved([it], AutoApproveReason.POLICY)
                                     self._record_auto_approves(items, deferred=policy_deferred)
                                     self._persist_auto_approved_heuristic_verdicts(
                                         items,
@@ -2412,6 +2469,19 @@ class SessionUIBase:
                 judge_event=judge_event,
             )
         # -- End manual policy early branch ---------------------------------------
+
+        # Commit staged policy-allow items now that no manual batch is being
+        # rejected: the whole batch is proceeding through the ordinary
+        # approval flow, so admin ``allow`` rules take effect exactly as
+        # before.  (In the manual-rejected path above, allow siblings were
+        # denied and never tagged, so no serialized item carries
+        # auto_approved=true for a call that never executes.)  Allow items
+        # were dropped from ``pending`` by the policy block, so iterate the
+        # full ``items`` list.
+        for it in items:
+            if it.get("_policy_allow"):
+                it["needs_approval"] = False
+                self._tag_auto_approved([it], AutoApproveReason.POLICY)
 
         # Per-tool auto-approve check (from workstream template or interactive "Always").
         # Suppressed when a budget-override item is present so the carve-out

@@ -1958,8 +1958,17 @@ class SessionUIBase:
         is the resolving human for approve/deny; timeout has no human actor
         (empty).  ``always_suppressed`` is true only when the incoming
         request actually asked for Always AND an approval was given (a
-        denied/timeout request suppresses nothing).  Best-effort — audit
-        failure is logged, never raised.
+        denied/timeout request suppresses nothing).
+
+        ``tool_name`` records the canonical namespaced executable identity
+        (``func_name``), never the presentation label; ``approval_label`` is
+        recorded separately as a non-authoritative display field.
+
+        Audit emission is best-effort, matching the ``tool.auto_approved``
+        precedent: an audit-write failure must not break the tool-execution
+        path (the human approval decision — not the audit row — is the
+        authorization).  Failures are logged at warning so operators can
+        reconcile; they are never silently dropped.
         """
         manual_items = [it for it in cycle.items if it.get("_manual")]
         if not manual_items:
@@ -1973,6 +1982,7 @@ class SessionUIBase:
 
             storage = get_storage()
             if storage is None:
+                log.warning("manual_resolved.audit_no_storage ws=%s", self.ws_id)
                 return
             for item in manual_items:
                 record_audit(
@@ -1984,7 +1994,8 @@ class SessionUIBase:
                     {
                         "approval_mode": "manual",
                         "decision": decision,
-                        "tool_name": item.get("approval_label", "") or item.get("func_name", ""),
+                        "tool_name": item.get("func_name", ""),
+                        "approval_label": item.get("approval_label", ""),
                         "call_id": item.get("call_id", ""),
                         "cycle_id": cycle.cycle_id,
                         "user_id": actor,
@@ -1994,7 +2005,7 @@ class SessionUIBase:
                     },
                 )
         except Exception:
-            log.debug("manual_resolved.audit_failed ws=%s", self.ws_id, exc_info=True)
+            log.warning("manual_resolved.audit_failed ws=%s", self.ws_id, exc_info=True)
 
     def resolve_all_approvals(
         self,

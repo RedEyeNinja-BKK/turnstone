@@ -7801,9 +7801,9 @@ async def admin_update_policy(request: Request) -> JSONResponse:
         updates["tool_pattern"] = str(body["tool_pattern"]).strip()[:256]
     if "action" in body:
         act = str(body["action"]).strip().lower()
-        if act not in ("allow", "deny", "ask"):
+        if act not in ("allow", "deny", "ask", "manual"):
             return JSONResponse(
-                {"error": "action must be one of: allow, deny, ask"},
+                {"error": "action must be one of: allow, deny, ask, manual"},
                 status_code=400,
             )
         updates["action"] = act

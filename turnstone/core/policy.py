@@ -100,9 +100,9 @@ def evaluate_tool_policy(
     Policies are evaluated in priority order (highest first).  The first
     matching policy wins.
 
-    Returns ``"allow"``, ``"deny"``, or ``"ask"`` if a policy matches,
-    or ``None`` if no policy matches (caller should fall through to the
-    default approval behaviour).
+    Returns ``"allow"``, ``"deny"``, ``"ask"``, or ``"manual"`` if a
+    policy matches, or ``None`` if no policy matches (caller should fall
+    through to the default approval behaviour).
     """
     policies = _cache.get(storage, org_id)
     if policies is None:
@@ -114,7 +114,7 @@ def evaluate_tool_policy(
         pattern = policy.get("tool_pattern", "")
         if fnmatch.fnmatch(tool_name, pattern):
             action: str = policy.get("action", "ask")
-            if action in ("allow", "deny", "ask"):
+            if action in ("allow", "deny", "ask", "manual"):
                 return action
             log.warning("Unknown policy action %r for policy %s", action, policy.get("policy_id"))
             return "ask"
@@ -129,7 +129,8 @@ def evaluate_tool_policies_batch(
 ) -> dict[str, str | None]:
     """Evaluate policies for multiple tools at once (single cached read).
 
-    Returns a dict mapping each tool name to its policy result.
+    Returns a dict mapping each tool name to its policy result
+    (``"allow"`` / ``"deny"`` / ``"ask"`` / ``"manual"`` / ``None``).
     """
     policies = _cache.get(storage, org_id)
     if policies is None:
@@ -144,7 +145,7 @@ def evaluate_tool_policies_batch(
             pattern = policy.get("tool_pattern", "")
             if fnmatch.fnmatch(name, pattern):
                 action = policy.get("action", "ask")
-                result = action if action in ("allow", "deny", "ask") else "ask"
+                result = action if action in ("allow", "deny", "ask", "manual") else "ask"
                 break
         results[name] = result
     return results

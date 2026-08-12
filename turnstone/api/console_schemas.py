@@ -316,7 +316,7 @@ class ToolPolicyInfo(BaseModel):
 class CreateToolPolicyRequest(BaseModel):
     name: str
     tool_pattern: str
-    action: str  # allow, deny, ask
+    action: str  # allow, deny, ask, manual
     priority: int = 0
     org_id: str = ""
     enabled: bool = True

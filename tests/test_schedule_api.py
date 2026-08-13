@@ -616,7 +616,7 @@ class TestScheduleRunAPI:
         client.app.state.scheduler = scheduler
         before = storage.get_scheduled_task(task_id)
 
-        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={})
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run")
 
         assert resp.status_code == 202, resp.text
         assert resp.json()["status"] == "dispatched"
@@ -632,17 +632,26 @@ class TestScheduleRunAPI:
 
         resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={"model": "other"})
         assert resp.status_code == 400
-        assert "empty JSON object" in resp.json()["error"]
+        assert "zero bytes" in resp.json()["error"]
+
+    def test_run_rejects_empty_json_object(self, client, storage):
+        """{} is a JSON body and must be rejected (zero-byte contract)."""
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        client.app.state.scheduler = type("S", (), {"dispatch_manual_task": lambda self, t: True})()
+
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={})
+        assert resp.status_code == 400
+        assert "zero bytes" in resp.json()["error"]
 
     def test_run_missing_task_404(self, client):
-        resp = client.post("/v1/api/admin/schedules/missing/run", json={})
+        resp = client.post("/v1/api/admin/schedules/missing/run")
         assert resp.status_code == 404
 
     def test_run_no_scheduler_503(self, client, storage):
         task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
         client.app.state.scheduler = None
 
-        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={})
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run")
         assert resp.status_code == 503
 
     def test_run_claimed_409(self, client, storage):
@@ -654,7 +663,7 @@ class TestScheduleRunAPI:
 
         client.app.state.scheduler = BusyScheduler()
 
-        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={})
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run")
         assert resp.status_code == 409
         assert "already in progress" in resp.json()["error"]
 

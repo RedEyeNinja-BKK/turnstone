@@ -1,4 +1,5 @@
-"""Add durable atomic scheduler leadership lease and task dispatch claims.
+"""Add durable atomic scheduler leadership lease and task dispatch claims
+(LocalClaw branch).
 
 This is the SCHEDULER-CORE CORRECTNESS FIX (classified separately from the
 Run Once capability): the old ``system_settings``-based scheduler lock used a
@@ -13,16 +14,21 @@ The lease is deliberately bounded (dispatch admission only), NOT a
 workstream-lifetime lock: scheduled storage has no authoritative
 terminal-state linkage to a node.
 
-Revision ID: 071
-Revises: 070
+Second revision of the LocalClaw manual-run branch.  Revision ID is globally
+unique (``lc_scheduler_claims``) and does NOT collide with upstream
+070/071.  A future upstream upgrade must merge ``lc_scheduler_claims`` with
+the upstream head via an explicit Alembic merge revision.
+
+Revision ID: lc_scheduler_claims
+Revises: lc_run_trigger
 Create Date: 2026-08-13
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "071"
-down_revision = "070"
+revision = "lc_scheduler_claims"
+down_revision = "lc_run_trigger"
 branch_labels = None
 depends_on = None
 

@@ -667,8 +667,8 @@ Delete a scheduled task and all its run history. Returns `{"status": "ok"}` or `
 
 Dispatch the stored schedule definition exactly once through `TaskScheduler`'s
 normal target-selection and workstream-creation path. The endpoint accepts no
-request body (an empty JSON object or no body) and does not accept prompt,
-model, tool, target, or approval overrides.
+request body: the body MUST be zero bytes. `{}`, any JSON object, a list, a
+malformed payload, or a chunked nonempty body is rejected with `400`.
 
 It is authorized like every schedule admin endpoint and runs disabled tasks
 too. It preserves the stored task's `enabled`, `last_run`, and `next_run`

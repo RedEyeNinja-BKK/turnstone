@@ -6939,13 +6939,15 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
 async def admin_run_schedule(request: Request) -> JSONResponse:
     """POST /v1/api/admin/schedules/{task_id}/run — dispatch once, asynchronously.
 
-    The body is deliberately an object (currently no options), so malformed,
-    list-shaped and chunked payloads get a deterministic 400. A completely
-    absent body is accepted as the implicit empty object. The synchronous
-    SDK dispatch runs in a worker thread and cannot block the console loop.
+    Contract: the request body MUST be zero bytes.  Any body — ``{}``, a
+    nonempty JSON object, a list, malformed payload, or a chunked nonempty
+    body — is rejected with 400.  This is intentionally the narrow original
+    contract: the endpoint accepts no options, so there is no valid JSON
+    body.  The synchronous SDK dispatch runs in a worker thread and cannot
+    block the console loop.
     """
     from turnstone.core.auth import require_permission
-    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+    from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
     if err:
@@ -6955,13 +6957,9 @@ async def admin_run_schedule(request: Request) -> JSONResponse:
         return err
     raw = await request.body()
     if raw:
-        body = await read_json_or_400(request)
-        if isinstance(body, JSONResponse):
-            return body
-        if body:
-            return JSONResponse(
-                {"error": "Manual run body must be an empty JSON object"}, status_code=400
-            )
+        return JSONResponse(
+            {"error": "Manual run request body must be empty (zero bytes)"}, status_code=400
+        )
     task = storage.get_scheduled_task(request.path_params["task_id"])
     if task is None:
         return JSONResponse({"error": "Schedule not found"}, status_code=404)

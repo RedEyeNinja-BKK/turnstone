@@ -109,7 +109,7 @@ def test_event_loop_stays_responsive_during_slow_dispatch(client, storage):
     resp_holder: list[Any] = []
 
     def do_post():
-        resp_holder.append(client.post("/v1/api/admin/schedules/task_ev/run", json={}))
+        resp_holder.append(client.post("/v1/api/admin/schedules/task_ev/run"))
 
     th = threading.Thread(target=do_post)
     th.start()
@@ -145,7 +145,7 @@ def test_chunked_nonempty_json_body_rejected(client, storage):
         headers={"Transfer-Encoding": "chunked", "Content-Type": "application/json"},
     )
     assert resp.status_code == 400
-    assert "empty JSON object" in resp.json()["error"]
+    assert "zero bytes" in resp.json()["error"]
 
 
 def test_empty_body_accepted(client, storage):

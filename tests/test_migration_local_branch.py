@@ -1,8 +1,9 @@
-"""Migration 070/071 rehearsals on the exact 1.8.0a6 lineage (head 069).
+"""LocalClaw branch migration rehearsals on the exact 1.8.0a6 lineage (head 069).
 
-070 adds ``scheduled_task_runs.trigger`` (historical rows default to
-``schedule``); 071 adds the atomic scheduler-lock table and per-task
-execution claims (SCHEDULER-CORE CORRECTNESS FIX).  These tests run against
+lc_run_trigger adds ``scheduled_task_runs.trigger`` (historical rows default to
+``schedule``); lc_scheduler_claims adds the atomic scheduler-lock table and
+per-task execution claims (SCHEDULER-CORE CORRECTNESS FIX).  Revision IDs are
+globally unique (no collision with upstream 070/071).  These tests run against
 SQLite (fast) and mirror the live PostgreSQL rehearsal.
 """
 
@@ -24,7 +25,7 @@ def _sqlite_migrate(db_path: str) -> None:
     alembic.command.upgrade(cfg, "head")
 
 
-class TestMigration070Trigger:
+class TestMigrationLcRunTrigger:
     def test_upgrade_backfills_historical_rows_to_schedule(self, tmp_path):
         db = tmp_path / "mig.db"
         # Build to 069, seed historical run, then upgrade to head.
@@ -48,7 +49,7 @@ class TestMigration070Trigger:
             ).scalar()
             rev = c.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
         assert trig == "schedule"
-        assert rev == "071"
+        assert rev == "lc_scheduler_claims"
 
     def test_downgrade_drops_trigger(self, tmp_path):
         db = tmp_path / "downgrade.db"
@@ -68,7 +69,7 @@ class TestMigration070Trigger:
         assert rev == "069"
 
 
-class TestMigration071Claims:
+class TestMigrationLcSchedulerClaims:
     def test_upgrade_creates_locks_and_claims(self, tmp_path):
         db = tmp_path / "claims.db"
         _sqlite_migrate(str(db))

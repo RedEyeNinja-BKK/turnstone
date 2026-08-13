@@ -674,11 +674,14 @@ class AsyncTurnstoneConsole(_BaseClient):
         records ``trigger="manual"``.  A 409 means a dispatch is already
         in progress; an ambiguous/lost response must not be blind-retried
         (inspect run history first).
+
+        Contract: sends an actual bodyless POST (zero-byte body).  The
+        server rejects any request body with 400.
         """
         return await self._request(
             "POST",
             f"/v1/api/admin/schedules/{task_id}/run",
-            json_body={},
+            json_body=None,
             response_model=StatusResponse,
         )
 

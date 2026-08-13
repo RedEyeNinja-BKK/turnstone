@@ -26,6 +26,15 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
+# Canonical tool-policy action vocabulary.  ``manual`` routes a winning
+# invocation directly to a fresh live human ApprovalCycle, bypassing every
+# automatic approval mechanism (see docs/governance.md).  This tuple is the
+# single source of truth: the console schema Literal, route validation, and
+# the evaluator membership checks all derive from it, so adding an action
+# updates every surface together.
+TOOL_POLICY_ACTIONS: tuple[str, ...] = ("allow", "deny", "ask", "manual")
+
+
 # Cache window for ``storage.list_tool_policies`` reads. Admin-edited
 # config — 60s is short enough that a one-off edit lands quickly without
 # manual invalidation, and long enough that a tool-heavy autonomous turn
@@ -114,7 +123,7 @@ def evaluate_tool_policy(
         pattern = policy.get("tool_pattern", "")
         if fnmatch.fnmatch(tool_name, pattern):
             action: str = policy.get("action", "ask")
-            if action in ("allow", "deny", "ask", "manual"):
+            if action in TOOL_POLICY_ACTIONS:
                 return action
             log.warning("Unknown policy action %r for policy %s", action, policy.get("policy_id"))
             return "ask"
@@ -145,7 +154,7 @@ def evaluate_tool_policies_batch(
             pattern = policy.get("tool_pattern", "")
             if fnmatch.fnmatch(name, pattern):
                 action = policy.get("action", "ask")
-                result = action if action in ("allow", "deny", "ask", "manual") else "ask"
+                result = action if action in TOOL_POLICY_ACTIONS else "ask"
                 break
         results[name] = result
     return results

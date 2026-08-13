@@ -304,11 +304,11 @@ class ListOrgsResponse(BaseModel):
 # Governance: Tool Policies
 # ---------------------------------------------------------------------------
 
-# Canonical tool-policy action vocabulary. ``manual`` routes a winning
-# invocation directly to a fresh live human ApprovalCycle, bypassing every
-# automatic approval mechanism (see docs/governance.md). The tuple is the
-# single source of truth for both the schema Literal and route validation.
-TOOL_POLICY_ACTIONS: tuple[str, ...] = ("allow", "deny", "ask", "manual")
+# Canonical tool-policy action vocabulary lives in turnstone.core.policy
+# (single source of truth for the schema Literal, route validation, and the
+# evaluator membership checks).  The Literal mirrors the tuple explicitly
+# (mypy does not accept ``Literal[*tuple]`` unpacking); a test asserts the
+# two stay in sync.
 ToolPolicyAction = Literal["allow", "deny", "ask", "manual"]
 
 

@@ -215,3 +215,19 @@ def test_mcp_tool_granular_policy(storage):
     # MCP tools now use func_name as approval_label
     assert evaluate_tool_policy(storage, "mcp__github__search") == "allow"
     assert evaluate_tool_policy(storage, "mcp__untrusted__exec") == "ask"
+
+
+def test_policy_action_vocabulary_surfaces_in_sync() -> None:
+    """The canonical action vocabulary (policy evaluator), the schema
+    Literal, and the console route validation must stay in sync so a
+    future action can't be added to one surface and not the others."""
+    import typing
+
+    from turnstone.api import console_schemas
+    from turnstone.core import policy
+
+    # policy.TOOL_POLICY_ACTIONS is the canonical source
+    assert policy.TOOL_POLICY_ACTIONS == ("allow", "deny", "ask", "manual")
+    # the schema Literal mirrors the canonical tuple (kept in sync by test)
+    literal_args = typing.get_args(console_schemas.ToolPolicyAction)
+    assert literal_args == policy.TOOL_POLICY_ACTIONS

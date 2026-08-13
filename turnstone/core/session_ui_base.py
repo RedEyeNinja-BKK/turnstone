@@ -318,6 +318,7 @@ class ApprovalCycle:
         "cycle_id",
         "decision",
         "event",
+        "has_manual",
         "items",
         "judge_event",
         "pending_verdicts",
@@ -336,6 +337,10 @@ class ApprovalCycle:
         self.items = items
         self.card = card
         self.call_ids: set[str] = {it.get("call_id", "") for it in items if it.get("call_id")}
+        # Whether any item in this cycle carries a winning ``manual`` policy
+        # result.  Set once at construction; lets resolution skip the manual
+        # audit scan for ordinary (non-manual) cycles entirely.
+        self.has_manual: bool = any(it.get("_manual") for it in items)
         # The judge generation that evaluated this batch — identity-
         # compared against the delivering daemon's cancel event so a
         # stale generation (a prior turn's run-to-completion daemon
@@ -1950,12 +1955,17 @@ class SessionUIBase:
         # denied / timeout), while ``tool.manual_resolved`` records the
         # approval MODE and the exact invocation identity.  ``resolving_user_id``
         # is the resolving human for approve/deny; timeout has no human actor.
+        # A timeout is ALWAYS a system resolution: never label it source=human
+        # even if a resolving user id was supplied.
+        resolution_source = (
+            "system" if decision_str == "timeout" else ("human" if resolving_user_id else "system")
+        )
         self._emit_manual_resolutions(
             cycle,
             decision=decision_str,
             always_suppressed=always_suppressed,
             resolving_user_id=resolving_user_id,
-            source="human" if resolving_user_id else "system",
+            source=resolution_source,
         )
         return cycle.cycle_id
 
@@ -1993,6 +2003,11 @@ class SessionUIBase:
         authorization).  Failures are logged at warning so operators can
         reconcile; they are never silently dropped.
         """
+        # Fast path: ordinary (non-manual) cycles carry no manual items.
+        # Skip the scan + allocation entirely for the overwhelmingly common
+        # case (the flag is set once at ApprovalCycle construction).
+        if not cycle.has_manual:
+            return
         manual_items = [it for it in cycle.items if it.get("_manual")]
         if not manual_items:
             return
@@ -2607,10 +2622,10 @@ class SessionUIBase:
         below; storage and metric callbacks run afterward so neither Stop
         nor a successor waits on I/O.
         """
-        # Prepare the manual gate locally.  Shared activity, mixed automatic
-        # bookkeeping, cycle registration, and the entire prompt bundle commit
-        # under ONE logical admission below; storage and metric callbacks run
-        # afterward so neither Stop nor a successor waits on I/O.
+        # Prepare the human approval gate locally.  Shared activity, mixed
+        # automatic bookkeeping, cycle registration, and the entire prompt
+        # bundle commit under ONE logical admission below; storage and metric
+        # callbacks run afterward so neither Stop nor a successor waits on I/O.
         first_pending = pending[0]
         label = first_pending.get("func_name", "")
         preview = first_pending.get("preview", "")[:60]
@@ -3532,13 +3547,17 @@ class SessionUIBase:
                 # Manual-policy items: expose the mode and the argument digest
                 # so the human can verify the exact invocation is the one being
                 # authorized.  The digest binds to the full prepared execution
-                # arguments; the card itself only carries the normal preview
-                # (argument values truncated at 200 chars/key) so raw argument
-                # content — which may include secrets — is not broadcast over
-                # SSE.  Full canonical arguments are deliberately NOT placed on
-                # the wire card.
+                # arguments; the card carries the normal preview (argument
+                # values truncated at 200 chars/key) with credentials redacted
+                # so sensitive values (tokens, keys, passwords) are not
+                # broadcast over SSE.  Full canonical arguments are
+                # deliberately NOT placed on the wire card.
                 entry["approval_mode"] = "manual"
                 entry["arg_digest"] = it.get("_manual_arg_digest", "")
+                if entry.get("preview"):
+                    from turnstone.core.output_guard import redact_credentials
+
+                    entry["preview"] = redact_credentials(entry["preview"])
             out.append(entry)
         return out
 

@@ -191,9 +191,7 @@ class TaskScheduler:
         task_id = task["task_id"]
         claim_id = uuid.uuid4().hex
         lease_seconds = max(30, self._lock_ttl)
-        until = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        )
+        until = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).strftime("%Y-%m-%dT%H:%M:%S")
         if not self._storage.claim_scheduled_task_execution(task_id, claim_id, until, now):
             log.info("scheduler.task_claimed_elsewhere", task_id=task_id)
             return False
@@ -274,7 +272,9 @@ class TaskScheduler:
             # Update last_run and compute next_run only for timer-triggered runs.
             next_run = self._compute_next_run(task)
             if task["schedule_type"] == "at":
-                self._storage.update_scheduled_task(task_id, last_run=now, next_run="", enabled=False)
+                self._storage.update_scheduled_task(
+                    task_id, last_run=now, next_run="", enabled=False
+                )
             else:
                 self._storage.update_scheduled_task(task_id, last_run=now, next_run=next_run)
 

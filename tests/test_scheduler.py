@@ -446,9 +446,7 @@ class TestManualSchedulerRun:
 
     def test_manual_at_run_does_not_disable_or_consume_task(self, mocks):
         collector, storage = mocks
-        task = _make_task(
-            schedule_type="at", at_time="2099-01-01T00:00:00", target_mode="node-001"
-        )
+        task = _make_task(schedule_type="at", at_time="2099-01-01T00:00:00", target_mode="node-001")
         collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
         scheduler = TaskScheduler(collector, storage)
 

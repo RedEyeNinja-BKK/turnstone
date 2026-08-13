@@ -6968,9 +6968,7 @@ async def admin_run_schedule(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Scheduler is unavailable"}, status_code=503)
     dispatched = await asyncio.to_thread(scheduler.dispatch_manual_task, task)
     if not dispatched:
-        return JSONResponse(
-            {"error": "Schedule dispatch is already in progress"}, status_code=409
-        )
+        return JSONResponse({"error": "Schedule dispatch is already in progress"}, status_code=409)
     return JSONResponse({"status": "dispatched"}, status_code=202)
 
 

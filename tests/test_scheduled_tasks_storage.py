@@ -320,17 +320,29 @@ class TestExecutionClaimsAndLocks:
         assert task["execution_claim_id"] == "new"
 
     def test_scheduler_lock_leadership(self, db):
-        assert db.try_acquire_scheduler_lock("owner-a", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
-        assert not db.try_acquire_scheduler_lock("owner-b", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+        assert db.try_acquire_scheduler_lock(
+            "owner-a", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
+        assert not db.try_acquire_scheduler_lock(
+            "owner-b", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
         assert db.release_scheduler_lock("owner-a")
-        assert db.try_acquire_scheduler_lock("owner-b", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+        assert db.try_acquire_scheduler_lock(
+            "owner-b", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
         # Wrong owner cannot release
         assert not db.release_scheduler_lock("owner-a")
 
     def test_expired_scheduler_lock_is_stealable(self, db):
-        assert db.try_acquire_scheduler_lock("owner-old", "2020-01-01T00:00:00", "2019-01-01T00:00:00")
-        assert db.try_acquire_scheduler_lock("owner-new", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
-        assert not db.try_acquire_scheduler_lock("owner-other", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+        assert db.try_acquire_scheduler_lock(
+            "owner-old", "2020-01-01T00:00:00", "2019-01-01T00:00:00"
+        )
+        assert db.try_acquire_scheduler_lock(
+            "owner-new", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
+        assert not db.try_acquire_scheduler_lock(
+            "owner-other", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
 
 
 class TestTriggerProvenance:

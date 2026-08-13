@@ -671,5 +671,8 @@ class TestScheduleRunAPI:
         task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
         client.app.state.scheduler = type("S", (), {"dispatch_manual_task": lambda self, t: True})()
 
-        assert client.post(f"/v1/api/admin/schedules/{task_id}/run", content=b"not-json").status_code == 400
+        assert (
+            client.post(f"/v1/api/admin/schedules/{task_id}/run", content=b"not-json").status_code
+            == 400
+        )
         assert client.post(f"/v1/api/admin/schedules/{task_id}/run", json=[]).status_code == 400

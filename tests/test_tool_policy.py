@@ -2,7 +2,11 @@
 
 import pytest
 
-from turnstone.core.policy import evaluate_tool_policies_batch, evaluate_tool_policy
+from turnstone.core.policy import (
+    evaluate_tool_policies_batch,
+    evaluate_tool_policy,
+    invalidate_policy_cache,
+)
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 
@@ -87,6 +91,52 @@ def test_first_match_wins(storage):
 
 
 # ---------------------------------------------------------------------------
+# Manual action
+# ---------------------------------------------------------------------------
+
+
+def test_manual_action_accepted(storage):
+    """``manual`` is a valid policy action alongside allow/deny/ask."""
+    storage.create_tool_policy("p1", "manual-gate", "mcp__*", "manual", 0)
+    assert evaluate_tool_policy(storage, "mcp__server__tool") == "manual"
+    assert evaluate_tool_policy(storage, "bash") is None
+
+
+def test_manual_action_batch(storage):
+    """Batch evaluation returns ``manual`` for matching tools."""
+    storage.create_tool_policy("p1", "manual-gate", "mcp__*", "manual", 0)
+    results = evaluate_tool_policies_batch(storage, ["mcp__server__tool", "bash"])
+    assert results["mcp__server__tool"] == "manual"
+    assert results["bash"] is None
+
+
+def test_unknown_action_still_falls_back_to_ask(storage):
+    """An unknown action retains the existing safe fallback to ``ask``."""
+    # Storage does not validate action values; a row with a bogus action
+    # must degrade to ``ask`` (never crash, never auto-approve).
+    storage.create_tool_policy("p-unknown", "unknown", "*", "sneaky", 0)
+    invalidate_policy_cache()
+    assert evaluate_tool_policy(storage, "bash") == "ask"
+    assert evaluate_tool_policies_batch(storage, ["bash"])["bash"] == "ask"
+
+
+def test_manual_priority_first_match(storage):
+    """Existing first-match priority semantics hold for manual:
+    higher-priority allow beats lower-priority manual, and
+    higher-priority manual beats lower-priority deny."""
+    storage.create_tool_policy("p1", "manual-low", "bash*", "manual", 10)
+    storage.create_tool_policy("p2", "allow-high", "bash*", "allow", 100)
+    assert evaluate_tool_policy(storage, "bash") == "allow"
+
+    storage2 = storage
+    # Flip: high manual + low deny → manual (first match wins)
+    storage2.create_tool_policy("p3", "deny-low", "bash*", "deny", 5)
+    storage2.create_tool_policy("p4", "manual-high", "bash*", "manual", 200)
+    invalidate_policy_cache()
+    assert evaluate_tool_policy(storage2, "bash") == "manual"
+
+
+# ---------------------------------------------------------------------------
 # MCP resource and prompt policy patterns
 # ---------------------------------------------------------------------------
 
@@ -165,3 +215,19 @@ def test_mcp_tool_granular_policy(storage):
     # MCP tools now use func_name as approval_label
     assert evaluate_tool_policy(storage, "mcp__github__search") == "allow"
     assert evaluate_tool_policy(storage, "mcp__untrusted__exec") == "ask"
+
+
+def test_policy_action_vocabulary_surfaces_in_sync() -> None:
+    """The canonical action vocabulary (policy evaluator), the schema
+    Literal, and the console route validation must stay in sync so a
+    future action can't be added to one surface and not the others."""
+    import typing
+
+    from turnstone.api import console_schemas
+    from turnstone.core import policy
+
+    # policy.TOOL_POLICY_ACTIONS is the canonical source
+    assert policy.TOOL_POLICY_ACTIONS == ("allow", "deny", "ask", "manual")
+    # the schema Literal mirrors the canonical tuple (kept in sync by test)
+    literal_args = typing.get_args(console_schemas.ToolPolicyAction)
+    assert literal_args == policy.TOOL_POLICY_ACTIONS

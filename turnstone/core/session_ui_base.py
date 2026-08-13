@@ -28,6 +28,7 @@ import contextlib
 import contextvars
 import copy
 import functools
+import hashlib
 import json
 import math
 import os
@@ -46,6 +47,86 @@ from turnstone.core.log import get_logger
 from turnstone.core.workstream import session_persistence_state
 
 log = get_logger(__name__)
+
+
+def canonical_args_json(args: dict[str, Any]) -> str:
+    """Deterministic JSON serialization of prepared execution arguments.
+
+    Stable across runs and processes: recursive ``sort_keys`` ordering,
+    compact separators, Unicode preserved (``ensure_ascii=False``), and
+    standard JSON scalar/list behaviour.  Used as the byte source for the
+    manual-approval argument digest.
+    """
+    return json.dumps(args, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def manual_execution_args(item: dict[str, Any]) -> dict[str, Any]:
+    """Derive the exact prepared execution-argument object for a prepared item.
+
+    Exactness contract (what the digest binds to):
+
+    - MCP tools: the full ``mcp_args`` dict consumed by ``_exec_mcp_tool`` —
+      byte-exact.  This is the v1 protected surface.
+    - ``bash`` / ``write_file`` / ``edit_file`` / ``memory``: the explicit
+      subset of prepared item fields the executor reads — byte-exact.
+    - Any other tool kind: falls back to the prepared ``func_args`` projection
+      (the judge lowering).  This projection is the only prepared argument
+      representation that exists at gate time, but it is NOT guaranteed to be
+      the full executor argument set (e.g. some executors read additional
+      prepared fields).  The v1 deployment targets MCP tools exclusively, so
+      this residual does not affect the protected surface; it is documented
+      for any future expansion to native tools.
+
+    The digest never includes the card preview or any truncated representation.
+    """
+    if item.get("mcp_args") is not None:
+        mcp_args = item["mcp_args"]
+        return mcp_args if isinstance(mcp_args, dict) else {}
+    func_name = item.get("func_name", "")
+    if func_name == "bash":
+        return {
+            "command": item.get("command", ""),
+            "timeout": item.get("timeout"),
+            "stop_on_error": bool(item.get("stop_on_error")),
+            "run_in_background": bool(item.get("run_in_background")),
+        }
+    if func_name == "write_file":
+        return {
+            "path": item.get("path", ""),
+            "content": item.get("content", ""),
+            "append": bool(item.get("append")),
+        }
+    if func_name == "edit_file":
+        return {
+            "path": item.get("path", ""),
+            "edits": item.get("edits", []),
+            "replace_all": bool(item.get("replace_all")),
+        }
+    if func_name == "memory":
+        return {
+            "action": item.get("action", ""),
+            "name": item.get("name", ""),
+            "content": item.get("content", ""),
+            "description": item.get("description"),
+            "mem_type": item.get("mem_type"),
+            "scope": item.get("scope", ""),
+            "scope_id": item.get("scope_id", ""),
+        }
+    func_args = item.get("func_args")
+    return func_args if isinstance(func_args, dict) else {}
+
+
+def manual_arg_digest(item: dict[str, Any]) -> str:
+    """SHA-256 hex digest of the canonical exact prepared execution args.
+
+    Computed from the same prepared argument object that execution
+    consumes — never from the card preview, reconstructed text, or a
+    truncated value.
+    """
+    return hashlib.sha256(
+        canonical_args_json(manual_execution_args(item)).encode("utf-8")
+    ).hexdigest()
+
 
 # Matches WebUI's historical listener queue size and the coordinator
 # UI's ``_LISTENER_QUEUE_MAX``. Per-queue cap keeps a slow SSE consumer
@@ -237,6 +318,7 @@ class ApprovalCycle:
         "cycle_id",
         "decision",
         "event",
+        "has_manual",
         "items",
         "judge_event",
         "pending_verdicts",
@@ -255,6 +337,10 @@ class ApprovalCycle:
         self.items = items
         self.card = card
         self.call_ids: set[str] = {it.get("call_id", "") for it in items if it.get("call_id")}
+        # Whether any item in this cycle carries a winning ``manual`` policy
+        # result.  Set once at construction; lets resolution skip the manual
+        # audit scan for ordinary (non-manual) cycles entirely.
+        self.has_manual: bool = any(it.get("_manual") for it in items)
         # The judge generation that evaluated this batch — identity-
         # compared against the delivering daemon's cancel event so a
         # stale generation (a prior turn's run-to-completion daemon
@@ -1765,6 +1851,7 @@ class SessionUIBase:
         timeout: bool = False,
         call_id: str | None = None,
         cycle_id: str | None = None,
+        resolving_user_id: str | None = None,
     ) -> str | None:
         """Unblock ONE pending approval cycle with the caller's decision.
 
@@ -1789,6 +1876,16 @@ class SessionUIBase:
         method only echoes the intent on the SSE event so peer tabs
         can label their resolved-status pill correctly).
 
+        ``requested_always`` is the raw client intent and
+        ``effective_always`` is what actually happened.  For a manual
+        cycle the effective Always is ALWAYS ``False`` even when a
+        stale/malicious client requested ``True``: the human approval
+        authorizes the exact current call once, the tool name is never
+        persisted into ``auto_approve_tools``, and the published
+        ``approval_resolved`` event reports ``always=False``.
+        ``tool.manual_resolved`` records ``always_suppressed=True`` only
+        when an approved manual request actually asked for Always.
+
         ``timeout`` flips the persisted ``user_decision`` from
         ``"denied"`` to ``"timeout"`` so the audit trail can
         distinguish an active user denial from a passive
@@ -1808,6 +1905,12 @@ class SessionUIBase:
             cycle = self._select_cycle_locked(cycle_id=cycle_id, call_id=call_id)
         if cycle is None:
             return None
+        # Manual cycles: the human's approval authorizes the exact current
+        # call once.  A requested Always is suppressed server-side —
+        # effective_always is False even when the client requested True.
+        manual_cycle = any(it.get("_manual") for it in cycle.items)
+        effective_always = bool(always) and approved and not manual_cycle
+        always_suppressed = bool(always) and approved and manual_cycle
         if not self._begin_approval_admission(lambda: self._approval_cycle_owner_aborted(cycle)):
             return None
         pending: list[dict[str, Any]] | None = None
@@ -1831,7 +1934,7 @@ class SessionUIBase:
                     cycle,
                     approved=approved,
                     feedback=feedback,
-                    always=always,
+                    always=effective_always,
                 )
             except Exception:
                 # The decision is authoritative and the gate was awakened in
@@ -1847,7 +1950,103 @@ class SessionUIBase:
             self._end_approval_admission()
         if pending:
             self._persist_verdict_decisions(pending, decision_str)
+        # Manual-policy resolutions carry an orthogonal audit record: the
+        # existing verdict row keeps its outcome semantics (approved /
+        # denied / timeout), while ``tool.manual_resolved`` records the
+        # approval MODE and the exact invocation identity.  ``resolving_user_id``
+        # is the resolving human for approve/deny; timeout has no human actor.
+        # A timeout is ALWAYS a system resolution: never label it source=human
+        # even if a resolving user id was supplied.
+        resolution_source = (
+            "system" if decision_str == "timeout" else ("human" if resolving_user_id else "system")
+        )
+        self._emit_manual_resolutions(
+            cycle,
+            decision=decision_str,
+            always_suppressed=always_suppressed,
+            resolving_user_id=resolving_user_id,
+            source=resolution_source,
+        )
         return cycle.cycle_id
+
+    def _emit_manual_resolutions(
+        self,
+        cycle: ApprovalCycle,
+        *,
+        decision: str,
+        always_suppressed: bool,
+        resolving_user_id: str | None = None,
+        source: str = "system",
+    ) -> None:
+        """Emit one ``tool.manual_resolved`` audit row per manual-policy call.
+
+        ``decision`` keeps the existing outcome vocabulary (``approved`` /
+        ``denied`` / ``timeout``); the event detail carries the orthogonal
+        approval mode (``approval_mode: "manual"``).
+
+        Actor attribution: ``resolving_user_id`` is the resolving human for
+        approve/deny (``source="human"``).  Timeout carries NO human actor.
+        Automatic lifecycle resolutions (workstream close / recovery /
+        system sweep) carry ``source="system"`` and NO human actor — they
+        must NEVER be attributed to ``self._user_id`` merely because that
+        user owns the workstream.  ``always_suppressed`` is true only when
+        the incoming request actually asked for Always AND an approval was
+        given (a denied/timeout request suppresses nothing).
+
+        ``tool_name`` records the canonical namespaced executable identity
+        (``func_name``), never the presentation label; ``approval_label`` is
+        recorded separately as a non-authoritative display field.
+
+        Audit emission is best-effort, matching the ``tool.auto_approved``
+        precedent: an audit-write failure must not break the tool-execution
+        path (the human approval decision — not the audit row — is the
+        authorization).  Failures are logged at warning so operators can
+        reconcile; they are never silently dropped.
+        """
+        # Fast path: ordinary (non-manual) cycles carry no manual items.
+        # Skip the scan + allocation entirely for the overwhelmingly common
+        # case (the flag is set once at ApprovalCycle construction).
+        if not cycle.has_manual:
+            return
+        manual_items = [it for it in cycle.items if it.get("_manual")]
+        if not manual_items:
+            return
+        actor = ""
+        if decision != "timeout":
+            actor = resolving_user_id or ""
+        try:
+            from datetime import UTC, datetime
+
+            from turnstone.core.audit import record_audit
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                log.warning("manual_resolved.audit_no_storage ws=%s", self.ws_id)
+                return
+            for item in manual_items:
+                record_audit(
+                    storage,
+                    actor,
+                    "tool.manual_resolved",
+                    "workstream",
+                    self.ws_id,
+                    {
+                        "approval_mode": "manual",
+                        "decision": decision,
+                        "source": source,
+                        "tool_name": item.get("func_name", ""),
+                        "approval_label": item.get("approval_label", ""),
+                        "call_id": item.get("call_id", ""),
+                        "cycle_id": cycle.cycle_id,
+                        "user_id": actor,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "always_suppressed": always_suppressed,
+                        "arg_digest": item.get("_manual_arg_digest", ""),
+                    },
+                )
+        except Exception:
+            log.warning("manual_resolved.audit_failed ws=%s", self.ws_id, exc_info=True)
 
     def resolve_all_approvals(
         self,
@@ -1855,6 +2054,8 @@ class SessionUIBase:
         feedback: str | None = None,
         *,
         timeout: bool = False,
+        resolving_user_id: str | None = None,
+        source: str = "system",
     ) -> int:
         """Resolve EVERY live cycle with one decision; returns the count.
 
@@ -1864,6 +2065,14 @@ class SessionUIBase:
         oldest-first so per-cycle bookkeeping (verdict stamps, SSE
         dismissals, per-cycle events) runs identically to a targeted
         resolution.
+
+        Actor attribution for manual resolutions: automatic lifecycle
+        sweeps (workstream close / recovery / system sweep) must NEVER be
+        attributed to ``self._user_id`` merely because that user owns the
+        workstream.  Pass ``resolving_user_id`` + ``source="human"`` only
+        when the calling path can prove an authenticated human initiator
+        (e.g. a user-initiated Stop/cancel endpoint); otherwise leave them
+        unset so the audit records ``source="system"`` with an empty actor.
 
         The admission barrier drains every bundle already linearized before
         the sweep, then atomically claims the eligible cycles. New admissions
@@ -1929,9 +2138,23 @@ class SessionUIBase:
                 if self._approval_sweeps == 0:
                     self._approval_admission_cond.notify_all()
         decision_str = "timeout" if timeout else ("approved" if approved else "denied")
-        for _cycle, pending in claimed:
+        for cycle, pending in claimed:
             if pending:
                 self._persist_verdict_decisions(pending, decision_str)
+            # A workstream-wide sweep (Stop, cancel, session close, worker
+            # recovery) resolves manual cycles too: emit the orthogonal
+            # ``tool.manual_resolved`` audit so the forensic record is
+            # complete on every resolution path.  Sweeps have no per-cycle
+            # human actor unless the calling path proves an authenticated
+            # initiator; the source distinguishes human-initiated sweeps
+            # from automatic lifecycle ones.
+            self._emit_manual_resolutions(
+                cycle,
+                decision=decision_str,
+                always_suppressed=False,
+                resolving_user_id=resolving_user_id,
+                source=source,
+            )
         return len(claimed)
 
     def _persist_verdict_decisions(
@@ -2138,11 +2361,29 @@ class SessionUIBase:
                             elif verdict == "allow":
                                 # Admin-defined ``allow`` rule fires the
                                 # auto-approve gate without any UI prompt.
-                                # Tag for /dashboard visibility so the
-                                # operator can see which calls bypassed
-                                # the prompt and why.
-                                it["needs_approval"] = False
-                                self._tag_auto_approved([it], AutoApproveReason.POLICY)
+                                # STAGE the result — do NOT commit
+                                # auto-approved item state yet.  If a manual
+                                # sibling later rejects the whole batch, the
+                                # allow sibling must serialize denied WITHOUT
+                                # auto_approved=true (no durable evidence of
+                                # approval for a call that never executes).
+                                # Not added to ``still_pending``: the
+                                # ``not still_pending`` branch below commits
+                                # the staged allow when every item resolved
+                                # by policy (deny+allow), and the manual
+                                # early branch rejects the batch before any
+                                # commit when a manual item exists.
+                                it["_policy_allow"] = True
+                            elif verdict == "manual":
+                                # Admin-defined ``manual`` rule: only a fresh
+                                # live human ApprovalCycle may execute this
+                                # invocation.  Tag the item with the mode; the
+                                # argument digest is computed AFTER batch
+                                # isolation succeeds (see the manual early
+                                # branch) so rejected mixed batches never pay
+                                # the canonicalization cost.
+                                it["_manual"] = True
+                                still_pending.append(it)
                             else:
                                 still_pending.append(it)
                         # If all were resolved by policy, check if any were denied
@@ -2163,6 +2404,16 @@ class SessionUIBase:
                                 policy_deferred: list[Callable[[], None]] = []
 
                                 def _commit_policy_result() -> None:
+                                    # Commit the staged policy-allow siblings
+                                    # now: the whole batch resolved by policy
+                                    # (allow/deny) and is being blocked.  The
+                                    # allow siblings did execute past the gate
+                                    # in this path (they were policy-approved),
+                                    # so they are tagged and audited.
+                                    for it in items:
+                                        if it.get("_policy_allow"):
+                                            it["needs_approval"] = False
+                                            self._tag_auto_approved([it], AutoApproveReason.POLICY)
                                     self._record_auto_approves(items, deferred=policy_deferred)
                                     self._persist_auto_approved_heuristic_verdicts(
                                         items,
@@ -2186,6 +2437,66 @@ class SessionUIBase:
         if _cancelled():
             return False, "Cancelled by user"
         # -- End tool policy evaluation -------------------------------------------
+
+        # -- Manual policy early branch -------------------------------------------
+        # A winning ``manual`` policy result for any prepared invocation routes
+        # the batch directly to a fresh human ApprovalCycle.  The automatic
+        # approval pipeline (skill allow, ``auto_approve_tools`` / stale
+        # "Approve + Always", blanket ``auto_approve``, ``skip_permissions``,
+        # Smart Approvals) is structurally unreachable for it: this branch
+        # returns before any of those gates run.
+        manual_items = [
+            it for it in items if it.get("_manual") and not it.get("error") and not it.get("denied")
+        ]
+        if manual_items:
+            if _cancelled():
+                return False, "Cancelled by user"
+            # Batch isolation — one Vincent GO authorizes exactly one protected
+            # prepared call.  Any other executable sibling (read, write,
+            # native, MCP, LOCAL/REMOTE pair) invalidates the whole batch:
+            # no sibling may execute under the same manual GO, and no sibling
+            # may leave durable auto-approval evidence.  Returning here — before
+            # the auto-approve commit paths — means none of them do.
+            executable = [it for it in items if not it.get("error") and not it.get("denied")]
+            if len(executable) != 1 or executable[0] is not manual_items[0]:
+                msg = (
+                    "Protected manual tool batches must contain exactly one "
+                    "executable call (the manual invocation); sibling calls "
+                    "are not permitted under the same manual GO."
+                )
+                for it in executable:
+                    it["denied"] = True
+                    it["denial_msg"] = f"Denied by user: {msg}"
+                self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
+                return False, msg
+            # Valid single-manual batch: compute the argument digest for the
+            # one executable manual call (after isolation, so rejected batches
+            # never pay the cost), then route directly to a fresh
+            # ApprovalCycle through the same helper the ordinary terminal
+            # human-prompt path uses (no duplicated approval machinery).
+            manual_item = manual_items[0]
+            manual_item["_manual_arg_digest"] = manual_arg_digest(manual_item)
+            return self._run_human_approval_cycle(
+                items,
+                pending=manual_items,
+                cancelled=_cancelled,
+                admit=_admit,
+                judge_event=judge_event,
+            )
+        # -- End manual policy early branch ---------------------------------------
+
+        # Commit staged policy-allow items now that no manual batch is being
+        # rejected: the whole batch is proceeding through the ordinary
+        # approval flow, so admin ``allow`` rules take effect exactly as
+        # before.  (In the manual-rejected path above, allow siblings were
+        # denied and never tagged, so no serialized item carries
+        # auto_approved=true for a call that never executes.)  Allow items
+        # were dropped from ``pending`` by the policy block, so iterate the
+        # full ``items`` list.
+        for it in items:
+            if it.get("_policy_allow"):
+                it["needs_approval"] = False
+                self._tag_auto_approved([it], AutoApproveReason.POLICY)
 
         # Per-tool auto-approve check (from workstream template or interactive "Always").
         # Suppressed when a budget-override item is present so the carve-out
@@ -2282,17 +2593,46 @@ class SessionUIBase:
                 persist()
             return True, None
 
-        # Prepare the manual gate locally.  Shared activity, mixed automatic
-        # bookkeeping, cycle registration, and the entire prompt bundle commit
-        # under ONE logical admission below; storage and metric callbacks run
-        # afterward so neither Stop nor a successor waits on I/O.
+        return self._run_human_approval_cycle(
+            items,
+            pending=pending,
+            cancelled=_cancelled,
+            admit=_admit,
+            judge_event=judge_event,
+        )
+
+    def _run_human_approval_cycle(
+        self,
+        items: list[dict[str, Any]],
+        pending: list[dict[str, Any]],
+        *,
+        cancelled: Callable[[], bool],
+        admit: Callable[[Callable[[], object]], bool],
+        judge_event: threading.Event | None,
+    ) -> tuple[bool, str | None]:
+        """Run one fresh human ApprovalCycle for the given pending batch.
+
+        Shared by the ordinary terminal human-prompt path and the manual
+        policy early branch (which routes a valid single-manual batch here
+        directly, bypassing every automatic approval mechanism).  There is
+        exactly one implementation of the human gate — no duplicated
+        approval system.
+        Shared activity, mixed automatic bookkeeping, cycle registration,
+        and the entire prompt bundle commit under ONE logical admission
+        below; storage and metric callbacks run afterward so neither Stop
+        nor a successor waits on I/O.
+        """
+        # Prepare the human approval gate locally.  Shared activity, mixed
+        # automatic bookkeeping, cycle registration, and the entire prompt
+        # bundle commit under ONE logical admission below; storage and metric
+        # callbacks run afterward so neither Stop nor a successor waits on I/O.
         first_pending = pending[0]
         label = first_pending.get("func_name", "")
         preview = first_pending.get("preview", "")[:60]
         heuristic_verdicts: list[dict[str, Any]] = []
         pending_verdicts: list[dict[str, Any]] = []
         for item in items:
-            if _cancelled():
+            if cancelled():
                 return False, "Cancelled by user"
             hv = item.get("_heuristic_verdict")
             if not hv:
@@ -2356,7 +2696,7 @@ class SessionUIBase:
             prompt_published = True
 
         try:
-            if not _admit(_commit_manual_prompt):
+            if not admit(_commit_manual_prompt):
                 return False, "Cancelled by user"
         except BaseException:
             if cycle_registered:
@@ -3203,6 +3543,21 @@ class SessionUIBase:
             if it.get("auto_approved"):
                 entry["auto_approved"] = True
                 entry["auto_approve_reason"] = it.get("auto_approve_reason", "")
+            if it.get("_manual"):
+                # Manual-policy items: expose the mode and the argument digest
+                # so the human can verify the exact invocation is the one being
+                # authorized.  The digest binds to the full prepared execution
+                # arguments; the card carries the normal preview (argument
+                # values truncated at 200 chars/key) with credentials redacted
+                # so sensitive values (tokens, keys, passwords) are not
+                # broadcast over SSE.  Full canonical arguments are
+                # deliberately NOT placed on the wire card.
+                entry["approval_mode"] = "manual"
+                entry["arg_digest"] = it.get("_manual_arg_digest", "")
+                if entry.get("preview"):
+                    from turnstone.core.output_guard import redact_credentials
+
+                    entry["preview"] = redact_credentials(entry["preview"])
             out.append(entry)
         return out
 

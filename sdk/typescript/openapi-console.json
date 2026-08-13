@@ -10488,6 +10488,12 @@
             "type": "string"
           },
           "action": {
+            "enum": [
+              "allow",
+              "deny",
+              "ask",
+              "manual"
+            ],
             "title": "Action",
             "type": "string"
           },
@@ -10542,6 +10548,12 @@
             "type": "string"
           },
           "action": {
+            "enum": [
+              "allow",
+              "deny",
+              "ask",
+              "manual"
+            ],
             "title": "Action",
             "type": "string"
           },
@@ -10598,6 +10610,12 @@
           "action": {
             "anyOf": [
               {
+                "enum": [
+                  "allow",
+                  "deny",
+                  "ask",
+                  "manual"
+                ],
                 "type": "string"
               },
               {

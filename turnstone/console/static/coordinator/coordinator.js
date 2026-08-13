@@ -2025,6 +2025,7 @@ function createCoordinatorPane(root, wsId, opts) {
           it.needs_approval &&
           it.func_name &&
           it.func_name !== "__budget_override__" &&
+          it.approval_mode !== "manual" &&
           !it.error,
       )
       .map((it) => it.approval_label || it.func_name);

@@ -45,8 +45,13 @@ role and permission-override editors.
 Admin-defined rules that control tool execution:
 
 - **Pattern matching**: Glob syntax via `fnmatch` (e.g., `bash*`, `file_write`, `*`)
-- **Actions**: `allow` (auto-approve), `deny` (block), `ask` (normal approval flow)
-- **Priority**: Higher priority evaluated first, first match wins
+- **Actions**: `allow` (auto-approve), `deny` (block), `ask` (normal approval flow),
+  `manual` (fresh live human ApprovalCycle only — every automatic approval
+  mechanism is bypassed for the invocation)
+- **Priority**: Higher priority evaluated first, first match wins; the winning
+  policy's action is authoritative. Equal-priority overlapping policies are
+  order-undefined under current storage (no deterministic tie-breaker) — do not
+  rely on a winner for overlapping rules at the same priority.
 - **Enforcement**: `evaluate_tool_policies_batch()` called in `WebUI.approve_tools()`
   before the `auto_approve` check
 - **MCP granular policies**: MCP resources and prompts are evaluated using their
@@ -56,6 +61,70 @@ Admin-defined rules that control tool execution:
   - Prompt invocations: `mcp__{server}__{prompt}` (e.g., `mcp__trusted__*` to allow,
     `mcp__*` to require approval for all)
   - Built-in tools continue to use `func_name` for backward compatibility
+
+**`manual` action semantics**
+
+A policy with `action = manual` requires that every invocation of the matched
+tool reach a fresh live human approval cycle before execution:
+
+- The winning policy result is `manual`; a higher-priority matching policy's
+  action (`allow` / `deny` / `ask`) overrides it exactly as it would any other
+  action — policy precedence remains administrative governance. Administrators
+  can deliberately raise a policy above a `manual` rule.
+- **Scope boundary**: tool policies are evaluated on **prepared calls that
+  enter the approval gate** (`needs_approval=True`). Calls prepared as
+  `needs_approval=False` (read-only built-ins such as `read_file` / `search`,
+  and other pre-auto-approved paths) are **not** elevated to `manual` merely
+  because an admin policy exists. The invariant below applies once `manual`
+  is the winning result *for a prepared invocation that entered the gate*;
+  it does not claim `manual` re-classifies a pre-prepared no-approval call.
+- Once `manual` is the winning result for a prepared invocation, **no runtime
+  automatic approval mechanism can satisfy it**: skill `allowed_tools`,
+  workstream `auto_approve_tools`, stale "Approve + Always" entries, blanket
+  `auto_approve`, `tools.skip_permissions`, and Smart Approvals are all
+  structurally bypassed (the batch is routed directly to the human gate before
+  those paths run).
+- **Batch isolation**: a batch containing a `manual` invocation must contain
+  exactly one executable call — that manual call. Any sibling (read, write,
+  native, MCP, LOCAL/REMOTE pair) causes the whole executable batch to be
+  rejected with zero execution.
+- **Approve + Always is suppressed** for manual cycles: an `always=true`
+  request approves the exact current call once, never persists the tool name,
+  and is audited with `always_suppressed: true`. A pre-existing Always entry
+  is never consulted on the manual path.
+- **Approver identity**: any human with the `tools.approve` permission may
+  resolve the cycle (RBAC). Timeout (no human action) fails closed and
+  executes nothing.
+- **Audit**: resolutions emit a `tool.manual_resolved` audit event carrying
+  `approval_mode: "manual"`, the outcome (`approved` / `denied` / `timeout`),
+  the exact namespaced tool name (`func_name`), the presentation
+  `approval_label` (non-authoritative), `call_id`, `cycle_id`, `user_id`,
+  `source`, `always_suppressed`, and a stable SHA-256 argument digest of the
+  exact prepared execution arguments. The `user_decision` field on
+  intent-verdict rows keeps its existing outcome vocabulary; the mode is
+  recorded orthogonally. Workstream-wide sweeps (Stop / cancel / session
+  close) emit the same event.
+  - **Human resolution**: a direct human approve/deny records
+    `source="human"` with the authenticated resolving `user_id`. An
+    authenticated user-initiated Cancel/Stop sweep records `source="human"`
+    with the authenticated initiating `user_id`.
+  - **System resolution**: a timeout records `source="system"` with an empty
+    human `user_id`. Automatic workstream close, recovery, and lifecycle /
+    system sweeps also record `source="system"` with an empty human `user_id`
+    — a human actor is never invented for an automatic resolution.
+  Audit emission is **best-effort**, matching the `tool.auto_approved`
+  precedent: the human approval decision — not the audit row — is the
+  authorization, so an audit-write failure is logged at warning for
+  reconciliation and never breaks the tool-execution path. The approval card
+  shows the normal preview (argument values truncated at 200 chars/key) plus
+  the digest — full raw arguments are deliberately not broadcast over SSE.
+- **Argument digest**: `SHA-256(canonical JSON of the exact prepared
+  execution args)` with `sort_keys=True`, `ensure_ascii=False`,
+  `separators=(",", ":")`, UTF-8. It is byte-exact for MCP tools (`mcp_args`)
+  and the named native executors (`bash`, `write_file`, `edit_file`,
+  `memory`); for any other tool kind it binds to the prepared judge
+  projection, which is the only prepared argument representation available
+  at gate time (documented residual — the v1 protected surface is MCP-only).
 
 ### Skills
 

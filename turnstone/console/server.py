@@ -74,6 +74,7 @@ from turnstone.core.model_registry import (
     strip_control_characters,
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
+from turnstone.core.policy import TOOL_POLICY_ACTIONS
 from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef
 from turnstone.core.rerank_calibrate import canonical_caps_value
 from turnstone.core.session_replay import (
@@ -118,6 +119,10 @@ from turnstone.core.workstream import (
     WorkstreamKind,
     workstream_persistence_state,
 )
+
+# Derived from the canonical action vocabulary so the error message stays in
+# sync if an action is added/removed.
+_POLICY_ACTION_ERROR = "action must be one of: " + ", ".join(TOOL_POLICY_ACTIONS)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterable
@@ -7735,9 +7740,9 @@ async def admin_create_policy(request: Request) -> JSONResponse:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not tool_pattern:
         return JSONResponse({"error": "tool_pattern is required"}, status_code=400)
-    if action not in ("allow", "deny", "ask"):
+    if action not in TOOL_POLICY_ACTIONS:
         return JSONResponse(
-            {"error": "action must be one of: allow, deny, ask"},
+            {"error": _POLICY_ACTION_ERROR},
             status_code=400,
         )
 
@@ -7803,9 +7808,9 @@ async def admin_update_policy(request: Request) -> JSONResponse:
         updates["tool_pattern"] = str(body["tool_pattern"]).strip()[:256]
     if "action" in body:
         act = str(body["action"]).strip().lower()
-        if act not in ("allow", "deny", "ask"):
+        if act not in TOOL_POLICY_ACTIONS:
             return JSONResponse(
-                {"error": "action must be one of: allow, deny, ask"},
+                {"error": _POLICY_ACTION_ERROR},
                 status_code=400,
             )
         updates["action"] = act

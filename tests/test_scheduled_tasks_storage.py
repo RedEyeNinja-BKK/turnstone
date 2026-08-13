@@ -281,3 +281,88 @@ class TestScheduledTaskRuns:
         runs = db.list_task_runs("task_001")
         assert len(runs) == 1
         assert runs[0]["run_id"] == "new_run"
+
+
+class TestExecutionClaimsAndLocks:
+    """Scheduler-core atomic coordination: per-task dispatch claims and
+    scheduler leadership leases (SCHEDULER-CORE CORRECTNESS FIX)."""
+
+    def test_claim_is_exclusive(self, db):
+        db.create_scheduled_task(**_make_task_kwargs(task_id="task_claim"))
+        assert db.claim_scheduled_task_execution(
+            "task_claim", "c1", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
+        assert not db.claim_scheduled_task_execution(
+            "task_claim", "c2", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
+        # Owner can renew
+        assert db.renew_scheduled_task_execution("task_claim", "c1", "2030-01-02T00:00:00")
+        # Wrong owner cannot renew/release
+        assert not db.renew_scheduled_task_execution("task_claim", "c2", "2030-01-03T00:00:00")
+        assert not db.release_scheduled_task_execution("task_claim", "c2")
+        # Owner release
+        assert db.release_scheduled_task_execution("task_claim", "c1")
+        # Now claimable again
+        assert db.claim_scheduled_task_execution(
+            "task_claim", "c3", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
+
+    def test_expired_claim_is_reclaimed(self, db):
+        db.create_scheduled_task(**_make_task_kwargs(task_id="task_expire"))
+        # Old claim already past its deadline
+        assert db.claim_scheduled_task_execution(
+            "task_expire", "old", "2020-01-01T00:00:00", "2019-01-01T00:00:00"
+        )
+        assert db.claim_scheduled_task_execution(
+            "task_expire", "new", "2030-01-01T00:00:00", "2026-01-01T00:00:00"
+        )
+        task = db.get_scheduled_task("task_expire")
+        assert task["execution_claim_id"] == "new"
+
+    def test_scheduler_lock_leadership(self, db):
+        assert db.try_acquire_scheduler_lock("owner-a", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+        assert not db.try_acquire_scheduler_lock("owner-b", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+        assert db.release_scheduler_lock("owner-a")
+        assert db.try_acquire_scheduler_lock("owner-b", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+        # Wrong owner cannot release
+        assert not db.release_scheduler_lock("owner-a")
+
+    def test_expired_scheduler_lock_is_stealable(self, db):
+        assert db.try_acquire_scheduler_lock("owner-old", "2020-01-01T00:00:00", "2019-01-01T00:00:00")
+        assert db.try_acquire_scheduler_lock("owner-new", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+        assert not db.try_acquire_scheduler_lock("owner-other", "2030-01-01T00:00:00", "2026-01-01T00:00:00")
+
+
+class TestTriggerProvenance:
+    """Run history provenance: default schedule, explicit manual."""
+
+    def test_record_defaults_to_schedule(self, db):
+        db.create_scheduled_task(**_make_task_kwargs(task_id="task_trig"))
+        db.record_task_run(
+            run_id="r_sched",
+            task_id="task_trig",
+            node_id="node_1",
+            ws_id="",
+            correlation_id="",
+            started="2026-01-01T00:00:00",
+            status="dispatched",
+            error="",
+        )
+        runs = db.list_task_runs("task_trig")
+        assert runs[0]["trigger"] == "schedule"
+
+    def test_record_manual_trigger(self, db):
+        db.create_scheduled_task(**_make_task_kwargs(task_id="task_trig2"))
+        db.record_task_run(
+            run_id="r_manual",
+            task_id="task_trig2",
+            node_id="node_1",
+            ws_id="",
+            correlation_id="",
+            started="2026-01-01T00:00:00",
+            status="dispatched",
+            error="",
+            trigger="manual",
+        )
+        runs = db.list_task_runs("task_trig2")
+        assert runs[0]["trigger"] == "manual"

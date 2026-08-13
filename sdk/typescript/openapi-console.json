@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.8.0a5",
+    "version": "1.8.0a6",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -1136,6 +1136,77 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/schedules/{task_id}/run": {
+      "post": {
+        "summary": "Manually dispatch a schedule once without changing its cadence",
+        "operationId": "v1_api_admin_schedules_{task_id}_run_post",
+        "tags": [
+          "Schedules"
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -9046,6 +9117,11 @@
           "error": {
             "default": "",
             "title": "Error",
+            "type": "string"
+          },
+          "trigger": {
+            "default": "schedule",
+            "title": "Trigger",
             "type": "string"
           }
         },

@@ -663,6 +663,32 @@ Response: updated `ScheduleInfo`. Returns `400` for validation errors, `404` if 
 
 Delete a scheduled task and all its run history. Returns `{"status": "ok"}` or `404`.
 
+#### `POST /v1/api/admin/schedules/{task_id}/run`
+
+Dispatch the stored schedule definition exactly once through `TaskScheduler`'s
+normal target-selection and workstream-creation path. The endpoint accepts no
+request body (an empty JSON object or no body) and does not accept prompt,
+model, tool, target, or approval overrides.
+
+It is authorized like every schedule admin endpoint and runs disabled tasks
+too. It preserves the stored task's `enabled`, `last_run`, and `next_run`
+fields; in particular it neither consumes an `at` task nor alters the cadence
+of a cron task. It creates normal run-history rows with `trigger: "manual"`.
+Returns `404` when the task does not exist, `503` when no scheduler is
+available, and `409` when a scheduler tick or another manual run currently
+holds the task's dispatch claim.
+
+```json
+{"status": "dispatched"}
+```
+
+> **Dispatch-lifetime limitation:** Run Once provides atomic admission and
+> bounded dispatch coordination. It does NOT prove same-task exclusivity
+> through downstream workstream terminal completion. After a successful
+> dispatch, do not invoke the same task again until its resulting workstream
+> is proven terminal; after an ambiguous/lost response, inspect run/workstream
+> history before any further action — never blind-retry.
+
 #### `GET /v1/api/admin/schedules/{task_id}/runs?limit=50`
 
 List execution history for a task (most recent first). `limit` defaults to 50, max 200.
@@ -678,13 +704,14 @@ List execution history for a task (most recent first). `limit` defaults to 50, m
       "correlation_id": "corr_789",
       "started": "2026-03-05T02:00:00Z",
       "status": "dispatched",
-      "error": ""
+      "error": "",
+      "trigger": "schedule"
     }
   ]
 }
 ```
 
-Status is `dispatched` on success or `failed` with an `error` message (e.g. no reachable nodes). Failed runs do not advance `next_run`.
+Status is `dispatched` on success or `failed` with an `error` message (e.g. no reachable nodes). Failed runs do not advance `next_run`. `trigger` records provenance: `"schedule"` for normal timer firings, `"manual"` for Run Once dispatches.
 
 ---
 

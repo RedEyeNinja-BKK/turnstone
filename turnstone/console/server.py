@@ -6936,6 +6936,46 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     return JSONResponse(task)
 
 
+async def admin_run_schedule(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/schedules/{task_id}/run — dispatch once, asynchronously.
+
+    The body is deliberately an object (currently no options), so malformed,
+    list-shaped and chunked payloads get a deterministic 400. A completely
+    absent body is accepted as the implicit empty object. The synchronous
+    SDK dispatch runs in a worker thread and cannot block the console loop.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
+    if err:
+        return err
+    raw = await request.body()
+    if raw:
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+        if body:
+            return JSONResponse(
+                {"error": "Manual run body must be an empty JSON object"}, status_code=400
+            )
+    task = storage.get_scheduled_task(request.path_params["task_id"])
+    if task is None:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        return JSONResponse({"error": "Scheduler is unavailable"}, status_code=503)
+    dispatched = await asyncio.to_thread(scheduler.dispatch_manual_task, task)
+    if not dispatched:
+        return JSONResponse(
+            {"error": "Schedule dispatch is already in progress"}, status_code=409
+        )
+    return JSONResponse({"status": "dispatched"}, status_code=202)
+
+
 async def admin_delete_schedule(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/schedules/{task_id} — delete task + runs."""
     from turnstone.core.auth import require_permission
@@ -16075,6 +16115,11 @@ def create_app(
                     Route(
                         "/api/admin/schedules/preview",
                         admin_preview_schedule,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/schedules/{task_id}/run",
+                        admin_run_schedule,
                         methods=["POST"],
                     ),
                     Route("/api/admin/schedules/{task_id}", admin_get_schedule),

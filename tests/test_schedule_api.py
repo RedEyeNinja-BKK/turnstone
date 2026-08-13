@@ -22,6 +22,7 @@ from turnstone.console.server import (
     admin_list_schedule_runs,
     admin_list_schedules,
     admin_preview_schedule,
+    admin_run_schedule,
     admin_update_schedule,
 )
 from turnstone.core.auth import AuthResult
@@ -58,6 +59,11 @@ def client(storage):
                     Route(
                         "/api/admin/schedules/preview",
                         admin_preview_schedule,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/schedules/{task_id}/run",
+                        admin_run_schedule,
                         methods=["POST"],
                     ),
                     Route("/api/admin/schedules/{task_id}", admin_get_schedule),
@@ -588,3 +594,73 @@ class TestPreviewSchedule:
             json={"schedule_type": "cron", "cron_expr": "0 6 * * *"},
         )
         assert all(t.endswith("+00:00") for t in resp.json()["next"])
+
+
+class TestScheduleRunAPI:
+    """Tests for POST /v1/api/admin/schedules/{task_id}/run (Run Once)."""
+
+    def test_run_dispatches_disabled_task_and_preserves_state(self, client, storage):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload(enabled=False)).json()[
+            "task_id"
+        ]
+
+        class Scheduler:
+            def __init__(self):
+                self.task = None
+
+            def dispatch_manual_task(self, task):
+                self.task = task
+                return True
+
+        scheduler = Scheduler()
+        client.app.state.scheduler = scheduler
+        before = storage.get_scheduled_task(task_id)
+
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={})
+
+        assert resp.status_code == 202, resp.text
+        assert resp.json()["status"] == "dispatched"
+        assert scheduler.task["task_id"] == task_id
+        after = storage.get_scheduled_task(task_id)
+        assert after["enabled"] == before["enabled"]
+        assert after["next_run"] == before["next_run"]
+        assert after["last_run"] == before["last_run"]
+
+    def test_run_rejects_nonempty_body(self, client, storage):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        client.app.state.scheduler = type("S", (), {"dispatch_manual_task": lambda self, t: True})()
+
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={"model": "other"})
+        assert resp.status_code == 400
+        assert "empty JSON object" in resp.json()["error"]
+
+    def test_run_missing_task_404(self, client):
+        resp = client.post("/v1/api/admin/schedules/missing/run", json={})
+        assert resp.status_code == 404
+
+    def test_run_no_scheduler_503(self, client, storage):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        client.app.state.scheduler = None
+
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={})
+        assert resp.status_code == 503
+
+    def test_run_claimed_409(self, client, storage):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+
+        class BusyScheduler:
+            def dispatch_manual_task(self, task):
+                return False
+
+        client.app.state.scheduler = BusyScheduler()
+
+        resp = client.post(f"/v1/api/admin/schedules/{task_id}/run", json={})
+        assert resp.status_code == 409
+        assert "already in progress" in resp.json()["error"]
+
+    def test_run_rejects_malformed_and_list_body(self, client, storage):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        client.app.state.scheduler = type("S", (), {"dispatch_manual_task": lambda self, t: True})()
+
+        assert client.post(f"/v1/api/admin/schedules/{task_id}/run", content=b"not-json").status_code == 400
+        assert client.post(f"/v1/api/admin/schedules/{task_id}/run", json=[]).status_code == 400

@@ -1530,6 +1530,26 @@ class StorageBackend(Protocol):
         """Return enabled tasks whose next_run <= now, ordered by next_run."""
         ...
 
+    def claim_scheduled_task_execution(
+        self, task_id: str, claim_id: str, until: str, now: str
+    ) -> bool:
+        """Atomically acquire a bounded dispatch lease, recovering expired claims.
+
+        Returns True exactly when this caller wins the claim.  The predicate
+        is ``claim_id == '' OR execution_claim_until <= now`` evaluated by the
+        storage engine inside one conditional UPDATE, so concurrent contenders
+        cannot both win.
+        """
+        ...
+
+    def renew_scheduled_task_execution(self, task_id: str, claim_id: str, until: str) -> bool:
+        """Extend a dispatch lease only when it remains owned by claim_id."""
+        ...
+
+    def release_scheduled_task_execution(self, task_id: str, claim_id: str) -> bool:
+        """Release a dispatch lease only when it is still owned by claim_id."""
+        ...
+
     def record_task_run(
         self,
         run_id: str,
@@ -1540,8 +1560,13 @@ class StorageBackend(Protocol):
         started: str,
         status: str,
         error: str,
+        trigger: str = "schedule",
     ) -> None:
-        """Record a scheduled task execution."""
+        """Record a scheduled task execution.
+
+        ``trigger`` records provenance: ``"schedule"`` for a normal timer
+        firing, ``"manual"`` for an operator-initiated Run Once dispatch.
+        """
         ...
 
     def list_task_runs(self, task_id: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -2461,6 +2486,19 @@ class StorageBackend(Protocol):
         ...
 
     # -- System settings -------------------------------------------------------
+
+    def try_acquire_scheduler_lock(self, owner: str, until: str, now: str) -> bool:
+        """Atomically acquire scheduler leadership or recover an expired lease.
+
+        Uses one ``INSERT ... ON CONFLICT ... DO UPDATE ... WHERE until <= now``
+        so only one contender may win even when two consoles race.  Returns
+        True exactly when *owner* holds the lease.
+        """
+        ...
+
+    def release_scheduler_lock(self, owner: str) -> bool:
+        """Release scheduler leadership only when it is still owned by owner."""
+        ...
 
     def get_system_setting(self, key: str, node_id: str = "") -> dict[str, Any] | None:
         """Return setting dict or None."""

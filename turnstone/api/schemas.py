@@ -267,6 +267,7 @@ class ScheduleRunInfo(BaseModel):
     started: str
     status: str = "dispatched"
     error: str = ""
+    trigger: str = "schedule"
 
 
 class ListScheduleRunsResponse(BaseModel):

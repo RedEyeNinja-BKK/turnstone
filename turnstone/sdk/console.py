@@ -665,6 +665,23 @@ class AsyncTurnstoneConsole(_BaseClient):
             "DELETE", f"/v1/api/admin/schedules/{task_id}", response_model=StatusResponse
         )
 
+    async def run_schedule(self, task_id: str) -> StatusResponse:
+        """Manually dispatch a stored schedule definition once.
+
+        Uses the exact stored definition — no prompt/model/tool/persona/
+        skill overrides are accepted.  The stored cadence (``enabled``,
+        ``next_run``, cron/at schedule) is left unchanged; run history
+        records ``trigger="manual"``.  A 409 means a dispatch is already
+        in progress; an ambiguous/lost response must not be blind-retried
+        (inspect run history first).
+        """
+        return await self._request(
+            "POST",
+            f"/v1/api/admin/schedules/{task_id}/run",
+            json_body={},
+            response_model=StatusResponse,
+        )
+
     async def list_schedule_runs(
         self, task_id: str, *, limit: int = 50
     ) -> ListScheduleRunsResponse:
@@ -1548,6 +1565,10 @@ class TurnstoneConsole:
 
     def delete_schedule(self, task_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_schedule(task_id))
+
+    def run_schedule(self, task_id: str) -> StatusResponse:
+        """Manually dispatch a stored schedule definition once (sync wrapper)."""
+        return self._runner.run(self._async.run_schedule(task_id))
 
     def list_schedule_runs(self, task_id: str, *, limit: int = 50) -> ListScheduleRunsResponse:
         return self._runner.run(self._async.list_schedule_runs(task_id, limit=limit))

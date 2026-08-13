@@ -64,6 +64,7 @@ from turnstone.core.storage._schema import (
     roles,
     scheduled_task_runs,
     scheduled_tasks,
+    scheduler_locks,
     services,
     skill_resources,
     skill_versions,
@@ -2568,6 +2569,53 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
+    def claim_scheduled_task_execution(
+        self, task_id: str, claim_id: str, until: str, now: str
+    ) -> bool:
+        """Atomically acquire a short dispatch lease or recover an expired one."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(scheduled_tasks)
+                .where(
+                    (scheduled_tasks.c.task_id == task_id)
+                    & (
+                        (scheduled_tasks.c.execution_claim_id == "")
+                        | (scheduled_tasks.c.execution_claim_until <= now)
+                    )
+                )
+                .values(execution_claim_id=claim_id, execution_claim_until=until)
+            )
+            conn.commit()
+            return result.rowcount == 1
+
+    def renew_scheduled_task_execution(self, task_id: str, claim_id: str, until: str) -> bool:
+        """Extend only the dispatch lease still owned by this attempt."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(scheduled_tasks)
+                .where(
+                    (scheduled_tasks.c.task_id == task_id)
+                    & (scheduled_tasks.c.execution_claim_id == claim_id)
+                )
+                .values(execution_claim_until=until)
+            )
+            conn.commit()
+            return result.rowcount == 1
+
+    def release_scheduled_task_execution(self, task_id: str, claim_id: str) -> bool:
+        """Release only the lease owned by this dispatch attempt."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(scheduled_tasks)
+                .where(
+                    (scheduled_tasks.c.task_id == task_id)
+                    & (scheduled_tasks.c.execution_claim_id == claim_id)
+                )
+                .values(execution_claim_id="", execution_claim_until="")
+            )
+            conn.commit()
+            return result.rowcount == 1
+
     def record_task_run(
         self,
         run_id: str,
@@ -2578,6 +2626,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         started: str,
         status: str,
         error: str,
+        trigger: str = "schedule",
     ) -> None:
 
         with self._conn() as conn:
@@ -2592,6 +2641,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     "started": started,
                     "status": status,
                     "error": error,
+                    "trigger": trigger,
                 },
             )
             conn.commit()
@@ -5120,6 +5170,32 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             return int(result or 0)
 
     # -- System settings -------------------------------------------------------
+
+    def try_acquire_scheduler_lock(self, owner: str, until: str, now: str) -> bool:
+        """Atomically create or steal an expired scheduler leadership lease."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.text(
+                    "INSERT INTO scheduler_locks (lock_name, owner, until) VALUES "
+                    "('scheduler_lock', :owner, :until) "
+                    "ON CONFLICT (lock_name) DO UPDATE SET owner=EXCLUDED.owner, until=EXCLUDED.until "
+                    "WHERE scheduler_locks.until <= :now"
+                ),
+                {"owner": owner, "until": until, "now": now},
+            )
+            conn.commit()
+            return result.rowcount == 1
+
+    def release_scheduler_lock(self, owner: str) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(scheduler_locks).where(
+                    (scheduler_locks.c.lock_name == "scheduler_lock")
+                    & (scheduler_locks.c.owner == owner)
+                )
+            )
+            conn.commit()
+            return result.rowcount == 1
 
     def get_system_setting(self, key: str, node_id: str = "") -> dict[str, Any] | None:
         with self._conn() as conn:

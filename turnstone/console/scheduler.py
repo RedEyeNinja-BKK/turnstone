@@ -4,16 +4,16 @@ Runs as a daemon thread inside the console process. Checks for due tasks
 every ``check_interval`` seconds and dispatches them to server nodes via
 the :class:`~turnstone.sdk.server.TurnstoneServer` SDK client.
 
-Uses a ``system_settings`` row for distributed locking in multi-console
-deployments.
+Scheduler leadership and per-task dispatch admission use durable atomic
+leases in storage (``scheduler_locks`` + ``scheduled_tasks.execution_claim_*``),
+not best-effort ``system_settings`` read-modify-write.
 """
 
 from __future__ import annotations
 
-import json
 import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -102,64 +102,15 @@ class TaskScheduler:
             self._stop_event.wait(self._check_interval)
 
     def _try_acquire_lock(self) -> bool:
-        """Try to acquire the scheduler lock via system_settings.
-
-        Uses a row with key ``scheduler_lock``.  The value is a JSON
-        object ``{"owner": "<id>", "acquired": "<iso>"}``.  Another
-        instance's lock is considered expired when its timestamp is
-        older than ``_lock_ttl`` seconds.
-
-        To reduce the TOCTOU window of a read-then-write approach, this
-        method writes unconditionally and reads back to verify ownership.
-        If two schedulers race, one write wins and the loser sees the
-        winner's value on read-back.  The race window is microseconds
-        (write + read-back) which is acceptable for 15s tick intervals.
-        """
+        """Atomically acquire a short scheduler-leadership lease in storage."""
         now = datetime.now(UTC)
         now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
-
-        # Check if another instance holds a non-expired lock before
-        # attempting to overwrite it.
-        existing = self._storage.get_system_setting("scheduler_lock")
-        if existing is not None:
-            try:
-                lock_data = json.loads(existing.get("value", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                lock_data = {}
-            owner = lock_data.get("owner", "")
-            acquired_str = lock_data.get("acquired", "")
-            if owner != self._lock_owner and acquired_str:
-                try:
-                    acquired_dt = datetime.strptime(acquired_str, "%Y-%m-%dT%H:%M:%S").replace(
-                        tzinfo=UTC
-                    )
-                    if (now - acquired_dt).total_seconds() < self._lock_ttl:
-                        return False  # Another instance holds a valid lock
-                except ValueError:
-                    pass  # Malformed timestamp — take the lock
-
-        # Write our lock and read back to verify we won any concurrent race.
-        lock_value = json.dumps({"owner": self._lock_owner, "acquired": now_str})
-        self._storage.upsert_system_setting("scheduler_lock", lock_value)
-        stored = self._storage.get_system_setting("scheduler_lock")
-        if stored is not None:
-            try:
-                data = json.loads(stored.get("value", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                return False
-            return bool(data.get("owner") == self._lock_owner)
-        return False
+        until = (now + timedelta(seconds=self._lock_ttl)).strftime("%Y-%m-%dT%H:%M:%S")
+        return self._storage.try_acquire_scheduler_lock(self._lock_owner, until, now_str)
 
     def _release_lock(self) -> None:
-        """Release the scheduler lock if we still own it."""
-        existing = self._storage.get_system_setting("scheduler_lock")
-        if existing is not None:
-            try:
-                lock_data = json.loads(existing.get("value", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                lock_data = {}
-            if lock_data.get("owner") == self._lock_owner:
-                self._storage.delete_system_setting("scheduler_lock")
+        """Release scheduler leadership only if this process still owns it."""
+        self._storage.release_scheduler_lock(self._lock_owner)
 
     def _tick(self) -> None:
         """Single scheduler iteration: acquire lock, query due tasks, dispatch."""
@@ -202,8 +153,82 @@ class TaskScheduler:
         finally:
             self._release_lock()
 
-    def _dispatch_task(self, task: dict[str, Any], now: str) -> None:
-        """Dispatch a single task as one or more CreateWorkstreamMessages."""
+    def dispatch_manual_task(self, task: dict[str, Any]) -> bool:
+        """Run one stored task without advancing its configured schedule.
+
+        Returns True when the dispatch attempt was admitted (durable claim
+        acquired and the normal dispatch path executed — success or recorded
+        failure).  Returns False when the task is currently claimed by another
+        dispatch attempt (scheduler tick or another manual run).  Ambiguous
+        callers must not blind-retry: a lost response after an admitted
+        dispatch cannot be distinguished from an unadmitted one without
+        inspecting run history.
+        """
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        return self._dispatch_task(task, now, advance_schedule=False, trigger="manual")
+
+    def _dispatch_task(
+        self,
+        task: dict[str, Any],
+        now: str,
+        *,
+        advance_schedule: bool = True,
+        trigger: str = "schedule",
+    ) -> bool:
+        """Dispatch a task while holding a durable short dispatch lease.
+
+        The lease prevents duplicate create-workstream calls, not remote
+        workstream overlap: scheduled storage has no authoritative
+        terminal-state link.  ``trigger`` records whether this firing came
+        from the timer (``"schedule"``) or an explicit Run Once request
+        (``"manual"``); manual runs never advance ``last_run``/``next_run``
+        or change ``enabled``.
+
+        Returns True when this attempt was admitted (claim acquired and the
+        dispatch sequence ran to completion — the run history records the
+        outcome).  Returns False when the claim was held by another attempt.
+        """
+        task_id = task["task_id"]
+        claim_id = uuid.uuid4().hex
+        lease_seconds = max(30, self._lock_ttl)
+        until = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).strftime("%Y-%m-%dT%H:%M:%S")
+        if not self._storage.claim_scheduled_task_execution(task_id, claim_id, until, now):
+            log.info("scheduler.task_claimed_elsewhere", task_id=task_id)
+            return False
+        renew_stop = threading.Event()
+
+        def _renew() -> None:
+            while not renew_stop.wait(max(1.0, lease_seconds / 2)):
+                renewed_until = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).strftime(
+                    "%Y-%m-%dT%H:%M:%S"
+                )
+                if not self._storage.renew_scheduled_task_execution(
+                    task_id, claim_id, renewed_until
+                ):
+                    log.warning("scheduler.task_claim_lost", task_id=task_id)
+                    return
+
+        renewer = threading.Thread(target=_renew, daemon=True, name="schedule-claim-renew")
+        renewer.start()
+        try:
+            self._dispatch_task_claimed(
+                task, now, advance_schedule=advance_schedule, trigger=trigger
+            )
+            return True
+        finally:
+            renew_stop.set()
+            renewer.join(timeout=1)
+            self._storage.release_scheduled_task_execution(task_id, claim_id)
+
+    def _dispatch_task_claimed(
+        self,
+        task: dict[str, Any],
+        now: str,
+        *,
+        advance_schedule: bool,
+        trigger: str,
+    ) -> bool:
+        """Dispatch one task after admission by the durable dispatch lease."""
         target_mode = task["target_mode"]
         task_id = task["task_id"]
         dispatched = False
@@ -220,41 +245,45 @@ class TaskScheduler:
                             max_fan_out=self._max_fan_out,
                         )
                         break
-                    self._dispatch_to_node(task, n["node_id"], now)
+                    self._dispatch_to_node(task, n["node_id"], now, trigger=trigger)
                     fan_count += 1
                     dispatched = True
             if not dispatched:
-                self._record_failure(task, now, "No reachable nodes for fan-out")
+                self._record_failure(task, now, "No reachable nodes for fan-out", trigger=trigger)
         elif target_mode == "pool":
-            self._dispatch_to_pool(task, now)
+            self._dispatch_to_pool(task, now, trigger=trigger)
             dispatched = True
         elif target_mode == "auto":
             node_id = _pick_best_node(self._collector)
             if node_id:
-                self._dispatch_to_node(task, node_id, now)
+                self._dispatch_to_node(task, node_id, now, trigger=trigger)
                 dispatched = True
             else:
-                self._record_failure(task, now, "No reachable nodes")
+                self._record_failure(task, now, "No reachable nodes", trigger=trigger)
         else:
             # Specific node_id
-            self._dispatch_to_node(task, target_mode, now)
+            self._dispatch_to_node(task, target_mode, now, trigger=trigger)
             dispatched = True
 
         if not dispatched:
-            return  # Don't advance schedule on failure
+            return False  # Don't advance schedule on failure
 
-        # Update last_run and compute next_run
-        next_run = self._compute_next_run(task)
-        if task["schedule_type"] == "at":
-            self._storage.update_scheduled_task(task_id, last_run=now, next_run="", enabled=False)
-        else:
-            self._storage.update_scheduled_task(task_id, last_run=now, next_run=next_run)
+        if advance_schedule:
+            # Update last_run and compute next_run only for timer-triggered runs.
+            next_run = self._compute_next_run(task)
+            if task["schedule_type"] == "at":
+                self._storage.update_scheduled_task(
+                    task_id, last_run=now, next_run="", enabled=False
+                )
+            else:
+                self._storage.update_scheduled_task(task_id, last_run=now, next_run=next_run)
 
         log_kw: dict[str, Any] = {
             "task_id": task_id,
             "target_mode": target_mode,
             "schedule_type": task["schedule_type"],
             "created_by": task.get("created_by", ""),
+            "trigger": trigger,
         }
         if task.get("auto_approve", 0):
             log_kw["auto_approve"] = True
@@ -262,6 +291,7 @@ class TaskScheduler:
             log.warning("scheduler.task_dispatched_auto_approve", **log_kw)
         else:
             log.info("scheduler.task_dispatched", **log_kw)
+        return True
 
     @staticmethod
     def _parse_tools(task: dict[str, Any]) -> list[str]:
@@ -300,11 +330,13 @@ class TaskScheduler:
             return url
         return ""
 
-    def _dispatch_to_node(self, task: dict[str, Any], node_id: str, now: str) -> None:
+    def _dispatch_to_node(
+        self, task: dict[str, Any], node_id: str, now: str, *, trigger: str = "schedule"
+    ) -> None:
         """Dispatch a workstream to a specific node via the SDK client."""
         server_url = self._get_node_url(node_id)
         if not server_url:
-            self._record_failure(task, now, f"No URL for node {node_id}")
+            self._record_failure(task, now, f"No URL for node {node_id}", trigger=trigger)
             return
 
         correlation_id = uuid.uuid4().hex
@@ -330,7 +362,7 @@ class TaskScheduler:
             )
             ws_id = resp.ws_id
         except Exception:
-            self._record_failure(task, now, f"SDK dispatch to {node_id} failed")
+            self._record_failure(task, now, f"SDK dispatch to {node_id} failed", trigger=trigger)
             log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
             return
 
@@ -343,17 +375,22 @@ class TaskScheduler:
             started=now,
             status="dispatched",
             error="",
+            trigger=trigger,
         )
 
-    def _dispatch_to_pool(self, task: dict[str, Any], now: str) -> None:
+    def _dispatch_to_pool(
+        self, task: dict[str, Any], now: str, *, trigger: str = "schedule"
+    ) -> None:
         """Dispatch to any available server node (pool mode)."""
         node_id = _pick_best_node(self._collector)
         if not node_id:
-            self._record_failure(task, now, "No reachable nodes for pool dispatch")
+            self._record_failure(task, now, "No reachable nodes for pool dispatch", trigger=trigger)
             return
-        self._dispatch_to_node(task, node_id, now)
+        self._dispatch_to_node(task, node_id, now, trigger=trigger)
 
-    def _record_failure(self, task: dict[str, Any], now: str, error: str) -> None:
+    def _record_failure(
+        self, task: dict[str, Any], now: str, error: str, *, trigger: str = "schedule"
+    ) -> None:
         """Record a failed dispatch attempt."""
         self._storage.record_task_run(
             run_id=uuid.uuid4().hex,
@@ -364,6 +401,7 @@ class TaskScheduler:
             started=now,
             status="failed",
             error=error,
+            trigger=trigger,
         )
         log.warning("scheduler.dispatch_failed", task_id=task["task_id"], error=error)
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,27 +10,16 @@ from turnstone.console.scheduler import TaskScheduler
 from turnstone.sdk._types import TurnstoneAPIError
 
 
-def _wire_lock_storage(storage: MagicMock, initial: dict[str, str] | None = None) -> None:
-    """Configure *storage* mock so upsert/get track scheduler_lock state.
+def _wire_lock_storage(storage: MagicMock, acquired: bool = True) -> None:
+    """Configure *storage* mock for the atomic scheduler leadership lease.
 
-    The scheduler's ``_try_acquire_lock`` now writes then reads back to
-    verify ownership.  The mock must reflect what was most recently
-    upserted so the read-back succeeds.
+    The scheduler now calls ``try_acquire_scheduler_lock`` once and trusts
+    the storage engine's atomic ``INSERT ... ON CONFLICT`` result — there is
+    no read-modify-write and no read-back.  ``acquired=False`` simulates
+    another console holding a non-expired lease.
     """
-    state: dict[str, dict[str, str] | None] = {"scheduler_lock": initial}
-
-    def _get(key: str, **_kw: object) -> dict[str, str] | None:
-        return state.get(key)
-
-    def _upsert(key: str, value: str, **_kw: object) -> None:
-        state[key] = {"value": value}
-
-    def _delete(key: str, **_kw: object) -> None:
-        state.pop(key, None)
-
-    storage.get_system_setting.side_effect = _get
-    storage.upsert_system_setting.side_effect = _upsert
-    storage.delete_system_setting.side_effect = _delete
+    storage.try_acquire_scheduler_lock.return_value = acquired
+    storage.release_scheduler_lock.return_value = True
 
 
 @pytest.fixture
@@ -39,8 +27,12 @@ def mocks():
     """Collector and storage mocks for scheduler tests."""
     collector = MagicMock()
     storage = MagicMock()
-    # Default: no existing lock
-    _wire_lock_storage(storage, initial=None)
+    # Default: lock acquisition succeeds
+    _wire_lock_storage(storage, acquired=True)
+    # Dispatch claims are free by default
+    storage.claim_scheduled_task_execution.return_value = True
+    storage.renew_scheduled_task_execution.return_value = True
+    storage.release_scheduled_task_execution.return_value = True
     return collector, storage
 
 
@@ -96,20 +88,14 @@ class TestSchedulerTick:
         scheduler = TaskScheduler(collector, storage)
         scheduler._tick()
 
-        storage.get_system_setting.assert_called()
-        storage.upsert_system_setting.assert_called()
+        storage.try_acquire_scheduler_lock.assert_called()
+        storage.release_scheduler_lock.assert_called()
         storage.list_due_tasks.assert_called_once()
 
     def test_tick_skips_when_locked(self, mocks):
         collector, storage = mocks
-        # Another instance holds the lock (recent timestamp)
-        from datetime import UTC, datetime
-
-        now_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        _wire_lock_storage(
-            storage,
-            initial={"value": json.dumps({"owner": "other-instance", "acquired": now_str})},
-        )
+        # Another instance holds a non-expired lease — storage says False.
+        _wire_lock_storage(storage, acquired=False)
 
         scheduler = TaskScheduler(collector, storage)
         scheduler._tick()
@@ -117,14 +103,8 @@ class TestSchedulerTick:
         storage.list_due_tasks.assert_not_called()
 
     def test_tick_takes_expired_lock(self, mocks):
-        """An expired lock from another instance should be taken over."""
+        """An expired lease from another instance is reclaimed by storage."""
         collector, storage = mocks
-        _wire_lock_storage(
-            storage,
-            initial={
-                "value": json.dumps({"owner": "other-instance", "acquired": "2020-01-01T00:00:00"})
-            },
-        )
         storage.list_due_tasks.return_value = []
 
         scheduler = TaskScheduler(collector, storage)
@@ -432,3 +412,88 @@ class TestSchedulerTick:
         storage.record_task_run.assert_called_once()
         run_kwargs = storage.record_task_run.call_args[1]
         assert run_kwargs["status"] == "failed"
+
+
+class TestManualSchedulerRun:
+    """Tests for TaskScheduler.dispatch_manual_task() (Run Once).
+
+    Manual runs must reuse the normal scheduler dispatch path, preserve the
+    stored schedule definition (enabled/next_run/last_run/cadence), and
+    record ``trigger="manual"`` in run history.
+    """
+
+    def test_disabled_manual_run_uses_dispatch_path_and_preserves_schedule(self, mocks):
+        collector, storage = mocks
+        task = _make_task(enabled=0, next_run="", target_mode="auto")
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+        scheduler = TaskScheduler(collector, storage)
+
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
+            assert scheduler.dispatch_manual_task(task) is True
+
+        mock_create.assert_called_once()
+        storage.update_scheduled_task.assert_not_called()
+        run_kwargs = storage.record_task_run.call_args[1]
+        assert run_kwargs["trigger"] == "manual"
+        assert run_kwargs["status"] == "dispatched"
+        # The durable claim was acquired and released around dispatch.
+        storage.claim_scheduled_task_execution.assert_called_once()
+        storage.release_scheduled_task_execution.assert_called_once()
+
+    def test_manual_at_run_does_not_disable_or_consume_task(self, mocks):
+        collector, storage = mocks
+        task = _make_task(schedule_type="at", at_time="2099-01-01T00:00:00", target_mode="node-001")
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+        scheduler = TaskScheduler(collector, storage)
+
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ):
+            assert scheduler.dispatch_manual_task(task) is True
+
+        storage.update_scheduled_task.assert_not_called()
+        assert storage.record_task_run.call_args[1]["trigger"] == "manual"
+
+    def test_manual_run_rejected_when_task_claimed(self, mocks):
+        collector, storage = mocks
+        task = _make_task(target_mode="auto")
+        # A scheduler tick (or another manual run) already holds the claim.
+        storage.claim_scheduled_task_execution.return_value = False
+        scheduler = TaskScheduler(collector, storage)
+
+        assert scheduler.dispatch_manual_task(task) is False
+        storage.record_task_run.assert_not_called()
+
+    def test_manual_run_release_is_owner_checked(self, mocks):
+        collector, storage = mocks
+        task = _make_task(target_mode="auto")
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+        scheduler = TaskScheduler(collector, storage)
+
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ):
+            scheduler.dispatch_manual_task(task)
+
+        # Release must pass the claim_id this attempt actually owns.
+        claim_id = storage.claim_scheduled_task_execution.call_args.args[1]
+        release_args = storage.release_scheduled_task_execution.call_args.args
+        assert release_args[1] == claim_id
+
+    def test_manual_run_records_failure_with_manual_trigger(self, mocks):
+        collector, storage = mocks
+        task = _make_task(target_mode="auto")
+        collector.get_nodes.return_value = ([], 0)  # no nodes
+        scheduler = TaskScheduler(collector, storage)
+
+        assert scheduler.dispatch_manual_task(task) is True  # admitted
+        run_kwargs = storage.record_task_run.call_args[1]
+        assert run_kwargs["status"] == "failed"
+        assert run_kwargs["trigger"] == "manual"

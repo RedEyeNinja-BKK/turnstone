@@ -109,6 +109,7 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `get_schedule(task_id)` | `ScheduleInfo` |
 | | `update_schedule(task_id, *, name=..., enabled=..., ...)` | `ScheduleInfo` |
 | | `delete_schedule(task_id)` | `StatusResponse` |
+| | `run_schedule(task_id)` | `StatusResponse` |
 | | `list_schedule_runs(task_id, *, limit=50)` | `ListScheduleRunsResponse` |
 | **MCP Registry** | `search_mcp_registry(q="", *, limit=20, cursor=None)` | `RegistrySearchResponse` |
 | | `install_from_registry(registry_name, source, *, index=0, name="", variables=None, env=None, headers=None)` | `McpServerDetail` |

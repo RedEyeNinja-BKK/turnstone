@@ -1147,6 +1147,77 @@
         }
       }
     },
+    "/v1/api/admin/schedules/{task_id}/run": {
+      "post": {
+        "summary": "Manually dispatch a schedule once without changing its cadence",
+        "operationId": "v1_api_admin_schedules_{task_id}_run_post",
+        "tags": [
+          "Schedules"
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/schedules/{task_id}/runs": {
       "get": {
         "summary": "List run history for a scheduled task",
@@ -10150,6 +10221,11 @@
           "error": {
             "default": "",
             "title": "Error",
+            "type": "string"
+          },
+          "trigger": {
+            "default": "schedule",
+            "title": "Trigger",
             "type": "string"
           }
         },

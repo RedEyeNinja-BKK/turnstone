@@ -6936,6 +6936,42 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     return JSONResponse(task)
 
 
+async def admin_run_schedule(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/schedules/{task_id}/run — dispatch once, asynchronously.
+
+    Contract: the request body MUST be zero bytes.  Any body — ``{}``, a
+    nonempty JSON object, a list, malformed payload, or a chunked nonempty
+    body — is rejected with 400.  This is intentionally the narrow original
+    contract: the endpoint accepts no options, so there is no valid JSON
+    body.  The synchronous SDK dispatch runs in a worker thread and cannot
+    block the console loop.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
+    if err:
+        return err
+    raw = await request.body()
+    if raw:
+        return JSONResponse(
+            {"error": "Manual run request body must be empty (zero bytes)"}, status_code=400
+        )
+    task = storage.get_scheduled_task(request.path_params["task_id"])
+    if task is None:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        return JSONResponse({"error": "Scheduler is unavailable"}, status_code=503)
+    dispatched = await asyncio.to_thread(scheduler.dispatch_manual_task, task)
+    if not dispatched:
+        return JSONResponse({"error": "Schedule dispatch is already in progress"}, status_code=409)
+    return JSONResponse({"status": "dispatched"}, status_code=202)
+
+
 async def admin_delete_schedule(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/schedules/{task_id} — delete task + runs."""
     from turnstone.core.auth import require_permission
@@ -16075,6 +16111,11 @@ def create_app(
                     Route(
                         "/api/admin/schedules/preview",
                         admin_preview_schedule,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/schedules/{task_id}/run",
+                        admin_run_schedule,
                         methods=["POST"],
                     ),
                     Route("/api/admin/schedules/{task_id}", admin_get_schedule),

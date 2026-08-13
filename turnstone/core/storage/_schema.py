@@ -286,6 +286,11 @@ scheduled_tasks = sa.Table(
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("last_run", sa.Text),
     sa.Column("next_run", sa.Text),
+    # A short-lived dispatch lease serializes scheduled and operator-triggered
+    # creation.  It is deliberately not a workstream-lifetime lock: the
+    # scheduler storage has no authoritative terminal-state linkage to a node.
+    sa.Column("execution_claim_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("execution_claim_until", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
@@ -304,6 +309,10 @@ scheduled_task_runs = sa.Table(
     sa.Column("started", sa.Text, nullable=False),
     sa.Column("status", sa.Text, nullable=False, server_default="dispatched"),
     sa.Column("error", sa.Text, nullable=False, server_default=""),
+    # Provenance of the run: "schedule" (timer firing) or "manual" (Run Once).
+    # Existing pre-feature rows resolve to "schedule" via the migration
+    # default; never NULL, so history has deterministic provenance.
+    sa.Column("trigger", sa.Text, nullable=False, server_default="schedule"),
 )
 
 sa.Index("idx_scheduled_task_runs_task_id", scheduled_task_runs.c.task_id)
@@ -786,6 +795,20 @@ system_settings = sa.Table(
 )
 
 sa.Index("idx_system_settings_node", system_settings.c.node_id)
+
+# Durable scheduler-leadership lease.  One row (lock_name) exists at a time;
+# ownership is transferred atomically via
+# ``INSERT ... ON CONFLICT ... DO UPDATE ... WHERE until <= now`` so two
+# consoles cannot both believe they lead a tick.  The lease is short-lived
+# and solely coordinates tick leadership — per-task dispatch admission is
+# the separate ``scheduled_tasks.execution_claim_*`` pair.
+scheduler_locks = sa.Table(
+    "scheduler_locks",
+    metadata,
+    sa.Column("lock_name", sa.Text, primary_key=True),
+    sa.Column("owner", sa.Text, nullable=False),
+    sa.Column("until", sa.Text, nullable=False),
+)
 
 # ---------------------------------------------------------------------------
 # MCP server definitions — database-backed MCP configuration

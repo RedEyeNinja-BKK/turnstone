@@ -406,6 +406,14 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Schedules"],
     ),
     EndpointSpec(
+        "/v1/api/admin/schedules/{task_id}/run",
+        "POST",
+        "Manually dispatch a schedule once without changing its cadence",
+        response_model=StatusResponse,
+        error_codes=[400, 404, 409, 503],
+        tags=["Schedules"],
+    ),
+    EndpointSpec(
         "/v1/api/admin/schedules/{task_id}",
         "PUT",
         "Update a scheduled task",

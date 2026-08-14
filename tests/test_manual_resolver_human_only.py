@@ -493,16 +493,30 @@ class TestRealJwtIntegration:
 
 
 class TestConsoleProxyProvenance:
-    """Prove the console proxy re-mint preserves the TRUE outer provenance as a
-    signed claim, and that a generic caller cannot self-assert it."""
+    """Auth-MODEL integration coverage of the console-proxy re-mint provenance
+    contract (signed orig_src claim + fail-closed predicate).
+
+    This is a MODEL test: it constructs the node-facing token the same way the
+    production console proxy does, then validates it through the real
+    ``validate_jwt`` / ``is_eligible_manual_resolver`` primitives.  The REAL
+    production helper ``turnstone.console.server._proxy_auth_headers`` is
+    regression-pinned separately in ``tests/test_coordinator_proxy_auth.py``
+    (Gate III-B-F-R2 direct-helper tests), which exercises the actual minting
+    code path end-to-end.
+    """
 
     SECRET = "test-secret-0123456789abcdef0123456789abcdef"
     AUD = "turnstone-server-aud"
 
     def _mint_proxy_token(self, outer_source, scopes, permissions, extra=None):
-        """Replicate the console _proxy_auth_headers re-mint for a given outer
+        """Model the console _proxy_auth_headers re-mint for a given outer
         AuthResult: source=console-proxy (unless coordinator/service), with
-        orig_src = outer token_source."""
+        orig_src = outer token_source.
+
+        This mirrors production behaviour for model-level integration testing;
+        the authoritative regression of the REAL helper is in
+        ``test_coordinator_proxy_auth.py``.
+        """
         is_coord = outer_source == "coordinator"
         is_console_service = outer_source == "console" and "service" in scopes
         source = "coordinator" if is_coord else "console" if is_console_service else "console-proxy"

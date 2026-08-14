@@ -136,7 +136,7 @@ For `manual` approval cards/batches (marked `conv-batch--manual`):
   session_ui_base, session_routes, resolver-human-only, card-ux, auth,
   auth_identity, console_routing_proxy, coordinator_proxy_auth, web_helpers,
   console, openapi).
-- Full local non-live suite: **__FULL_SUITE_SUMMARY__** (on exact R1 head).
+- Full local non-live suite (LOCAL regression evidence, NOT GitHub CI) on runtime-source head 1149db44: **12052 passed, 14 skipped, 8 deselected in 3445.61s (0:57:25), exit 0**.
 - ruff check clean; ruff format clean; mypy clean on affected Python.
 
 ## Residual

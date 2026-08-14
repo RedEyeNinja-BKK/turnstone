@@ -1852,6 +1852,10 @@ class SessionUIBase:
         call_id: str | None = None,
         cycle_id: str | None = None,
         resolving_user_id: str | None = None,
+        resolver_source: str = "",
+        resolver_token_source: str = "",
+        resolver_orig_src: str = "",
+        resolver_service_scope: bool = False,
     ) -> str | None:
         """Unblock ONE pending approval cycle with the caller's decision.
 
@@ -1966,6 +1970,10 @@ class SessionUIBase:
             always_suppressed=always_suppressed,
             resolving_user_id=resolving_user_id,
             source=resolution_source,
+            resolver_source=resolver_source,
+            resolver_token_source=resolver_token_source,
+            resolver_orig_src=resolver_orig_src,
+            resolver_service_scope=resolver_service_scope,
         )
         return cycle.cycle_id
 
@@ -1977,6 +1985,10 @@ class SessionUIBase:
         always_suppressed: bool,
         resolving_user_id: str | None = None,
         source: str = "system",
+        resolver_source: str = "",
+        resolver_token_source: str = "",
+        resolver_orig_src: str = "",
+        resolver_service_scope: bool = False,
     ) -> None:
         """Emit one ``tool.manual_resolved`` audit row per manual-policy call.
 
@@ -2043,6 +2055,15 @@ class SessionUIBase:
                         "timestamp": datetime.now(UTC).isoformat(),
                         "always_suppressed": always_suppressed,
                         "arg_digest": item.get("_manual_arg_digest", ""),
+                        # Gate III-B-F: resolver provenance — the authenticated
+                        # authority path that resolved this manual cycle.  These
+                        # are forensic/reconciliation fields; they are NOT proof
+                        # of physical humanness.  The authorization decision is
+                        # server-enforced in the approve handler.
+                        "resolver_source": resolver_source,
+                        "resolver_token_source": resolver_token_source,
+                        "resolver_orig_src": resolver_orig_src,
+                        "resolver_service_scope": resolver_service_scope,
                     },
                 )
         except Exception:

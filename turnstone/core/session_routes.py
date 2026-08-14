@@ -929,6 +929,85 @@ def make_approve_handler(
             and any(it.get("approval_mode") == "manual" for it in target_card.get("items") or [])
         )
         resolving_user_id = auth_user_id(request)
+        # Resolver provenance for forensic reconciliation of MANUAL cycles
+        # (recorded in ``tool.manual_resolved``).  These fields describe the
+        # authenticated authority path; they are NOT proof of physical
+        # humanness.  Authorization is enforced above (human-only invariant).
+        # ``token_source`` carries the JWT ``src`` claim: "jwt" (direct),
+        # "console-proxy" (browser via console proxy), "coordinator"
+        # (coordinator-minted), "console" (service), etc.  For a
+        # console-proxied resolver the trusted ``orig_src`` claim (minted by
+        # the console proxy) records the TRUE outer authenticated source.
+        _auth_result = getattr(getattr(request, "state", None), "auth_result", None)
+        resolver_source = str(getattr(_auth_result, "token_source", "") or "")
+        resolver_token_source = str(getattr(_auth_result, "token_source", "") or "")
+        resolver_orig_src = str(
+            (getattr(_auth_result, "extra_claims", None) or {}).get("orig_src", "") or ""
+        )
+        resolver_service_scope = bool(
+            _auth_result is not None and _auth_result.has_scope("service")
+        )
+        # -- Manual-policy cycles: human-only resolver authority ----------
+        # A cycle carrying a winning ``manual`` policy may only be resolved
+        # by an authenticated HUMAN operator holding ``tools.approve``.
+        # Generic service-scope bypass (which normally passes
+        # ``require_any_permission``) is NOT sufficient; ``admin.coordinator``
+        # alone is NOT sufficient; coordinator/service automation without a
+        # qualifying human path is NOT sufficient; ambiguous provenance
+        # fails closed.
+        if manual_cycle:
+            from turnstone.core.auth import AuthResult, is_eligible_manual_resolver
+
+            auth_result: AuthResult | None = getattr(
+                getattr(request, "state", None), "auth_result", None
+            )
+            if auth_result is None:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            if auth_result.has_scope("service"):
+                # Machine/service principal — never a qualifying human
+                # resolver for a strict ``manual`` cycle, even though the
+                # service scope bypasses ordinary RBAC checks.
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Forbidden: service-scoped callers cannot resolve "
+                            "a manual approval cycle"
+                        )
+                    },
+                    status_code=403,
+                )
+            if not is_eligible_manual_resolver(auth_result):
+                # Fail closed: only eligible authenticated OPERATOR SESSION
+                # provenance (direct password/oidc login, or a console-proxied
+                # human whose signed ``orig_src`` is password/oidc) qualifies.
+                # API tokens (``database``), the ambiguous ``jwt`` default,
+                # coordinator/service/console/cli automation, and blank/unknown
+                # provenance are all rejected.
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Forbidden: resolver provenance does not qualify "
+                            "as an eligible human operator session for a "
+                            "manual approval cycle"
+                        )
+                    },
+                    status_code=403,
+                )
+            if not auth_result.has_permission("tools.approve"):
+                # ``admin.coordinator`` alone (without ``tools.approve``) is
+                # not sufficient for a strict ``manual`` cycle.
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Forbidden: resolving a manual approval cycle "
+                            "requires the 'tools.approve' permission"
+                        )
+                    },
+                    status_code=403,
+                )
+            # Qualifying human path: authenticated operator session with
+            # ``tools.approve`` and eligible direct or console-proxied human
+            # provenance.  The manual cycle may proceed to resolution.
         # Resolve FIRST, then whitelist: the "Approve + Always" names
         # must describe the cycle that actually resolved.  On the cycle
         # path the resolve is pinned to the lookup's cycle_id, so the
@@ -948,6 +1027,10 @@ def make_approve_handler(
                         always=always,
                         cycle_id=pinned_cycle_id,
                         resolving_user_id=resolving_user_id,
+                        resolver_source=resolver_source,
+                        resolver_token_source=resolver_token_source,
+                        resolver_orig_src=resolver_orig_src,
+                        resolver_service_scope=resolver_service_scope,
                     )
                 elif body_call_id or body_cycle_id:
                     # Lookup matched a card that carries no cycle_id
@@ -960,6 +1043,10 @@ def make_approve_handler(
                         call_id=body_call_id or None,
                         cycle_id=body_cycle_id or None,
                         resolving_user_id=resolving_user_id,
+                        resolver_source=resolver_source,
+                        resolver_token_source=resolver_token_source,
+                        resolver_orig_src=resolver_orig_src,
+                        resolver_service_scope=resolver_service_scope,
                     )
                 else:
                     # No selector AND nothing pending at lookup time:
@@ -975,6 +1062,10 @@ def make_approve_handler(
                     call_id=body_call_id or None,
                     cycle_id=body_cycle_id or None,
                     resolving_user_id=resolving_user_id,
+                    resolver_source=resolver_source,
+                    resolver_token_source=resolver_token_source,
+                    resolver_orig_src=resolver_orig_src,
+                    resolver_service_scope=resolver_service_scope,
                 )
         except TypeError:
             # Pre-cycle SessionUI impls (external/custom) without the

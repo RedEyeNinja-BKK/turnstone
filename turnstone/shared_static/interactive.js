@@ -1183,6 +1183,15 @@ class Pane {
     // The composer is disabled while pending, so the only typing surface is the
     // feedback field: there Enter approves (with feedback) / Esc denies and other
     // keys type; elsewhere y|Enter approve, n|Esc deny, a = approve-all.
+    //
+    // MANUAL-CARD HARDENING (Gate III-B-F): a manual approval card must never
+    // be resolved by generic keyboard activity.  Bare Enter/`y` must not
+    // approve a manual card; Enter in an auto-focused feedback field must not
+    // approve; approve-all (`a`) must not approve.  Only a DELIBERATE
+    // activation of an explicitly focused Approve control (Tab to the button
+    // then Enter/Space, or pointer click) approves.  Deny remains available
+    // via Escape/`n` (fail-closed).  We detect the manual card by the
+    // ``conv-batch--manual`` class and require the deliberate path.
     this.el.addEventListener("keydown", (e) => {
       if (!this.pendingApproval || !this.approvalBlockEl) return;
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
@@ -1203,10 +1212,33 @@ class Pane {
           }
         }
       }
+      // A manual approval card is any pending block carrying the
+      // ``conv-batch--manual`` class.  For those, only the deliberate
+      // control-activation path may approve.
+      const isManual = targetBlock
+        ? targetBlock.classList.contains("conv-batch--manual")
+        : false;
       const fb = targetBlock
         ? targetBlock.querySelector(".conv-feedback")
         : null;
       if (ae && fb && ae === fb) {
+        // Feedback field focused: typing Enter must NOT approve a manual
+        // card (that would be an accidental approval from a stray Enter).
+        // For manual cards only Escape denies (fail-closed); all other
+        // keys type feedback.  Non-manual cards keep legacy behavior.
+        if (isManual) {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            this.resolveApproval(
+              false,
+              false,
+              this.getFeedback(targetBlock),
+              false,
+              targetId,
+            );
+          }
+          return;
+        }
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           this.resolveApproval(
@@ -1217,6 +1249,38 @@ class Pane {
             targetId,
           );
         } else if (e.key === "Escape") {
+          e.preventDefault();
+          this.resolveApproval(
+            false,
+            false,
+            this.getFeedback(targetBlock),
+            false,
+            targetId,
+          );
+        }
+        return;
+      }
+      // Deliberate activation of an explicitly focused Approve control
+      // (Tab-focus the button, then Enter/Space).  This is the ONLY
+      // keyboard approval for a manual card.
+      if (ae && ae.classList && ae.classList.contains("conv-btn--approve")) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          this.resolveApproval(
+            true,
+            false,
+            this.getFeedback(targetBlock),
+            false,
+            targetId,
+          );
+          return;
+        }
+      }
+      // Manual cards: reject all other generic approval keys.  Deny stays
+      // easy (Escape / `n`), approve-all is never allowed.
+      if (isManual) {
+        const km = e.key.toLowerCase();
+        if (km === "n" || e.key === "Escape") {
           e.preventDefault();
           this.resolveApproval(
             false,
@@ -4260,15 +4324,30 @@ class Pane {
     if (!announced) this.messagesEl.appendChild(block);
     this._indexToolRows(block);
     if (!autoApproved) {
+      // Gate III-B-F: mark manual-policy cards so the keydown handler can
+      // require a deliberate gesture.  Manual cards carry
+      // ``conv-batch--manual``; ordinary ask cards do not.
+      if ((items || []).some((it) => it.approval_mode === "manual")) {
+        block.classList.add("conv-batch--manual");
+      }
       this._registerApprovalCycle(cycleId, [block], items);
       const fb = block.querySelector(".conv-feedback");
       // Focus the feedback field only for the FIRST (oldest) live cycle —
       // a sibling card arriving while the user is typing into another
-      // cycle's field must not steal focus mid-word.
+      // cycle's field must not steal focus mid-word.  Gate III-B-F: NEVER
+      // auto-focus the feedback field on a MANUAL card — that would let a
+      // stray Enter become an accidental approval.  Manual cards leave
+      // focus where it is; the operator deliberately moves to the Approve
+      // button (Tab) or clicks it.
       if (this._oldestCycleId() === cycleId) {
-        requestAnimationFrame(() => {
-          if (fb) fb.focus();
-        });
+        const isManual = (items || []).some(
+          (it) => it.approval_mode === "manual",
+        );
+        if (!isManual) {
+          requestAnimationFrame(() => {
+            if (fb) fb.focus();
+          });
+        }
       }
     }
     this._relinkAgentCards(items);

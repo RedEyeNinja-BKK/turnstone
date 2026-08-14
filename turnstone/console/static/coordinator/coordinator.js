@@ -545,6 +545,14 @@ function createCoordinatorPane(root, wsId, opts) {
   // the composer / any input keep its own keys; _currentPendingBatch skips a
   // batch whose actions are already disabled (the in-flight double-fire guard).
   // No feedback field here (unlike interactive), so no feedback special-case.
+  //
+  // MANUAL-CARD HARDENING (Gate III-B-F): a manual approval batch must never
+  // be resolved by generic keyboard activity.  Bare Enter must NOT approve a
+  // manual batch; approve-all (Shift+A) must NOT approve a manual batch.
+  // Only a DELIBERATE activation of an explicitly focused Approve control
+  // (Tab-focus the button, then Enter/Space, or pointer click) approves.
+  // Deny remains available via Escape/`d` (fail-closed).  Manual batches
+  // carry the ``conv-batch--manual`` class.
   root.addEventListener("keydown", function (e) {
     const ae = document.activeElement;
     if (
@@ -559,6 +567,25 @@ function createCoordinatorPane(root, wsId, opts) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const batch = _currentPendingBatch();
     if (!batch) return;
+    const isManual = batch.classList.contains("conv-batch--manual");
+    // Deliberate activation of an explicitly focused Approve control —
+    // the ONLY keyboard approval for a manual batch.
+    if (ae && ae.classList && ae.classList.contains("conv-btn--approve")) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        _resolveBatchAction(batch, true, false);
+      }
+      return;
+    }
+    // Manual batches: reject generic approval keys.  Deny stays easy
+    // (Escape / `d`); approve-all is never allowed.
+    if (isManual) {
+      if (e.key === "Escape" || e.key.toLowerCase() === "d") {
+        e.preventDefault();
+        _resolveBatchAction(batch, false, false);
+      }
+      return;
+    }
     if (e.key === "Enter") {
       e.preventDefault();
       _resolveBatchAction(batch, true, false);
@@ -2526,10 +2553,21 @@ function createCoordinatorPane(root, wsId, opts) {
       judgePending: !!judgePending,
       cycleId: cycleId || "",
     });
+    // Gate III-B-F: mark manual-policy batches so the keydown handler can
+    // require a deliberate gesture.
+    if (list.some((it) => it.approval_mode === "manual")) {
+      batch.classList.add("conv-batch--manual");
+    }
     const firstPending = list.find((it) => it.needs_approval);
     if (batch && firstPending && firstPending.call_id) {
       const cached = judgeVerdicts.get(firstPending.call_id);
-      if (cached) _focusBatchPrimary(batch, cached.recommendation);
+      // Gate III-B-F: never auto-focus the Approve button on a MANUAL
+      // batch — that would let a stray Enter become an accidental
+      // approval.  Manual batches leave focus alone; the operator
+      // deliberately Tabs to Approve or clicks it.
+      if (cached && !batch.classList.contains("conv-batch--manual")) {
+        _focusBatchPrimary(batch, cached.recommendation);
+      }
     }
   }
 
@@ -3867,8 +3905,13 @@ function createCoordinatorPane(root, wsId, opts) {
             _appendVerdictLineTo(entry.row, judgeVerdicts.get(ev.call_id));
             // Focus the construct's primary action once the verdict
             // gives the reviewer context to act on — judge=deny defaults
-            // focus to Deny, otherwise Approve.
-            if (entry.batch.classList.contains("conv-batch--pending")) {
+            // focus to Deny, otherwise Approve.  Gate III-B-F: never
+            // auto-focus the Approve button on a MANUAL batch — that
+            // would let a stray Enter become an accidental approval.
+            if (
+              entry.batch.classList.contains("conv-batch--pending") &&
+              !entry.batch.classList.contains("conv-batch--manual")
+            ) {
               _focusBatchPrimary(entry.batch, ev.recommendation);
             }
             break;

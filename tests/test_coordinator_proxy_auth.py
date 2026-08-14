@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 import jwt as pyjwt
 
 from turnstone.console.server import _proxy_auth_headers
-from turnstone.core.auth import JWT_AUD_SERVER, AuthResult
+from turnstone.core.auth import JWT_AUD_SERVER, AuthResult, is_eligible_manual_resolver
 
 _SECRET = "x" * 64
 
@@ -119,3 +119,146 @@ def test_empty_auth_falls_back_to_service_token_or_empty():
     # No proxy_token_mgr configured → empty headers.
     headers = _proxy_auth_headers(_build_request(auth))
     assert headers == {}
+
+
+# ---------------------------------------------------------------------------
+# Gate III-B-F-R2 - direct _proxy_auth_headers trusted-origin regression
+#
+# These exercise the REAL production helper (turnstone.console.server.
+# _proxy_auth_headers), not a reimplementation.  They pin the signed
+# ``orig_src`` claim that the node uses to enforce the eligible-operator-
+# session manual-resolver invariant: a proxied request may only be treated
+# as a human operator session when the trusted console attested the outer
+# source was password/oidc.
+# ---------------------------------------------------------------------------
+
+
+def _proxy_auth_result(auth: AuthResult) -> AuthResult:
+    """Run the REAL _proxy_auth_headers and validate the emitted node JWT."""
+    import turnstone.core.auth as auth_mod
+
+    headers = _proxy_auth_headers(_build_request(auth))
+    token = headers["Authorization"].removeprefix("Bearer ")
+    result = auth_mod.validate_jwt(token, _SECRET, audience=JWT_AUD_SERVER)
+    assert result is not None, "node-facing JWT must validate"
+    return result
+
+
+def test_direct_password_origin_via_real_proxy_allowed():
+    """Outer password login → actual proxy → src=console-proxy, signed
+    orig_src=password, user+permissions preserved, no service scope, eligible."""
+    auth = AuthResult(
+        user_id="10eb9569fe8047e7857eefe2682ecff5",
+        scopes=frozenset({"read", "write", "approve"}),
+        token_source="password",
+        permissions=frozenset({"tools.approve"}),
+    )
+    node = _proxy_auth_result(auth)
+    assert node.token_source == "console-proxy"
+    assert node.extra_claims.get("orig_src") == "password"
+    assert node.user_id == "10eb9569fe8047e7857eefe2682ecff5"
+    assert "tools.approve" in node.permissions
+    assert not node.has_scope("service")
+    assert is_eligible_manual_resolver(node) is True
+
+
+def test_direct_oidc_origin_via_real_proxy_allowed():
+    auth = AuthResult(
+        user_id="10eb9569fe8047e7857eefe2682ecff5",
+        scopes=frozenset({"read", "write", "approve"}),
+        token_source="oidc",
+        permissions=frozenset({"tools.approve"}),
+    )
+    node = _proxy_auth_result(auth)
+    assert node.token_source == "console-proxy"
+    assert node.extra_claims.get("orig_src") == "oidc"
+    assert is_eligible_manual_resolver(node) is True
+
+
+def test_direct_database_origin_via_real_proxy_rejected():
+    """API-token origin must NOT become human-qualified through the proxy."""
+    auth = AuthResult(
+        user_id="10eb9569fe8047e7857eefe2682ecff5",
+        scopes=frozenset({"read", "write", "approve"}),
+        token_source="database",
+        permissions=frozenset({"tools.approve"}),
+    )
+    node = _proxy_auth_result(auth)
+    assert node.token_source == "console-proxy"
+    assert node.extra_claims.get("orig_src") == "database"
+    assert is_eligible_manual_resolver(node) is False
+
+
+def test_direct_ambiguous_jwt_origin_via_real_proxy_rejected():
+    auth = AuthResult(
+        user_id="user-1",
+        scopes=frozenset({"read", "write", "approve"}),
+        token_source="jwt",
+        permissions=frozenset({"tools.approve"}),
+    )
+    node = _proxy_auth_result(auth)
+    assert node.token_source == "console-proxy"
+    assert node.extra_claims.get("orig_src") == "jwt"
+    assert is_eligible_manual_resolver(node) is False
+
+
+def test_direct_coordinator_origin_via_real_proxy_rejected_and_src_preserved():
+    auth = AuthResult(
+        user_id="10eb9569fe8047e7857eefe2682ecff5",
+        scopes=frozenset({"read", "write", "approve"}),
+        token_source="coordinator",
+        permissions=frozenset({"admin.coordinator"}),
+        extra_claims={"coord_ws_id": "coord1"},
+    )
+    node = _proxy_auth_result(auth)
+    assert node.token_source == "coordinator"  # src preserved, not console-proxy
+    assert node.extra_claims.get("orig_src") == "coordinator"
+    assert node.extra_claims.get("coord_ws_id") == "coord1"
+    assert is_eligible_manual_resolver(node) is False
+
+
+def test_direct_console_service_origin_via_real_proxy_rejected():
+    auth = AuthResult(
+        user_id="console-service",
+        scopes=frozenset({"read", "write", "approve", "service"}),
+        token_source="console",
+        permissions=frozenset(),
+    )
+    node = _proxy_auth_result(auth)
+    assert node.token_source == "console"  # service source preserved
+    assert node.extra_claims.get("orig_src") == "console"
+    assert node.has_scope("service")
+    assert is_eligible_manual_resolver(node) is False
+
+
+def test_spoofed_incoming_orig_src_is_overwritten_by_trusted_proxy():
+    """A malicious/foreign inbound claim orig_src=password must NOT survive
+    the re-mint: the trusted console overwrites orig_src from the AUTHENTICATED
+    outer token_source (database), so the node sees database and rejects."""
+    auth = AuthResult(
+        user_id="10eb9569fe8047e7857eefe2682ecff5",
+        scopes=frozenset({"read", "write", "approve"}),
+        token_source="database",
+        permissions=frozenset({"tools.approve"}),
+        extra_claims={"orig_src": "password"},  # spoof attempt
+    )
+    node = _proxy_auth_result(auth)
+    assert node.extra_claims.get("orig_src") == "database", (
+        "proxy must overwrite orig_src from authenticated outer token_source"
+    )
+    assert node.extra_claims.get("orig_src") != "password"
+    assert is_eligible_manual_resolver(node) is False
+
+
+def test_spoofed_incoming_orig_src_coordinator_overwritten():
+    auth = AuthResult(
+        user_id="10eb9569fe8047e7857eefe2682ecff5",
+        scopes=frozenset({"read", "write", "approve"}),
+        token_source="coordinator",
+        permissions=frozenset({"admin.coordinator"}),
+        extra_claims={"orig_src": "password"},  # spoof attempt
+    )
+    node = _proxy_auth_result(auth)
+    assert node.token_source == "coordinator"
+    assert node.extra_claims.get("orig_src") == "coordinator"
+    assert is_eligible_manual_resolver(node) is False

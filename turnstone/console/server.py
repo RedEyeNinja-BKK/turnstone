@@ -355,6 +355,14 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
             coord_ws_id = auth_result.extra_claims.get("coord_ws_id")
             if coord_ws_id:
                 extra["coord_ws_id"] = coord_ws_id
+        # Gate III-B-F-R1: preserve the ORIGINAL authenticated provenance of
+        # the outer request as a signed claim.  A bare ``source="console-proxy"``
+        # does not distinguish a proxied human browser (password/oidc login)
+        # from an API-token (database) or other automation caller that also
+        # enters the proxy.  ``orig_src`` is minted here by the trusted console
+        # inside the signed JWT (never client-supplied) so the node can enforce
+        # the human-only manual-resolver invariant on the TRUE outer source.
+        extra["orig_src"] = auth_result.token_source or ""
         token = create_jwt(
             user_id=auth_result.user_id,
             scopes=auth_result.scopes,

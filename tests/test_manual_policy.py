@@ -92,6 +92,23 @@ def _wait_until_pending(ui: ConsoleCoordinatorUI, timeout: float = 5.0) -> None:
     raise AssertionError("approval cycle was never registered")
 
 
+def _pending_manual_confirmation(ui: ConsoleCoordinatorUI) -> str:
+    """Return the fresh single-use manual_confirmation of the oldest pending
+    MANUAL cycle (used by tests that deliberately approve through the current
+    manual approval protocol).  Empty when no manual cycle is pending."""
+    cycles = getattr(ui, "_approval_cycles", None)
+    if cycles:
+        for cyc in cycles.values():
+            if not getattr(cyc, "resolved", False) and getattr(cyc, "has_manual", False):
+                return getattr(cyc, "manual_confirmation", "") or ""
+    pending = getattr(ui, "_pending_approval", None)
+    if pending:
+        for it in pending.get("items") or []:
+            if it.get("_manual_confirmation"):
+                return it["_manual_confirmation"]
+    return ""
+
+
 def _run_gate_with_resolution(
     ui: ConsoleCoordinatorUI,
     storage: Any,
@@ -122,11 +139,17 @@ def _run_gate_with_resolution(
             _wait_until_pending(ui)
             if before_resolve is not None:
                 before_resolve()
+            # Gate III-B-FINAL: a deliberate manual APPROVE must present the
+            # fresh single-use confirmation for the live cycle.  Tests that
+            # approve use the current manual protocol; deny/timeout never
+            # require it.
+            conf = _pending_manual_confirmation(ui) if approved else None
             ui.resolve_approval(
                 approved,
                 always=always,
                 timeout=timeout,
                 resolving_user_id=resolving_user_id,
+                manual_confirmation=conf,
             )
         finally:
             t.join(timeout=5.0)

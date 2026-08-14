@@ -33,6 +33,7 @@ import json
 import math
 import os
 import queue
+import secrets
 import threading
 import time
 import uuid
@@ -321,6 +322,8 @@ class ApprovalCycle:
         "has_manual",
         "items",
         "judge_event",
+        "manual_confirmation",
+        "manual_confirmation_used",
         "pending_verdicts",
         "publication_done",
         "resolved",
@@ -341,6 +344,23 @@ class ApprovalCycle:
         # result.  Set once at construction; lets resolution skip the manual
         # audit scan for ordinary (non-manual) cycles entirely.
         self.has_manual: bool = any(it.get("_manual") for it in items)
+        # Gate III-B-FINAL: for a MANUAL cycle, an APPROVE resolution must
+        # present the fresh, unpredictable, single-use ``manual_confirmation``
+        # bound to this exact live cycle.  The value is generated at cycle
+        # construction, attached to each manual item (so the current UI can
+        # echo it back on deliberate Approve activation), and never reused
+        # across cycles.  Legacy/stale clients that merely POST
+        # ``approved=true`` without the confirmation fail closed.  DENY never
+        # requires it.
+        if self.has_manual:
+            conf = secrets.token_urlsafe(32)
+            for it in items:
+                if it.get("_manual"):
+                    it["_manual_confirmation"] = conf
+            self.manual_confirmation: str = conf
+        else:
+            self.manual_confirmation = ""
+        self.manual_confirmation_used: bool = False
         # The judge generation that evaluated this batch — identity-
         # compared against the delivering daemon's cancel event so a
         # stale generation (a prior turn's run-to-completion daemon
@@ -1856,6 +1876,7 @@ class SessionUIBase:
         resolver_token_source: str = "",
         resolver_orig_src: str = "",
         resolver_service_scope: bool = False,
+        manual_confirmation: str | None = None,
     ) -> str | None:
         """Unblock ONE pending approval cycle with the caller's decision.
 
@@ -1915,6 +1936,27 @@ class SessionUIBase:
         manual_cycle = any(it.get("_manual") for it in cycle.items)
         effective_always = bool(always) and approved and not manual_cycle
         always_suppressed = bool(always) and approved and manual_cycle
+        # Gate III-B-FINAL: a MANUAL-cycle APPROVE must present the fresh,
+        # single-use ``manual_confirmation`` minted for THIS exact live cycle.
+        # A legacy/stale client that merely posts ``approved=true`` without it
+        # (or with a wrong/reused value) fails closed: no resolution, no
+        # backend dispatch, no mutation-ledger entry.  DENY never requires it.
+        if manual_cycle and approved:
+            expected = cycle.manual_confirmation or ""
+            provided = manual_confirmation or ""
+            if (
+                not expected
+                or not provided
+                or cycle.manual_confirmation_used
+                or not secrets.compare_digest(provided, expected)
+            ):
+                log.warning(
+                    "approval.manual_confirmation_rejected ws=%s cycle=%s "
+                    "(missing/wrong/reused confirmation)",
+                    self.ws_id,
+                    cycle.cycle_id,
+                )
+                return None
         if not self._begin_approval_admission(lambda: self._approval_cycle_owner_aborted(cycle)):
             return None
         pending: list[dict[str, Any]] | None = None
@@ -1933,6 +1975,10 @@ class SessionUIBase:
                     feedback=feedback,
                     decision=decision_str,
                 )
+            # We won the claim: the single-use manual confirmation is now
+            # consumed, so the same value cannot approve a second time.
+            if pending is not None and manual_cycle and approved:
+                cycle.manual_confirmation_used = True
             try:
                 self._publish_approval_resolution(
                     cycle,
@@ -3573,8 +3619,14 @@ class SessionUIBase:
                 # so sensitive values (tokens, keys, passwords) are not
                 # broadcast over SSE.  Full canonical arguments are
                 # deliberately NOT placed on the wire card.
+                #
+                # ``manual_confirmation`` is the fresh single-use value the
+                # CURRENT UI must echo back on a deliberate Approve activation;
+                # a legacy/stale client unaware of it cannot approve.  It is
+                # bound to this exact live cycle and consumed on first use.
                 entry["approval_mode"] = "manual"
                 entry["arg_digest"] = it.get("_manual_arg_digest", "")
+                entry["manual_confirmation"] = it.get("_manual_confirmation", "")
                 if entry.get("preview"):
                     from turnstone.core.output_guard import redact_credentials
 

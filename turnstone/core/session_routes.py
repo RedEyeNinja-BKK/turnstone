@@ -836,6 +836,8 @@ def make_approve_handler(
         approved = bool(body.get("approved", False))
         feedback = body.get("feedback")
         always = bool(body.get("always", False))
+        body_conf_raw = body.get("manual_confirmation", "")
+        manual_confirmation = body_conf_raw.strip() if isinstance(body_conf_raw, str) else ""
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
@@ -1008,6 +1010,21 @@ def make_approve_handler(
             # Qualifying human path: authenticated operator session with
             # ``tools.approve`` and eligible direct or console-proxied human
             # provenance.  The manual cycle may proceed to resolution.
+            # Gate III-B-FINAL: a MANUAL-cycle APPROVE must carry the fresh,
+            # single-use ``manual_confirmation`` minted for this exact live
+            # cycle.  A legacy/stale client that posts ``approved=true``
+            # without it is rejected here (fail closed) before any resolution
+            # or backend dispatch.  DENY never requires the confirmation.
+            if approved and not manual_confirmation:
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Forbidden: resolving a manual approval cycle "
+                            "requires a valid manual_confirmation"
+                        )
+                    },
+                    status_code=409,
+                )
         # Resolve FIRST, then whitelist: the "Approve + Always" names
         # must describe the cycle that actually resolved.  On the cycle
         # path the resolve is pinned to the lookup's cycle_id, so the
@@ -1031,6 +1048,7 @@ def make_approve_handler(
                         resolver_token_source=resolver_token_source,
                         resolver_orig_src=resolver_orig_src,
                         resolver_service_scope=resolver_service_scope,
+                        manual_confirmation=manual_confirmation or None,
                     )
                 elif body_call_id or body_cycle_id:
                     # Lookup matched a card that carries no cycle_id
@@ -1047,6 +1065,7 @@ def make_approve_handler(
                         resolver_token_source=resolver_token_source,
                         resolver_orig_src=resolver_orig_src,
                         resolver_service_scope=resolver_service_scope,
+                        manual_confirmation=manual_confirmation or None,
                     )
                 else:
                     # No selector AND nothing pending at lookup time:
@@ -1066,6 +1085,7 @@ def make_approve_handler(
                     resolver_token_source=resolver_token_source,
                     resolver_orig_src=resolver_orig_src,
                     resolver_service_scope=resolver_service_scope,
+                    manual_confirmation=manual_confirmation or None,
                 )
         except TypeError:
             # Pre-cycle SessionUI impls (external/custom) without the

@@ -2094,6 +2094,13 @@ function createCoordinatorPane(root, wsId, opts) {
         always: !!always,
         call_id: callId,
         cycle_id: batch.dataset.cycleId || null,
+        // Gate III-B-FINAL: a manual APPROVE must carry the fresh single-use
+        // confirmation for this cycle; the server rejects approved=true
+        // without it.  DENY omits it.
+        manual_confirmation:
+          approved && batch.dataset.manualConfirmation
+            ? batch.dataset.manualConfirmation
+            : null,
       });
       if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
     } catch (e) {
@@ -2557,6 +2564,12 @@ function createCoordinatorPane(root, wsId, opts) {
     // require a deliberate gesture.
     if (list.some((it) => it.approval_mode === "manual")) {
       batch.classList.add("conv-batch--manual");
+      // Gate III-B-FINAL: capture the fresh single-use manual_confirmation
+      // so a deliberate Approve activation can echo it back to the server.
+      const mc = list.find((it) => it.manual_confirmation);
+      if (mc && mc.manual_confirmation) {
+        batch.dataset.manualConfirmation = mc.manual_confirmation;
+      }
     }
     const firstPending = list.find((it) => it.needs_approval);
     if (batch && firstPending && firstPending.call_id) {

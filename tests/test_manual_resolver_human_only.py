@@ -76,6 +76,10 @@ class _FakeUI:
                     "approval_label": "mcp__x__tool",
                     "needs_approval": True,
                     "approval_mode": "manual" if manual else "ask",
+                    # Gate III-B-FINAL: the current manual card carries the
+                    # fresh single-use confirmation the current UI echoes back
+                    # on a deliberate Approve activation.
+                    "manual_confirmation": "test-confirmation" if manual else "",
                 }
             ],
         }
@@ -123,7 +127,14 @@ def _run(handler, auth_result, body=None):
 
 
 def _body():
-    return {"approved": True, "cycle_id": "cyc1", "call_id": "call1"}
+    # The current manual approval protocol includes the fresh single-use
+    # confirmation on an APPROVE.  DENY tests pass their own body without it.
+    return {
+        "approved": True,
+        "cycle_id": "cyc1",
+        "call_id": "call1",
+        "manual_confirmation": "test-confirmation",
+    }
 
 
 # --- synthetic AuthResult fixtures -----------------------------------------
@@ -644,5 +655,63 @@ class TestNonManualAskUnaffected:
     def test_ask_admin_coordinator_allowed(self):
         handler, ui = self._ask_handler()
         resp = _run(handler, COORD, _body())
+        assert resp.status_code == 200
+        assert len(ui.calls) == 1
+
+
+class TestManualConfirmationHandler:
+    """Handler-level Gate III-B-FINAL confirmation enforcement."""
+
+    def test_manual_approve_without_confirmation_rejected_409(self):
+        """Legacy/stale client posts approved=true with NO manual_confirmation
+        on a MANUAL cycle → 409, zero resolution."""
+        handler, ui = _make_handler()
+        body = {"approved": True, "cycle_id": "cyc1", "call_id": "call1"}  # no conf
+        resp = _run(handler, PASSWORD_HUMAN, body)
+        assert resp.status_code == 409
+        assert ui.calls == []
+
+    def test_manual_approve_with_confirmation_allowed(self):
+        """Current protocol: approved=true + valid manual_confirmation on a
+        manual cycle → proceeds to resolve_approval."""
+        handler, ui = _make_handler()
+        resp = _run(handler, PASSWORD_HUMAN, _body())
+        assert resp.status_code == 200
+        assert len(ui.calls) == 1
+        kwargs = ui.calls[0][1]
+        assert kwargs.get("manual_confirmation") == "test-confirmation"
+
+    def test_manual_deny_without_confirmation_allowed(self):
+        """DENY never requires the confirmation (fail-closed)."""
+        handler, ui = _make_handler()
+        body = {"approved": False, "cycle_id": "cyc1", "call_id": "call1"}
+        resp = _run(handler, PASSWORD_HUMAN, body)
+        assert resp.status_code == 200
+        assert len(ui.calls) == 1
+        assert ui.calls[0][0][0] is False
+
+    def test_ask_approve_without_confirmation_still_allowed(self):
+        """Ordinary non-manual ask is unchanged: no confirmation required."""
+        from turnstone.core.session_routes import SessionEndpointConfig, make_approve_handler
+
+        ui = _FakeUI(manual=False)
+
+        class _FakeMgr:
+            def get(self, ws_id):
+                return MagicMock(ui=ui)
+
+        cfg = SessionEndpointConfig(
+            manager_lookup=lambda request: (_FakeMgr(), None),
+            permission_gate=None,
+            tenant_check=None,
+            not_found_label="Workstream not found",
+            audit_action_prefix="workstream",
+        )
+        handler = make_approve_handler(
+            cfg, accepted_permissions=("tools.approve", "admin.coordinator")
+        )
+        resp = _run(
+            handler, PASSWORD_HUMAN, {"approved": True, "cycle_id": "cyc1", "call_id": "call1"}
+        )
         assert resp.status_code == 200
         assert len(ui.calls) == 1

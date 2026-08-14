@@ -901,7 +901,13 @@ class Pane {
 
   _registerApprovalCycle(cycleId, blockEls, items) {
     const callIds = (items || []).map((it) => it && it.call_id).filter(Boolean);
-    this.approvalCycles.set(cycleId, { blockEls, callIds });
+    // Gate III-B-FINAL: capture the fresh single-use manual_confirmation for
+    // this cycle so a deliberate Approve activation can echo it back to the
+    // server.  Legacy/stale clients without it cannot approve.
+    const manualConfirmation =
+      ((items || []).find((it) => it && it.approval_mode === "manual") || {})
+        .manual_confirmation || "";
+    this.approvalCycles.set(cycleId, { blockEls, callIds, manualConfirmation });
     this._syncApprovalState();
   }
 
@@ -4403,6 +4409,14 @@ class Pane {
             always: !!always,
             cycle_id: id.startsWith("legacy:") ? null : id,
             call_id: entry.callIds[0] || null,
+            // Gate III-B-FINAL: a manual APPROVE must carry the fresh
+            // single-use confirmation minted for this exact cycle.  The
+            // server rejects approved=true without it (stale/legacy clients
+            // fail closed).  DENY omits it.
+            manual_confirmation:
+              approved && entry.manualConfirmation
+                ? entry.manualConfirmation
+                : null,
           }),
         },
       ).catch((err) => {

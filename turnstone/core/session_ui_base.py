@@ -1854,6 +1854,7 @@ class SessionUIBase:
         resolving_user_id: str | None = None,
         resolver_source: str = "",
         resolver_token_source: str = "",
+        resolver_orig_src: str = "",
         resolver_service_scope: bool = False,
     ) -> str | None:
         """Unblock ONE pending approval cycle with the caller's decision.
@@ -1971,6 +1972,7 @@ class SessionUIBase:
             source=resolution_source,
             resolver_source=resolver_source,
             resolver_token_source=resolver_token_source,
+            resolver_orig_src=resolver_orig_src,
             resolver_service_scope=resolver_service_scope,
         )
         return cycle.cycle_id
@@ -1985,6 +1987,7 @@ class SessionUIBase:
         source: str = "system",
         resolver_source: str = "",
         resolver_token_source: str = "",
+        resolver_orig_src: str = "",
         resolver_service_scope: bool = False,
     ) -> None:
         """Emit one ``tool.manual_resolved`` audit row per manual-policy call.
@@ -2059,6 +2062,7 @@ class SessionUIBase:
                         # server-enforced in the approve handler.
                         "resolver_source": resolver_source,
                         "resolver_token_source": resolver_token_source,
+                        "resolver_orig_src": resolver_orig_src,
                         "resolver_service_scope": resolver_service_scope,
                     },
                 )

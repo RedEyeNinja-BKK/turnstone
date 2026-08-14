@@ -935,10 +935,15 @@ def make_approve_handler(
         # humanness.  Authorization is enforced above (human-only invariant).
         # ``token_source`` carries the JWT ``src`` claim: "jwt" (direct),
         # "console-proxy" (browser via console proxy), "coordinator"
-        # (coordinator-minted), "console" (service), etc.
+        # (coordinator-minted), "console" (service), etc.  For a
+        # console-proxied resolver the trusted ``orig_src`` claim (minted by
+        # the console proxy) records the TRUE outer authenticated source.
         _auth_result = getattr(getattr(request, "state", None), "auth_result", None)
         resolver_source = str(getattr(_auth_result, "token_source", "") or "")
         resolver_token_source = str(getattr(_auth_result, "token_source", "") or "")
+        resolver_orig_src = str(
+            (getattr(_auth_result, "extra_claims", None) or {}).get("orig_src", "") or ""
+        )
         resolver_service_scope = bool(
             _auth_result is not None and _auth_result.has_scope("service")
         )
@@ -951,7 +956,7 @@ def make_approve_handler(
         # qualifying human path is NOT sufficient; ambiguous provenance
         # fails closed.
         if manual_cycle:
-            from turnstone.core.auth import AuthResult
+            from turnstone.core.auth import AuthResult, is_eligible_manual_resolver
 
             auth_result: AuthResult | None = getattr(
                 getattr(request, "state", None), "auth_result", None
@@ -971,15 +976,19 @@ def make_approve_handler(
                     },
                     status_code=403,
                 )
-            if auth_result.token_source not in ("jwt", "database", "password", "console-proxy"):
-                # Coordinator tokens, channel adapters, and other
-                # non-direct-human provenance are not a qualifying human
-                # resolver for a strict ``manual`` cycle.
+            if not is_eligible_manual_resolver(auth_result):
+                # Fail closed: only eligible authenticated OPERATOR SESSION
+                # provenance (direct password/oidc login, or a console-proxied
+                # human whose signed ``orig_src`` is password/oidc) qualifies.
+                # API tokens (``database``), the ambiguous ``jwt`` default,
+                # coordinator/service/console/cli automation, and blank/unknown
+                # provenance are all rejected.
                 return JSONResponse(
                     {
                         "error": (
                             "Forbidden: resolver provenance does not qualify "
-                            "as a human operator for a manual approval cycle"
+                            "as an eligible human operator session for a "
+                            "manual approval cycle"
                         )
                     },
                     status_code=403,
@@ -996,9 +1005,9 @@ def make_approve_handler(
                     },
                     status_code=403,
                 )
-            # Qualifying human path: authenticated principal with
-            # ``tools.approve`` and direct/console-proxied human provenance.
-            # The manual cycle may proceed to resolution.
+            # Qualifying human path: authenticated operator session with
+            # ``tools.approve`` and eligible direct or console-proxied human
+            # provenance.  The manual cycle may proceed to resolution.
         # Resolve FIRST, then whitelist: the "Approve + Always" names
         # must describe the cycle that actually resolved.  On the cycle
         # path the resolve is pinned to the lookup's cycle_id, so the
@@ -1020,6 +1029,7 @@ def make_approve_handler(
                         resolving_user_id=resolving_user_id,
                         resolver_source=resolver_source,
                         resolver_token_source=resolver_token_source,
+                        resolver_orig_src=resolver_orig_src,
                         resolver_service_scope=resolver_service_scope,
                     )
                 elif body_call_id or body_cycle_id:
@@ -1035,6 +1045,7 @@ def make_approve_handler(
                         resolving_user_id=resolving_user_id,
                         resolver_source=resolver_source,
                         resolver_token_source=resolver_token_source,
+                        resolver_orig_src=resolver_orig_src,
                         resolver_service_scope=resolver_service_scope,
                     )
                 else:
@@ -1053,6 +1064,7 @@ def make_approve_handler(
                     resolving_user_id=resolving_user_id,
                     resolver_source=resolver_source,
                     resolver_token_source=resolver_token_source,
+                    resolver_orig_src=resolver_orig_src,
                     resolver_service_scope=resolver_service_scope,
                 )
         except TypeError:

@@ -1487,6 +1487,50 @@ class ServiceTokenManager:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Manual-approval human resolver predicate (Gate III-B-F-R1)
+# ---------------------------------------------------------------------------
+
+
+# Eligible DIRECT authenticated operator-session provenance for resolving a
+# strict ``manual`` approval cycle.  These are the two canonical human-login
+# sources: username/password login (``password``) and OIDC/SSO login
+# (``oidc``).  Everything else — API tokens (``database``), the compatibility
+# default for a JWT without an explicit ``src`` claim (``jwt``), coordinator
+# automation (``coordinator``), service identity (``console``), CLI
+# (``cli``), and blank/unknown — is NOT a qualifying human resolver.
+ELIGIBLE_HUMAN_TOKEN_SOURCES: frozenset[str] = frozenset({"password", "oidc"})
+
+
+def is_eligible_manual_resolver(auth_result: AuthResult | None) -> bool:
+    """Return True only for a resolver that may resolve a strict manual cycle.
+
+    The caller must ALREADY have enforced ``tools.approve`` and non-service
+    scope; this helper narrows the provenance to an eligible authenticated
+    OPERATOR SESSION.  It is deliberately fail-closed: unknown/blank sources
+    and the ambiguous ``jwt`` default do not qualify.
+
+    Two accepted shapes:
+    - DIRECT human session: ``token_source`` is ``password`` or ``oidc``.
+    - PROXIED human session: ``token_source`` is ``console-proxy`` AND the
+      signed ``orig_src`` claim (minted by the trusted console proxy) is
+      ``password`` or ``oidc``.  A bare ``console-proxy`` with no trusted
+      original source, or a proxied API-token/service/coordinator origin,
+      does NOT qualify.
+    """
+    if auth_result is None:
+        return False
+    if auth_result.has_scope("service"):
+        return False
+    src = auth_result.token_source or ""
+    if src in ELIGIBLE_HUMAN_TOKEN_SOURCES:
+        return True
+    if src == "console-proxy":
+        orig = (auth_result.extra_claims or {}).get("orig_src", "") or ""
+        return orig in ELIGIBLE_HUMAN_TOKEN_SOURCES
+    return False
+
+
 class AuthMiddleware:
     """ASGI middleware that enforces bearer-token / cookie authentication.
 

@@ -2717,9 +2717,17 @@ class SessionUIBase:
         card: dict[str, Any] = {
             "type": "approve_request",
             "cycle_id": cycle_id,
-            "items": self._serialize_approval_items(items),
         }
         cycle = ApprovalCycle(items, card, judge_event)
+        # Gate III-B-FINAL-R1 ordering fix: ``ApprovalCycle.__init__`` mints
+        # the fresh single-use ``manual_confirmation`` and injects
+        # ``_manual_confirmation`` into each manual item.  The wire card MUST
+        # therefore be serialized AFTER the cycle exists so the delivered /
+        # replayed card carries the SAME non-empty confirmation the valid
+        # APPROVE path requires.  Serializing before the mint left
+        # ``manual_confirmation=""`` on every manual card — a current browser
+        # could never approve (silent 409 -> timeout auto-deny).
+        card["items"] = self._serialize_approval_items(items)
         prompt_published = False
         cycle_registered = False
 

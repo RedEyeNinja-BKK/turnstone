@@ -7600,6 +7600,36 @@ class ChatSession:
                 f"{raw_tail}"
             )
         if name in _BACKEND_CONNECT_EXC_NAMES:
+            # Registry-removal misclassification guard (registry incident
+            # 2026-08-15): an in-flight request that started before a registry
+            # reload can fail with a connect-class error against a stale client
+            # for an alias that was disabled/removed — BEFORE the next send's
+            # _refresh_model_from_registry latches _registry_alias_removed.
+            # When the current registry proves this session's alias is
+            # absent/disabled (registry loads enabled_only=True, so disabled ==
+            # removed), classify as registry removal, not provider unreachable.
+            # Genuine connection failures to a still-registered alias are
+            # unaffected (registry.has_alias returns True -> fall through).
+            if serving_context is None or alias == (self._model_alias or ""):
+                registry = getattr(self, "_registry", None)
+                if registry is not None and not registry.has_alias(
+                    self._model_alias or ""
+                ):
+                    available = ""
+                    if registry.count:
+                        available = (
+                            f" Available: {', '.join(registry.list_aliases())}"
+                        )
+                    if getattr(self, "_kind", None) == WorkstreamKind.COORDINATOR:
+                        remedy = "Recreate the alias or adjust the workstream model."
+                    else:
+                        remedy = "Switch to another model with /model <alias>."
+                    return (
+                        f"The model '{self._model_alias}' this session was using "
+                        f"has been removed from the registry (disabled or deleted), "
+                        f"and no fallback model could carry the turn. {remedy}"
+                        f"{available}{raw_tail}"
+                    )
             return (
                 f"Backend unreachable ({name}): cannot reach {provider_label} "
                 f"at {base_url} for model={model_label}. "

@@ -8318,6 +8318,36 @@ class ChatSession:
                 f"{raw_tail}"
             )
         if name in _BACKEND_CONNECT_EXC_NAMES:
+            # Registry-removal misclassification guard: an in-flight request
+            # that started before a registry reload can fail with a
+            # connect-class error against a stale client for an alias that was
+            # disabled/removed — BEFORE the next send latches
+            # _registry_alias_removed. When the current registry proves this
+            # session's primary alias is absent/disabled (registry loads
+            # enabled_only=True, so disabled == removed), classify as registry
+            # removal, not provider unreachable. Genuine connection failures to
+            # a still-registered alias are unaffected (has_alias -> fall
+            # through), and the guard is connect-branch + primary-alias only.
+            if serving_context is None or alias == (self._model_alias or ""):
+                registry = getattr(self, "_registry", None)
+                if registry is not None and not registry.has_alias(
+                    self._model_alias or ""
+                ):
+                    available = ""
+                    if registry.count:
+                        available = (
+                            f" Available: {', '.join(registry.list_aliases())}"
+                        )
+                    if self._kind == WorkstreamKind.COORDINATOR:
+                        remedy = "Recreate the alias or adjust the workstream model."
+                    else:
+                        remedy = "Switch to another model with /model <alias>."
+                    return (
+                        f"The model '{self._model_alias}' this session was using "
+                        f"has been removed from the registry (disabled or deleted), "
+                        f"and no fallback model could carry the turn. {remedy}"
+                        f"{available}{raw_tail}"
+                    )
             return (
                 f"Backend unreachable ({name}): cannot reach {provider_label} "
                 f"at {base_url} for model={model_label}. "

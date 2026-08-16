@@ -58,10 +58,12 @@ def _stub(
     return stub
 
 
-def _format(stub: Any, exc: BaseException) -> str | None:
+def _format(stub: Any, exc: BaseException, serving_context: Any = None) -> str | None:
     """Invoke the method as if on a real session — ``__func__`` skips
     the descriptor protocol so we can pass any object as ``self``."""
-    return ChatSession._format_backend_error(stub, exc)  # type: ignore[arg-type]
+    return ChatSession._format_backend_error(  # type: ignore[arg-type]
+        stub, exc, serving_context=serving_context
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +173,78 @@ def test_connect_message_says_unreachable(exc_cls):
     assert "http://192.168.0.5:8000/v1" in msg
     # Raw exception text is preserved as a tail for grep-correlation.
     assert "dial tcp: i/o timeout" in msg
+
+
+def _registry_stub(*, present: bool, aliases: list[str] | None = None) -> Any:
+    """Minimal registry for the connect-class misclassification guard."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        has_alias=lambda _name: present,
+        count=1 if present else 0,
+        list_aliases=lambda: aliases or (["flatspark"] if present else []),
+    )
+
+
+@pytest.mark.parametrize("exc_cls", [ConnectError, ConnectTimeout, APIConnectionError])
+def test_connect_error_on_removed_alias_classifies_registry_removal(exc_cls):
+    """A removed/disabled primary alias + connect-class exception must be
+    classified as registry removal, not provider unreachable."""
+    stub = _stub()
+    stub._registry = _registry_stub(present=False)
+    stub._kind = None
+    msg = _format(stub, exc_cls("connection error"))
+    assert msg is not None
+    assert "has been removed from the registry (disabled or deleted)" in msg
+    assert "Backend unreachable" not in msg
+    assert "Switch to another model with /model <alias>." in msg
+
+
+@pytest.mark.parametrize("exc_cls", [ConnectError, ConnectTimeout, APIConnectionError])
+def test_connect_error_on_valid_alias_stays_provider_unreachable(exc_cls):
+    """A still-valid alias + genuine upstream connection failure must remain
+    provider-unreachable (the registry guard must not mask it)."""
+    stub = _stub()
+    stub._registry = _registry_stub(present=True)
+    stub._kind = None
+    msg = _format(stub, exc_cls("connection refused"))
+    assert msg is not None
+    assert "Backend unreachable" in msg
+    assert "removed from the registry" not in msg
+
+
+@pytest.mark.parametrize("exc_cls", [ReadTimeout, APITimeoutError])
+def test_removed_alias_timeout_is_not_misclassified(exc_cls):
+    """The guard is connect-branch-only: a timeout on a removed alias must not
+    be rewritten to registry-removal wording."""
+    stub = _stub()
+    stub._registry = _registry_stub(present=False)
+    stub._kind = None
+    msg = _format(stub, exc_cls())
+    assert msg is not None
+    assert "Backend timeout" in msg
+    assert "removed from the registry" not in msg
+
+
+@pytest.mark.parametrize("exc_cls", [ConnectError, ConnectTimeout, APIConnectionError])
+def test_connect_error_on_fallback_alias_stays_provider_unreachable(exc_cls):
+    """A connect error for a non-primary (fallback) alias is never rewritten
+    to the session's own registry removal, even when the primary is absent."""
+    stub = _stub()
+    stub._registry = _registry_stub(present=False)
+    stub._kind = None
+    lane = stub._lane
+    serving = SimpleNamespace(
+        model_alias="fallback-alias",
+        backend_model_id="flatspark",
+        base_url="http://192.168.0.5:8000/v1",
+        provider_label="openai-compatible",
+        lane=lane,
+    )
+    msg = _format(stub, exc_cls("connection error"), serving_context=serving)
+    assert msg is not None
+    assert "Backend unreachable" in msg
+    assert "removed from the registry" not in msg
 
 
 def test_not_found_points_at_model_name_mismatch():

@@ -1786,6 +1786,15 @@ class IntentJudge:
                         judge_turns,
                         tools=_tools,
                         max_tokens=2048,
+                        # Ordinary tool-approval intent judging is finite
+                        # validation of a single call — bounded+none keeps it
+                        # on Luna NT.  It must not ride the parent session's
+                        # agentic/deliberate classification.  A weighing/
+                        # deliberation judge that genuinely requires deep
+                        # reasoning is a distinct call site that passes an
+                        # explicit agentic+deliberate contract; this helper's
+                        # default stays bounded.
+                        routing_contract={"work_shape": "bounded", "reasoning_intent": "none"},
                         cancel_ref=ref,
                     )
 

@@ -1808,7 +1808,9 @@ class TestPersonaDiscovery:
     ) -> None:
         self._seed()
         session = _session(mock_openai_client)
-        item = session._prepare_task("t1", {"prompt": "go", "persona": "Writer"})
+        item = session._prepare_task(
+            "t1", {"prompt": "go", "persona": "Writer", "work_shape": "bounded"}
+        )
         assert not item.get("error"), item.get("error")
         assert item["persona"] == "writer"
         assert "persona: writer" in item["header"]

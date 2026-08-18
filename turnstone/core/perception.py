@@ -106,6 +106,10 @@ def describe(
             lane,
             turns,
             max_tokens=4096,
+            # Perception is a finite artifact (describe attachment content).
+            # bounded+none keeps it on Luna NT and prevents it from riding
+            # the parent session's agentic/deliberate classification.
+            routing_contract={"work_shape": "bounded", "reasoning_intent": "none"},
             resolve_attachments=lambda _ids: {_PERCEPTION_REF_ID: parts},
             cancel_ref=cancel_ref,
         )

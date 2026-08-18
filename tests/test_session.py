@@ -455,6 +455,7 @@ class TestTaskExec:
         item = {
             "call_id": "c1",
             "prompt": "investigate",
+            "work_shape": "bounded",
             "_principal_id": "user-a",
             "_origin_cancel_event": origin_event,
             "_origin_generation": 7,
@@ -548,7 +549,7 @@ class TestTaskExec:
             "content": "# Research Skill\nws={{ws_id}} model={{model}} node={{node_id}}",
         }
         with patch.object(session, "_get_skill_by_name", return_value=skill):
-            item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
+            item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research", "work_shape": "bounded"})
 
         # Item carries the minimized projection — name/content/risk_level only.
         assert item["skill"] == {
@@ -581,7 +582,7 @@ class TestTaskExec:
         operating guidance appear in the system message, and there is NO
         capability turn — just system + prompt."""
         session = _make_session()
-        item = session._prepare_task("c1", {"prompt": "do x"})
+        item = session._prepare_task("c1", {"prompt": "do x", "work_shape": "bounded"})
 
         assert item["skill"] is None
         assert item["persona"] == ""
@@ -616,7 +617,7 @@ class TestTaskExec:
         )
         assert "parent_only_fact" in session.system_messages[0]["content"]
 
-        item = session._prepare_task("c1", {"prompt": "do x"})
+        item = session._prepare_task("c1", {"prompt": "do x", "work_shape": "bounded"})
         captured: dict[str, Any] = {}
 
         def fake_run_agent(messages, **kwargs):
@@ -651,7 +652,13 @@ class TestTaskExec:
             patch.object(get_storage(), "get_persona_by_name", return_value=persona_row),
         ):
             item = session._prepare_task(
-                "c1", {"prompt": "do x", "skill": "research", "persona": "engineer"}
+                "c1",
+                {
+                    "prompt": "do x",
+                    "skill": "research",
+                    "persona": "engineer",
+                    "work_shape": "bounded",
+                },
             )
 
         assert item.get("needs_approval") is True
@@ -674,7 +681,7 @@ class TestTaskExec:
         """Unknown persona name → clean error item, no approval."""
         session = _make_session()
         with patch.object(get_storage(), "get_persona_by_name", return_value=None):
-            item = session._prepare_task("c1", {"prompt": "do x", "persona": "ghost"})
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "ghost", "work_shape": "bounded"})
         assert item.get("needs_approval") is False
         assert "ghost" in item["error"]
         assert "Omit `persona`" in item["error"]
@@ -693,7 +700,7 @@ class TestTaskExec:
             "applies_to_kinds": ["coordinator"],
         }
         with patch.object(get_storage(), "get_persona_by_name", return_value=coord_row):
-            item = session._prepare_task("c1", {"prompt": "do x", "persona": "orchestrator"})
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "orchestrator", "work_shape": "bounded"})
         assert item.get("needs_approval") is False
         assert "interactive" in item["error"]
 
@@ -718,7 +725,7 @@ class TestTaskExec:
             "applies_to_kinds": ["interactive"],
         }
         with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
-            item = session._prepare_task("c1", {"prompt": "edit auth", "persona": "readonly"})
+            item = session._prepare_task("c1", {"prompt": "edit auth", "persona": "readonly", "work_shape": "bounded"})
         assert item["persona_tools"] == frozenset({"read_file", "search"})
 
         captured: dict = {}
@@ -740,7 +747,7 @@ class TestTaskExec:
             {"function": {"name": "read_file"}},
             {"function": {"name": "bash"}},
         ]
-        item = session._prepare_task("c1", {"prompt": "do x"})
+        item = session._prepare_task("c1", {"prompt": "do x", "work_shape": "bounded"})
         assert item["persona_tools"] is None
 
         captured: dict = {}
@@ -768,7 +775,7 @@ class TestTaskExec:
         # Parent runs under a read-only persona.
         session._persona_tools = frozenset({"read_file", "search"})
 
-        item = session._prepare_task("c1", {"prompt": "edit auth"})
+        item = session._prepare_task("c1", {"prompt": "edit auth", "work_shape": "bounded"})
         assert item["persona_tools"] is None  # no CHILD persona
 
         captured: dict = {}
@@ -806,7 +813,7 @@ class TestTaskExec:
             "applies_to_kinds": ["interactive"],
         }
         with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
-            item = session._prepare_task("c1", {"prompt": "do x", "persona": "sandboxed"})
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "sandboxed", "work_shape": "bounded"})
         assert item["persona_mcp"] is False
         assert item["persona_tools"] is None
 
@@ -865,7 +872,7 @@ class TestTaskExec:
             "applies_to_kinds": ["interactive"],
         }
         with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
-            item = session._prepare_task("c1", {"prompt": "do x", "persona": "nomem"})
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "nomem", "work_shape": "bounded"})
         assert item["persona_memory"] is persona_memory
 
         captured: dict = {}
@@ -909,7 +916,7 @@ class TestTaskExec:
             "applies_to_kinds": ["interactive"],
         }
         with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
-            item = session._prepare_task("c1", {"prompt": "do x", "persona": "engineer"})
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "engineer", "work_shape": "bounded"})
         session._evaluate_intent([item])
         assert item["func_args"]["persona"] == "engineer"
 
@@ -923,7 +930,7 @@ class TestTaskExec:
         behavior so a future refactor of the ``(args.get("skill") or "").strip()``
         chokepoint can't quietly diverge."""
         session = _make_session()
-        item = session._prepare_task("c1", {"prompt": "do x", "skill": skill_value})
+        item = session._prepare_task("c1", {"prompt": "do x", "skill": skill_value, "work_shape": "bounded"})
         assert item.get("needs_approval") is True
         assert item["skill"] is None
         assert "skill:" not in item["header"]
@@ -935,7 +942,7 @@ class TestTaskExec:
         bogus name fails fast at approval time rather than at exec."""
         session = _make_session()
         with patch.object(session, "_get_skill_by_name", return_value=None):
-            item = session._prepare_task("c1", {"prompt": "do x", "skill": "ghost"})
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "ghost", "work_shape": "bounded"})
         assert item.get("needs_approval") is False
         assert "unknown skill 'ghost'" in item["error"]
         assert "skills(action='find'" in item["error"]
@@ -952,7 +959,7 @@ class TestTaskExec:
             "enabled": False,
         }
         with patch.object(session, "_get_skill_by_name", return_value=disabled_skill):
-            item = session._prepare_task("c1", {"prompt": "do x", "skill": "retired"})
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "retired", "work_shape": "bounded"})
         assert item.get("needs_approval") is False
         assert "is disabled" in item["error"]
         # Distinct wording from the unknown-skill error, so the LLM can
@@ -972,7 +979,7 @@ class TestTaskExec:
             "risk_level": "critical",
         }
         with patch.object(session, "_get_skill_by_name", return_value=risky_skill):
-            item = session._prepare_task("c1", {"prompt": "do x", "skill": "danger"})
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "danger", "work_shape": "bounded"})
         assert item.get("needs_approval") is False
         assert "principal-load-only" in item["header"]
         assert "/skill danger" in item["error"]
@@ -992,7 +999,7 @@ class TestTaskExec:
             "risk_level": "low",
         }
         with patch.object(session, "_get_skill_by_name", return_value=ok_skill):
-            item = session._prepare_task("c1", {"prompt": "do x", "skill": "research"})
+            item = session._prepare_task("c1", {"prompt": "do x", "skill": "research", "work_shape": "bounded"})
         assert "skill: research" in item["header"]
         assert "risk:" not in item["header"]
 
@@ -1013,7 +1020,7 @@ class TestTaskExec:
 
         skill = {"name": "research", "content": "# Research", "enabled": True}
         with patch.object(session, "_get_skill_by_name", return_value=skill):
-            item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
+            item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research", "work_shape": "bounded"})
         session._evaluate_intent([item])
 
         fa = item["func_args"]
@@ -1032,7 +1039,7 @@ class TestTaskExec:
         fake_judge.arg_budget_chars.return_value = 200_000
         monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
 
-        item = session._prepare_task("c1", {"prompt": "do x"})
+        item = session._prepare_task("c1", {"prompt": "do x", "work_shape": "bounded"})
         session._evaluate_intent([item])
 
         fa = item["func_args"]
@@ -2127,6 +2134,76 @@ def _project_func_args(item: dict[str, Any], *, budget: int = 200_000) -> Any:
     return item.get("func_args", "<<UNSET>>")
 
 
+class TestTaskExecWorkShape:
+    """The task_agent semantic contract is carried BY WORK, never by the
+    executor identity: _exec_task threads the admitted work_shape (bounded for
+    finite inspection, agentic for substantive engineering) into _run_agent so
+    the inner model_turn can claim the correct Switchyard lane."""
+
+    def test_exec_threads_bounded_work_shape_to_run_agent(self, tmp_db) -> None:
+        session = _make_session()
+        run_agent = MagicMock(return_value="done")
+        item = {
+            "call_id": "c1",
+            "prompt": "inspect X",
+            "work_shape": "bounded",
+            "model_override": None,
+            "_principal_id": "user-a",
+            "_origin_cancel_event": threading.Event(),
+            "_origin_generation": 7,
+        }
+        with patch.object(session, "_run_agent", run_agent):
+            session._exec_task(item)
+        assert run_agent.call_args.kwargs["agent_work_shape"] == "bounded"
+
+    def test_exec_threads_agentic_work_shape_to_run_agent(self, tmp_db) -> None:
+        session = _make_session()
+        run_agent = MagicMock(return_value="done")
+        item = {
+            "call_id": "c1",
+            "prompt": "multi-step engineering",
+            "work_shape": "agentic",
+            "model_override": None,
+            "_principal_id": "user-a",
+            "_origin_cancel_event": threading.Event(),
+            "_origin_generation": 7,
+        }
+        with patch.object(session, "_run_agent", run_agent):
+            session._exec_task(item)
+        assert run_agent.call_args.kwargs["agent_work_shape"] == "agentic"
+
+    def test_exec_rejects_missing_work_shape(self, tmp_db) -> None:
+        """The executor never synthesizes a work_shape: an item without one
+        (an unexpected producer/path) fails closed instead of silently choosing
+        a model-spend lane."""
+        session = _make_session()
+        run_agent = MagicMock(return_value="done")
+        item = {
+            "call_id": "c1",
+            "prompt": "investigate",
+            "model_override": None,
+            "_principal_id": "user-a",
+            "_origin_cancel_event": threading.Event(),
+            "_origin_generation": 7,
+        }
+        with patch.object(session, "_run_agent", run_agent):
+            with pytest.raises(ValueError):
+                session._exec_task(item)
+        run_agent.assert_not_called()
+
+    def test_prepare_task_requires_work_shape(self, tmp_db) -> None:
+        """task_agent admission REQUIRES an explicit work_shape; a missing or
+        invalid value is rejected with a directive error (never silently
+        defaulted to a model-spend lane)."""
+        session = _make_session()
+        item = session._prepare_task("c1", {"prompt": "inspect X"})
+        assert item["error"] and "work_shape" in item["error"]
+        assert "execute" not in item
+        item2 = session._prepare_task("c1", {"prompt": "inspect X", "work_shape": "bogus"})
+        assert item2["error"] and "work_shape" in item2["error"]
+        assert "execute" not in item2
+
+
 class TestEvaluateIntentProjection:
     """The projection block in ``_evaluate_intent`` is the judge's only view of
     a pending call's arguments.  A narrow projection silently starves the judge:
@@ -2529,17 +2606,17 @@ class TestAgentModelOverride:
 
     def test_prepare_task_extracts_model_override(self, tmp_db) -> None:
         session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_task("c1", {"prompt": "do x", "model": "fast"})
+        item = session._prepare_task("c1", {"prompt": "do x", "model": "fast", "work_shape": "bounded"})
         assert item["model_override"] == "fast"
 
     def test_prepare_task_missing_model_arg_means_no_override(self, tmp_db) -> None:
         session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_task("c1", {"prompt": "do x"})
+        item = session._prepare_task("c1", {"prompt": "do x", "work_shape": "bounded"})
         assert item["model_override"] is None
 
     def test_prepare_task_unknown_model_returns_error(self, tmp_db) -> None:
         session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_task("c1", {"prompt": "do x", "model": "bogus"})
+        item = session._prepare_task("c1", {"prompt": "do x", "model": "bogus", "work_shape": "bounded"})
         assert item.get("needs_approval") is False
         assert "error" in item
         assert "unknown model alias 'bogus'" in item["error"]
@@ -2551,7 +2628,7 @@ class TestAgentModelOverride:
         per-role ``task_alias``. The LLM should reach the default by omitting
         ``model=`` instead."""
         session = _make_session(registry=self._registry(), model_alias="default")
-        item = session._prepare_task("c1", {"prompt": "do x", "model": "default"})
+        item = session._prepare_task("c1", {"prompt": "do x", "model": "default", "work_shape": "bounded"})
         assert item.get("needs_approval") is False
         assert "'default' is not a selectable model alias" in item["error"]
 

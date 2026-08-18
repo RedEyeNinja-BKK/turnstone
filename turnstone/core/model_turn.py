@@ -264,13 +264,137 @@ def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> M
 
 
 # Providers whose request shape carries an ``extra_body`` dict, so
-# operator ``server_compat`` pins and template-kwarg reasoning levers
-# reach the wire through it.  Real Anthropic and Google keep their own
-# param paths inside their providers and must never be handed one.  THE
-# membership test — shared by :func:`provider_extra_params` and the
-# callers that layer their own pins onto a resolved lane, so the two
-# cannot disagree about which lanes accept extra_body at all.
+# operator ``server_compat`` pins and request-level routing metadata reach the
+# wire through it.  Real Anthropic and Google keep their own param paths inside
+# their providers and must never be handed one.
 EXTRA_BODY_PROVIDERS: tuple[str, ...] = ("openai", "openai-compatible", "anthropic-compatible")
+
+# Switchyard's resource router consumes these fields from the normalized
+# OpenAI request extensions.  They are deliberately request-scoped: a session
+# binding chooses the universal route, while each admitted work item chooses
+# its semantic contract.
+ROUTING_CONTRACT_FIELDS = ("work_shape", "reasoning_intent", "work_class")
+
+
+def routing_contract_extra_params(
+    provider: LLMProvider,
+    contract: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    """Return the explicit Switchyard semantic contract for one request.
+
+    This is not prompt inference and not a model/session default.  Callers
+    must provide both orthogonal fields; malformed or partial contracts fail
+    closed before dispatch.  ``work_class`` is retained only for compatibility
+    with older callers and is never synthesized here.
+    """
+    if not contract:
+        return None
+    if provider.provider_name not in EXTRA_BODY_PROVIDERS:
+        raise ValueError("routing semantic contracts require an OpenAI-shaped provider")
+    allowed = {
+        "work_shape": {"bounded", "agentic"},
+        "reasoning_intent": {"none", "deliberate"},
+        "work_class": {"bounded", "agentic", "reasoning"},
+    }
+    unknown = set(contract) - set(allowed)
+    if unknown:
+        raise ValueError(f"unknown routing contract field(s): {sorted(unknown)!r}")
+    if "work_class" not in contract and set(contract) != {"work_shape", "reasoning_intent"}:
+        raise ValueError("routing contract requires work_shape and reasoning_intent")
+    for key, value in contract.items():
+        if value not in allowed[key]:
+            raise ValueError(f"invalid {key}={value!r}")
+    if contract.get("work_shape") == "bounded" and contract.get("reasoning_intent") == "deliberate":
+        raise ValueError("bounded work_shape with reasoning_intent=deliberate is contradictory")
+    return dict(contract)
+
+
+def _merge_routing_contract(
+    lane: ModelLane,
+    contract: dict[str, str] | None,
+    *,
+    authoritative: bool = False,
+) -> dict[str, Any] | None:
+    """Layer one validated semantic contract into OpenAI ``extra_body``.
+
+    Precedence (symmetric, never cost-motivated):
+
+    - An ALIAS-level semantic pin in ``lane.extra_params`` (a FIXED semantic
+      alias like ``switchyard-smart-reasoning`` → ``work_class=reasoning`` from
+      ``server_compat.extra_body``) is authoritative when the caller passes
+      only a DEFAULT contract (``authoritative=False``): an explicitly
+      user/operator-selected fixed alias must not silently morph to another
+      lane because a call site contributed an ordinary default.
+
+    - A caller EXPLICIT contract (``authoritative=True`` — e.g. a task_agent
+      admission work_shape, or a deliberate escalation) wins over the alias
+      pin when compatible, and REJECTS (fails closed) when it contradicts the
+      pin — it never silently resolves by cost/expense.
+
+    - On a neutral alias (no semantic pin — the phase-1 interactive default),
+      the caller's explicit OR default contract fully determines the lane.
+
+    Contradictions (explicit bounded + fixed reasoning alias; explicit
+    deliberate + fixed bounded alias) raise; they are never silently reduced
+    to "deliberate wins."
+    """
+    fields = routing_contract_extra_params(lane.provider, contract)
+    if not fields:
+        return lane.extra_params
+    base = dict(lane.extra_params or {})
+    if not any(key in base for key in ROUTING_CONTRACT_FIELDS):
+        # Neutral alias: caller contract determines the lane.
+        merged = dict(base)
+        merged.update(fields)
+        return merged
+
+    # Fixed semantic alias present.
+    if not authoritative:
+        # Caller default must not override an explicit fixed alias pin.
+        return base
+
+    # Caller explicit contract vs fixed alias pin: compatible => explicit wins,
+    # contradictory => fail closed.  Translate the legacy work_class pin.
+    alias_pin = dict(base)
+    # Detect contradiction by comparing the resolved orthogonal contract.
+    alias_contract = _alias_pin_contract(alias_pin)
+    caller_contract = _contract_from_fields(fields)
+    if caller_contract is not None and alias_contract is not None:
+        if caller_contract != alias_contract:
+            raise ValueError(
+                f"routing contract {caller_contract!r} contradicts the fixed alias "
+                f"semantic pin {alias_contract!r}; reclassify the work or select a "
+                "compatible alias (never resolved by cost)"
+            )
+        return alias_pin  # identical; keep the alias's (canonical) form.
+    merged = dict(base)
+    merged.update(fields)
+    return merged
+
+
+def _contract_from_fields(fields: dict[str, Any]) -> tuple[str, str] | None:
+    shape = fields.get("work_shape")
+    intent = fields.get("reasoning_intent")
+    if shape and intent:
+        return (str(shape), str(intent))
+    return None
+
+
+def _alias_pin_contract(pin: dict[str, Any]) -> tuple[str, str] | None:
+    """Resolve a fixed alias's semantic pin (work_class OR work_shape+intent)
+    to the orthogonal (shape, intent) pair for contradiction detection."""
+    wc = pin.get("work_class")
+    if wc == "bounded":
+        return ("bounded", "none")
+    if wc == "agentic":
+        return ("agentic", "none")
+    if wc == "reasoning":
+        return ("agentic", "deliberate")
+    shape = pin.get("work_shape")
+    intent = pin.get("reasoning_intent")
+    if shape:
+        return (str(shape), str(intent or "none"))
+    return None
 
 
 def provider_extra_params(
@@ -1139,6 +1263,8 @@ def model_turn(
     max_tokens: int = 4096,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
+    routing_contract: dict[str, str] | None = None,
+    routing_contract_authoritative: bool = False,
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
@@ -1333,6 +1459,12 @@ def model_turn(
     # (house rule: a Python-level constant anywhere on this path is a
     # hidden pin).  Direct keyword call (not **kwargs) so strict mypy
     # checks the module's most important invocation against the Protocol.
+    lane = replace(
+        lane,
+        extra_params=_merge_routing_contract(
+            lane, routing_contract, authoritative=routing_contract_authoritative
+        ),
+    )
     effective_effort = (
         reasoning_effort
         or lane.reasoning_effort

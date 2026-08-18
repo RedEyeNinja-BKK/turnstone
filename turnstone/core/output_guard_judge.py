@@ -685,6 +685,11 @@ class OutputGuardJudge:
                     judge_turns,
                     tools=None,
                     max_tokens=512,
+                    # Output-guard is a finite advisory/evaluation helper on
+                    # tool output — bounded+none keeps it on Luna NT rather
+                    # than riding the parent workstream's agentic/deliberate
+                    # classification.  It is never a substitutive device.
+                    routing_contract={"work_shape": "bounded", "reasoning_intent": "none"},
                     cancel_ref=ref,
                 )
             finally:

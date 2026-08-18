@@ -1497,3 +1497,244 @@ def test_capability_bool_overrides_coerced() -> None:
     )
     assert kept.server_parses_reasoning is False
     assert kept.thinking_mode == "manual"
+
+
+def _contract_lane(provider: _FakeProvider, extra: dict[str, Any] | None = None) -> ModelLane:
+    return _lane(provider, extra_params=extra or {})
+
+
+def test_routing_contract_applies_bounded_none() -> None:
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider)
+    model_turn(
+        lane,
+        [Turn.user("x")],
+        routing_contract={"work_shape": "bounded", "reasoning_intent": "none"},
+    )
+    (call,) = provider.calls
+    ep = call["extra_params"]
+    assert ep["work_shape"] == "bounded"
+    assert ep["reasoning_intent"] == "none"
+
+
+def test_routing_contract_applies_agentic_none() -> None:
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider)
+    model_turn(
+        lane,
+        [Turn.user("x")],
+        routing_contract={"work_shape": "agentic", "reasoning_intent": "none"},
+    )
+    (call,) = provider.calls
+    assert call["extra_params"]["work_shape"] == "agentic"
+    assert call["extra_params"]["reasoning_intent"] == "none"
+
+
+def test_routing_contract_default_does_not_override_fixed_alias_pin() -> None:
+    # A deliberate alias pin (work_class=reasoning) must NOT be clobbered by an
+    # ordinary caller DEFAULT (agentic+none) — the explicit fixed alias wins.
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={"work_class": "reasoning"})
+    model_turn(
+        lane,
+        [Turn.user("x")],
+        routing_contract={"work_shape": "agentic", "reasoning_intent": "none"},
+    )
+    (call,) = provider.calls
+    assert call["extra_params"].get("work_class") == "reasoning"
+    assert "reasoning_intent" not in call["extra_params"]
+
+
+def test_routing_contract_neutral_alias_uses_caller_default() -> None:
+    # A NEUTRAL alias (no semantic pin) lets the caller's contract (default or
+    # explicit) determine the lane. This is the phase-1 interactive default.
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={})  # no pin
+    model_turn(
+        lane,
+        [Turn.user("x")],
+        routing_contract={"work_shape": "agentic", "reasoning_intent": "none"},
+    )
+    (call,) = provider.calls
+    assert call["extra_params"]["work_shape"] == "agentic"
+    assert call["extra_params"]["reasoning_intent"] == "none"
+
+
+def test_routing_contract_authoritative_deliberate_wins_on_neutral() -> None:
+    # Explicit (authoritative) deliberate on a neutral alias -> deliberate.
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={})
+    model_turn(
+        lane,
+        [Turn.user("x")],
+        routing_contract={"work_shape": "agentic", "reasoning_intent": "deliberate"},
+        routing_contract_authoritative=True,
+    )
+    (call,) = provider.calls
+    assert call["extra_params"]["reasoning_intent"] == "deliberate"
+    assert call["extra_params"]["work_shape"] == "agentic"
+
+
+def test_routing_contract_authoritative_bounded_matches_fixed_bounded_alias() -> None:
+    # Authoritative bounded on a fixed bounded alias is compatible; keep the
+    # alias's canonical form.
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={"work_class": "bounded"})
+    model_turn(
+        lane,
+        [Turn.user("x")],
+        routing_contract={"work_shape": "bounded", "reasoning_intent": "none"},
+        routing_contract_authoritative=True,
+    )
+    (call,) = provider.calls
+    assert call["extra_params"].get("work_class") == "bounded"
+
+
+def test_routing_contract_authoritative_bounded_on_fixed_reasoning_alias_rejected() -> None:
+    # Authoritative bounded + fixed reasoning alias is a contradiction -> fail
+    # closed (never resolved by cost).
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={"work_class": "reasoning"})
+    with pytest.raises(ValueError):
+        model_turn(
+            lane,
+            [Turn.user("x")],
+            routing_contract={"work_shape": "bounded", "reasoning_intent": "none"},
+            routing_contract_authoritative=True,
+        )
+
+
+def test_routing_contract_authoritative_deliberate_on_fixed_bounded_alias_rejected() -> None:
+    # Authoritative deliberate + fixed bounded alias is a contradiction ->
+    # fail closed.
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={"work_class": "bounded"})
+    with pytest.raises(ValueError):
+        model_turn(
+            lane,
+            [Turn.user("x")],
+            routing_contract={"work_shape": "agentic", "reasoning_intent": "deliberate"},
+            routing_contract_authoritative=True,
+        )
+
+
+def test_routing_contract_authoritative_agentic_on_fixed_reasoning_alias_rejected() -> None:
+    # Authoritative agentic+none + fixed reasoning alias is a contradiction
+    # (different intent) -> fail closed.
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={"work_class": "reasoning"})
+    with pytest.raises(ValueError):
+        model_turn(
+            lane,
+            [Turn.user("x")],
+            routing_contract={"work_shape": "agentic", "reasoning_intent": "none"},
+            routing_contract_authoritative=True,
+        )
+
+
+def test_routing_contract_authoritative_matches_fixed_reasoning_alias() -> None:
+    # Authoritative agentic+deliberate + fixed reasoning alias is compatible;
+    # keep the alias form.
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={"work_class": "reasoning"})
+    model_turn(
+        lane,
+        [Turn.user("x")],
+        routing_contract={"work_shape": "agentic", "reasoning_intent": "deliberate"},
+        routing_contract_authoritative=True,
+    )
+    (call,) = provider.calls
+    assert call["extra_params"].get("work_class") == "reasoning"
+
+
+def test_routing_contract_invalid_value_rejected() -> None:
+    from turnstone.core.model_turn import routing_contract_extra_params
+
+    with pytest.raises(ValueError):
+        routing_contract_extra_params(
+            _FakeProvider([]), {"work_shape": "bogus", "reasoning_intent": "none"}
+        )
+
+
+def test_routing_contract_contradictory_bounded_deliberate_rejected() -> None:
+    from turnstone.core.model_turn import routing_contract_extra_params
+
+    with pytest.raises(ValueError):
+        routing_contract_extra_params(
+            _FakeProvider([]),
+            {"work_shape": "bounded", "reasoning_intent": "deliberate"},
+        )
+
+
+def test_routing_contract_requires_orthogonal_pair() -> None:
+    from turnstone.core.model_turn import routing_contract_extra_params
+
+    with pytest.raises(ValueError):
+        routing_contract_extra_params(_FakeProvider([]), {"work_shape": "bounded"})
+
+
+def test_routing_contract_rejects_non_openai_provider() -> None:
+    from turnstone.core.model_turn import routing_contract_extra_params
+
+    class _AnthropicProvider:
+        provider_name = "anthropic"
+
+    with pytest.raises(ValueError):
+        routing_contract_extra_params(
+            _AnthropicProvider(), {"work_shape": "bounded", "reasoning_intent": "none"}
+        )
+
+
+def test_routing_contract_none_is_noop() -> None:
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra={"temperature": 0.2})
+    model_turn(lane, [Turn.user("x")], routing_contract=None)
+    (call,) = provider.calls
+    assert call["extra_params"] == {"temperature": 0.2}
+
+
+def _merged(lane_extra, contract, authoritative=False):
+    """Return extra_params after model_turn merges contract over lane_extra."""
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = _contract_lane(provider, extra=lane_extra or {})
+    kwargs = {"routing_contract": contract}
+    if authoritative:
+        kwargs["routing_contract_authoritative"] = True
+    if contract is not None:
+        model_turn(lane, [Turn.user("x")], **kwargs)
+    else:
+        model_turn(lane, [Turn.user("x")])
+    (call,) = provider.calls
+    return call["extra_params"]
+
+
+def test_precedence_matrix() -> None:
+    agentic_default = {"work_shape": "agentic", "reasoning_intent": "none"}
+    # 1. caller DEFAULT agentic + neutral alias -> agentic (caller wins)
+    ep = _merged({}, agentic_default)
+    assert ep["work_shape"] == "agentic" and ep["reasoning_intent"] == "none"
+    # 2. explicit bounded + neutral alias -> bounded (caller wins, authoritative)
+    ep = _merged({}, {"work_shape": "bounded", "reasoning_intent": "none"}, True)
+    assert ep["work_shape"] == "bounded" and ep["reasoning_intent"] == "none"
+    # 3. explicit agentic + neutral alias -> agentic (caller wins)
+    ep = _merged({}, {"work_shape": "agentic", "reasoning_intent": "none"}, True)
+    assert ep["work_shape"] == "agentic"
+    # 4. explicit deliberate + neutral alias -> deliberate (caller wins)
+    ep = _merged({}, {"work_shape": "agentic", "reasoning_intent": "deliberate"}, True)
+    assert ep["reasoning_intent"] == "deliberate"
+    # 5. explicit bounded + FIXED reasoning alias -> REJECTED (contradiction)
+    with pytest.raises(ValueError):
+        _merged({"work_class": "reasoning"}, {"work_shape": "bounded", "reasoning_intent": "none"}, True)
+    # 6. explicit deliberate + FIXED agentic alias -> REJECTED (contradiction)
+    with pytest.raises(ValueError):
+        _merged({"work_class": "agentic"}, {"work_shape": "agentic", "reasoning_intent": "deliberate"}, True)
+    # 7. DEFAULT agentic + FIXED reasoning alias -> pin wins (deliberate preserved)
+    ep = _merged({"work_class": "reasoning"}, agentic_default, False)
+    assert ep.get("work_class") == "reasoning"
+    assert "reasoning_intent" not in ep
+    # 8. explicit agentic+none + FIXED agentic alias -> compatible, alias form kept
+    ep = _merged({"work_class": "agentic"}, {"work_shape": "agentic", "reasoning_intent": "none"}, True)
+    assert ep.get("work_class") == "agentic"
+    # 9. DEFAULT bounded + FIXED reasoning alias -> pin wins (deliberate)
+    ep = _merged({"work_class": "reasoning"}, {"work_shape": "bounded", "reasoning_intent": "none"}, False)
+    assert ep.get("work_class") == "reasoning"

@@ -8421,6 +8421,7 @@ class ChatSession:
         cancel_ref: list[Any] | None = None,
         lane: ModelLane | None = None,
         principal_id: str | None = None,
+        routing_contract: dict[str, str] | None = None,
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
         extraction) through ``model_turn`` on the session's primary lane.
@@ -8493,6 +8494,17 @@ class ChatSession:
             max_tokens=clamped,
             temperature=self.temperature if temperature is None else temperature,
             reasoning_effort=None if suppress_reasoning else reasoning_effort,
+            # Utility completions (title, extraction, compaction, memory
+            # composition, perception, ordinary judge/output-guard helpers)
+            # are finite artifacts.  Unless an explicit contract is passed,
+            # they claim bounded+none so Switchyard serves them on Luna NT —
+            # they must NOT inherit the parent workstream's agentic/deliberate
+            # classification, and must NOT be promoted to agentic merely
+            # because the enclosing session is agentic.  A caller that
+            # genuinely needs deliberation passes a deliberate contract at the
+            # call site (e.g. a weighing judge), never by mutating this
+            # default.
+            routing_contract=routing_contract or {"work_shape": "bounded", "reasoning_intent": "none"},
             # The abort seam (default None): compaction passes a fresh
             # per-attempt _CancelRef so a user Stop closes the in-flight
             # summary HTTP stream instead of waiting it out.  Title-gen
@@ -8764,6 +8776,7 @@ class ChatSession:
                 prepare_wire,
                 my_generation,
                 principal_id=principal_id,
+                routing_contract={"work_shape": "agentic", "reasoning_intent": "none"},
             )
         except BackendAuthUnavailableError:
             # Explicit fail-closed policy: never reinterpret an authentication
@@ -8880,6 +8893,7 @@ class ChatSession:
                 prepare_wire,
                 my_generation,
                 principal_id=principal_id,
+                routing_contract={"work_shape": "agentic", "reasoning_intent": "none"},
             )
         except BackendAuthUnavailableError:
             # Fail-closed policy — never another lane's business.
@@ -8937,6 +8951,7 @@ class ChatSession:
         my_generation: int = 0,
         *,
         principal_id: str | None = None,
+        routing_contract: dict[str, str] | None = None,
     ) -> ModelTurnResult:
         """One lane's creation ladder around ``model_turn``.
 
@@ -8986,6 +9001,18 @@ class ChatSession:
                     self.messages,
                     tools=self._get_active_tools(caps),
                     max_tokens=self.max_tokens,
+                    # The foreground interactive lane is, by default, Turnstone's
+                    # substantive agentic/non-deliberative working lane (Flash NT),
+                    # NOT the deliberate route.  The old failure was a fixed
+                    # deliberate binding (thinking on everything); the inverse
+                    # failure would be a fixed bounded binding (Luna on
+                    # everything).  Ordinary Turnstone interactive work is
+                    # agentic-non-deliberative, so agentic+none is the explicit
+                    # contract; genuine deliberation is reached only by an
+                    # explicit deliberate reclassification/escalation (separate
+                    # seam), never by an effort/thinking request field.
+                    routing_contract=routing_contract
+                    or {"work_shape": "agentic", "reasoning_intent": "none"},
                     deferred_names=self._get_deferred_names(caps),
                     prepare_wire=prepare_wire,
                     admit_request=functools.partial(
@@ -19351,6 +19378,32 @@ class ChatSession:
             persona_mcp = snap.mcp
             persona_memory = snap.memory
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
+        # The WORK SHAPE is declared by the model at admission, exactly like
+        # model=/skill=/persona=, so a task_agent is never classified by its
+        # executor identity.  Work semantics determine the lane — "metadata
+        # missing" is NOT itself evidence of agentic work, so a missing
+        # work_shape is REJECTED here (the orchestration layer — the calling
+        # model that will execute the work — must resolve the classification),
+        # never silently converted into a model-spend default.  The task_agent
+        # JSON schema declares work_shape required; this enforces it at runtime
+        # for callers that bypass the schema.
+        work_shape_arg = (args.get("work_shape") or "").lower().strip()
+        if work_shape_arg not in ("bounded", "agentic"):
+            return {
+                "call_id": call_id,
+                "func_name": "task_agent",
+                "header": "\u2717 task_agent: work_shape required",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    "Error: task_agent requires an explicit work_shape. "
+                    "Classify the work and pass work_shape='bounded' for a finite, "
+                    "self-contained inspection/operation, or work_shape='agentic' "
+                    "for substantive multi-step engineering/analysis. "
+                    f"(received {work_shape_arg!r})"
+                ),
+            }
+        agent_work_shape = work_shape_arg
         header = "\u2699 task_agent (autonomous agent"
         if skill_data:
             # High/critical skills were denied above (principal-load-only), so a
@@ -19358,6 +19411,7 @@ class ChatSession:
             header += f", skill: {skill_data['name']}"
         if persona_arg:
             header += f", persona: {persona_arg}"
+        header += f", work: {agent_work_shape}"
         header += ")"
         return {
             "call_id": call_id,
@@ -19369,6 +19423,7 @@ class ChatSession:
             "execute": self._exec_task,
             "prompt": prompt,
             "model_override": model_override,
+            "work_shape": agent_work_shape,
             "skill": skill_data,
             "persona": persona_arg,
             "persona_prompt": persona_prompt,
@@ -24512,6 +24567,7 @@ class ChatSession:
         auto_tools: set[str] | None = None,
         reasoning_effort: str | None = None,
         agent_alias: str | None = None,
+        agent_work_shape: str = "agentic",
         parent_call_id: str | None = None,
         principal_id: str | None = None,
         origin_cancel_event: threading.Event | None = None,
@@ -24540,6 +24596,7 @@ class ChatSession:
                         auto_tools=auto_tools,
                         reasoning_effort=reasoning_effort,
                         agent_alias=agent_alias,
+                        agent_work_shape=agent_work_shape,
                         parent_call_id=parent_call_id,
                         principal_id=principal_id,
                         cancel_scope=cancel_scope,
@@ -24565,6 +24622,7 @@ class ChatSession:
         auto_tools: set[str] | None = None,
         reasoning_effort: str | None = None,
         agent_alias: str | None = None,
+        agent_work_shape: str = "agentic",
         parent_call_id: str | None = None,
         principal_id: str | None = None,
         *,
@@ -24707,6 +24765,11 @@ class ChatSession:
                         temperature=self.temperature if same_lane else None,
                         reasoning_effort=reasoning_effort
                         or (self.reasoning_effort if same_lane else None),
+                        routing_contract={
+                            "work_shape": agent_work_shape,
+                            "reasoning_intent": "none",
+                        },
+                        routing_contract_authoritative=True,
                         mint=mint,
                         wire_id_map=wire_id_map,
                         cancel_ref=cancel_scope.cancel_ref,
@@ -25234,6 +25297,17 @@ class ChatSession:
         # reap a successor's detached processes that happen to share call_id.
         shell_owner = f"task_agent:{call_id}:{uuid.uuid4().hex}"
         shell_token = _active_shell_owner.set(shell_owner)
+        # The executor never synthesizes a work_shape.  `_prepare_task` is the
+        # sole producer and now requires an explicit work_shape; any item that
+        # reaches execution without one is an unexpected producer/path and must
+        # fail closed rather than silently incur a model-spend decision
+        # ("metadata missing" is NOT evidence of agentic work; it is resolved
+        # by the orchestration layer, never guessed here).
+        agent_work_shape = item.get("work_shape")
+        if agent_work_shape not in ("bounded", "agentic"):
+            raise ValueError(
+                f"task_agent execute requires an explicit work_shape; got {agent_work_shape!r}"
+            )
         try:
             result = self._run_agent(
                 agent_turns,
@@ -25241,6 +25315,7 @@ class ChatSession:
                 tools=task_tools,
                 auto_tools=TASK_AUTO_TOOLS,
                 agent_alias=item.get("model_override"),
+                agent_work_shape=agent_work_shape,
                 parent_call_id=call_id,
                 principal_id=item.get("_principal_id"),
                 origin_cancel_event=item.get("_origin_cancel_event"),

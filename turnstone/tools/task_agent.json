@@ -8,6 +8,11 @@
         "type": "string",
         "description": "Complete task description for the sub-agent."
       },
+      "work_shape": {
+        "type": "string",
+        "enum": ["bounded", "agentic"],
+        "description": "REQUIRED. Classify the SHAPE of the requested work — NOT the executor's identity. Use 'bounded' for a finite, self-contained inspection/operation the agent completes in a bounded number of steps. Use 'agentic' for substantive multi-step engineering/analysis with evolving history. This selects the semantic lane: bounded->Luna NT, agentic->Flash NT. Deliberate multi-step work should still be 'agentic'. You MUST classify based on the actual work requested."
+      },
       "skill": {
         "type": "string",
         "description": "Optional skill name providing capability and procedure (reference material) the sub-agent applies to the task — NOT its identity. Use `skills(action='find', query='...')` to discover available names. An empty value is acceptable and yields a competent general-purpose task helper."
@@ -21,7 +26,7 @@
         "description": "Optional model alias to run this task agent on. Omit to use the current session model. (No alternative aliases configured in this session.)"
       }
     },
-    "required": ["prompt"]
+    "required": ["prompt", "work_shape"]
   },
   "primary_key": "prompt"
 }

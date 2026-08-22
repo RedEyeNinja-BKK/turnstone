@@ -21,7 +21,12 @@
    of the native Turnstone/Pydantic idiom.
 5. **Native Turnstone validation first** — inspected Turnstone source: `pydantic>=2.0` is a core
    dependency; `jsonschema` is NOT a dependency and unused. Runtime BWP objects should use the native
-   Pydantic v2 idiom (JSON Schema as interchange/documentation only); no new dependency.
+   Pydantic v2 idiom (JSON Schema as interchange/documentation only); no new dependency. Future
+   Pydantic models MUST preserve strict schema semantics (`extra="forbid"`).
+6. **Hard-requirement support audit (direct-review #5000030053)** — every BWP resource-facing hard
+   field classified against the live production Switchyard/FleetRouter ingress: `work_shape` and
+   `reasoning_intent` are ENFORCED_NOW; `inference_locality` (≠ any), `context_size_requirement`
+   (≠ null), and `output_budget` (≠ null) are UNSUPPORTED_V1 and FAIL CLOSED before dispatch (F1–F4).
 
 ## 1. Artifact structural integrity
 
@@ -32,10 +37,10 @@ All 4 BWP schemas + vocabularies + 5 qualification examples + validator report p
 
 | Trial | work_shape × reasoning | inference_locality | Derived executor | Dispatch | Verdict | Result |
 |---|---|---|---|---|---|---|
-| T1 bounded routine | bounded × none | local_required | turnstone-native | allowed | PASS | ✅ |
+| T1 bounded routine | bounded × none | any (v1 dispatchable surface) | turnstone-native | allowed | PASS | ✅ |
 | T2 agentic non-deliberate | agentic × none | any | hermes | allowed | PASS | ✅ |
 | T3 deliberate/reasoning | agentic × deliberate | any | hermes | allowed | PASS | ✅ |
-| T5 real-estate workload | bounded × none | local_required | hermes (document_parsing) | allowed | PASS | ✅ |
+| T5 real-estate workload | bounded × none | any | hermes (document_parsing) | allowed | PASS | ✅ |
 
 **T4 (insufficient/ambiguous)** structurally valid but **never dispatches**: disposition **CLARIFY**.
 
@@ -61,6 +66,10 @@ All 4 BWP schemas + vocabularies + 5 qualification examples + validator report p
 | R18 | Executor self-assessment cannot force PASS |
 | R19 | Unknown property nested under nullable `resource_observed` rejected |
 | R20 | Unknown property under nested `inference_resource` rejected |
+| F1 | `inference_locality=local_required` FAILS CLOSED before dispatch (UNSUPPORTED_V1) |
+| F2 | `inference_locality=hosted_allowed` FAILS CLOSED before dispatch (UNSUPPORTED_V1) |
+| F3 | `context_size_requirement` non-null FAILS CLOSED before dispatch (UNSUPPORTED_V1) |
+| F4 | `output_budget` non-null FAILS CLOSED before dispatch (UNSUPPORTED_V1) |
 
 ## 4. Positive controls (must remain valid / shape-independent) — ALL PASS
 
@@ -72,10 +81,11 @@ All 4 BWP schemas + vocabularies + 5 qualification examples + validator report p
 | C3 | ESCALATED outcome reachable (operator-gated), NOT_EVALUATED |
 | C4 | **inference_locality does NOT select the executor** (local_required vs hosted_allowed → same executor) |
 | C5 | Executor assignment never carries/rewrites inference locality |
-| C6 | local_required + PROVEN local resource compliant (PASS) |
+| C6 | local_required + PROVEN local resource compliant (PASS) — adjudication-semantics demo (packet would fail v1 dispatch gate; exercises receipt observed-locality rules) |
 | C7 | Local provider/model with PROVEN local locality compliant (names never prove locality) |
 | C8 | PASS requires all criteria MET + evidence sufficient |
 | C9 | Valid nullable `resource_observed=null` accepted |
+| C10 | No provider/model/resource-selection logic added to Turnstone |
 
 ## 5. Provenance separation checks
 
@@ -98,3 +108,7 @@ All 4 BWP schemas + vocabularies + 5 qualification examples + validator report p
 - Sufficiency disposition (CLARIFY/REJECT) is minimal; escalation is operator-gated.
 - Hermes advisory carried to integration plan: adjudicate only after `validate_receipt` passes (or
   fail closed on any validation error).
+- **Hard-requirement support:** the v1 dispatchable surface is `inference_locality=any`,
+  `context_size_requirement=null`, `output_budget=null` (ENFORCED_NOW = work_shape + reasoning_intent).
+  UNSUPPORTED_V1 fields are REJECTED before dispatch; receipt-level locality adjudication (R12–R14,
+  C6/C7) remains evidence semantics only, never a v1 enforcement substitute.

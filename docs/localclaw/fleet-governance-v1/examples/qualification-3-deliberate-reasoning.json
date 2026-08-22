@@ -38,10 +38,10 @@
         "operations/checkpoint-routing-stage2-design-2026-08-21.md",
         "operations/fleet-governance-v1-2026-08-22/FLEET-GOVERNANCE-V1-DESIGN.md"
       ],
-      "context_size_requirement": 400000,
+      "context_size_requirement": null,
       "retrieval_required": true
     },
-    "output_budget": 12000,
+    "output_budget": null,
     "preferences": [],
     "inference_locality": "any"
   },

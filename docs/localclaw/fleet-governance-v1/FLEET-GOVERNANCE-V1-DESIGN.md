@@ -190,6 +190,40 @@ Generalized FleetRouter doctrine upward:
   eligibility function **never consults preferences** (unit-proven: ineligible remains ineligible
   regardless of preference).
 
+### 6a. Hard-requirement support audit (v1) — direct-review #5000030053
+
+A hard requirement must be **enforced BEFORE execution** by the current production
+Switchyard/FleetRouter structured ingress. Receipt-level detection is evidence only; it cannot
+substitute for eligibility enforcement. Each BWP resource-facing hard field is classified from the
+live production ingress (routes.toml `ac57f4c5…`, FleetRouter source `fleet_router.rs` at the deployed
+S2-H lineage):
+
+| Field | Classification | Production ingress / enforcement | Evidence |
+|---|---|---|---|
+| `work_shape` | **ENFORCED_NOW** | `work_shape_source = "request"` reads `extensions.fields["work_shape"]`; per-candidate `work_shape` limitation; missing/invalid = hard error at the Turnstone/task_agent/BWP-validator ingress (at the pure router level, missing/invalid shape is permissive — no exclusion, never prompt-guessed); legacy `work_class` translated | routes.smart `work_shape_source="request"`; `fleet_router.rs` `declared_work_shape()` / `work_shape_eligible()` |
+| `reasoning_intent` | **ENFORCED_NOW** | `require_reasoning` from normalized reasoning controls OR legacy `work_class=reasoning`; candidate must advertise `reasoning=true` (thinking-capable mandatory for deliberate) | `fleet_router.rs` `reasoning_requested()` / `declared_legacy_reasoning()`; candidate `reasoning` advertisement |
+| `inference_locality` | **UNSUPPORTED_V1** | No field read by FleetRouter extensions; no config key in production routes.toml; no pre-selection transport | routes.toml has no locality key; `fleet_router.rs` never reads locality |
+| `context_size_requirement` | **UNSUPPORTED_V1** | S2-E `context_fits()` exists but `ContextAdmissionPolicy` is `Unmanaged` for all production candidates (no `input_token_source`/`usable_context` config); and it consumes runtime-computed input tokens vs candidate capacity, never a caller-declared requirement | routes.toml has no context_policy/input_token_source; `fleet_router.rs` `context_fits()` returns true for Unmanaged |
+| `output_budget` | **UNSUPPORTED_V1** | BWP field has no ingress to `max_output_tokens`; `max_output_tokens` only used inside the inactive S2-E Bounded admission | routes.toml no budget admission; `fleet_router.rs` `context_fits()` Bounded-only |
+
+**Fail-closed rule (v1):** any UNSUPPORTED_V1 hard requirement blocks dispatch BEFORE assignment/execution
+(`validate_for_dispatch` returns `REJECT` with an `UNSUPPORTED_V1` reason; disposition `REJECT`). In v1 the
+active surface is therefore:
+
+- `inference_locality` — only `any` is dispatchable (`local_required` / `hosted_allowed` fail closed until a
+  future, separately authorized Switchyard enhancement provides a structured ingress).
+- `context_size_requirement` — must be `null` in v1.
+- `output_budget` — must be `null` in v1.
+
+Controls F1–F4 prove each fails closed before dispatch; C10 proves no provider/model/resource-selection
+logic is added to Turnstone. Receipt-level locality observation (R12–R14, C6/C7) remains valid evidence
+semantics for the future, not a v1 enforcement substitute.
+
+**Evidence provenance note:** the audit reads the production routes.toml that the live process loaded
+(PID 1431983 `--config /home/vincent/.local/lib/localclaw-switchyard/routes.toml`); that file retains a
+stale "STAGING CANDIDATE" banner and pre-S2-H hash reference from its candidate origin, which is
+provenance noise only — the running process and the audited keys are the evidence.
+
 ## 7. Semantic capabilities (no inference-resource identities)
 
 The REQUEST describes **what the work requires**, never which resource satisfies it.

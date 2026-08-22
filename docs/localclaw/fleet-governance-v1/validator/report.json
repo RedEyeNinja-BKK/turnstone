@@ -219,6 +219,30 @@
       "label": "unknown property under nested inference_resource rejected",
       "ok": true,
       "detail": "inference_resource.required_model"
+    },
+    {
+      "id": "F1",
+      "label": "inference_locality=local_required FAILS CLOSED (UNSUPPORTED_V1, no pre-selection ingress)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.inference_locality='local_required' has no pre-selection FleetRouter ingress; only 'any' is dispatchable in v1"
+    },
+    {
+      "id": "F2",
+      "label": "inference_locality=hosted_allowed FAILS CLOSED (UNSUPPORTED_V1)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.inference_locality='hosted_allowed' has no pre-selection FleetRouter ingress; only 'any' is dispatchable in v1"
+    },
+    {
+      "id": "F3",
+      "label": "context_size_requirement non-null FAILS CLOSED (UNSUPPORTED_V1)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.context.context_size_requirement has no pre-selection ingress; set null in v1"
+    },
+    {
+      "id": "F4",
+      "label": "output_budget non-null FAILS CLOSED (UNSUPPORTED_V1)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.output_budget has no pre-selection ingress; set null in v1"
     }
   ],
   "controls": [
@@ -260,7 +284,7 @@
     },
     {
       "id": "C6",
-      "label": "local_required + PROVEN local resource compliant",
+      "label": "local_required + PROVEN local resource compliant (adjudication semantics)",
       "ok": true,
       "detail": "verdict=PASS"
     },
@@ -281,6 +305,12 @@
       "label": "valid nullable resource_observed=null accepted",
       "ok": true,
       "detail": "receipt_valid=True"
+    },
+    {
+      "id": "C10",
+      "label": "no provider/model/resource-selection logic added to Turnstone",
+      "ok": true,
+      "detail": "executor functions return lanes only; forbidden identity keys absent from executor code"
     }
   ],
   "ok": true

@@ -40,10 +40,10 @@
       "required_inputs": [
         "operations/fleet-readiness-probe-results-2026-08-21.md"
       ],
-      "context_size_requirement": 200000,
+      "context_size_requirement": null,
       "retrieval_required": true
     },
-    "output_budget": 8000,
+    "output_budget": null,
     "preferences": [],
     "inference_locality": "any"
   },

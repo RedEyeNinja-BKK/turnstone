@@ -42,9 +42,9 @@
       "context_size_requirement": null,
       "retrieval_required": false
     },
-    "output_budget": 6000,
+    "output_budget": null,
     "preferences": [],
-    "inference_locality": "local_required"
+    "inference_locality": "any"
   },
   "authority": {
     "risk_class": "advisory",

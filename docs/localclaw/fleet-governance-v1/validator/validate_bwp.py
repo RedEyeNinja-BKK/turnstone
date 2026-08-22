@@ -50,6 +50,10 @@ DEMONSTRATIONS (self-test; see VALIDATION.md)
   R18 Executor self-assessment cannot force PASS.
   R19 Unknown property nested under nullable resource_observed rejected.
   R20 Unknown property nested under inference_resource rejected.
+  F1  inference_locality=local_required FAILS CLOSED before dispatch (UNSUPPORTED_V1).
+  F2  inference_locality=hosted_allowed FAILS CLOSED before dispatch (UNSUPPORTED_V1).
+  F3  context_size_requirement non-null FAILS CLOSED before dispatch (UNSUPPORTED_V1).
+  F4  output_budget non-null FAILS CLOSED before dispatch (UNSUPPORTED_V1).
   C1  Executor selection must NOT follow work_shape (shape-independent).
   C2  Sufficiency disposition is deterministic (DISPATCH/CLARIFY/REJECT).
   C3  ESCALATED outcome is reachable (operator-gated) and does not evaluate hard constraints.
@@ -59,6 +63,7 @@ DEMONSTRATIONS (self-test; see VALIDATION.md)
   C7  Local provider/model with PROVEN local locality is compliant (names never prove locality).
   C8  PASS requires all criteria MET + evidence sufficient.
   C9  Valid nullable resource_observed=null accepted.
+  C10 No provider/model/resource-selection logic added to Turnstone.
 
 USAGE
   python3 validate_bwp.py            # run all checks + self-test; exit 0 on expected results
@@ -385,17 +390,60 @@ def sufficiency_disposition(packet: dict) -> str:
     return "REJECT"  # INSUFFICIENT
 
 
+def unsupported_v1_reason(bwp: dict) -> str | None:
+    """Hard-requirement support audit gate (direct-review #5000030053).
+
+    A BWP hard requirement must be ENFORCED BEFORE EXECUTION by the current
+    production Switchyard/FleetRouter structured ingress. Fields with no
+    pre-selection ingress are UNSUPPORTED_V1 and must fail closed BEFORE
+    dispatch (never dispatch and rely on post-hoc receipt detection).
+
+    Supported (ENFORCED_NOW):
+      - work_shape  (work_shape_source="request" -> extensions.fields["work_shape"])
+      - reasoning_intent (require_reasoning from normalized reasoning controls /
+        legacy work_class=reasoning; candidate must advertise reasoning=true)
+
+    Unsupported (UNSUPPORTED_V1, fail closed):
+      - inference_locality != "any" (no FleetRouter ingress/config)
+      - context_size_requirement non-null (no pre-selection ingress; S2-E
+        context admission not wired in production config)
+      - output_budget non-null (no pre-selection ingress to max_output_tokens
+        in production admission)
+    """
+    reqs = bwp.get("requirements", {})
+    il = reqs.get("inference_locality")
+    if il not in (None, "any"):
+        return (f"UNSUPPORTED_V1: requirements.inference_locality={il!r} has no pre-selection "
+                "FleetRouter ingress; only 'any' is dispatchable in v1")
+    ctx = reqs.get("context") or {}
+    if ctx.get("context_size_requirement") is not None:
+        return ("UNSUPPORTED_V1: requirements.context.context_size_requirement has no "
+                "pre-selection ingress; set null in v1")
+    if reqs.get("output_budget") is not None:
+        return ("UNSUPPORTED_V1: requirements.output_budget has no pre-selection ingress; "
+                "set null in v1")
+    return None
+
+
 def validate_for_dispatch(packet: dict):
-    """R1/C2: only a structurally valid, SUFFICIENT request may dispatch."""
+    """R1/C2 + support gate: only a structurally valid, SUFFICIENT request whose
+    hard requirements are all ENFORCED_NOW may dispatch."""
     issues = validate_bwp(packet)
     disposition = sufficiency_disposition(packet)
+    unsupported = unsupported_v1_reason(packet)
     if not issues.valid:
-        return {"allowed": False, "reason": "validation_errors", "disposition": disposition,
+        # A structurally invalid packet is never dispatchable; disposition is
+        # descriptive only, but REJECT is the coherent disposition (it cannot
+        # DISPATCH). The `allowed` boolean is the authoritative gate.
+        return {"allowed": False, "reason": "validation_errors", "disposition": "REJECT",
                 "errors": issues.errors, "warnings": issues.warnings}
     if packet["intent"]["sufficiency"]["state"] != "SUFFICIENT":
         return {"allowed": False,
                 "reason": f"sufficiency_gate: state={packet['intent']['sufficiency']['state']}",
                 "disposition": disposition, "errors": [], "warnings": issues.warnings}
+    if unsupported:
+        return {"allowed": False, "reason": unsupported, "disposition": "REJECT",
+                "errors": [], "warnings": issues.warnings}
     return {"allowed": True, "reason": "dispatch_ok", "disposition": "DISPATCH",
             "errors": [], "warnings": issues.warnings}
 
@@ -1144,18 +1192,23 @@ def run_self_test() -> dict:
     report["controls"].append({"id": "C5", "label": "executor assignment does not carry or rewrite inference locality",
                                "ok": c5_ok, "detail": "assignment contains no locality fields"})
 
-    # ---- C6: local_required + PROVEN local resource is compliant (PASS) ----
-    bwp_c6 = load_example("qualification-1-bounded-routine.json")  # inference_locality=local_required; receipt built with locality=local
+    # ---- C6: local_required + PROVEN local resource is compliant (PASS).
+    # Adjudication-semantics demo (receipt observed-locality rules). NOTE: this
+    # packet would FAIL the v1 dispatch gate (inference_locality=local_required is
+    # UNSUPPORTED_V1) — it exercises adjudication semantics only, not dispatch.
+    bwp_c6 = json.loads(json.dumps(load_example("qualification-1-bounded-routine.json")))
+    bwp_c6["requirements"]["inference_locality"] = "local_required"  # override: adjudication-only
     assignment_c6 = build_assignment(bwp_c6)
-    receipt_c6 = build_receipt(bwp_c6, assignment_c6, "T1")
+    receipt_c6 = build_receipt(bwp_c6, assignment_c6, "T1")  # build_receipt sets observed locality=local
     verdict_c6 = adjudicate(receipt_c6, bwp_c6, assignment_c6)
     c6_ok = (verdict_c6["work_outcome"] == "PASS"
              and verdict_c6["basis"]["hard_constraint_status"] == "SATISFIED")
-    report["controls"].append({"id": "C6", "label": "local_required + PROVEN local resource compliant",
+    report["controls"].append({"id": "C6", "label": "local_required + PROVEN local resource compliant (adjudication semantics)",
                                "ok": c6_ok, "detail": f"verdict={verdict_c6['work_outcome']}"})
 
     # ---- C7: provider/model identity alone never proves locality (local + hosted both valid facts) ----
     bwp_c7 = json.loads(json.dumps(load_example("qualification-1-bounded-routine.json")))
+    bwp_c7["requirements"]["inference_locality"] = "local_required"  # adjudication-only override
     assignment_c7 = build_assignment(bwp_c7)
     receipt_c7 = build_receipt(bwp_c7, assignment_c7, "T1")
     receipt_c7["resource_observed"]["inference_resource"] = {"provider": "comfy", "model": "qwen", "locality": "local"}
@@ -1183,6 +1236,63 @@ def run_self_test() -> dict:
     c9_ok = validate_receipt(receipt_c9, bwp_c9, assignment_c9).valid
     report["controls"].append({"id": "C9", "label": "valid nullable resource_observed=null accepted",
                                "ok": c9_ok, "detail": f"receipt_valid={c9_ok}"})
+
+    # ---- F1-F4: UNSUPPORTED_V1 hard requirements FAIL CLOSED before dispatch ----
+    base_f = load_example("qualification-1-bounded-routine.json")
+
+    bwp_f1 = json.loads(json.dumps(base_f))
+    bwp_f1["requirements"]["inference_locality"] = "local_required"
+    d_f1 = validate_for_dispatch(bwp_f1)
+    f1_ok = (not d_f1["allowed"] and d_f1["disposition"] == "REJECT"
+             and d_f1["reason"].startswith("UNSUPPORTED_V1") and "inference_locality" in d_f1["reason"])
+    report["rejections"].append({"id": "F1", "label": "inference_locality=local_required FAILS CLOSED (UNSUPPORTED_V1, no pre-selection ingress)",
+                                 "ok": f1_ok, "detail": d_f1["reason"]})
+
+    bwp_f2 = json.loads(json.dumps(base_f))
+    bwp_f2["requirements"]["inference_locality"] = "hosted_allowed"
+    d_f2 = validate_for_dispatch(bwp_f2)
+    f2_ok = (not d_f2["allowed"] and d_f2["disposition"] == "REJECT"
+             and d_f2["reason"].startswith("UNSUPPORTED_V1"))
+    report["rejections"].append({"id": "F2", "label": "inference_locality=hosted_allowed FAILS CLOSED (UNSUPPORTED_V1)",
+                                 "ok": f2_ok, "detail": d_f2["reason"]})
+
+    bwp_f3 = json.loads(json.dumps(base_f))
+    bwp_f3["requirements"]["context"]["context_size_requirement"] = 200000
+    d_f3 = validate_for_dispatch(bwp_f3)
+    f3_ok = (not d_f3["allowed"] and d_f3["disposition"] == "REJECT"
+             and d_f3["reason"].startswith("UNSUPPORTED_V1") and "context_size_requirement" in d_f3["reason"])
+    report["rejections"].append({"id": "F3", "label": "context_size_requirement non-null FAILS CLOSED (UNSUPPORTED_V1)",
+                                 "ok": f3_ok, "detail": d_f3["reason"]})
+
+    bwp_f4 = json.loads(json.dumps(base_f))
+    bwp_f4["requirements"]["output_budget"] = 4000
+    d_f4 = validate_for_dispatch(bwp_f4)
+    f4_ok = (not d_f4["allowed"] and d_f4["disposition"] == "REJECT"
+             and d_f4["reason"].startswith("UNSUPPORTED_V1") and "output_budget" in d_f4["reason"])
+    report["rejections"].append({"id": "F4", "label": "output_budget non-null FAILS CLOSED (UNSUPPORTED_V1)",
+                                 "ok": f4_ok, "detail": d_f4["reason"]})
+
+    # ---- C10: no provider/model/resource-selection logic added to Turnstone ----
+    # select_executor/derive_executor_candidates return executor lanes only, never
+    # provider/model/resource identities; supported hard fields (work_shape,
+    # reasoning_intent) are the only ENFORCED_NOW ingress fields.
+    c10_ok = True
+    for label, fname in examples:
+        b = load_example(fname)
+        ex = select_executor(b)
+        c10_ok = c10_ok and ex["executor"] in EXECUTORS and ex["executor"] is not None
+    # Static: derive_executor_candidates/select_executor never reference forbidden keys
+    # in CODE (docstrings excluded — they legitimately mention provider/model to
+    # document what the functions must NOT do).
+    import inspect as _inspect, re as _re
+    src = _inspect.getsource(derive_executor_candidates) + _inspect.getsource(select_executor)
+    src_code = _re.sub(r'""".*?"""', "", src, flags=_re.DOTALL)  # strip docstrings
+    # Forbidden identity keys as standalone identifiers (word-boundary), so semantic
+    # capability names like gpu_workload_execution do not false-positive.
+    c10_ok = c10_ok and not any(_re.search(rf"\b{_re.escape(k)}\b", src_code) for k in FORBIDDEN_KEYS)
+    report["controls"].append({"id": "C10", "label": "no provider/model/resource-selection logic added to Turnstone",
+                               "ok": c10_ok,
+                               "detail": "executor functions return lanes only; forbidden identity keys absent from executor code"})
 
     # ---- select_executor sanity (no capability gap -> never assigns operator-only or None) ----
     for label, fname in examples:

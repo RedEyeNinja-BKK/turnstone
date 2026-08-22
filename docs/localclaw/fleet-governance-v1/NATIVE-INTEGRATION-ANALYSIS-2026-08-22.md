@@ -110,6 +110,11 @@ Inspection of the Turnstone source at the PR base (fork `main` @ dbdbcf9f) found
 - **Exact native gap:** the BWP *governance policy* layer (sufficiency disposition, per-criterion
   acceptance, evidence-sufficiency mapping, adjudicate) is not provided by native Pydantic models or
   workstream APIs — it remains thin C-class policy code. Nothing else requires a new mechanism.
+- **Strictness invariant (direct-review #5000030053):** future runtime Pydantic models MUST preserve
+  the schemas' `additionalProperties:false` by declaring `model_config = ConfigDict(extra="forbid")`
+  (and evaluating strict typing deliberately). Do not rely on Pydantic BaseModel defaults, which do
+  not forbid extras by default. JSON Schema files remain the canonical interchange/documentation
+  contract; the Pydantic models mirror them with `extra="forbid"`.
 
 ## 4. Executor-selection decomposition
 
@@ -134,7 +139,8 @@ Turnstone authoring workflow (skill: fleet-governance-v1)
   → author BWP REQUEST (schema v0.1; requirements.inference_locality is RESOURCE-scoped
     only — executor placement derives from capabilities + authority, never this field)
   → store as workstream attachment                        [native: attachments]
-  → validate: standard JSON Schema (A) + policy checks (C)
+  → validate: thin Pydantic v2 model layer (native Turnstone idiom,
+    extra="forbid") + C-class policy checks
   → sufficiency gate: SUFFICIENT | CLARIFY | REJECT       [C helper, authoring-time]
         CLARIFY/REJECT → recorded in workstream; NO assignment; NO dispatch
   → Turnstone assignment (native orchestration):
@@ -176,7 +182,8 @@ consistency helper; `adjudicate()` should gate on receipt validity before adjudi
 
 - `run_self_test()`, `main()`, `load_example()`, `build_assignment()`, `build_receipt()`, all R/C
   demonstration logic (D).
-- `_enforce_schema_shape()` recursive mirror (A — replaced by standard JSON Schema).
+- `_enforce_schema_shape()` recursive mirror (A — replaced by the native Pydantic v2 model idiom;
+  JSON Schema retained as interchange/documentation only).
 - `eligibility()` / `apply_preferences()` (D — FleetRouter specification; already in Switchyard).
 - `LANES` table + `select_executor()` precedence as runtime router (B/C — policy document only).
 - `_scan_subtree_for_identity_keys` belt-and-suspenders (A-replaced; drop once standard validation

@@ -54,7 +54,10 @@ a runtime-integration step requiring a separate Vincent GO.
 3. **Author REQUEST** — per schema v0.1: work fields, semantic capabilities,
    inference_locality (resource-scoped only; never selects the executor),
    context/output-budget, authority envelope, acceptance, evidence,
-   control.
+   control. **v1 support gate:** only `inference_locality=any`,
+   `context_size_requirement=null`, `output_budget=null` are dispatchable
+   (UNSUPPORTED_V1 fields fail closed before dispatch — work_shape and
+   reasoning_intent are the only ENFORCED_NOW resource-facing fields).
 4. **Validate** — run the deterministic validator; any error → fix, never
    dispatch invalid.
 5. **Derive ASSIGNMENT** — executor from capabilities + authority

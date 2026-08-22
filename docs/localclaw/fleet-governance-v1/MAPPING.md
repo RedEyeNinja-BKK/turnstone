@@ -66,12 +66,26 @@ produce; VERDICT maps evidence → outcome with the explicit two-vocabulary spli
 
 | BWP need | Existing mechanism |
 |---|---|
-| Resource eligibility from work requirements | FleetRouter (closed S2-H baseline): work_shape + reasoning_intent + readiness + context fit |
+| Resource eligibility from work requirements | FleetRouter (closed S2-H baseline): `work_shape` + `reasoning_intent` + readiness + context fit |
 | Preference among eligible | Router preference stage; preferences INACTIVE in BWP v1 |
 | Actual resource selection | Router selects; observed in RECEIPT `resource_observed` |
 
 **Rule:** Turnstone produces requirements; FleetRouter selects resources. The BWP
 never crosses this line (validator-enforced).
+
+### 5a. v1 supported hard-requirement ingress (direct-review #5000030053)
+
+| BWP hard field | Classification | Structured ingress |
+|---|---|---|
+| `work_shape` | **ENFORCED_NOW** | `extensions.fields["work_shape"]` via `work_shape_source="request"`; per-candidate exclusion; legacy `work_class` translated |
+| `reasoning_intent` | **ENFORCED_NOW** | normalized reasoning controls / legacy `work_class=reasoning` → `require_reasoning` → candidate must advertise `reasoning=true` |
+| `inference_locality` | **UNSUPPORTED_V1** | none (no FleetRouter field/config); **fail closed** unless `any` |
+| `context_size_requirement` | **UNSUPPORTED_V1** | none (S2-E context admission not wired in production; consumes runtime input tokens, not a declared requirement); **fail closed** unless `null` |
+| `output_budget` | **UNSUPPORTED_V1** | none (no ingress to `max_output_tokens` in production admission); **fail closed** unless `null` |
+
+`UNSUPPORTED_V1` hard fields block dispatch BEFORE assignment/execution (`validate_for_dispatch` →
+`REJECT`, `UNSUPPORTED_V1` reason). No Switchyard/FleetRouter modification is made to support them; a
+future structured constraint is a separate, separately authorized workstream.
 
 ## 6. Control-plane reuse (no new infrastructure)
 

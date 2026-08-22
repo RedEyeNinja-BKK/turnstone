@@ -1,0 +1,59 @@
+{
+  "schema_version": "0.1",
+  "kind": "bwp-request",
+  "packet_id": "fgv1-t4-insufficient-ambiguous-004",
+  "provenance": {
+    "operator": "RedEyeNinja",
+    "workstream_id": "a8da7a535d294090938e45a3077b14ba",
+    "correlation_id": "fgv1-t4-20260822",
+    "created_at": "2026-08-22T17:15:00+07:00",
+    "supersedes": null,
+    "description": "Requested action on the inference fleet; outcome underspecified. Held for clarification."
+  },
+  "intent": {
+    "outcome": "UNDEFINED — operator request was 'do something about the fleet'; no concrete deliverable, boundary, or success bar was stated.",
+    "non_goals": [],
+    "sufficiency": {
+      "state": "AMBIGUOUS",
+      "rationale": "No deliverable, no boundary, no acceptance bar. Provisional capability guess recorded for clarification, but this packet MUST NOT dispatch. Operator clarification required before a new SUFFICIENT packet is authored.",
+      "adjudicated_by": "Turnstone"
+    }
+  },
+  "work": {
+    "work_shape": "bounded",
+    "reasoning_intent": "none"
+  },
+  "requirements": {
+    "capabilities_required": ["text_generation", "local_execution"],
+    "context": {
+      "required_inputs": [],
+      "context_size_requirement": null,
+      "retrieval_required": false
+    },
+    "output_budget": null,
+    "locality": "local",
+    "preferences": []
+  },
+  "authority": {
+    "risk_class": "advisory",
+    "allowed_actions": ["read_files"],
+    "forbidden_actions": ["deploy_production", "publish_public", "manage_services", "manage_containers", "create_credentials"],
+    "mutation_envelope": {
+      "targets": [],
+      "allowed_mutations": [],
+      "approval_required": false
+    },
+    "credential_rule": "logical-refs-only"
+  },
+  "acceptance": {
+    "criteria": ["Clarified deliverable, boundary, and success bar confirmed with operator before any dispatch"]
+  },
+  "evidence": {
+    "requirements": ["read_back"]
+  },
+  "control": {
+    "timeout_seconds": 300,
+    "cancel_policy": "never dispatch while AMBIGUOUS/INSUFFICIENT",
+    "escalation_conditions": ["operator clarification request returned", "operator supersedes with concrete outcome"]
+  }
+}

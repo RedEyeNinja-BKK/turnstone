@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "bwp-verdict-v0.1.json",
+  "title": "Fleet Governance v1 — VERDICT",
+  "description": "Turnstone-adjudicated work outcome. Work outcome vocabulary (PASS/FAIL/INDETERMINATE/ESCALATED) is SEPARATE from evidence epistemology (PROVEN/PROPOSED/ASSUMED/FAILED/INDETERMINATE). PASS requires acceptance + authority compliance + evidence sufficiency.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "packet_id",
+    "correlation_id",
+    "workstream_id",
+    "adjudicated_at",
+    "work_outcome",
+    "basis",
+    "closeout"
+  ],
+  "properties": {
+    "schema_version": { "const": "0.1" },
+    "kind": { "const": "bwp-verdict" },
+    "packet_id": { "type": "string" },
+    "correlation_id": { "type": "string" },
+    "workstream_id": { "type": "string" },
+    "adjudicated_at": { "type": "string", "format": "date-time" },
+    "work_outcome": { "enum": ["PASS", "FAIL", "INDETERMINATE", "ESCALATED"] },
+    "basis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["acceptance", "authority_compliance", "evidence_sufficiency"],
+      "properties": {
+        "acceptance": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["criterion", "met", "evidence_ref"],
+            "properties": {
+              "criterion": { "type": "string" },
+              "met": { "type": "boolean" },
+              "evidence_ref": { "type": "string" }
+            }
+          }
+        },
+        "authority_compliance": {
+          "enum": ["COMPLIANT", "VIOLATION"],
+          "description": "VIOLATION when receipt actions_taken exceed allowed_actions or touch forbidden_actions."
+        },
+        "evidence_sufficiency": {
+          "enum": ["SUFFICIENT", "INSUFFICIENT"],
+          "description": "SUFFICIENT when all BWP evidence requirements are satisfied and no blocking INDETERMINATE claim remains."
+        },
+        "evidence_epistemology": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claim", "status"],
+            "properties": {
+              "claim": { "type": "string" },
+              "status": { "enum": ["PROVEN", "PROPOSED", "ASSUMED", "FAILED", "INDETERMINATE"] }
+            }
+          },
+          "description": "Claim-level epistemology, kept separate from work_outcome. A receipt may contain many PROVEN claims and still yield FAIL."
+        },
+        "hard_constraint_status": {
+          "enum": ["SATISFIED", "VIOLATED", "NOT_EVALUATED"],
+          "description": "Overall hard-requirement satisfaction (capabilities/locality/work-class admission)."
+        }
+      }
+    },
+    "closeout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workstream_state", "receipt_links", "next_action"],
+      "properties": {
+        "workstream_state": { "enum": ["closed", "escalated", "reopened"] },
+        "receipt_links": { "type": "array", "items": { "type": "string" } },
+        "escalation_ref": { "type": ["string", "null"] },
+        "next_action": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,237 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "bwp-request-v0.1.json",
+  "title": "Fleet Governance v1 — Bounded Work Packet (REQUEST / Requirements)",
+  "description": "Turnstone-authored work-requirements object. Captures intent, sufficiency, work class, semantic capability requirements, abstract resource requirements, authority envelope, acceptance criteria, evidence requirements, and control. NEVER contains provider/model/resource identities. NEVER lets prompt prose replace structured routing metadata.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "packet_id",
+    "provenance",
+    "intent",
+    "work",
+    "requirements",
+    "authority",
+    "acceptance",
+    "evidence",
+    "control"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1",
+      "description": "BWP family schema version. Bumping requires review."
+    },
+    "kind": {
+      "const": "bwp-request",
+      "description": "Discriminator for the request object."
+    },
+    "packet_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Stable identity shared across request/assignment/receipt/verdict."
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operator", "workstream_id", "correlation_id", "created_at"],
+      "properties": {
+        "operator": { "type": "string" },
+        "workstream_id": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "supersedes": { "type": ["string", "null"] },
+        "description": {
+          "type": "string",
+          "x-routing-neutral": true,
+          "description": "Human-readable summary. Prose is NEVER authoritative routing metadata: mention of providers/models/resources in prose is permitted and does not affect routing (at most an audit warning). Routing is determined ONLY by the structural work fields."
+        }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "non_goals", "sufficiency"],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "description": "What 'done' means, precisely and testably."
+        },
+        "non_goals": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Explicit scope boundaries. Prevents executor scope-creep."
+        },
+        "sufficiency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "rationale"],
+          "properties": {
+            "state": { "enum": ["SUFFICIENT", "AMBIGUOUS", "INSUFFICIENT"] },
+            "rationale": { "type": "string" },
+            "adjudicated_by": { "const": "Turnstone" }
+          },
+          "description": "Deterministic dispatch gate. Only SUFFICIENT may be assigned."
+        }
+      }
+    },
+    "work": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["work_shape", "reasoning_intent"],
+      "properties": {
+        "work_shape": {
+          "enum": ["bounded", "agentic"],
+          "description": "REQUIRED structural work class. Matches task_agent enum. Never derived from prompt prose."
+        },
+        "reasoning_intent": {
+          "enum": ["none", "deliberate"],
+          "description": "Orthogonal to work_shape. deliberate => thinking-capable candidate mandatory."
+        }
+      },
+      "x-structural": true,
+      "x-provenance": "Turnstone derived"
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capabilities_required", "locality"],
+      "properties": {
+        "capabilities_required": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "SEMANTIC capabilities from the v1 vocabulary. NEVER resource identities (no htpc-llm, no model/provider/GPU endpoint)."
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required_inputs": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "References/inputs the work needs. Minimal hydration seam only."
+            },
+            "context_size_requirement": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "description": "Approximate/exact context tokens when known. Admission input, not a resource pick."
+            },
+            "retrieval_required": {
+              "type": "boolean",
+              "description": "Simple yes/no for memory/archive retrieval. No retrieval machinery in v1."
+            }
+          }
+        },
+        "output_budget": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Explicit output token budget where resource admission needs it. Optional."
+        },
+        "locality": {
+          "enum": ["hosted", "local", "local_required", "any"],
+          "description": "Hard constraint. local_required may eliminate hosted resources. 'any' = no locality constraint."
+        },
+        "preferences": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "value", "active"],
+            "properties": {
+              "name": { "enum": ["latency", "cost"] },
+              "value": { "type": "string" },
+              "active": { "const": false }
+            }
+          },
+          "description": "Reserved preference hooks. MUST be inactive in v1 (active:false enforced). Preferences NEVER determine eligibility; they operate only among eligible choices."
+        }
+      },
+      "x-resource-identity-forbidden": true
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk_class", "allowed_actions", "forbidden_actions", "mutation_envelope", "credential_rule"],
+      "properties": {
+        "risk_class": { "enum": ["advisory", "operational", "elevated", "critical"] },
+        "allowed_actions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Semantic action ids from vocabulary. Receipt actions_taken must be a subset."
+        },
+        "forbidden_actions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Semantic action ids explicitly forbidden. Attempted use => authority violation."
+        },
+        "mutation_envelope": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "targets": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Operational targets (e.g., 'docker-vm', 'truenas-bkk'). These are governance targets, NOT inference resources."
+            },
+            "allowed_mutations": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Semantic mutation kinds permitted within targets."
+            },
+            "approval_required": { "type": "boolean" }
+          }
+        },
+        "credential_rule": {
+          "const": "logical-refs-only",
+          "description": "Never embed credentials in packets; logical references only."
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criteria"],
+      "properties": {
+        "criteria": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Testable acceptance criteria for the executor AND independent reviewer."
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirements"],
+      "properties": {
+        "requirements": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Semantic evidence types required for PASS (read_back, hash, disk_state, routing_telemetry, ...). Verdict PASS requires all satisfied."
+        }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout_seconds", "cancel_policy", "escalation_conditions"],
+      "properties": {
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "cancel_policy": {
+          "type": "string",
+          "description": "e.g., 'no re-issue on timeout; classify INDETERMINATE; reconcile target before retry'."
+        },
+        "escalation_conditions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Conditions that trigger operator escalation rather than substitution."
+        }
+      }
+    }
+  }
+}

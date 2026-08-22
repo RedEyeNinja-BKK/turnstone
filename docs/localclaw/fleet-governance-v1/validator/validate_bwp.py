@@ -41,10 +41,24 @@ DEMONSTRATIONS (self-test; see VALIDATION.md)
   R9  Assignment must never carry provider/model identity.
   R10 Synonym-key identity smuggling (unknown properties) must be rejected (additionalProperties:false).
   R11 A blocking INDETERMINATE claim must prevent PASS (INDETERMINATE).
-  R12 A proven hard-constraint violation (local_required + hosted resource) must FAIL.
+  R12 A PROVEN hosted inference locality under local_required must FAIL (VIOLATED).
+  R13 local_required + unknown locality => INDETERMINATE (never inferred FAIL).
+  R14 Provider/model names alone never prove locality => INDETERMINATE when locality unobserved.
+  R15 One NOT_MET acceptance criterion => FAIL.
+  R16 A required criterion without positive PROVEN adjudication => INDETERMINATE.
+  R17 Absence of FAILED claims alone cannot make criteria MET.
+  R18 Executor self-assessment cannot force PASS.
+  R19 Unknown property nested under nullable resource_observed rejected.
+  R20 Unknown property nested under inference_resource rejected.
   C1  Executor selection must NOT follow work_shape (shape-independent).
   C2  Sufficiency disposition is deterministic (DISPATCH/CLARIFY/REJECT).
   C3  ESCALATED outcome is reachable (operator-gated) and does not evaluate hard constraints.
+  C4  inference_locality does NOT select the executor (locality separation).
+  C5  Executor assignment never carries/rewrites inference locality.
+  C6  local_required + PROVEN local resource is compliant (PASS).
+  C7  Local provider/model with PROVEN local locality is compliant (names never prove locality).
+  C8  PASS requires all criteria MET + evidence sufficient.
+  C9  Valid nullable resource_observed=null accepted.
 
 USAGE
   python3 validate_bwp.py            # run all checks + self-test; exit 0 on expected results
@@ -79,7 +93,8 @@ SUFFICIENCY_STATES = set(VOCAB["sufficiency_states"])
 WORK_SHAPES = set(VOCAB["work_shapes"])
 REASONING_INTENTS = set(VOCAB["reasoning_intents"])
 RISK_CLASSES = set(VOCAB["risk_classes"])
-LOCALITIES = set(VOCAB["localities"])
+INFERENCE_LOCALITIES = set(VOCAB["inference_localities"])
+OBSERVED_LOCALITIES = set(VOCAB["observed_localities"])
 EVIDENCE_STATUSES = set(VOCAB["evidence_claim_statuses"])
 WORK_OUTCOMES = set(VOCAB["work_outcomes"])
 EXECUTORS = set(VOCAB["executors"])
@@ -155,10 +170,16 @@ def _scan_subtree_for_identity_tokens(obj, where: str, issues: Issues, kind="war
 
 def _enforce_schema_shape(obj, schema, where: str, issues: Issues):
     """Recursive additionalProperties:false enforcement DRIVEN BY THE ACTUAL SCHEMA
-    JSON files (LB-1 depth fix). Mirrors the declared nested structure so synonym-key
-    identity smuggling fails at any depth (e.g. requirements.context.required_model,
-    assignment.assigned.required_model, receipt.required_model)."""
-    if not isinstance(obj, dict) or schema.get("type") != "object":
+    JSON files (LB-1 depth fix + union-type handling). Mirrors the declared nested
+    structure so synonym-key identity smuggling fails at any depth (e.g.
+    requirements.context.required_model, assignment.assigned.required_model,
+    receipt.required_model). Handles union types such as ["object", "null"]
+    (nullable nested objects are shape-checked when present; null values pass).
+    Scope note: the runtime design retires this mirror in favor of the native
+    Turnstone/Pydantic validation idiom (see NATIVE-INTEGRATION-ANALYSIS)."""
+    types = schema.get("type")
+    type_list = types if isinstance(types, list) else [types]
+    if not isinstance(obj, dict) or "object" not in type_list:
         return
     props = schema.get("properties", {})
     allowed = set(props.keys())
@@ -264,8 +285,9 @@ def validate_bwp(packet: dict) -> Issues:
         if c not in CAPABILITIES:
             issues.error(f"requirements.capabilities_required: '{c}' is not a semantic capability "
                          f"(resource identities are forbidden; use the vocabulary)")
-    if reqs.get("locality") not in LOCALITIES:
-        issues.error(f"requirements.locality: invalid {reqs.get('locality')!r}")
+    if reqs.get("inference_locality") not in INFERENCE_LOCALITIES:
+        issues.error(f"requirements.inference_locality: invalid {reqs.get('inference_locality')!r} "
+                     f"(inference-resource locality only; NEVER selects the executor)")
     # R2: scan the requirements subtree for forbidden identity keys/tokens
     _scan_subtree_for_identity_keys(reqs, "requirements", issues)
     _scan_subtree_for_identity_tokens(reqs, "requirements", issues, kind="warning")
@@ -392,8 +414,10 @@ def validate_for_dispatch(packet: dict):
 # work_shape / reasoning_intent describe INFERENCE SEMANTICS for chain 2 ONLY.
 # They NEVER select an executor: no mechanical agentic->Hermes or bounded->Turnstone
 # mapping. Executor selection derives from required capabilities, authority/risk,
-# available execution surfaces, locality/placement constraints, and operator gates.
-# Provider/model/resource selection remains FleetRouter's, never Turnstone's.
+# available execution surfaces, and operator gates. `inference_locality` is a
+# RESOURCE constraint for chain 2 ONLY and NEVER selects an executor (ownership
+# separation, direct-review correction 1). Provider/model/resource selection
+# remains FleetRouter's, never Turnstone's.
 # ---------------------------------------------------------------------------
 
 MUTATING_ACTIONS = {"manage_services", "manage_containers", "deploy_production",
@@ -402,11 +426,12 @@ MUTATING_ACTIONS = {"manage_services", "manage_containers", "deploy_production",
 
 def derive_executor_candidates(bwp: dict) -> dict:
     """Executor ELIGIBILITY: lanes whose capability surface satisfies the required
-    semantic capabilities AND whose placement satisfies locality constraints.
+    semantic capabilities. `inference_locality` is deliberately NOT consulted:
+    executor placement derives from capabilities + authority + sanctioned
+    execution surfaces (Turnstone-owned), never from inference-resource locality.
     Returns {'candidates': [...], 'capability_gap': bool}."""
     reqs = bwp.get("requirements", {})
     caps = set(reqs.get("capabilities_required", []))
-    locality = reqs.get("locality", "any")
     LANES = {
         "turnstone-native": {"text_generation", "structured_extraction", "filesystem_read", "filesystem_write",
                              "local_execution", "code_execution", "deterministic_computation", "memory_retrieval",
@@ -424,15 +449,14 @@ def derive_executor_candidates(bwp: dict) -> dict:
     }
     capable = [lane for lane, lane_caps in LANES.items() if caps <= lane_caps]
     capable = [l for l in capable if l not in ("operator", "external")]
-    # Placement constraint: local_required excludes remote execution surfaces.
-    if locality == "local_required" and "openclaw-remote" in capable:
-        capable.remove("openclaw-remote")
     return {"candidates": capable, "capability_gap": not capable}
 
 
 def select_executor(bwp: dict) -> dict:
-    """Executor ASSIGNMENT precedence (capability + authority + placement only).
-    Never consults work_shape / reasoning_intent; never selects a provider/model."""
+    """Executor ASSIGNMENT precedence (capability + authority + operator gates only).
+    Never consults work_shape / reasoning_intent; never consults inference_locality;
+    never selects a provider/model. `inference_locality` is a FleetRouter resource
+    constraint and does NOT choose Hermes/OpenClaw/Turnstone."""
     auth = bwp.get("authority", {})
     reqs = bwp.get("requirements", {})
     caps = set(reqs.get("capabilities_required", []))
@@ -449,10 +473,9 @@ def select_executor(bwp: dict) -> dict:
     if derived["capability_gap"]:
         return {"executor": None,
                 "rationale": f"executor capability gap: no execution surface provides {sorted(caps)}; report, do not assign"}
-    # 3. Emission-bound work (capability-driven lane)
+    # 3. Emission-bound work (capability-driven lane; emission target by authority envelope)
     if "external_emission" in caps:
-        lane = "openclaw-remote" if reqs.get("locality") == "hosted" else "openclaw-local"
-        return {"executor": lane,
+        return {"executor": "openclaw-local",
                 "rationale": "external_emission capability => OpenClaw lane (target by authority envelope)"}
     # 4. Browser/web automation (capability-driven lane)
     if caps & {"web_browsing", "browser_automation"}:
@@ -480,11 +503,13 @@ def select_executor(bwp: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def eligibility(candidates, bwp: dict):
-    """Hard requirements only. Candidates: [{'id', 'capabilities', 'locality',
-    'context_capacity', 'supports_reasoning', 'supports_work_shapes'}]."""
+    """Hard requirements only (FleetRouter-chain demonstration). Candidates:
+    [{'id', 'capabilities', 'locality' (inference-resource locality), 'context_capacity',
+    'supports_reasoning', 'supports_work_shapes'}]. Consumes inference_locality
+    (resource constraint) ONLY; never executor placement."""
     reqs = bwp.get("requirements", {})
     caps = set(reqs.get("capabilities_required", []))
-    locality = reqs.get("locality", "any")
+    inference_locality = reqs.get("inference_locality", "any")
     ctx_req = (reqs.get("context") or {}).get("context_size_requirement")
     work = bwp.get("work", {})
     reasoning = work.get("reasoning_intent") == "deliberate"
@@ -492,9 +517,9 @@ def eligibility(candidates, bwp: dict):
     for c in candidates:
         if not caps <= set(c.get("capabilities", [])):
             continue
-        if locality == "local_required" and c.get("locality") != "local":
+        if inference_locality == "local_required" and c.get("locality") != "local":
             continue
-        if locality == "hosted" and c.get("locality") not in ("hosted", "any"):
+        if inference_locality == "hosted_allowed" and c.get("locality") not in ("hosted", "any"):
             continue
         if ctx_req is not None and c.get("context_capacity") is not None and ctx_req > c["context_capacity"]:
             continue
@@ -618,58 +643,75 @@ def adjudicate(receipt: dict, bwp: dict, assignment: dict, escalated: bool = Fal
     """Return a verdict object per the deterministic rules. Evidence epistemology
     (claim statuses) is kept separate from the work outcome.
 
-    LB-2 rules (design §5):
-      - A materially INDETERMINATE claim BLOCKS PASS (=> INDETERMINATE unless a FAIL
-        condition is proven).
-      - Hard constraints are evaluated from observed receipt facts: locality=local_required
-        with an observed external inference resource => VIOLATED => FAIL.
+    Direct-review corrections (2026-08-22):
+      - Hard-constraint adjudication uses the OBSERVED inference-resource locality
+        (resource_observed.inference_resource.locality), never provider/model names.
+        local_required + PROVEN hosted => VIOLATED => FAIL; + PROVEN local => compliant;
+        + unknown/unobservable => INDETERMINATE (blocking), never inferred FAIL.
+      - Acceptance is adjudicated PER CRITERION from positive PROVEN evidence
+        references (criterion_refs): MET only when a PROVEN claim references the
+        criterion; NOT_MET from a FAILED reference; INDETERMINATE otherwise.
+        Absence of a FAILED claim alone never makes a criterion MET; the executor's
+        acceptance self-assessment is never authoritative.
     """
     rv = validate_receipt(receipt, bwp, assignment)
     authority_violation = any("authority violation" in e for e in rv.errors)
     evidence_gap = any("evidence gap" in e for e in rv.errors)
 
-    # LB-2: evaluate hard constraints from observed receipt facts (minimal deterministic
-    # rule: local_required + observed external inference resource = violation).
+    # --- Hard constraints from OBSERVED locality (not provider/model presence) ---
     hard_violation = False
-    locality = bwp["requirements"].get("locality")
+    locality_indeterminate = False
+    inference_locality = bwp["requirements"].get("inference_locality")
     observed = receipt.get("resource_observed") or {}
     inferred = observed.get("inference_resource") or {}
-    if locality == "local_required" and (inferred.get("provider") or inferred.get("model")):
-        hard_violation = True
+    observed_locality = inferred.get("locality")
+    if inference_locality == "local_required":
+        if observed_locality == "hosted":
+            hard_violation = True
+        elif observed_locality not in ("local",):
+            # unknown or absent => locality not proven => INDETERMINATE, never FAIL.
+            locality_indeterminate = True
 
-    # LB-2: a materially INDETERMINATE claim blocks PASS.
+    # A materially INDETERMINATE claim blocks PASS.
     blocking_indeterminate = any(
         c.get("status") == "INDETERMINATE" for c in receipt.get("evidence_claims", [])
     )
 
+    # --- Per-criterion acceptance adjudication (direct-review correction 3) ---
+    claims = receipt.get("evidence_claims", [])
+    criteria = bwp["acceptance"]["criteria"]
+    adjudicated = []
+    for idx, criterion in enumerate(criteria):
+        refs = {str(idx), criterion, f"c{idx}"}
+        met = any(cl.get("status") == "PROVEN" and (set(cl.get("criterion_refs", [])) & refs)
+                  for cl in claims)
+        not_met = any(cl.get("status") == "FAILED" and (set(cl.get("criterion_refs", [])) & refs)
+                      for cl in claims)
+        if not_met:
+            status = "NOT_MET"
+        elif met:
+            status = "MET"
+        else:
+            status = "INDETERMINATE"  # no positive PROVEN adjudication => not MET
+        adjudicated.append({"criterion": criterion, "status": status,
+                            "evidence_refs": [cl.get("evidence_ref", "") for cl in claims
+                                               if (set(cl.get("criterion_refs", [])) & refs)],
+                            "rationale": ("positive PROVEN evidence" if met else
+                                          "proven failure" if not_met else
+                                          "not positively adjudicated from evidence")})
+
     basis = {
-        "acceptance": [
-            {"criterion": c, "met": False, "evidence_ref": "adjudicated"} for c in bwp["acceptance"]["criteria"]
-        ],
+        "acceptance": adjudicated,
         "authority_compliance": "VIOLATION" if authority_violation else "COMPLIANT",
-        "evidence_sufficiency": "INSUFFICIENT" if (evidence_gap or blocking_indeterminate) else "SUFFICIENT",
+        "evidence_sufficiency": "INSUFFICIENT" if (evidence_gap or blocking_indeterminate or locality_indeterminate) else "SUFFICIENT",
         "evidence_epistemology": [
             {"claim": cl.get("claim", ""), "status": cl.get("status", "PROPOSED")}
-            for cl in receipt.get("evidence_claims", [])
+            for cl in claims
         ],
         "hard_constraint_status": ("NOT_EVALUATED" if escalated else
-                                   "VIOLATED" if hard_violation else "SATISFIED"),
+                                   "VIOLATED" if hard_violation else
+                                   "UNVERIFIABLE" if locality_indeterminate else "SATISFIED"),
     }
-
-    # Acceptance: in this design-artifact validator, adjudication marks acceptance
-    # from the executor's artifacts/claims; the authoritative per-criterion
-    # adjudication is a Turnstone review step. Here we require the receipt to
-    # demonstrate coverage: all criteria are treated as met unless a failure
-    # claim contradicts them (conservative default for the demonstration).
-    fail_claims = [c for c in receipt.get("evidence_claims", []) if c.get("status") == "FAILED"]
-    if fail_claims:
-        basis["acceptance"] = [
-            {"criterion": c, "met": False, "evidence_ref": "failed-claim"} for c in bwp["acceptance"]["criteria"]
-        ]
-    else:
-        basis["acceptance"] = [
-            {"criterion": c, "met": True, "evidence_ref": "receipt"} for c in bwp["acceptance"]["criteria"]
-        ]
 
     if escalated:
         outcome = "ESCALATED"
@@ -677,9 +719,10 @@ def adjudicate(receipt: dict, bwp: dict, assignment: dict, escalated: bool = Fal
         outcome = "FAIL"
     elif hard_violation:
         outcome = "FAIL"
-    elif any(not a["met"] for a in basis["acceptance"]):
+    elif any(a["status"] == "NOT_MET" for a in adjudicated):
         outcome = "FAIL"
-    elif evidence_gap or blocking_indeterminate:
+    elif (evidence_gap or blocking_indeterminate or locality_indeterminate
+          or any(a["status"] == "INDETERMINATE" for a in adjudicated)):
         outcome = "INDETERMINATE"
     else:
         outcome = "PASS"
@@ -971,16 +1014,103 @@ def run_self_test() -> dict:
                                  "ok": r11_ok, "detail": f"verdict={verdict11['work_outcome']}"})
 
     bwp12 = json.loads(json.dumps(load_example("qualification-1-bounded-routine.json")))
-    bwp12["requirements"]["locality"] = "local_required"
+    bwp12["requirements"]["inference_locality"] = "local_required"
     assignment12 = build_assignment(bwp12)
     receipt12 = build_receipt(bwp12, assignment12, "T1")
-    receipt12["resource_observed"]["inference_resource"] = {"provider": "openai", "model": "gpt-5.6-luna"}
+    # PROVEN hosted locality (not provider/model presence) => hard-constraint violation
+    receipt12["resource_observed"]["inference_resource"] = {"provider": "openai", "model": "gpt-5.6-luna", "locality": "hosted"}
     verdict12 = adjudicate(receipt12, bwp12, assignment12)
     r12_ok = (verdict12["work_outcome"] == "FAIL"
               and verdict12["basis"]["hard_constraint_status"] == "VIOLATED")
-    report["rejections"].append({"id": "R12", "label": "hard-constraint violation (local_required + hosted resource) -> FAIL",
+    report["rejections"].append({"id": "R12", "label": "hard-constraint violation (local_required + PROVEN hosted locality) -> FAIL",
                                  "ok": r12_ok,
                                  "detail": f"verdict={verdict12['work_outcome']}, hard_constraint_status={verdict12['basis']['hard_constraint_status']}"})
+
+    # ---- R13: local_required + unknown/unobservable locality -> INDETERMINATE (not FAIL) ----
+    bwp13 = json.loads(json.dumps(load_example("qualification-1-bounded-routine.json")))
+    bwp13["requirements"]["inference_locality"] = "local_required"
+    assignment13 = build_assignment(bwp13)
+    receipt13 = build_receipt(bwp13, assignment13, "T1")
+    receipt13["resource_observed"]["inference_resource"] = {"provider": "openai", "model": "gpt-5.6-luna", "locality": "unknown"}
+    verdict13 = adjudicate(receipt13, bwp13, assignment13)
+    r13_ok = (verdict13["work_outcome"] == "INDETERMINATE"
+              and verdict13["basis"]["hard_constraint_status"] == "UNVERIFIABLE")
+    report["rejections"].append({"id": "R13", "label": "local_required + unknown locality -> INDETERMINATE (never inferred FAIL)",
+                                 "ok": r13_ok,
+                                 "detail": f"verdict={verdict13['work_outcome']}, hard_constraint_status={verdict13['basis']['hard_constraint_status']}"})
+
+    # ---- R14: provider/model names alone never establish locality (no locality field) ----
+    bwp14 = json.loads(json.dumps(load_example("qualification-1-bounded-routine.json")))
+    bwp14["requirements"]["inference_locality"] = "local_required"
+    assignment14 = build_assignment(bwp14)
+    receipt14 = build_receipt(bwp14, assignment14, "T1")
+    receipt14["resource_observed"]["inference_resource"] = {"provider": "openai", "model": "gpt-5.6-luna"}  # no locality field
+    verdict14 = adjudicate(receipt14, bwp14, assignment14)
+    r14_ok = (verdict14["work_outcome"] == "INDETERMINATE"
+              and verdict14["basis"]["hard_constraint_status"] == "UNVERIFIABLE")
+    report["rejections"].append({"id": "R14", "label": "provider/model presence alone cannot prove locality -> INDETERMINATE",
+                                 "ok": r14_ok,
+                                 "detail": f"verdict={verdict14['work_outcome']} (no locality fact observed)"})
+
+    # ---- R15: one NOT_MET criterion -> FAIL ----
+    bwp15 = load_example("qualification-1-bounded-routine.json")
+    assignment15 = build_assignment(bwp15)
+    receipt15 = build_receipt(bwp15, assignment15, "T1")
+    receipt15["evidence_claims"].append({"claim": "criterion 0 failed", "status": "FAILED",
+                                          "satisfies": [], "criterion_refs": ["0"]})
+    verdict15 = adjudicate(receipt15, bwp15, assignment15)
+    r15_ok = (verdict15["work_outcome"] == "FAIL"
+              and any(a["status"] == "NOT_MET" for a in verdict15["basis"]["acceptance"]))
+    report["rejections"].append({"id": "R15", "label": "one NOT_MET criterion -> FAIL",
+                                 "ok": r15_ok, "detail": f"verdict={verdict15['work_outcome']}"})
+
+    # ---- R16: one INDETERMINATE required criterion (no positive PROVEN ref) -> INDETERMINATE ----
+    bwp16 = load_example("qualification-1-bounded-routine.json")
+    assignment16 = build_assignment(bwp16)
+    receipt16 = build_receipt(bwp16, assignment16, "T1")
+    # remove criterion_refs from all claims: no criterion positively adjudicated
+    for cl in receipt16["evidence_claims"]:
+        cl.pop("criterion_refs", None)
+    verdict16 = adjudicate(receipt16, bwp16, assignment16)
+    r16_ok = (verdict16["work_outcome"] == "INDETERMINATE"
+              and all(a["status"] == "INDETERMINATE" for a in verdict16["basis"]["acceptance"]))
+    report["rejections"].append({"id": "R16", "label": "INDETERMINATE required criterion (no positive adjudication) -> INDETERMINATE",
+                                 "ok": r16_ok, "detail": f"verdict={verdict16['work_outcome']}"})
+
+    # ---- R17: absence of FAILED claims alone cannot produce MET (R16 is the proof; explicit assert) ----
+    r17_ok = r16_ok and verdict16["work_outcome"] == "INDETERMINATE"
+    report["rejections"].append({"id": "R17", "label": "absence of FAILED claims alone cannot make criteria MET",
+                                 "ok": r17_ok, "detail": "no FAILED claim present, yet verdict != PASS"})
+
+    # ---- R18: executor self-assessment claiming success cannot force PASS ----
+    bwp18 = load_example("qualification-1-bounded-routine.json")
+    assignment18 = build_assignment(bwp18)
+    receipt18 = build_receipt(bwp18, assignment18, "T1")
+    receipt18["acceptance_self_assessment"]["claimed"] = True
+    for cl in receipt18["evidence_claims"]:
+        cl.pop("criterion_refs", None)  # self-assessment alone, no PROVEN adjudication refs
+    verdict18 = adjudicate(receipt18, bwp18, assignment18)
+    r18_ok = (verdict18["work_outcome"] == "INDETERMINATE")
+    report["rejections"].append({"id": "R18", "label": "executor self-assessment cannot force PASS",
+                                 "ok": r18_ok, "detail": f"verdict={verdict18['work_outcome']} despite self-assessment claimed=True"})
+
+    # ---- R19: unknown property nested under nullable resource_observed rejected ----
+    bwp19 = load_example("qualification-1-bounded-routine.json")
+    assignment19 = build_assignment(bwp19)
+    receipt19 = build_receipt(bwp19, assignment19, "T1")
+    receipt19["resource_observed"]["required_model"] = "gpt-5.6-luna"
+    r19_ok = any("unknown property" in e for e in validate_receipt(receipt19, bwp19, assignment19).errors)
+    report["rejections"].append({"id": "R19", "label": "unknown nested property under nullable resource_observed rejected",
+                                 "ok": r19_ok, "detail": "resource_observed.required_model"})
+
+    # ---- R20: unknown property nested under inference_resource rejected ----
+    bwp20 = load_example("qualification-1-bounded-routine.json")
+    assignment20 = build_assignment(bwp20)
+    receipt20 = build_receipt(bwp20, assignment20, "T1")
+    receipt20["resource_observed"]["inference_resource"] = {"locality": "local", "required_model": "gpt-5.6-luna"}
+    r20_ok = any("unknown property" in e for e in validate_receipt(receipt20, bwp20, assignment20).errors)
+    report["rejections"].append({"id": "R20", "label": "unknown property under nested inference_resource rejected",
+                                 "ok": r20_ok, "detail": "inference_resource.required_model"})
 
     # ---- C3: ESCALATED outcome is reachable and NOT_EVALUATED (review finding N4) ----
     bwp_c3 = load_example("qualification-1-bounded-routine.json")
@@ -991,6 +1121,68 @@ def run_self_test() -> dict:
              and verdict_c3["basis"]["hard_constraint_status"] == "NOT_EVALUATED")
     report["controls"].append({"id": "C3", "label": "ESCALATED outcome reachable (operator-gated)",
                                "ok": c3_ok, "detail": f"verdict={verdict_c3['work_outcome']}"})
+
+    # ---- C4: inference_locality does NOT select the executor (direct-review correction 1) ----
+    bwp_c4a = load_example("qualification-1-bounded-routine.json")
+    bwp_c4b = json.loads(json.dumps(bwp_c4a))
+    bwp_c4a["requirements"]["inference_locality"] = "local_required"
+    bwp_c4b["requirements"]["inference_locality"] = "hosted_allowed"
+    ex_a = select_executor(bwp_c4a)
+    ex_b = select_executor(bwp_c4b)
+    c4_ok = (ex_a["executor"] == ex_b["executor"]
+             and "locality" not in ex_a["rationale"].lower()
+             and "locality" not in ex_b["rationale"].lower())
+    report["controls"].append({"id": "C4", "label": "inference_locality does not select executor",
+                               "ok": c4_ok,
+                               "detail": f"local_required -> {ex_a['executor']}; hosted_allowed -> {ex_b['executor']}"})
+
+    # ---- C5: executor assignment never rewrites/contains inference locality ----
+    bwp_c5 = load_example("qualification-1-bounded-routine.json")
+    assignment_c5 = build_assignment(bwp_c5)
+    ser = json.dumps(assignment_c5)
+    c5_ok = ("inference_locality" not in ser and "locality" not in ser)
+    report["controls"].append({"id": "C5", "label": "executor assignment does not carry or rewrite inference locality",
+                               "ok": c5_ok, "detail": "assignment contains no locality fields"})
+
+    # ---- C6: local_required + PROVEN local resource is compliant (PASS) ----
+    bwp_c6 = load_example("qualification-1-bounded-routine.json")  # inference_locality=local_required; receipt built with locality=local
+    assignment_c6 = build_assignment(bwp_c6)
+    receipt_c6 = build_receipt(bwp_c6, assignment_c6, "T1")
+    verdict_c6 = adjudicate(receipt_c6, bwp_c6, assignment_c6)
+    c6_ok = (verdict_c6["work_outcome"] == "PASS"
+             and verdict_c6["basis"]["hard_constraint_status"] == "SATISFIED")
+    report["controls"].append({"id": "C6", "label": "local_required + PROVEN local resource compliant",
+                               "ok": c6_ok, "detail": f"verdict={verdict_c6['work_outcome']}"})
+
+    # ---- C7: provider/model identity alone never proves locality (local + hosted both valid facts) ----
+    bwp_c7 = json.loads(json.dumps(load_example("qualification-1-bounded-routine.json")))
+    assignment_c7 = build_assignment(bwp_c7)
+    receipt_c7 = build_receipt(bwp_c7, assignment_c7, "T1")
+    receipt_c7["resource_observed"]["inference_resource"] = {"provider": "comfy", "model": "qwen", "locality": "local"}
+    verdict_c7 = adjudicate(receipt_c7, bwp_c7, assignment_c7)
+    c7_ok = (verdict_c7["work_outcome"] == "PASS"
+             and verdict_c7["basis"]["hard_constraint_status"] == "SATISFIED")
+    report["controls"].append({"id": "C7", "label": "local provider/model with PROVEN local locality is compliant (names never prove locality)",
+                               "ok": c7_ok, "detail": f"verdict={verdict_c7['work_outcome']}"})
+
+    # ---- C8: PASS requires all criteria explicitly MET + evidence sufficient ----
+    bwp_c8 = load_example("qualification-1-bounded-routine.json")
+    assignment_c8 = build_assignment(bwp_c8)
+    receipt_c8 = build_receipt(bwp_c8, assignment_c8, "T1")
+    verdict_c8 = adjudicate(receipt_c8, bwp_c8, assignment_c8)
+    c8_ok = (verdict_c8["work_outcome"] == "PASS"
+             and all(a["status"] == "MET" for a in verdict_c8["basis"]["acceptance"]))
+    report["controls"].append({"id": "C8", "label": "PASS requires all criteria MET + evidence sufficient",
+                               "ok": c8_ok, "detail": f"verdict={verdict_c8['work_outcome']}"})
+
+    # ---- C9: valid nullable resource_observed = null accepted ----
+    bwp_c9 = json.loads(json.dumps(load_example("qualification-2-agentic-nondeliberate.json")))
+    assignment_c9 = build_assignment(bwp_c9)
+    receipt_c9 = build_receipt(bwp_c9, assignment_c9, "T2")
+    receipt_c9["resource_observed"] = None
+    c9_ok = validate_receipt(receipt_c9, bwp_c9, assignment_c9).valid
+    report["controls"].append({"id": "C9", "label": "valid nullable resource_observed=null accepted",
+                               "ok": c9_ok, "detail": f"receipt_valid={c9_ok}"})
 
     # ---- select_executor sanity (no capability gap -> never assigns operator-only or None) ----
     for label, fname in examples:
@@ -1006,12 +1198,21 @@ def run_self_test() -> dict:
 
 def build_receipt(bwp: dict, assignment: dict, label: str) -> dict:
     """Fixture receipt for a positive example: claims satisfy the BWP evidence
-    requirements with PROVEN status; actions stay inside allowed_actions."""
+    requirements with PROVEN status and reference ALL acceptance criteria; actions
+    stay inside allowed_actions; observed inference locality is set to 'local' when
+    the packet requires local inference (else null)."""
     allowed = bwp["authority"]["allowed_actions"]
+    n_criteria = len(bwp["acceptance"]["criteria"])
+    criterion_refs = [str(i) for i in range(n_criteria)]
     claims = []
     for ev in bwp["evidence"]["requirements"]:
         claims.append({"claim": f"{label}: evidence '{ev}' satisfied by read-back/verification",
-                       "status": "PROVEN", "satisfies": [ev], "evidence_ref": f"receipt/{bwp['packet_id']}/{ev}"})
+                       "status": "PROVEN", "satisfies": [ev],
+                       "criterion_refs": list(criterion_refs),
+                       "evidence_ref": f"receipt/{bwp['packet_id']}/{ev}"})
+    inf = None
+    if bwp["requirements"].get("inference_locality") == "local_required":
+        inf = {"locality": "local"}
     return {
         "schema_version": "0.1",
         "kind": "bwp-evidence-receipt",
@@ -1031,7 +1232,7 @@ def build_receipt(bwp: dict, assignment: dict, label: str) -> dict:
             "ledger_refs": [],
         },
         "resource_observed": {
-            "inference_resource": None,
+            "inference_resource": inf,
             "routing_evidence_ref": "routing.jsonl#fixture",
             "reasoning_tokens": None,
             "note": "Observed from routing telemetry/journal/logs. Never an input to the BWP; never inferred when unobservable.",

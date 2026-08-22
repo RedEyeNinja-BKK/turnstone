@@ -96,7 +96,7 @@
     "requirements": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["capabilities_required", "locality"],
+      "required": ["capabilities_required", "inference_locality"],
       "properties": {
         "capabilities_required": {
           "type": "array",
@@ -129,9 +129,9 @@
           "minimum": 0,
           "description": "Explicit output token budget where resource admission needs it. Optional."
         },
-        "locality": {
-          "enum": ["hosted", "local", "local_required", "any"],
-          "description": "Hard constraint. local_required may eliminate hosted resources. 'any' = no locality constraint."
+        "inference_locality": {
+          "enum": ["local_required", "hosted_allowed", "any"],
+          "description": "HARD constraint on INFERENCE-RESOURCE locality ONLY (FleetRouter eligibility). local_required eliminates hosted inference resources; hosted_allowed permits hosted; any = no constraint. NEVER selects the executor: executor placement derives from capabilities + authority + sanctioned execution surfaces (Turnstone-owned), not this field."
         },
         "preferences": {
           "type": "array",

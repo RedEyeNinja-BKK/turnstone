@@ -58,7 +58,7 @@ governed home for `operations/`, or explicitly authorize initializing one) — s
 | Lifecycle / provenance | ws identity, state, children, approve/restrict/cancel/close, history/events/export | Native workstreams (all above) | **YES** | packet_id ↔ ws_id linkage convention only | None (convention in skill) | — | Native API (reference-doc-stable); no custom lifecycle |
 | REQUEST / BWP storage | BWP lives somewhere native; no new datastore | Workstream attachments (+ content GET/POST); workstream export | **YES** | attach BWP JSON as structured attachment; reference in workstream | None (attachment usage; maybe tiny JSON read/write glue) | Storage already native | Attachments are native; no DB/table |
 | Task sufficiency gate | SUFFICIENT→DISPATCH; AMBIGUOUS→CLARIFY; INSUFFICIENT→REJECT; smallest interception BEFORE dispatch | task_agent requires work_shape (fail-closed); workstream approve/pending states; no native sufficiency concept | **PARTIAL** | Sufficiency is a governance decision at AUTHORING time; native has no such gate | Small policy helper: `sufficiency_disposition()` (C-class, ~20 lines) | Native has no sufficiency concept; must not become a second dispatcher — runs at authoring, not dispatch | Policy code, no runtime hook; resilient |
-| Executor eligibility / assignment | capability + authority + placement → candidates → Turnstone assignment; NOT work_shape; no parallel router | Skills catalog (74) + MCP registry + roles/personas/policies + working-rules executor-selection model + native delegation (child workstream / MCP agent_run) | **PARTIAL** | No native capability→executor index engine; Turnstone orchestration is the decision | Documented policy mapping in the skill; optional read-only advisory helper; NO precedence-code-as-router | Assignment is a governance decision; native delegation exists and is used; mapping is policy | Avoids hidden router; uses native delegation; skill content is upgrade-safe |
+| Executor eligibility / assignment | capability + authority → candidates → Turnstone assignment; NOT work_shape; NOT inference_locality (resource-scoped, FleetRouter only); no parallel router | Skills catalog (74) + MCP registry + roles/personas/policies + working-rules executor-selection model + native delegation (child workstream / MCP agent_run) | **PARTIAL** | No native capability→executor index engine; Turnstone orchestration is the decision | Documented policy mapping in the skill; optional read-only advisory helper; NO precedence-code-as-router | Assignment is a governance decision; native delegation exists and is used; mapping is policy | Avoids hidden router; uses native delegation; skill content is upgrade-safe |
 | Inference-semantics handoff | carry work_shape + reasoning_intent into Switchyard adaptive-ingress; no FleetRouter change; no new path; no prose | Alias `capabilities.server_compat.extra_body` → Switchyard extensions (proven); task_agent REQUIRED work_shape; fixed aliases | **YES** | None (BWP metadata_handoff maps onto existing contract) | None (mapping rule in skill) | — | Existing proven path; unchanged |
 | Authority envelope | declare/bind native authority; no Python reimplementation | Roles, tool policies (allow/deny/ask/manual), prompt policies (tool_gate), personas (tool_allowlist), schedule auto_approve_tools, native verdicts (risk_level + user_decision), mutation ledger | **YES** (tool-level) | BWP risk_class/allowed/forbidden is a semantic declaration needing MAPPING to native surfaces (policy/allowlist/auto_approve_tools) | Declarative mapping table in skill; packet-consistency checks (overlap, credential_rule) small C-code | Native enforcement exists; mapping is policy | Uses native enforcement; no authz reimplementation |
 | Evidence | reuse native history/tasks/attachments/artifacts/ledger/exports; no parallel evidence store | Workstream events/history/export/attachments; schedule runs; MCP run IDs; mutation ledger (hash chain); audit (partial); read-back verification skills | **YES** | Evidence RECEIPT is a governance REPORT format → workstream attachment; evidence_refs → native artifacts | Receipt schema (designed) + tiny formatter | Receipt is the governance contract object, not a store | Attachment-based; no parallel store |
@@ -70,7 +70,7 @@ Function-by-function classification of `validator/validate_bwp.py`:
 
 | Validator responsibility | Class | Decision |
 |---|---|---|
-| `_enforce_schema_shape()` recursive unknown-key mirror | **A** | REPLACE with standard JSON Schema application (`jsonschema` or equivalent against the four schema files). The hand-rolled mirror already drifted from the schemas once (LB-1); never ship a duplicate validator. |
+| `_enforce_schema_shape()` recursive unknown-key mirror | **A** | REPLACE with the **native Turnstone/Pydantic v2 model idiom** (see §5a finding): `pydantic>=2.0` is already a core dependency, `jsonschema` is NOT a dependency and is unused in Turnstone source. The hand-rolled mirror already drifted from the schemas once (LB-1); never ship a duplicate validator. Keep JSON Schema as interchange/documentation only. |
 | JSON load/parse + vocab conformance (capabilities/actions/evidence types) | **A** | JSON Schema `enum`/`const`/`pattern` covers most; thin glue only. |
 | `sufficiency_disposition()` / `validate_for_dispatch()` (DISPATCH/CLARIFY/REJECT) | **C** | Keep as small policy helper invoked at authoring time. Not a runtime hook; not a dispatcher. |
 | `derive_executor_candidates()` / `select_executor()` + `LANES` table + precedence | **B/C (policy only)** | Do NOT deploy as a router. Authoritative assignment = Turnstone orchestration via native delegation (skills catalog + MCP registry + working-rules). If kept, it is an advisory/audit helper only, explicitly marked non-authoritative. |
@@ -81,10 +81,35 @@ Function-by-function classification of `validator/validate_bwp.py`:
 | Prose-warning tripwire (`_scan_string_for_tokens` warnings) | **C (optional)** | Audit signal only; keep only if a deterministic warning is wanted at authoring; never blocking. |
 | `build_assignment` / `build_receipt` fixtures, `load_example`, `run_self_test`, `main`, R/C demos | **D** | Qualification/test-only. Do NOT deploy. |
 
-**Conclusion:** the production FGV1 validator can be **substantially smaller** — roughly a standard
-JSON Schema application + a thin C-class policy module (sufficiency, authority-consistency,
-evidence-sufficiency, adjudicate, formatters) + the skill content. The bulk of the 59.5 KB artifact
-(fixtures, demos, recursive mirror, eligibility spec, LANES table) is A/D and must not be shipped.
+**Conclusion:** the production FGV1 validator can be **substantially smaller** — roughly a thin
+Pydantic model layer (native dependency) + a C-class policy module (sufficiency,
+authority-consistency, evidence-sufficiency, per-criterion acceptance, adjudicate, formatters) + the
+skill content. The bulk of the 59.5 KB artifact (fixtures, demos, recursive mirror, eligibility spec,
+LANES table) is A/D and must not be shipped.
+
+## 3a. Native Turnstone validation-model finding (direct-review correction 5, read-only)
+
+Inspection of the Turnstone source at the PR base (fork `main` @ dbdbcf9f) found:
+
+- **`pydantic>=2.0` (+ `pydantic-settings>=2.14.2`) are core dependencies** (`pyproject.toml`);
+  `jsonschema` is **not** a dependency and has **0 usages** in `turnstone/`.
+- **Pydantic v2 BaseModel is the dominant supported schema idiom**: `turnstone/api/{schemas,
+  server_schemas, console_schemas}.py` define request/response models as the single source of truth
+  for the generated OpenAPI spec. The module docstring states these models are intentionally NOT used
+  for runtime validation in handlers (they drive OpenAPI); runtime handlers use
+  `turnstone/core/web_helpers.read_json_or_400()` / `read_multipart_create_or_400()` for minimal
+  structural checks, and the SDK uses `response_model.model_validate(body_data)` for typed client
+  responses.
+- **Workstream attachments are content-addressed blobs** (`turnstone/core/attachments.py`,
+  `attachment_buffer.py`) with byte caps + MIME/type classification; there is **no typed JSON-payload
+  validation pattern** for arbitrary attachment content today.
+- **Extension point:** a BWP runtime object can be validated with a **thin Pydantic v2 model** (native
+  dependency, matching the project idiom) hosted on a native workstream attachment, without modifying
+  package internals and without adding a new dependency. JSON Schema remains useful as
+  interchange/documentation only.
+- **Exact native gap:** the BWP *governance policy* layer (sufficiency disposition, per-criterion
+  acceptance, evidence-sufficiency mapping, adjudicate) is not provided by native Pydantic models or
+  workstream APIs — it remains thin C-class policy code. Nothing else requires a new mechanism.
 
 ## 4. Executor-selection decomposition
 
@@ -106,7 +131,8 @@ evidence-sufficiency, adjudicate, formatters) + the skill content. The bulk of t
 
 ```text
 Turnstone authoring workflow (skill: fleet-governance-v1)
-  → author BWP REQUEST (schema v0.1)                      [native: workstream]
+  → author BWP REQUEST (schema v0.1; requirements.inference_locality is RESOURCE-scoped
+    only — executor placement derives from capabilities + authority, never this field)
   → store as workstream attachment                        [native: attachments]
   → validate: standard JSON Schema (A) + policy checks (C)
   → sufficiency gate: SUFFICIENT | CLARIFY | REJECT       [C helper, authoring-time]
@@ -131,9 +157,9 @@ package-core modification, no monkey-patches, no wrapper layer around native API
 
 ## 6. Custom code that would still be required (explicit, minimal)
 
-1. **JSON Schema application** — standard library/dependency (`jsonschema`) applied to the four
-   schema files at authoring/validation time (A). Alternative if dependency policy forbids: keep a
-   small, reviewed schema-checker — but prefer standard.
+1. **Pydantic v2 model layer (native dependency)** — thin Pydantic BaseModel classes mirroring the
+   four BWP schemas at the runtime boundary (native Turnstone idiom; NO new dependency; JSON Schema
+   retained as interchange/documentation).
 2. **Policy module (C-class, thin)** — `sufficiency_disposition()`; packet-consistency checks
    (authority overlap, credential_rule, metadata_handoff match); evidence-sufficiency mapping
    (PROVEN-only + blocking-INDETERMINATE); `adjudicate()` (PASS/FAIL/INDETERMINATE/ESCALATED +
@@ -172,7 +198,8 @@ consistency helper; `adjudicate()` should gate on receipt validity before adjudi
   ordering as permanent policy.
 - **Ledger:** use the existing `mutation_ledger.py` helper for tamper-evident governance records;
   do not duplicate a second audit trail.
-- **Dependency surface:** policy module uses stdlib + optional `jsonschema`; no new daemons/DB/MCP.
+- **Dependency surface:** policy module uses stdlib + native `pydantic` (already a Turnstone core
+  dependency); NO new runtime dependency (`jsonschema` NOT added); no new daemons/DB/MCP.
 
 ## 9. Recommendation
 

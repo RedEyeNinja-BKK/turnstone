@@ -34,13 +34,15 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["criterion", "met", "evidence_ref"],
+            "required": ["criterion", "status", "evidence_refs", "rationale"],
             "properties": {
               "criterion": { "type": "string" },
-              "met": { "type": "boolean" },
-              "evidence_ref": { "type": "string" }
+              "status": { "enum": ["MET", "NOT_MET", "INDETERMINATE"] },
+              "evidence_refs": { "type": "array", "items": { "type": "string" } },
+              "rationale": { "type": "string" }
             }
-          }
+          },
+          "description": "Per-criterion Turnstone adjudication. MET only from positive PROVEN evidence references; NOT_MET from a FAILED reference; INDETERMINATE when not positively adjudicated. Absence of a FAILED claim never makes a criterion MET. Executor self-assessment is never authoritative."
         },
         "authority_compliance": {
           "enum": ["COMPLIANT", "VIOLATION"],
@@ -64,8 +66,8 @@
           "description": "Claim-level epistemology, kept separate from work_outcome. A receipt may contain many PROVEN claims and still yield FAIL."
         },
         "hard_constraint_status": {
-          "enum": ["SATISFIED", "VIOLATED", "NOT_EVALUATED"],
-          "description": "Overall hard-requirement satisfaction (capabilities/locality/work-class admission)."
+          "enum": ["SATISFIED", "VIOLATED", "NOT_EVALUATED", "UNVERIFIABLE"],
+          "description": "Overall hard-requirement satisfaction. VIOLATED when a hard constraint (e.g. inference_locality=local_required) contradicts OBSERVED locality; UNVERIFIABLE when the constraint cannot be established from evidence (=> INDETERMINATE outcome); NOT_EVALUATED when escalated."
         }
       }
     },

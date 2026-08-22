@@ -12,7 +12,11 @@
   },
   "intent": {
     "outcome": "Evaluate three design options for where a future kernel + stable baseline + task working set + archive retrieval context system should attach to the BWP family, score each against integration cost, authority preservation, and evidence quality, and recommend one direction with a rationale.",
-    "non_goals": ["No context system implementation", "No schema deployment", "No routing changes"],
+    "non_goals": [
+      "No context system implementation",
+      "No schema deployment",
+      "No routing changes"
+    ],
     "sufficiency": {
       "state": "SUFFICIENT",
       "rationale": "Decision question, evaluation criteria, and deliverable form are explicit; deliberate analysis is required.",
@@ -24,7 +28,11 @@
     "reasoning_intent": "deliberate"
   },
   "requirements": {
-    "capabilities_required": ["text_generation", "long_context_processing", "document_parsing"],
+    "capabilities_required": [
+      "text_generation",
+      "long_context_processing",
+      "document_parsing"
+    ],
     "context": {
       "required_inputs": [
         "operations/checkpoint-routing-stage2-design-2026-08-21.md",
@@ -34,13 +42,25 @@
       "retrieval_required": true
     },
     "output_budget": 12000,
-    "locality": "any",
-    "preferences": []
+    "preferences": [],
+    "inference_locality": "any"
   },
   "authority": {
     "risk_class": "advisory",
-    "allowed_actions": ["read_files", "retrieve_memory", "write_shared_workspace"],
-    "forbidden_actions": ["deploy_production", "mutate_configuration", "manage_services", "manage_containers", "create_credentials", "install_packages", "publish_public"],
+    "allowed_actions": [
+      "read_files",
+      "retrieve_memory",
+      "write_shared_workspace"
+    ],
+    "forbidden_actions": [
+      "deploy_production",
+      "mutate_configuration",
+      "manage_services",
+      "manage_containers",
+      "create_credentials",
+      "install_packages",
+      "publish_public"
+    ],
     "mutation_envelope": {
       "targets": [],
       "allowed_mutations": [],
@@ -56,11 +76,17 @@
     ]
   },
   "evidence": {
-    "requirements": ["independent_review", "read_back"]
+    "requirements": [
+      "independent_review",
+      "read_back"
+    ]
   },
   "control": {
     "timeout_seconds": 5400,
     "cancel_policy": "no re-issue on timeout; classify INDETERMINATE; reconcile before retry",
-    "escalation_conditions": ["design requires changing the authority boundary", "recommendation would require a new control-plane mechanism"]
+    "escalation_conditions": [
+      "design requires changing the authority boundary",
+      "recommendation would require a new control-plane mechanism"
+    ]
   }
 }

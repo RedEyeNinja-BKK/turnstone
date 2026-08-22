@@ -54,8 +54,8 @@ evidence store (evidence states + ledger + workstream export exist).
 flowchart TD
     A["operator intent"] --> B["Turnstone: task-sufficiency decision<br/>SUFFICIENT | AMBIGUOUS | INSUFFICIENT"]
     B -->|AMBIGUOUS / INSUFFICIENT| E["clarify / escalate —<br/>never dispatches"]
-    B -->|SUFFICIENT| C["BWP REQUEST (requirements)<br/>semantic capabilities, locality,<br/>authority envelope, acceptance,<br/>evidence requirements, control"]
-    C -->|validate| C2{"validator: valid?<br/>no identity fields?<br/>no prose routing?"}
+    B -->|SUFFICIENT| C["BWP REQUEST (requirements)<br/>semantic capabilities, inference_locality,<br/>authority envelope, acceptance,<br/>evidence requirements, control"]
+    C -->|validate| C2{"validator: valid?<br/>no structural identity fields?<br/>sufficiency gate passed?"}
     C2 -->|no| E
     C2 -->|yes| D["Turnstone derives ASSIGNMENT<br/>select_executor(): capabilities +<br/>authority + placement (never work_shape)<br/>(not a manual routing list)"]
     D --> F["Executor (Hermes / OpenClaw /<br/>Turnstone-native) executes<br/>inside authority envelope"]
@@ -76,7 +76,7 @@ All four share `packet_id` + `correlation_id` + `workstream_id`. Ownership and t
 
 Owns: intent/outcome, non-goals, **task sufficiency**, **work shape** (bounded|agentic),
 **reasoning intent** (none|deliberate), **required capabilities** (semantic vocabulary),
-**resource requirements expressed abstractly** (locality, context, output budget),
+**resource requirements expressed abstractly** (inference_locality, context, output budget),
 **authority envelope** (risk class, allowed/forbidden actions, mutation envelope),
 **acceptance criteria**, **evidence requirements**, **control** (timeout/cancel/escalation).
 
@@ -104,22 +104,38 @@ BWP work_shape + reasoning_intent
 `work_shape` / `reasoning_intent` describe INFERENCE SEMANTICS for the FleetRouter chain only. They
 NEVER select an executor: there is **no mechanical `agentic → Hermes` or `bounded → Turnstone/OpenClaw`
 mapping**. Executor selection derives from required capabilities, authority/risk, available execution
-surfaces, locality/placement constraints, and operator/governance gates.
+surfaces, and operator/governance gates. `inference_locality` is a RESOURCE constraint
+for the FleetRouter chain only and NEVER selects an executor.
 
 ### 4.3 EVIDENCE RECEIPT — executor-produced + observed
 
 Owns: executor that actually ran, actions actually taken, produced artifacts (paths + hashes),
 run IDs / ledger refs, failures/uncertainties, and — **where observable — the actual
-resource/model/provider that executed** (routing telemetry, journal, logs). Each evidence claim
-carries an **epistemology status** (`PROVEN / PROPOSED / ASSUMED / FAILED / INDETERMINATE`).
+resource/model/provider that executed** (routing telemetry, journal, logs), plus the **observed
+inference-resource locality** (`local | hosted | unknown`) from authoritative telemetry. Each
+evidence claim carries an **epistemology status** (`PROVEN / PROPOSED / ASSUMED / FAILED /
+INDETERMINATE`) and optional `criterion_refs` (references to the REQUEST acceptance criteria the
+claim positively adjudicates).
 
 **The actual Switchyard-selected inference resource is an observed receipt fact, never a BWP input.**
+**Provider/model names never establish locality — only the observed `locality` fact does.**
 
 ### 4.4 VERDICT — Turnstone-adjudicated afterward
 
-Owns the **work outcome**: `PASS / FAIL / INDETERMINATE / ESCALATED`, with basis (per-criterion
-acceptance, authority compliance, evidence sufficiency) and closeout (workstream state, receipt
-links, escalation ref).
+Owns the **work outcome**: `PASS / FAIL / INDETERMINATE / ESCALATED`, with basis and closeout
+(workstream state, receipt links, escalation ref).
+
+**Per-criterion acceptance adjudication (direct-review correction 3):** every acceptance criterion
+is adjudicated explicitly by Turnstone from evidence:
+
+```text
+criterion: {id/statement, status: MET | NOT_MET | INDETERMINATE, evidence_refs, rationale}
+```
+
+- **MET** only from a **positive PROVEN evidence claim** referencing the criterion (`criterion_refs`);
+- **NOT_MET** from a FAILED evidence claim referencing the criterion;
+- **INDETERMINATE** otherwise — **no criterion may become MET merely because no FAILED claim exists**;
+- the executor's `acceptance_self_assessment` is **advisory only, never authoritative**.
 
 ## 5. Evidence epistemology vs work outcome (explicitly separate)
 
@@ -131,16 +147,32 @@ links, escalation ref).
 Rules:
 - A receipt may contain many **individually PROVEN** claims and still produce an overall **FAIL**
   verdict (e.g., proven that the wrong thing was done).
-- **PASS** requires: all acceptance criteria met AND authority compliance AND **evidence
-  sufficiency** (all BWP evidence requirements satisfied; no blocking INDETERMINATE claim).
-- **FAIL** when: any acceptance criterion unmet, or authority violation, or proven hard-constraint
+- **PASS** requires: ALL acceptance criteria explicitly **MET** from positive PROVEN evidence AND
+  authority compliance AND **evidence sufficiency** (all BWP evidence requirements satisfied; no
+  blocking INDETERMINATE claim) AND hard constraints satisfied.
+- **FAIL** when: any acceptance criterion NOT_MET, or authority violation, or proven hard-constraint
   violation.
-- **INDETERMINATE** when evidence is insufficient to adjudicate (missing required evidence, or
-  blocking INDETERMINATE claim) and no FAIL condition is proven.
+- **INDETERMINATE** when evidence is insufficient to adjudicate (missing required evidence, blocking
+  INDETERMINATE claim, a required criterion not positively adjudicated, or an unverifiable hard
+  constraint) and no FAIL condition is proven.
 - **ESCALATED** when the authority/uncertainty boundary is crossed (forbidden action attempted,
   acceptance criteria changed mid-flight, packet exceeds granted authority, or operator gate required).
 
-The adjudicator is deterministic: it maps acceptance/authority/evidence into the outcome using these rules.
+**Hard-constraint adjudication uses OBSERVED locality (direct-review correction 2):**
+
+| `inference_locality` | Observed `resource_observed.inference_resource.locality` | Result |
+|---|---|---|
+| `local_required` | `hosted` (PROVEN) | **VIOLATED → FAIL** |
+| `local_required` | `local` (PROVEN) | compliant (SATISFIED) |
+| `local_required` | `unknown` or absent (unproven) | **UNVERIFIABLE → INDETERMINATE** (never inferred FAIL) |
+| `hosted_allowed` / `any` | any | no locality constraint |
+
+Provider/model presence never establishes locality; the observed `locality` fact comes from
+Switchyard/resource telemetry or another authoritative factual source — no second
+readiness/resource-classification system is invented.
+
+The adjudicator is deterministic: it maps per-criterion acceptance/authority/evidence/observed
+constraints into the outcome using these rules.
 
 ## 6. Hard requirements vs preferences
 
@@ -150,7 +182,7 @@ Generalized FleetRouter doctrine upward:
 > **Preferences operate only among already-eligible choices.**
 > **A preference can never rescue an invalid option.**
 
-- **Hard (in REQUEST):** `work_shape`, `reasoning_intent`, `capabilities_required`, `locality`,
+- **Hard (in REQUEST):** `work_shape`, `reasoning_intent`, `capabilities_required`, `inference_locality`,
   context constraints, authority envelope (risk class, allowed/forbidden actions), acceptance,
   evidence requirements.
 - **Preferences (in REQUEST, reserved):** `requirements.preferences[]` with `active: false` for v1
@@ -170,7 +202,9 @@ The REQUEST describes **what the work requires**, never which resource satisfies
 **Forbidden (identity):** `htpc-llm`, a specific model, a specific provider, a specific GPU
 endpoint, `resource = HTPC`.
 
-- `locality = local_required` **may eliminate hosted resources** (hard constraint).
+- `inference_locality = local_required` **may eliminate hosted inference resources** (hard constraint).
+- `inference_locality` is **resource-scoped only**: it NEVER selects the executor (executor placement
+  derives from capabilities + authority + sanctioned surfaces). `hosted_allowed` / `any` permit hosted.
 - `resource = HTPC` **must not appear** as a structural governance requirement (validator rejects).
 - Resource identities remain FleetRouter/Switchyard facts and selections, observed in the RECEIPT.
 - **Prose is never authoritative routing metadata:** a legitimate task may *analyze or discuss*
@@ -186,7 +220,7 @@ endpoint, `resource = HTPC`.
 | Value | Origin |
 |---|---|
 | Outcome, non-goals, operator identity, authorized scope | **Operator supplied** (through intent) |
-| Sufficiency state, work_shape, reasoning_intent, capabilities_required, locality, authority envelope, acceptance criteria, evidence requirements, timeout/cancel/escalation | **Turnstone derived** (from intent + policy + capability knowledge) |
+| Sufficiency state, work_shape, reasoning_intent, capabilities_required, inference_locality, authority envelope, acceptance criteria, evidence requirements, timeout/cancel/escalation | **Turnstone derived** (from intent + policy + capability knowledge) |
 | Executor, derivation rationale, run correlation IDs | **Executor assigned** (by Turnstone at dispatch, capability+authority-derived) |
 | Resource/model/provider actually selected | **FleetRouter selected** (observed during execution, recorded in RECEIPT) |
 | Actions taken, artifacts, evidence claims, failures | **Observed during execution** (executor truthfully reports) |
@@ -212,7 +246,7 @@ endpoint, `resource = HTPC`.
 | Resource preference becoming task sufficiency | Three-way separation: sufficiency (Turnstone) → eligibility (FleetRouter) → preference (FleetRouter, inactive in v1) |
 | Hydration machinery changing governance intent | v1 has minimal context seams only; hydration is a later phase |
 | `eligible_lanes[]` manual routing list | Schema has **no** eligible-lanes field; ASSIGNMENT derives executor from capabilities + authority via `derive_executor_candidates()`/`select_executor()` — never from `work_shape` |
-| Executor selection becoming a second router | `work_shape`/`reasoning_intent` describe inference semantics for FleetRouter only; `select_executor()` never consults them; capability/authority/placement only |
+| Executor selection becoming a second router | `work_shape`/`reasoning_intent` describe inference semantics for FleetRouter only; `select_executor()` never consults them; `inference_locality` is resource-scoped only and never selects the executor; capability/authority/placement only |
 
 ## 10a. Sufficiency failure lifecycle (deterministic disposition)
 
@@ -250,12 +284,14 @@ optimization policy is **not activated**. The validator rejects any packet with 
 
 The deterministic validator (`validator/validate_bwp.py`) implements:
 
-- Structural conformance (mirrors the four JSON Schemas; stdlib only).
+- Structural conformance — recursive additionalProperties:false enforcement driven by the actual
+  schema JSONs (stdlib only; enums/consts are schema declarations, disclosed in VALIDATION.md). The
+  runtime design retires this mirror in favor of the native Turnstone/Pydantic v2 idiom.
 - **Sufficiency gate + disposition** — only `SUFFICIENT` may dispatch; AMBIGUOUS→CLARIFY, INSUFFICIENT→REJECT (computed, no new lifecycle object).
 - **Structural identity rejection** — forbidden identity keys in requirement fields (e.g. `requirements.model`, `requirements.resource`) rejected; capabilities must come from the semantic vocabulary.
 - **Vocab conformance** — capabilities/actions/evidence types from the semantic vocabulary.
 - **Prose is never routing truth** — prose mention of identities produces warnings/audit signals only, never invalidation; missing structural `work_shape`/`reasoning_intent` still fails hard.
-- **Executor eligibility/assignment** — `derive_executor_candidates()`/`select_executor()` derive executor from capabilities + authority + placement; capability gap ⇒ no assignment; never consults `work_shape`.
+- **Executor eligibility/assignment** — `derive_executor_candidates()`/`select_executor()` derive executor from capabilities + authority + placement; capability gap ⇒ no assignment; never consults `work_shape`, never consults `inference_locality`.
 - **Authority compliance** — receipt actions ⊆ allowed actions.
 - **Evidence sufficiency** — receipt satisfies every BWP evidence requirement before PASS.
 - **Deterministic adjudication** — verdict from acceptance + authority + evidence rules.
@@ -293,24 +329,34 @@ Runtime integration is **not authorized** by this milestone; a separate Vincent 
   audit signals, never blocking. Structural field requirements remain the primary control.
 - **`derive_executor_candidates()`/`select_executor()` are specifications**, not runtime code. Their
   precedence rules must be reviewed before any runtime integration to avoid encoding a second routing
-  system; the shape-independence control (C1) is the executable proof that executor selection does not
-  follow `work_shape`.
-- **Receipt resource observation depends on routing telemetry availability** (routing.jsonl /
-  journal / exporter). Where telemetry is absent, `resource_observed` must be `null` and the claim
-  marked accordingly — never inferred.
-- **Sufficiency disposition** (CLARIFY/REJECT) is minimal by design; the independent review is asked
-  whether an explicit ESCALATE disposition is warranted.
+  system; the shape-independence control (C1) and locality-independence control (C4/C5) are the
+  executable proofs that executor selection follows capability/authority only.
+- **Receipt resource/locality observation depends on routing telemetry availability** (routing.jsonl /
+  journal / exporter). Where telemetry is absent, `resource_observed` / `locality` must be `null`/
+  `unknown` and the claim marked accordingly — never inferred from provider/model names.
+- **Sufficiency disposition** (CLARIFY/REJECT) is minimal by design; escalation is operator-gated
+  (never gate-computed).
+- **Runtime validation idiom (direct-review correction 5):** Turnstone's native validation idiom is
+  **Pydantic v2** (`pydantic>=2.0` is a core dependency; `jsonschema` is NOT a dependency and is
+  unused). Pydantic models in `turnstone/api/*schemas*.py` are the OpenAPI source-of-truth pattern;
+  runtime handlers use `read_json_or_400`/manual checks, and the SDK uses `model_validate` for typed
+  responses. The BWP runtime layer should therefore prefer the native Pydantic model idiom (or an
+  existing native schema mechanism), keep JSON Schema as interchange/documentation, and add a new
+  dependency only if a demonstrated gap remains.
 
 ## 17. Recommendation
 
 **Fleet Governance v1 DESIGN = PASS / READY FOR RUNTIME-INTEGRATION PLANNING** (confirmed by Hermes
 independent material review `run_ea85e5db…` + confirmation `run_6bb98db6…` + final confirmation
-`run_6747ed9f…`, all read-only; no remaining load-bearing findings).
+`run_6747ed9f…`, plus direct ChatGPT review #4999999331 and the corrective pass 2026-08-22, all
+read-only; no remaining load-bearing findings).
 
-Review outcome: 2 load-bearing findings found and fixed narrowly (LB-1 additionalProperties:false
-enforcement at all depths; LB-2 blocking-INDETERMINATE + hard-constraint evaluation), plus N3/N4/N6
-hardening. Non-load-bearing items and the Hermes advisory (adjudicate only after validate_receipt
-passes) are carried as **runtime-integration-plan items**, not design blockers.
+Review outcome: 2 load-bearing findings fixed (LB-1 additionalProperties:false at all depths; LB-2
+blocking-INDETERMINATE + hard-constraint evaluation); direct-review corrective pass added
+inference-locality/executor-placement separation, observed-locality hard-constraint adjudication,
+per-criterion acceptance adjudication, nullable-schema strictness probes, and the native
+Pydantic-first validation finding. Non-load-bearing items and the Hermes advisory (adjudicate only
+after validate_receipt passes) are carried as **runtime-integration-plan items**, not design blockers.
 
 Runtime integration (skill creation, validator deployment, production use) requires a **separate
 Vincent GO**; nothing is wired into live Turnstone behavior.

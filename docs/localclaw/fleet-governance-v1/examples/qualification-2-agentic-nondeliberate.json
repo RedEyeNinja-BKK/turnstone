@@ -12,7 +12,12 @@
   },
   "intent": {
     "outcome": "Produce a structured fleet readiness matrix covering all inference-capable members: per-member capability, readiness state, context capacity, tools support, and residency, from live telemetry and current-state observations, with an evidence row per member.",
-    "non_goals": ["No readiness-state mutation", "No model/provider changes", "No credential access", "No GPU load injection"],
+    "non_goals": [
+      "No readiness-state mutation",
+      "No model/provider changes",
+      "No credential access",
+      "No GPU load injection"
+    ],
     "sufficiency": {
       "state": "SUFFICIENT",
       "rationale": "Scope (members, attributes, evidence form) is explicit; boundary is read-only telemetry.",
@@ -24,20 +29,41 @@
     "reasoning_intent": "none"
   },
   "requirements": {
-    "capabilities_required": ["text_generation", "web_retrieval", "network_access", "structured_extraction", "long_context_processing"],
+    "capabilities_required": [
+      "text_generation",
+      "web_retrieval",
+      "network_access",
+      "structured_extraction",
+      "long_context_processing"
+    ],
     "context": {
-      "required_inputs": ["operations/fleet-readiness-probe-results-2026-08-21.md"],
+      "required_inputs": [
+        "operations/fleet-readiness-probe-results-2026-08-21.md"
+      ],
       "context_size_requirement": 200000,
       "retrieval_required": true
     },
     "output_budget": 8000,
-    "locality": "any",
-    "preferences": []
+    "preferences": [],
+    "inference_locality": "any"
   },
   "authority": {
     "risk_class": "operational",
-    "allowed_actions": ["read_files", "run_commands", "access_network", "retrieve_memory", "write_shared_workspace"],
-    "forbidden_actions": ["deploy_production", "mutate_configuration", "manage_services", "manage_containers", "create_credentials", "install_packages"],
+    "allowed_actions": [
+      "read_files",
+      "run_commands",
+      "access_network",
+      "retrieve_memory",
+      "write_shared_workspace"
+    ],
+    "forbidden_actions": [
+      "deploy_production",
+      "mutate_configuration",
+      "manage_services",
+      "manage_containers",
+      "create_credentials",
+      "install_packages"
+    ],
     "mutation_envelope": {
       "targets": [],
       "allowed_mutations": [],
@@ -53,11 +79,18 @@
     ]
   },
   "evidence": {
-    "requirements": ["read_back", "routing_telemetry", "hash"]
+    "requirements": [
+      "read_back",
+      "routing_telemetry",
+      "hash"
+    ]
   },
   "control": {
     "timeout_seconds": 3600,
     "cancel_policy": "no re-issue on timeout; classify INDETERMINATE; reconcile target before retry",
-    "escalation_conditions": ["a member's live state cannot be established after two probes", "evidence contradicts prior inventory materially"]
+    "escalation_conditions": [
+      "a member's live state cannot be established after two probes",
+      "evidence contradicts prior inventory materially"
+    ]
   }
 }

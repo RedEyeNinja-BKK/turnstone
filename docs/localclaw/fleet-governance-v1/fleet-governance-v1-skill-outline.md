@@ -52,13 +52,15 @@ a runtime-integration step requiring a separate Vincent GO.
 2. **Determine sufficiency** — explicit gate; if AMBIGUOUS/INSUFFICIENT, produce
    the clarification/escalation packet and STOP (no dispatch).
 3. **Author REQUEST** — per schema v0.1: work fields, semantic capabilities,
-   locality/context/output-budget, authority envelope, acceptance, evidence,
+   inference_locality (resource-scoped only; never selects the executor),
+   context/output-budget, authority envelope, acceptance, evidence,
    control.
 4. **Validate** — run the deterministic validator; any error → fix, never
    dispatch invalid.
-5. **Derive ASSIGNMENT** — executor from capabilities + authority + placement
+5. **Derive ASSIGNMENT** — executor from capabilities + authority
    (`derive_executor_candidates()` / `select_executor()`); capability gap →
-   report, do not assign; never from work_shape.
+   report, do not assign; never from work_shape; never from inference_locality
+   (resource-scoped, FleetRouter only).
 6. **Dispatch with delegation envelope** — existing hermes/openclaw protocols;
    structured metadata handoff (work_shape/reasoning_intent).
 7. **Collect RECEIPT** — truthful executor report + observed facts (including

@@ -168,9 +168,57 @@
     },
     {
       "id": "R12",
-      "label": "hard-constraint violation (local_required + hosted resource) -> FAIL",
+      "label": "hard-constraint violation (local_required + PROVEN hosted locality) -> FAIL",
       "ok": true,
       "detail": "verdict=FAIL, hard_constraint_status=VIOLATED"
+    },
+    {
+      "id": "R13",
+      "label": "local_required + unknown locality -> INDETERMINATE (never inferred FAIL)",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE, hard_constraint_status=UNVERIFIABLE"
+    },
+    {
+      "id": "R14",
+      "label": "provider/model presence alone cannot prove locality -> INDETERMINATE",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE (no locality fact observed)"
+    },
+    {
+      "id": "R15",
+      "label": "one NOT_MET criterion -> FAIL",
+      "ok": true,
+      "detail": "verdict=FAIL"
+    },
+    {
+      "id": "R16",
+      "label": "INDETERMINATE required criterion (no positive adjudication) -> INDETERMINATE",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE"
+    },
+    {
+      "id": "R17",
+      "label": "absence of FAILED claims alone cannot make criteria MET",
+      "ok": true,
+      "detail": "no FAILED claim present, yet verdict != PASS"
+    },
+    {
+      "id": "R18",
+      "label": "executor self-assessment cannot force PASS",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE despite self-assessment claimed=True"
+    },
+    {
+      "id": "R19",
+      "label": "unknown nested property under nullable resource_observed rejected",
+      "ok": true,
+      "detail": "resource_observed.required_model"
+    },
+    {
+      "id": "R20",
+      "label": "unknown property under nested inference_resource rejected",
+      "ok": true,
+      "detail": "inference_resource.required_model"
     }
   ],
   "controls": [
@@ -197,6 +245,42 @@
       "label": "ESCALATED outcome reachable (operator-gated)",
       "ok": true,
       "detail": "verdict=ESCALATED"
+    },
+    {
+      "id": "C4",
+      "label": "inference_locality does not select executor",
+      "ok": true,
+      "detail": "local_required -> turnstone-native; hosted_allowed -> turnstone-native"
+    },
+    {
+      "id": "C5",
+      "label": "executor assignment does not carry or rewrite inference locality",
+      "ok": true,
+      "detail": "assignment contains no locality fields"
+    },
+    {
+      "id": "C6",
+      "label": "local_required + PROVEN local resource compliant",
+      "ok": true,
+      "detail": "verdict=PASS"
+    },
+    {
+      "id": "C7",
+      "label": "local provider/model with PROVEN local locality is compliant (names never prove locality)",
+      "ok": true,
+      "detail": "verdict=PASS"
+    },
+    {
+      "id": "C8",
+      "label": "PASS requires all criteria MET + evidence sufficient",
+      "ok": true,
+      "detail": "verdict=PASS"
+    },
+    {
+      "id": "C9",
+      "label": "valid nullable resource_observed=null accepted",
+      "ok": true,
+      "detail": "receipt_valid=True"
     }
   ],
   "ok": true

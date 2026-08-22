@@ -12,7 +12,12 @@
   },
   "intent": {
     "outcome": "Parse the supplied listing document batch into a structured dataset (address, price, features, condition, source page) and produce a comparison analysis with per-field confidence notes; deliverable is a dataset file plus a summary report. No external publication.",
-    "non_goals": ["No publication to any external platform", "No live property-data retrieval", "No pricing or investment advice", "No schema/policy changes"],
+    "non_goals": [
+      "No publication to any external platform",
+      "No live property-data retrieval",
+      "No pricing or investment advice",
+      "No schema/policy changes"
+    ],
     "sufficiency": {
       "state": "SUFFICIENT",
       "rationale": "Inputs, extraction schema, deliverable form, privacy boundary, and confidence convention are explicit and testable.",
@@ -24,23 +29,47 @@
     "reasoning_intent": "none"
   },
   "requirements": {
-    "capabilities_required": ["document_parsing", "structured_extraction", "text_generation", "filesystem_read"],
+    "capabilities_required": [
+      "document_parsing",
+      "structured_extraction",
+      "text_generation",
+      "filesystem_read"
+    ],
     "context": {
-      "required_inputs": ["real_estate/document_batch/listing_20260822.pdf"],
+      "required_inputs": [
+        "real_estate/document_batch/listing_20260822.pdf"
+      ],
       "context_size_requirement": null,
       "retrieval_required": false
     },
     "output_budget": 6000,
-    "locality": "local",
-    "preferences": []
+    "preferences": [],
+    "inference_locality": "local_required"
   },
   "authority": {
     "risk_class": "advisory",
-    "allowed_actions": ["read_files", "run_commands", "write_shared_workspace"],
-    "forbidden_actions": ["deploy_production", "publish_public", "emit_external_channel", "manage_services", "manage_containers", "create_credentials", "access_network"],
+    "allowed_actions": [
+      "read_files",
+      "run_commands",
+      "write_shared_workspace"
+    ],
+    "forbidden_actions": [
+      "deploy_production",
+      "publish_public",
+      "emit_external_channel",
+      "manage_services",
+      "manage_containers",
+      "create_credentials",
+      "access_network"
+    ],
     "mutation_envelope": {
-      "targets": ["real_estate/workspace"],
-      "allowed_mutations": ["write_dataset", "write_report"],
+      "targets": [
+        "real_estate/workspace"
+      ],
+      "allowed_mutations": [
+        "write_dataset",
+        "write_report"
+      ],
       "approval_required": false
     },
     "credential_rule": "logical-refs-only"
@@ -54,11 +83,19 @@
     ]
   },
   "evidence": {
-    "requirements": ["hash", "disk_state", "read_back"]
+    "requirements": [
+      "hash",
+      "disk_state",
+      "read_back"
+    ]
   },
   "control": {
     "timeout_seconds": 2700,
     "cancel_policy": "no re-issue on timeout; classify INDETERMINATE; reconcile before retry",
-    "escalation_conditions": ["document batch missing or unreadable", "extraction would require inventing facts", "privacy boundary cannot be honored"]
+    "escalation_conditions": [
+      "document batch missing or unreadable",
+      "extraction would require inventing facts",
+      "privacy boundary cannot be honored"
+    ]
   }
 }

@@ -66,13 +66,18 @@
     "resource_observed": {
       "type": ["object", "null"],
       "additionalProperties": false,
-      "description": "OBSERVED FACT ONLY. Where routing telemetry/journal/exporter evidence exists, records the actual resource/model/provider that executed. null when not observable.",
+      "description": "OBSERVED FACT ONLY. Where routing telemetry/journal/exporter evidence exists, records the actual resource/model/provider that executed, plus the OBSERVED inference-resource locality (local|hosted|unknown). null when not observable. Provider/model names NEVER establish locality.",
       "properties": {
         "inference_resource": {
           "type": ["object", "null"],
+          "additionalProperties": false,
           "properties": {
             "provider": { "type": "string" },
-            "model": { "type": "string" }
+            "model": { "type": "string" },
+            "locality": {
+              "enum": ["local", "hosted", "unknown"],
+              "description": "OBSERVED inference-resource locality from authoritative routing/resource telemetry (e.g. Switchyard routing.jsonl / exporter / readiness source). local = on-prem/local execution surface; hosted = external cloud resource; unknown = not observable from available telemetry. Provider/model names alone never establish locality."
+            }
           }
         },
         "routing_evidence_ref": { "type": "string" },
@@ -107,6 +112,11 @@
             "type": "array",
             "items": { "type": "string" },
             "description": "Semantic evidence types from the REQUEST's evidence.requirements that this claim satisfies (read_back, hash, disk_state, routing_telemetry, ...)."
+          },
+          "criterion_refs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "References (index or id) to REQUEST acceptance.criteria that this claim positively adjudicates. A criterion is MET only when a PROVEN claim references it; absence of a FAILED claim alone never makes a criterion MET."
           },
           "evidence_ref": { "type": "string" }
         }

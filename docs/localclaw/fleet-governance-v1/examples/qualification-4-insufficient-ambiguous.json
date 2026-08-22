@@ -24,20 +24,31 @@
     "reasoning_intent": "none"
   },
   "requirements": {
-    "capabilities_required": ["text_generation", "local_execution"],
+    "capabilities_required": [
+      "text_generation",
+      "local_execution"
+    ],
     "context": {
       "required_inputs": [],
       "context_size_requirement": null,
       "retrieval_required": false
     },
     "output_budget": null,
-    "locality": "local",
-    "preferences": []
+    "preferences": [],
+    "inference_locality": "any"
   },
   "authority": {
     "risk_class": "advisory",
-    "allowed_actions": ["read_files"],
-    "forbidden_actions": ["deploy_production", "publish_public", "manage_services", "manage_containers", "create_credentials"],
+    "allowed_actions": [
+      "read_files"
+    ],
+    "forbidden_actions": [
+      "deploy_production",
+      "publish_public",
+      "manage_services",
+      "manage_containers",
+      "create_credentials"
+    ],
     "mutation_envelope": {
       "targets": [],
       "allowed_mutations": [],
@@ -46,14 +57,21 @@
     "credential_rule": "logical-refs-only"
   },
   "acceptance": {
-    "criteria": ["Clarified deliverable, boundary, and success bar confirmed with operator before any dispatch"]
+    "criteria": [
+      "Clarified deliverable, boundary, and success bar confirmed with operator before any dispatch"
+    ]
   },
   "evidence": {
-    "requirements": ["read_back"]
+    "requirements": [
+      "read_back"
+    ]
   },
   "control": {
     "timeout_seconds": 300,
     "cancel_policy": "never dispatch while AMBIGUOUS/INSUFFICIENT",
-    "escalation_conditions": ["operator clarification request returned", "operator supersedes with concrete outcome"]
+    "escalation_conditions": [
+      "operator clarification request returned",
+      "operator supersedes with concrete outcome"
+    ]
   }
 }

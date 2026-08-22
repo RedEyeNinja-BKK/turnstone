@@ -12,7 +12,11 @@
   },
   "intent": {
     "outcome": "Produce a drift report comparing deployment-facts.yaml fields (pip package, deployed commit, DB revision, service identities, Switchyard identity) against live system state, with per-field evidence and a PASS or DRIFT verdict.",
-    "non_goals": ["No configuration mutation", "No service restarts", "No schedule changes"],
+    "non_goals": [
+      "No configuration mutation",
+      "No service restarts",
+      "No schedule changes"
+    ],
     "sufficiency": {
       "state": "SUFFICIENT",
       "rationale": "Outcome, boundary, evidence form, and verdict definition are explicit and testable.",
@@ -24,20 +28,36 @@
     "reasoning_intent": "none"
   },
   "requirements": {
-    "capabilities_required": ["filesystem_read", "local_execution", "text_generation"],
+    "capabilities_required": [
+      "filesystem_read",
+      "local_execution",
+      "text_generation"
+    ],
     "context": {
-      "required_inputs": ["operations/turnstone-deployment-facts.yaml"],
+      "required_inputs": [
+        "operations/turnstone-deployment-facts.yaml"
+      ],
       "context_size_requirement": null,
       "retrieval_required": false
     },
     "output_budget": 4000,
-    "locality": "local",
-    "preferences": []
+    "preferences": [],
+    "inference_locality": "local_required"
   },
   "authority": {
     "risk_class": "advisory",
-    "allowed_actions": ["read_files", "run_commands", "write_shared_workspace"],
-    "forbidden_actions": ["deploy_production", "publish_public", "manage_services", "manage_containers", "create_credentials"],
+    "allowed_actions": [
+      "read_files",
+      "run_commands",
+      "write_shared_workspace"
+    ],
+    "forbidden_actions": [
+      "deploy_production",
+      "publish_public",
+      "manage_services",
+      "manage_containers",
+      "create_credentials"
+    ],
     "mutation_envelope": {
       "targets": [],
       "allowed_mutations": [],
@@ -53,11 +73,17 @@
     ]
   },
   "evidence": {
-    "requirements": ["read_back", "hash"]
+    "requirements": [
+      "read_back",
+      "hash"
+    ]
   },
   "control": {
     "timeout_seconds": 1800,
     "cancel_policy": "no re-issue on timeout; classify INDETERMINATE; reconcile target before retry",
-    "escalation_conditions": ["live state contradicts facts file materially", "required evidence source unavailable"]
+    "escalation_conditions": [
+      "live state contradicts facts file materially",
+      "required evidence source unavailable"
+    ]
   }
 }

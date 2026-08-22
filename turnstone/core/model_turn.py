@@ -281,6 +281,12 @@ ROUTING_CONTRACT_FIELDS = (
     "output_budget",
 )
 
+# Lane-selecting fields only (work_shape/reasoning_intent/work_class). Used to
+# detect a FIXED semantic alias pin; FLEET-1 task-requirement fields must NOT
+# flip that detector (a lane pin is about lane selection, not resource
+# requirements).
+LANE_CONTRACT_FIELDS = ("work_shape", "reasoning_intent", "work_class")
+
 # FLEET-1 resource-requirement fields. They are task requirements (not lane
 # selection): `min_context_tokens` travels through extra_body into Switchyard's
 # structured ingress; `output_budget` maps to the NORMALIZED wire
@@ -290,7 +296,7 @@ FLEET1_RESOURCE_REQUIREMENT_FIELDS = ("min_context_tokens", "output_budget")
 
 def routing_contract_extra_params(
     provider: LLMProvider,
-    contract: dict[str, str] | None,
+    contract: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Return the explicit Switchyard semantic contract for one request.
 
@@ -344,7 +350,7 @@ def routing_contract_extra_params(
 
 def _merge_routing_contract(
     lane: ModelLane,
-    contract: dict[str, str] | None,
+    contract: dict[str, Any] | None,
     *,
     authoritative: bool = False,
 ) -> dict[str, Any] | None:
@@ -375,7 +381,7 @@ def _merge_routing_contract(
     if not fields:
         return lane.extra_params
     base = dict(lane.extra_params or {})
-    if not any(key in base for key in ROUTING_CONTRACT_FIELDS):
+    if not any(key in base for key in LANE_CONTRACT_FIELDS):
         # Neutral alias: caller contract determines the lane (FLEET-1 resource
         # requirements are included via `fields`; output_budget is excluded by
         # the validator helper and applied as max_output_tokens at the call site).
@@ -1325,7 +1331,7 @@ def model_turn(
     max_tokens: int = 4096,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
-    routing_contract: dict[str, str] | None = None,
+    routing_contract: dict[str, Any] | None = None,
     routing_contract_authoritative: bool = False,
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,

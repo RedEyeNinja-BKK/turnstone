@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "bwp-assignment-v0.1.json",
+  "title": "Fleet Governance v1 — ASSIGNMENT",
+  "description": "Turnstone-derived executor assignment at dispatch time. Records WHO executes and WHY (derived from capabilities + authority constraints, NOT a manual routing list) plus run correlation IDs and structured metadata handoff. NEVER selects a provider/model.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "packet_id",
+    "correlation_id",
+    "workstream_id",
+    "created_at",
+    "dispatch_gate",
+    "assigned",
+    "metadata_handoff"
+  ],
+  "properties": {
+    "schema_version": { "const": "0.1" },
+    "kind": { "const": "bwp-assignment" },
+    "packet_id": { "type": "string" },
+    "correlation_id": { "type": "string" },
+    "workstream_id": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "dispatch_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sufficiency_at_dispatch", "validated", "validator_version"],
+      "properties": {
+        "sufficiency_at_dispatch": { "const": "SUFFICIENT" },
+        "validated": { "const": true },
+        "validator_version": { "type": "string" }
+      },
+      "description": "Evidence that the sufficiency gate and structural validation passed BEFORE dispatch."
+    },
+    "assigned": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executor", "derivation", "rationale", "delegation_envelope_ref"],
+      "properties": {
+        "executor": {
+          "enum": ["turnstone-native", "hermes", "openclaw-local", "openclaw-remote", "operator", "external"]
+        },
+        "derivation": {
+          "const": "capability+authority",
+          "description": "Executor is derived from required capabilities + authority envelope + risk_class. Not a manually authored routing list."
+        },
+        "rationale": { "type": "string" },
+        "delegation_envelope_ref": { "type": "string" },
+        "run_correlation_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Run/task IDs from the executor. Filled at dispatch/poll time. Run IDs alone are never completion proof."
+        }
+      }
+    },
+    "metadata_handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["work_shape", "reasoning_intent"],
+      "properties": {
+        "work_shape": { "enum": ["bounded", "agentic"] },
+        "reasoning_intent": { "enum": ["none", "deliberate"] },
+        "note": {
+          "const": "Passed structurally to executor ingress / extra_body. FleetRouter selects the resource; this object never names one."
+        }
+      }
+    }
+  }
+}

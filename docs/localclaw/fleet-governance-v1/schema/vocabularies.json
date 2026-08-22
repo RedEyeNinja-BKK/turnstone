@@ -1,0 +1,81 @@
+{
+  "schema_version": "0.1",
+  "description": "Semantic vocabularies for Fleet Governance v1. Capabilities describe WHAT the work requires, never WHICH resource should satisfy it. Resource identities (models, providers, GPU endpoints) are FleetRouter facts and are FORBIDDEN here.",
+  "capabilities": [
+    "text_generation",
+    "image_generation",
+    "structured_extraction",
+    "code_execution",
+    "web_retrieval",
+    "web_browsing",
+    "filesystem_read",
+    "filesystem_write",
+    "container_management",
+    "local_execution",
+    "process_management",
+    "network_access",
+    "gpu_workload_execution",
+    "document_parsing",
+    "image_analysis",
+    "browser_automation",
+    "external_emission",
+    "memory_retrieval",
+    "long_context_processing",
+    "deterministic_computation"
+  ],
+  "capability_notes": {
+    "gpu_workload_execution": "Semantic capability: the work requires a GPU workload to run (inference/generation/render). The specific GPU host is a resource identity and must NOT be named in a BWP.",
+    "external_emission": "Semantic capability: delivery/emission to an external platform (e.g., Discord channel). The channel target is an operational detail of the authority envelope, not an inference-resource identity."
+  },
+  "actions": [
+    "read_files",
+    "write_shared_workspace",
+    "write_repository",
+    "run_commands",
+    "execute_code",
+    "manage_services",
+    "manage_containers",
+    "mutate_configuration",
+    "deploy_production",
+    "publish_public",
+    "emit_external_channel",
+    "access_network",
+    "retrieve_memory",
+    "install_packages",
+    "create_credentials",
+    "destroy_assets",
+    "inspect_remote_hosts"
+  ],
+  "action_notes": {
+    "create_credentials": "Never authorized in v1 operational packets by default. Logical credential references only.",
+    "destroy_assets": "Destructive. Requires risk_class critical and operator approval."
+  },
+  "evidence_types": [
+    "read_back",
+    "disk_state",
+    "hash",
+    "transcript",
+    "routing_telemetry",
+    "independent_review",
+    "health_check",
+    "run_ids",
+    "ledger_reference",
+    "executor_report"
+  ],
+  "sufficiency_states": ["SUFFICIENT", "AMBIGUOUS", "INSUFFICIENT"],
+  "work_shapes": ["bounded", "agentic"],
+  "reasoning_intents": ["none", "deliberate"],
+  "risk_classes": ["advisory", "operational", "elevated", "critical"],
+  "inference_localities": ["local_required", "hosted_allowed", "any"],
+  "observed_localities": ["local", "hosted", "unknown"],
+  "evidence_claim_statuses": ["PROVEN", "PROPOSED", "ASSUMED", "FAILED", "INDETERMINATE"],
+  "work_outcomes": ["PASS", "FAIL", "INDETERMINATE", "ESCALATED"],
+  "executors": ["turnstone-native", "hermes", "openclaw-local", "openclaw-remote", "operator", "external"],
+  "forbidden_resource_identity_tokens": [
+    "htpc", "comfyninja", "reninja", "luna", "terra", "sol", "deepseek", "flash", "gpt-",
+    "switchyard", "llama", "qwen", ":8645", ":8647", ":8445", ":8081", ":8080", "openai", "gemma", "codex"
+  ],
+  "forbidden_resource_identity_keys": [
+    "model", "provider", "resource", "endpoint", "gpu", "device", "node", "route", "backend"
+  ]
+}

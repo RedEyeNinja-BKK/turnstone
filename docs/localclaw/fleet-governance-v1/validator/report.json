@@ -1,0 +1,317 @@
+{
+  "examples": [
+    {
+      "label": "T1 bounded routine",
+      "packet": "qualification-1-bounded-routine.json",
+      "ok": true,
+      "bwp_valid": true,
+      "dispatch": {
+        "allowed": true,
+        "reason": "dispatch_ok",
+        "disposition": "DISPATCH",
+        "errors": [],
+        "warnings": []
+      },
+      "assignment_valid": true,
+      "receipt_valid": true,
+      "verdict": "PASS",
+      "errors": []
+    },
+    {
+      "label": "T2 agentic non-deliberate",
+      "packet": "qualification-2-agentic-nondeliberate.json",
+      "ok": true,
+      "bwp_valid": true,
+      "dispatch": {
+        "allowed": true,
+        "reason": "dispatch_ok",
+        "disposition": "DISPATCH",
+        "errors": [],
+        "warnings": []
+      },
+      "assignment_valid": true,
+      "receipt_valid": true,
+      "verdict": "PASS",
+      "errors": []
+    },
+    {
+      "label": "T3 deliberate/reasoning",
+      "packet": "qualification-3-deliberate-reasoning.json",
+      "ok": true,
+      "bwp_valid": true,
+      "dispatch": {
+        "allowed": true,
+        "reason": "dispatch_ok",
+        "disposition": "DISPATCH",
+        "errors": [],
+        "warnings": []
+      },
+      "assignment_valid": true,
+      "receipt_valid": true,
+      "verdict": "PASS",
+      "errors": []
+    },
+    {
+      "label": "T5 real-estate workload",
+      "packet": "qualification-5-real-estate-workload.json",
+      "ok": true,
+      "bwp_valid": true,
+      "dispatch": {
+        "allowed": true,
+        "reason": "dispatch_ok",
+        "disposition": "DISPATCH",
+        "errors": [],
+        "warnings": []
+      },
+      "assignment_valid": true,
+      "receipt_valid": true,
+      "verdict": "PASS",
+      "errors": []
+    }
+  ],
+  "rejections": [
+    {
+      "id": "R1",
+      "label": "ambiguous work must not dispatch (CLARIFY)",
+      "ok": true,
+      "detail": "sufficiency_gate: state=AMBIGUOUS; disposition=CLARIFY"
+    },
+    {
+      "id": "R2",
+      "label": "resource identity rejected as capability",
+      "ok": true,
+      "detail": "capabilities_required=['htpc-llm']"
+    },
+    {
+      "id": "R2b",
+      "label": "resource key rejected in requirements",
+      "ok": true,
+      "detail": "requirements.resource='HTPC'"
+    },
+    {
+      "id": "R8",
+      "label": "structural model key rejected in requirements",
+      "ok": true,
+      "detail": "requirements.model='DeepSeek'"
+    },
+    {
+      "id": "R3",
+      "label": "missing work_shape rejected",
+      "ok": true,
+      "detail": "work.work_shape removed"
+    },
+    {
+      "id": "R4",
+      "label": "preference never rescues ineligible (ranking not exercised in v1: apply_preferences is a stub; eligibility filtering proven)",
+      "ok": true,
+      "detail": "eligible=['A'], ranked=['A']"
+    },
+    {
+      "id": "R5",
+      "label": "executor broadening authority -> FAIL",
+      "ok": true,
+      "detail": "verdict=FAIL"
+    },
+    {
+      "id": "R6",
+      "label": "PASS without required evidence -> INDETERMINATE",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE"
+    },
+    {
+      "id": "R7b",
+      "label": "structural metadata cannot be omitted (prose cannot substitute)",
+      "ok": true,
+      "detail": "work.reasoning_intent removed"
+    },
+    {
+      "id": "R9",
+      "label": "assignment provider/model identity rejected",
+      "ok": true,
+      "detail": "assigned.model='gpt-5.6-luna'"
+    },
+    {
+      "id": "R10",
+      "label": "synonym-key identity smuggling rejected (requirements)",
+      "ok": true,
+      "detail": "requirements.required_model='gpt-5.6-luna'"
+    },
+    {
+      "id": "R10b",
+      "label": "synonym-key identity smuggling rejected (provenance)",
+      "ok": true,
+      "detail": "provenance.resource='HTPC'"
+    },
+    {
+      "id": "R10c",
+      "label": "nested synonym-key identity smuggling rejected (requirements.context)",
+      "ok": true,
+      "detail": "requirements.context.required_model='gpt-5.6-luna'"
+    },
+    {
+      "id": "R10d",
+      "label": "nested synonym-key identity smuggling rejected (assignment.assigned)",
+      "ok": true,
+      "detail": "assigned.required_model='gpt-5.6-luna'"
+    },
+    {
+      "id": "R10e",
+      "label": "unknown top-level key rejected in receipt",
+      "ok": true,
+      "detail": "receipt.required_model='gpt-5.6-luna'"
+    },
+    {
+      "id": "R11",
+      "label": "blocking INDETERMINATE claim -> INDETERMINATE",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE"
+    },
+    {
+      "id": "R12",
+      "label": "hard-constraint violation (local_required + PROVEN hosted locality) -> FAIL",
+      "ok": true,
+      "detail": "verdict=FAIL, hard_constraint_status=VIOLATED"
+    },
+    {
+      "id": "R13",
+      "label": "local_required + unknown locality -> INDETERMINATE (never inferred FAIL)",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE, hard_constraint_status=UNVERIFIABLE"
+    },
+    {
+      "id": "R14",
+      "label": "provider/model presence alone cannot prove locality -> INDETERMINATE",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE (no locality fact observed)"
+    },
+    {
+      "id": "R15",
+      "label": "one NOT_MET criterion -> FAIL",
+      "ok": true,
+      "detail": "verdict=FAIL"
+    },
+    {
+      "id": "R16",
+      "label": "INDETERMINATE required criterion (no positive adjudication) -> INDETERMINATE",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE"
+    },
+    {
+      "id": "R17",
+      "label": "absence of FAILED claims alone cannot make criteria MET",
+      "ok": true,
+      "detail": "no FAILED claim present, yet verdict != PASS"
+    },
+    {
+      "id": "R18",
+      "label": "executor self-assessment cannot force PASS",
+      "ok": true,
+      "detail": "verdict=INDETERMINATE despite self-assessment claimed=True"
+    },
+    {
+      "id": "R19",
+      "label": "unknown nested property under nullable resource_observed rejected",
+      "ok": true,
+      "detail": "resource_observed.required_model"
+    },
+    {
+      "id": "R20",
+      "label": "unknown property under nested inference_resource rejected",
+      "ok": true,
+      "detail": "inference_resource.required_model"
+    },
+    {
+      "id": "F1",
+      "label": "inference_locality=local_required FAILS CLOSED (UNSUPPORTED_V1, no pre-selection ingress)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.inference_locality='local_required' has no pre-selection FleetRouter ingress; only 'any' is dispatchable in v1"
+    },
+    {
+      "id": "F2",
+      "label": "inference_locality=hosted_allowed FAILS CLOSED (UNSUPPORTED_V1)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.inference_locality='hosted_allowed' has no pre-selection FleetRouter ingress; only 'any' is dispatchable in v1"
+    },
+    {
+      "id": "F3",
+      "label": "context_size_requirement non-null FAILS CLOSED (UNSUPPORTED_V1)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.context.context_size_requirement has no pre-selection ingress; set null in v1"
+    },
+    {
+      "id": "F4",
+      "label": "output_budget non-null FAILS CLOSED (UNSUPPORTED_V1)",
+      "ok": true,
+      "detail": "UNSUPPORTED_V1: requirements.output_budget has no pre-selection ingress; set null in v1"
+    }
+  ],
+  "controls": [
+    {
+      "id": "C2",
+      "label": "sufficiency disposition deterministic (DISPATCH/CLARIFY/REJECT)",
+      "ok": true,
+      "detail": "SUFFICIENT->DISPATCH, AMBIGUOUS->CLARIFY, INSUFFICIENT->REJECT"
+    },
+    {
+      "id": "R7",
+      "label": "prose mention of identities is warning-only (packet stays valid)",
+      "ok": true,
+      "detail": "valid=True, dispatch=True, warnings=4"
+    },
+    {
+      "id": "C1",
+      "label": "executor selection follows capability/authority, not work_shape",
+      "ok": true,
+      "detail": "T1 with work_shape=agentic -> turnstone-native; T2 with work_shape=bounded -> hermes"
+    },
+    {
+      "id": "C3",
+      "label": "ESCALATED outcome reachable (operator-gated)",
+      "ok": true,
+      "detail": "verdict=ESCALATED"
+    },
+    {
+      "id": "C4",
+      "label": "inference_locality does not select executor",
+      "ok": true,
+      "detail": "local_required -> turnstone-native; hosted_allowed -> turnstone-native"
+    },
+    {
+      "id": "C5",
+      "label": "executor assignment does not carry or rewrite inference locality",
+      "ok": true,
+      "detail": "assignment contains no locality fields"
+    },
+    {
+      "id": "C6",
+      "label": "local_required + PROVEN local resource compliant (adjudication semantics)",
+      "ok": true,
+      "detail": "verdict=PASS"
+    },
+    {
+      "id": "C7",
+      "label": "local provider/model with PROVEN local locality is compliant (names never prove locality)",
+      "ok": true,
+      "detail": "verdict=PASS"
+    },
+    {
+      "id": "C8",
+      "label": "PASS requires all criteria MET + evidence sufficient",
+      "ok": true,
+      "detail": "verdict=PASS"
+    },
+    {
+      "id": "C9",
+      "label": "valid nullable resource_observed=null accepted",
+      "ok": true,
+      "detail": "receipt_valid=True"
+    },
+    {
+      "id": "C10",
+      "label": "no provider/model/resource-selection logic added to Turnstone",
+      "ok": true,
+      "detail": "executor functions return lanes only; forbidden identity keys absent from executor code"
+    }
+  ],
+  "ok": true
+}

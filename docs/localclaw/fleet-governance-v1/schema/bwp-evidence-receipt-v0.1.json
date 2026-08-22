@@ -1,0 +1,139 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "bwp-evidence-receipt-v0.1.json",
+  "title": "Fleet Governance v1 — EVIDENCE RECEIPT",
+  "description": "Executor-produced truthful report + observed execution facts. Each claim carries an epistemology status (PROVEN/PROPOSED/ASSUMED/FAILED/INDETERMINATE). The actual Switchyard-selected inference resource is an OBSERVED receipt fact, never a BWP input.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "packet_id",
+    "correlation_id",
+    "workstream_id",
+    "received_at",
+    "executor",
+    "execution",
+    "evidence_claims"
+  ],
+  "properties": {
+    "schema_version": { "const": "0.1" },
+    "kind": { "const": "bwp-evidence-receipt" },
+    "packet_id": { "type": "string" },
+    "correlation_id": { "type": "string" },
+    "workstream_id": { "type": "string" },
+    "received_at": { "type": "string", "format": "date-time" },
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["declared_executor", "actual_executor"],
+      "properties": {
+        "declared_executor": {
+          "enum": ["turnstone-native", "hermes", "openclaw-local", "openclaw-remote", "operator", "external"]
+        },
+        "actual_executor": {
+          "enum": ["turnstone-native", "hermes", "openclaw-local", "openclaw-remote", "operator", "external"],
+          "description": "Observed. Must match declared for a clean PASS; mismatch is a material finding."
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actions_taken"],
+      "properties": {
+        "actions_taken": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Semantic action ids actually taken. Must be a subset of the REQUEST's allowed_actions (authority compliance)."
+        },
+        "artifacts_produced": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "hash_sha256"],
+            "properties": {
+              "path": { "type": "string" },
+              "hash_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        },
+        "run_ids": { "type": "array", "items": { "type": "string" } },
+        "ledger_refs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "resource_observed": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "OBSERVED FACT ONLY. Where routing telemetry/journal/exporter evidence exists, records the actual resource/model/provider that executed, plus the OBSERVED inference-resource locality (local|hosted|unknown). null when not observable. Provider/model names NEVER establish locality.",
+      "properties": {
+        "inference_resource": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "provider": { "type": "string" },
+            "model": { "type": "string" },
+            "locality": {
+              "enum": ["local", "hosted", "unknown"],
+              "description": "OBSERVED inference-resource locality from authoritative routing/resource telemetry (e.g. Switchyard routing.jsonl / exporter / readiness source). local = on-prem/local execution surface; hosted = external cloud resource; unknown = not observable from available telemetry. Provider/model names alone never establish locality."
+            }
+          }
+        },
+        "routing_evidence_ref": { "type": "string" },
+        "reasoning_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "note": {
+          "const": "Observed from routing telemetry/journal/logs. Never an input to the BWP; never inferred when unobservable."
+        }
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["state", "description"],
+        "properties": {
+          "state": { "enum": ["PROVEN", "PROPOSED", "ASSUMED", "FAILED", "INDETERMINATE"] },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "evidence_claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "status", "satisfies"],
+        "properties": {
+          "claim": { "type": "string" },
+          "status": { "enum": ["PROVEN", "PROPOSED", "ASSUMED", "FAILED", "INDETERMINATE"] },
+          "satisfies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Semantic evidence types from the REQUEST's evidence.requirements that this claim satisfies (read_back, hash, disk_state, routing_telemetry, ...)."
+          },
+          "criterion_refs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "References (index or id) to REQUEST acceptance.criteria that this claim positively adjudicates. A criterion is MET only when a PROVEN claim references it; absence of a FAILED claim alone never makes a criterion MET."
+          },
+          "evidence_ref": { "type": "string" }
+        }
+      },
+      "minItems": 1
+    },
+    "acceptance_self_assessment": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "Executor's own claim about acceptance. NEVER authoritative; Turnstone adjudicates from evidence.",
+      "properties": {
+        "claimed": { "type": "boolean" },
+        "per_criterion": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

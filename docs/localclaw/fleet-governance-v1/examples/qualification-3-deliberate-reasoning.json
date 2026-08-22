@@ -1,0 +1,92 @@
+{
+  "schema_version": "0.1",
+  "kind": "bwp-request",
+  "packet_id": "fgv1-t3-deliberate-reasoning-003",
+  "provenance": {
+    "operator": "RedEyeNinja",
+    "workstream_id": "a8da7a535d294090938e45a3077b14ba",
+    "correlation_id": "fgv1-t3-20260822",
+    "created_at": "2026-08-22T17:10:00+07:00",
+    "supersedes": null,
+    "description": "Evaluate hydration seam placement options for a future context architecture and recommend one direction."
+  },
+  "intent": {
+    "outcome": "Evaluate three design options for where a future kernel + stable baseline + task working set + archive retrieval context system should attach to the BWP family, score each against integration cost, authority preservation, and evidence quality, and recommend one direction with a rationale.",
+    "non_goals": [
+      "No context system implementation",
+      "No schema deployment",
+      "No routing changes"
+    ],
+    "sufficiency": {
+      "state": "SUFFICIENT",
+      "rationale": "Decision question, evaluation criteria, and deliverable form are explicit; deliberate analysis is required.",
+      "adjudicated_by": "Turnstone"
+    }
+  },
+  "work": {
+    "work_shape": "agentic",
+    "reasoning_intent": "deliberate"
+  },
+  "requirements": {
+    "capabilities_required": [
+      "text_generation",
+      "long_context_processing",
+      "document_parsing"
+    ],
+    "context": {
+      "required_inputs": [
+        "operations/checkpoint-routing-stage2-design-2026-08-21.md",
+        "operations/fleet-governance-v1-2026-08-22/FLEET-GOVERNANCE-V1-DESIGN.md"
+      ],
+      "context_size_requirement": null,
+      "retrieval_required": true
+    },
+    "output_budget": null,
+    "preferences": [],
+    "inference_locality": "any"
+  },
+  "authority": {
+    "risk_class": "advisory",
+    "allowed_actions": [
+      "read_files",
+      "retrieve_memory",
+      "write_shared_workspace"
+    ],
+    "forbidden_actions": [
+      "deploy_production",
+      "mutate_configuration",
+      "manage_services",
+      "manage_containers",
+      "create_credentials",
+      "install_packages",
+      "publish_public"
+    ],
+    "mutation_envelope": {
+      "targets": [],
+      "allowed_mutations": [],
+      "approval_required": false
+    },
+    "credential_rule": "logical-refs-only"
+  },
+  "acceptance": {
+    "criteria": [
+      "All three options scored against the stated criteria",
+      "Recommendation names the chosen seam and the rejected alternatives with reasons",
+      "No implementation or schema changes performed"
+    ]
+  },
+  "evidence": {
+    "requirements": [
+      "independent_review",
+      "read_back"
+    ]
+  },
+  "control": {
+    "timeout_seconds": 5400,
+    "cancel_policy": "no re-issue on timeout; classify INDETERMINATE; reconcile before retry",
+    "escalation_conditions": [
+      "design requires changing the authority boundary",
+      "recommendation would require a new control-plane mechanism"
+    ]
+  }
+}

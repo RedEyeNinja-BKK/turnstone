@@ -1,12 +1,20 @@
 # Quality Gate — Pre/Post Correctness Battery (Hydration v1)
 
-Seven cases, executed identically **before** any Hydration mutation (baseline captured 2026-08-22, all PASS — record at `<LOCAL_SHARED_WORKSPACE_PATH>/operations/hydration-v1-quality-baseline-2026-08-22.md`) and **replayed after** Hydration.
+Seven cases, executed **before** any Hydration mutation and **replayed after** Hydration, in the **same primary session/workstream type** (a fresh representative Turnstone session/workstream) with **identical inputs**.
 
-**Primary test surface (required):** the pre/post battery runs in a **fresh representative Turnstone session/workstream that actually receives the modified persona and reduced memory index** — not only task_agent/Hermes. Task_agent and Hermes may remain **independent review lanes**, but the primary PASS/FAIL determination is made on the fresh Turnstone session (spawned via the native workstream/session surface with the post-mutation persona + memory index).
+**Step 1 PRE-mutation baseline (primary evidence, per review #5000250206):** at transaction Step 1, spawn a fresh representative Turnstone session/workstream with the **current** persona + memory index and capture, before any mutation:
+- cases 1–7 results + retry counts;
+- static prefix (system-message tokens);
+- preflight retrieval cost (tokens consumed by the preflight step before the first substantive action);
+- effective cost (static + preflight).
+
+**Post-Hydration replay** uses the **same primary session/workstream type** and the **identical inputs**, producing the same four measurements.
+
+**Primary test surface (required):** the pre/post battery runs in that fresh representative Turnstone session/workstream that actually receives the modified persona and reduced memory index — not only task_agent/Hermes. **The existing task_agent baseline becomes secondary evidence** (already captured 2026-08-22, all PASS, at `<LOCAL_SHARED_WORKSPACE_PATH>/operations/hydration-v1-quality-baseline-2026-08-22.md`); it is retained as an independent review lane but does not substitute for the fresh-session primary baseline.
 
 **Quality definition:** preservation of architecture correctness, authority boundaries, evidence semantics, factual continuity, retrieval correctness, fail-closed behavior, and effective-context cost. **Response similarity is not a quality metric.**
 
-Baseline capture lane: Turnstone-native `task_agent` (bounded lane); two first-attempt empty outputs passed on an identical retry. Replay (fresh-session primary) must treat an empty first attempt as a retry and record the retry count.
+Baseline capture lanes: primary = fresh representative Turnstone session (Step 1, to be captured at implementation); secondary = existing Turnstone-native `task_agent` capture (2026-08-22; two first-attempt empty outputs passed on an identical retry). Replay must treat an empty first attempt as a retry and record the retry count on the primary session.
 
 ## Effective-context cost measurement (acceptance criterion, finding 2)
 
@@ -30,8 +38,8 @@ Baseline capture lane: Turnstone-native `task_agent` (bounded lane); two first-a
 
 ## Replay procedure
 
-1. Spawn a fresh representative Turnstone session/workstream with the **post-mutation persona + reduced memory index** (native surface).
-2. Re-run cases 1–7 in that fresh session with the identical baseline inputs (recorded in the quality-baseline file); record the effective-context measurement (static + preflight).
+1. Spawn a fresh representative Turnstone session/workstream with the **post-mutation persona + reduced memory index** (native surface) — **same session/workstream type as the Step-1 primary baseline**.
+2. Re-run cases 1–7 in that fresh session with the **identical baseline inputs** (recorded in the quality-baseline file); record static prefix, preflight retrieval cost, and effective total.
 3. Record PASS/FAIL per case + retry counts.
 4. PASS = per-case expected structure preserved AND no regression in any listed invariant AND effective-cost target met (≤ 26–28K).
 5. Any FAIL or cost-target miss → Hydration regression → stop and roll back the offending transaction step before continuing.

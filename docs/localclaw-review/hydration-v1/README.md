@@ -35,7 +35,7 @@ Hermes measured ≈24K static tokens and is **not** a v1 optimization target.
 ## H2.1 accepted architecture (2026-08-22)
 
 - **Persona = minimum unconditional kernel.** Detailed doctrine lives on-demand in named skills / `working-rules` / references; single-source authority does not imply unconditional injection.
-- **Core Identity skill disposition: Option 3 — retire.** Session-start sequence moves to `identity/working-rules.md`; doctrine lives in the persona kernel + Turnstone Management reference.
+- **Core Identity skill disposition: Option 3 — retire via disable (row retained, NOT deleted; `enabled=false` + `is_default=false`).** Session-start sequence moves to `identity/working-rules.md`; doctrine lives in the persona kernel + Turnstone Management reference.
 - **Stable baseline = pointer manifest**, never a copied facts database; no active-task required inputs, no duplicated checkpoint inventories.
 - **Memory retirement = semantic/state-equivalent restoration**, with a complete restoration manifest; evidence stays in the native archive path.
 - **Preflight enforcement = governance fail-closed contract** (no new callable subsystem; skipping preflight is an acceptance failure).

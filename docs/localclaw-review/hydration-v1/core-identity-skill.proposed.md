@@ -4,13 +4,16 @@
 
 | Property | Current | Proposed |
 |---|---|---|
-| `activation` | `default` (injected every session) | **retired** (Option 3) |
-| `is_default` | `true` | removed |
+| `activation` | `default` (injected every session) | **retired (Option 3) — disabled, NOT deleted** |
+| `is_default` | `true` | `false` |
+| `enabled` | `true` | `false` |
 | Content size | 7,963 bytes (~2.0K tokens) | **0 tokens injected** |
 | Availability of doctrine | automatic | kernel (persona) + existing references |
-| Skill row | present in catalog | disabled/removed via native skills surface (reversible) |
+| Skill row | present in catalog | **retained in storage** (hidden from `find` unless `enabled_only=false`; rejected by `load`/`spawn_workstream`) |
 
-**Change mechanism:** native skills update (disable) / admin skill removal per supported API. Rollback: restore prior content + `activation=default` (byte-identical).
+**Exact mechanism (per review #5000250206):** disable/deactivate **without deleting the row** — the native skills surface supports flipping the `enabled` flag (`disable`), and the admin skill update supports `is_default=false` (PUT `/v1/api/admin/skills/{skill_id}`). A disabled skill stays in storage, is hidden from `find` (unless `enabled_only=false`), and is rejected by `load` / `spawn_workstream(skill=…)`. **Deletion is NOT used in v1.**
+
+**Rollback (byte-identical):** re-enable the retained row via the native skills `enable` — the skill row and its content were never deleted, so restore is **byte-identical** (no content change). If a later phase ever deletes the row (not planned), rollback would be **semantic/state-equivalent** with **non-restorable metadata**: `skill_id`, `created`/`updated` timestamps, and version/approval history.
 
 ## Rationale (PR #8 review finding 4 — adopted)
 
@@ -29,7 +32,7 @@ The unconditional **kernel** now lives entirely in the persona (`turnstone-kerne
 ## Exact implementation
 
 1. At implementation time: append a short "Session Start Sequence" section to `identity/working-rules.md` (the read-first list: deployment facts → working-rules → API reference → schedule/governance READMEs → named skills as needed).
-2. Disable/remove the `Turnstone Core Identity` skill via the native skills surface.
+2. **Disable** the `Turnstone Core Identity` skill via the native skills surface: set `enabled=false` and `is_default=false` (admin skill update). The row is retained; nothing is deleted.
 3. Verify: fresh-session prompt contains **no** Core Identity content; kernel (persona) doctrine intact; `working-rules.md` carries the session-start sequence; quality-gate cases 1–5 PASS.
 
-Rollback: restore prior skill content + `activation=default` (byte-identical); remove the added working-rules section if reverting.
+Rollback: **re-enable the retained skill row** (native `enable`; byte-identical, no content restore needed); remove the added working-rules section if reverting. No deletion is performed in v1, so no semantic-restore path is required for the skill.

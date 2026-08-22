@@ -46,15 +46,15 @@ Freshness: verify each pointer at the freshness rule stated; re-verify on first 
 
 ## 5. Current vs superseded checkpoints
 - authoritative source: <LOCAL_SHARED_WORKSPACE_PATH>/operations/checkpoint-*.md
-- pointer/identity: ordered index of current → superseded checkpoints (one line each: status, path, date)
-- freshness: update when a checkpoint is created or closed
-- retrieval: read_file each listed checkpoint
+- pointer/identity: **pointer/query, not an inventory** — `search(glob=<LOCAL_SHARED_WORKSPACE_PATH>/operations/checkpoint-*.md)` plus the current-baseline pointers already listed in §2. Superseded checkpoints are identified by status line in each file (e.g. "CLOSED"), not by a maintained list here.
+- freshness: re-query at first use; do not maintain a duplicated index
+- retrieval: native search/glob over the checkpoint directory
 
-## 6. Required inputs for the current milestone
-- authoritative source: this manifest (operator/planning)
-- pointer/identity: required file paths for the active milestone
-- freshness: per milestone
-- retrieval: preflight step 0 (hydration protocol) reads this section and verifies each path
+## 6. Required inputs for the active task
+- authoritative source: **task working set** (workstream attachments / task brief), NOT this manifest
+- pointer/identity: the active workstream's attachments and task brief
+- freshness: per task
+- retrieval: preflight step 0 (hydration protocol) resolves required inputs from the **task working set** — the manifest does not hold them
 
 ## 7. Archive / retrieval locations
 - authoritative source: <LOCAL_SHARED_WORKSPACE_PATH>/operations/ + archives/
@@ -68,4 +68,5 @@ Freshness: verify each pointer at the freshness rule stated; re-verify on first 
 - Live memory population / active-memory name lists (→ native memory surface, live query).
 - Model/routes hashes, MCP tool counts, schedule states, panel counts (→ deployment facts / native APIs).
 - Full checkpoint contents (→ the checkpoint files themselves).
+- Active-milestone required inputs (→ the task working set; the manifest does not hold them).
 - Any mutable operational value whose authority lives elsewhere.

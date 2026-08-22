@@ -27,14 +27,21 @@
 - Governance/security references, active feedback, current operating rules
 - Active project/workstream pointers and current-phase records
 
-## Expected category counts (from H1/H2 measurement, to be confirmed at generation)
+## Expected category counts (estimates, NOT quotas — from H1/H2 measurement, confirmed at generation)
 
 - Session-visible index: ≈ 746 entries
 - Estimated keep (live/current): ≈ 130–160
 - Estimated retire (D-class): ≈ 580–610
 - Target injected index: ≈ 10–13K tokens (from ≈ 52–60K)
 
-Final keep/retire set is **operator-approved before any deletion** (transaction Step 6–7).
+These ranges are **estimates used for planning, not quotas**. The exact keep/retire set is determined by the classification rules + per-candidate anchor/restorability check (below), then **operator-approved before any deletion** (transaction Step 6–7).
+
+## Per-candidate gate (every retired entry must satisfy one of)
+
+1. **Verified archival retrieval anchor** — a concrete, existing path to the authoritative evidence outside the memory subsystem (e.g. `<LOCAL_SHARED_WORKSPACE_PATH>/operations/<checkpoint|evidence>.md`), verified to resolve at retirement time; or
+2. **Fully recoverable from the retirement manifest** — the entry's `content` is non-empty and captured in the manifest, so it can be re-saved semantically/state-equivalently at any time.
+
+A candidate that satisfies **neither** is **kept**, not retired. No candidate is retired on the basis of classification alone.
 
 ## Restoration manifest — full schema
 

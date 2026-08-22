@@ -1,8 +1,22 @@
 # Quality Gate — Pre/Post Correctness Battery (Hydration v1)
 
-Seven cases, executed identically **before** any Hydration mutation (baseline captured 2026-08-22, all PASS — record at `<LOCAL_SHARED_WORKSPACE_PATH>/operations/hydration-v1-quality-baseline-2026-08-22.md`) and **replayed after** Hydration. Quality preservation = architecture correctness, authority boundaries, factual continuity, evidence semantics, retrieval correctness, fail-closed behavior. **Response similarity is not a quality metric.**
+Seven cases, executed identically **before** any Hydration mutation (baseline captured 2026-08-22, all PASS — record at `<LOCAL_SHARED_WORKSPACE_PATH>/operations/hydration-v1-quality-baseline-2026-08-22.md`) and **replayed after** Hydration.
 
-Execution lane: Turnstone-native `task_agent` (bounded lane). Note: two baseline cases produced an empty first attempt and passed on a single identical retry; replay must treat an empty first attempt as a retry and record the retry count.
+**Primary test surface (required):** the pre/post battery runs in a **fresh representative Turnstone session/workstream that actually receives the modified persona and reduced memory index** — not only task_agent/Hermes. Task_agent and Hermes may remain **independent review lanes**, but the primary PASS/FAIL determination is made on the fresh Turnstone session (spawned via the native workstream/session surface with the post-mutation persona + memory index).
+
+**Quality definition:** preservation of architecture correctness, authority boundaries, evidence semantics, factual continuity, retrieval correctness, fail-closed behavior, and effective-context cost. **Response similarity is not a quality metric.**
+
+Baseline capture lane: Turnstone-native `task_agent` (bounded lane); two first-attempt empty outputs passed on an identical retry. Replay (fresh-session primary) must treat an empty first attempt as a retry and record the retry count.
+
+## Effective-context cost measurement (acceptance criterion, finding 2)
+
+**Effective cost = static prefix tokens + automatically retrieved preflight/context tokens before substantive execution.**
+
+- Static prefix: measured from the fresh-session system message (persona + policies + skills + memory index + env/tools/context).
+- Preflight/retrieval tokens: measured as the tokens consumed by the preflight step (step 0) — manifest read + required-input resolution — **before** the first substantive action.
+- **Preflight must retrieve only context explicitly required by the active task** (the task working set). It is not permitted to bulk-load archives or the stable-baseline beyond the task-required minimum.
+- Target: static ≈ 21–24K; effective ≤ 26–28K; measured at the pre/post gate with the same representative task.
+- The acceptance test uses one representative task whose required inputs are known, and records: static prefix tokens, preflight retrieval tokens, effective total.
 
 | # | Case | Invariant tested | Expected result | Evidence for PASS | Regression definition |
 |---|---|---|---|---|---|
@@ -16,11 +30,12 @@ Execution lane: Turnstone-native `task_agent` (bounded lane). Note: two baseline
 
 ## Replay procedure
 
-1. Re-run cases 1–7 with the identical baseline inputs (recorded in the quality-baseline file).
-2. Record PASS/FAIL per case + retry counts.
-3. PASS = per-case expected structure preserved AND no regression in any listed invariant.
-4. Any FAIL → Hydration regression → stop and roll back the offending transaction step before continuing.
-5. Independent review of post-results by Hermes (already-qualified path) recommended.
+1. Spawn a fresh representative Turnstone session/workstream with the **post-mutation persona + reduced memory index** (native surface).
+2. Re-run cases 1–7 in that fresh session with the identical baseline inputs (recorded in the quality-baseline file); record the effective-context measurement (static + preflight).
+3. Record PASS/FAIL per case + retry counts.
+4. PASS = per-case expected structure preserved AND no regression in any listed invariant AND effective-cost target met (≤ 26–28K).
+5. Any FAIL or cost-target miss → Hydration regression → stop and roll back the offending transaction step before continuing.
+6. Independent review of post-results by Hermes and task_agent (already-qualified paths) as **independent review lanes** — secondary to the fresh-session primary determination.
 
 ## Sensitive-payload note
 

@@ -101,12 +101,14 @@ Any failure ⇒ **INDETERMINATE / STOP**; no substantive execution, no guessed c
 
 | Removed category | Canonical home | Loaded when |
 |---|---|---|
-| Executor-selection decision tree, lane tables, routing review | `identity/working-rules.md` | management/routing decisions |
-| Capability planes, MCP decision tree, source-of-truth hierarchy | `Turnstone Core Identity` skill (named, on-demand) | onboarding/deep reference |
+| Executor-selection decision tree, lane tables, routing review, session-start sequence | `identity/working-rules.md` | management/routing decisions; session grounding |
+| Capability planes, MCP decision tree, source-of-truth hierarchy | `Turnstone Management` skill (named) + `identity/working-rules.md` | onboarding/deep reference |
 | API reference, native mechanisms, maintenance runbooks, governance surfaces | `Turnstone Management` skill (named) | deep management/maintenance |
 | Deployment identity, services, paths, token references | `<LOCAL_DEPLOYMENT_FACTS_PATH>` | session start per protocol |
 | Domain operations | Domain personas + their skills | domain session active |
 | Closed milestones, evidence, history | `<LOCAL_SHARED_WORKSPACE_PATH>/operations/` + checkpoints + retirement manifest | archive retrieval |
 | Session identity/context machinery | Native modules (env/context/tools/session) | always (native, unchanged) |
+
+**Core Identity skill is retired (Option 3).** Its prior unique content (capability planes, MCP decision tree, reporting skeleton) is covered by `identity/working-rules.md` and the `Turnstone Management` reference; the session-start read-first list moves to `identity/working-rules.md` at implementation time.
 
 Single-source authority is achieved by **removing duplicate copies from unconditional injection**, not by merging everything into the persona.

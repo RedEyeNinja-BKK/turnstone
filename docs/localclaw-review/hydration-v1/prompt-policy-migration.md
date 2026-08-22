@@ -2,7 +2,7 @@
 
 Nine prompt policies currently exist. **All nine are globally injected into every session** regardless of persona (verified in `compose_system_message`: DB policies are appended unconditionally). H2.1 decision: only genuinely **universal** rules stay globally injected; **domain** rules move behind their existing persona activation path.
 
-The table below shows, for every policy, the required behavior, its authoritative destination, how/when the behavior becomes available after disablement, and the verification case. Domain policies are **not** disabled on semantic similarity alone — each destination already contains the policy's required behavior (verified against the persona catalog on 2026-08-22).
+The table below shows, for every policy, the required behavior, its authoritative destination, how/when the behavior becomes available after disablement, and the verification case. Domain policies are **not** disabled on semantic similarity alone — each destination already contains the policy's required behavior (verified against the persona catalog on 2026-08-22), and **at implementation time each disabled policy's activation path is exercised**: the relevant task path is run and the behavior is confirmed present at the destination (text existence in the catalog is not sufficient — see transaction Step 3).
 
 ## Keep (universal — remain globally injected)
 
@@ -22,6 +22,18 @@ The table below shows, for every policy, the required behavior, its authoritativ
 | **proxmox-manager-prompt-policy** | Proxmox read-before-act; pfs-pair hazard; operator gates for power/kernel/firewall | `proxmox-manager` persona (already embeds) | `proxmox-manager` persona session active | proxmox-manager session exhibits the rules |
 | **ChummyThailand Etsy OBM** | Etsy analysis/drafting scope; privacy; no Etsy mutations | `etsy-store-manager` persona (already embeds) | `etsy-store-manager` persona session active | etsy session exhibits the rules |
 | **process-engine-context** | PE pipeline; operator-only gate; nothing ships untried | `process-engine` / `process-engine-generator` personas + PE skills (already embed) | PE persona/skills session active | PE session exhibits the rules |
+
+## Activation-path proof (finding 5 — required at implementation time)
+
+For **each** disabled domain policy, before disabling, run the concrete task path that activates its destination persona and confirm the policy's required behavior is actually present and effective **in that activated context** — e.g.:
+
+- hermes-manager: open a hermes-manager session and query the MCP-only/operator-gate rules → confirm present.
+- openclaw-manager: open an openclaw-manager session and confirm LOCAL/REMOTE MCP-only + one-command-at-a-time rules.
+- truenas-manager / proxmox-manager: open the persona session and confirm read-only/operator-gate + hazard rules.
+- etsy-store-manager: open the persona session and confirm analysis/drafting scope + privacy rules.
+- process-engine-context: open a PE persona session and confirm pipeline + operator-gate rules.
+
+The verification column in the table above records the intended check; the transaction (Step 3) executes it. If any destination does **not** exhibit the behavior under its activation path, that policy stays enabled until the destination is corrected.
 
 ## Expected token effect
 

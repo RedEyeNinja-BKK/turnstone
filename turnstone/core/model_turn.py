@@ -273,7 +273,19 @@ EXTRA_BODY_PROVIDERS: tuple[str, ...] = ("openai", "openai-compatible", "anthrop
 # OpenAI request extensions.  They are deliberately request-scoped: a session
 # binding chooses the universal route, while each admitted work item chooses
 # its semantic contract.
-ROUTING_CONTRACT_FIELDS = ("work_shape", "reasoning_intent", "work_class")
+ROUTING_CONTRACT_FIELDS = (
+    "work_shape",
+    "reasoning_intent",
+    "work_class",
+    "min_context_tokens",
+    "output_budget",
+)
+
+# FLEET-1 resource-requirement fields. They are task requirements (not lane
+# selection): `min_context_tokens` travels through extra_body into Switchyard's
+# structured ingress; `output_budget` maps to the NORMALIZED wire
+# `max_output_tokens` (never a second extra_body budget key).
+FLEET1_RESOURCE_REQUIREMENT_FIELDS = ("min_context_tokens", "output_budget")
 
 
 def routing_contract_extra_params(
@@ -283,9 +295,17 @@ def routing_contract_extra_params(
     """Return the explicit Switchyard semantic contract for one request.
 
     This is not prompt inference and not a model/session default.  Callers
-    must provide both orthogonal fields; malformed or partial contracts fail
+    must provide either both orthogonal lane fields, a legacy ``work_class``,
+    or a FLEET-1 resource requirement; malformed or partial contracts fail
     closed before dispatch.  ``work_class`` is retained only for compatibility
     with older callers and is never synthesized here.
+
+    FLEET-1: ``min_context_tokens`` (positive int) is validated and included
+    in the returned extra-body contract (Switchyard reads it from the
+    normalized request extensions).  ``output_budget`` (positive int) is
+    VALIDATED here but intentionally EXCLUDED from the returned extra-body
+    fields — it maps to the normalized ``max_output_tokens`` request field,
+    never to a second budget key on the wire.
     """
     if not contract:
         return None
@@ -296,17 +316,30 @@ def routing_contract_extra_params(
         "reasoning_intent": {"none", "deliberate"},
         "work_class": {"bounded", "agentic", "reasoning"},
     }
-    unknown = set(contract) - set(allowed)
+    unknown = set(contract) - set(allowed) - set(FLEET1_RESOURCE_REQUIREMENT_FIELDS)
     if unknown:
         raise ValueError(f"unknown routing contract field(s): {sorted(unknown)!r}")
-    if "work_class" not in contract and set(contract) != {"work_shape", "reasoning_intent"}:
+    has_lane = "work_shape" in contract or "work_class" in contract
+    has_fleet1 = bool(set(FLEET1_RESOURCE_REQUIREMENT_FIELDS) & set(contract))
+    if not has_lane and not has_fleet1:
+        raise ValueError(
+            "routing contract requires work_shape+reasoning_intent, work_class, "
+            "or a FLEET-1 resource requirement"
+        )
+    if "work_shape" in contract and "reasoning_intent" not in contract:
+        raise ValueError("routing contract requires work_shape and reasoning_intent")
+    if "reasoning_intent" in contract and "work_shape" not in contract:
         raise ValueError("routing contract requires work_shape and reasoning_intent")
     for key, value in contract.items():
+        if key in FLEET1_RESOURCE_REQUIREMENT_FIELDS:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"invalid {key}={value!r}: must be a positive integer")
+            continue
         if value not in allowed[key]:
             raise ValueError(f"invalid {key}={value!r}")
     if contract.get("work_shape") == "bounded" and contract.get("reasoning_intent") == "deliberate":
         raise ValueError("bounded work_shape with reasoning_intent=deliberate is contradictory")
-    return dict(contract)
+    return {k: v for k, v in contract.items() if k != "output_budget"}
 
 
 def _merge_routing_contract(
@@ -343,15 +376,23 @@ def _merge_routing_contract(
         return lane.extra_params
     base = dict(lane.extra_params or {})
     if not any(key in base for key in ROUTING_CONTRACT_FIELDS):
-        # Neutral alias: caller contract determines the lane.
+        # Neutral alias: caller contract determines the lane (FLEET-1 resource
+        # requirements are included via `fields`; output_budget is excluded by
+        # the validator helper and applied as max_output_tokens at the call site).
         merged = dict(base)
         merged.update(fields)
         return merged
 
     # Fixed semantic alias present.
     if not authoritative:
-        # Caller default must not override an explicit fixed alias pin.
-        return base
+        # Caller default must not override an explicit fixed alias pin, but
+        # FLEET-1 resource requirements still travel: they are task
+        # requirements (min_context_tokens), not lane selection.
+        merged = dict(base)
+        merged.update(
+            {k: v for k, v in fields.items() if k in FLEET1_RESOURCE_REQUIREMENT_FIELDS}
+        )
+        return merged
 
     # Caller explicit contract vs fixed alias pin: compatible => explicit wins,
     # contradictory => fail closed.  Translate the legacy work_class pin.
@@ -366,10 +407,31 @@ def _merge_routing_contract(
                 f"semantic pin {alias_contract!r}; reclassify the work or select a "
                 "compatible alias (never resolved by cost)"
             )
-        return alias_pin  # identical; keep the alias's (canonical) form.
+        # Identical lane contract: keep the alias's canonical lane form, but still
+        # layer FLEET-1 resource requirements (min_context_tokens) on top.
+        merged = dict(alias_pin)
+        merged.update(
+            {k: v for k, v in fields.items() if k in FLEET1_RESOURCE_REQUIREMENT_FIELDS}
+        )
+        return merged
     merged = dict(base)
     merged.update(fields)
     return merged
+
+
+def _apply_output_budget(max_tokens: int, contract: dict[str, Any] | None) -> int:
+    """FLEET-1: a declared ``output_budget`` is a HARD CAP on the normalized
+    ``max_output_tokens`` generation limit (min of the caller's own limit and
+    the budget). Absent/invalid => unchanged. Validation already happened in
+    ``routing_contract_extra_params``; this helper never raises and never
+    invents a second budget field.
+    """
+    if not contract:
+        return max_tokens
+    budget = contract.get("output_budget")
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+        return max_tokens
+    return min(max_tokens, budget)
 
 
 def _contract_from_fields(fields: dict[str, Any]) -> tuple[str, str] | None:
@@ -1523,7 +1585,7 @@ def model_turn(
                 model=lane.model,
                 messages=dispatched_wire,
                 tools=tools,
-                max_tokens=max_tokens,
+                max_tokens=_apply_output_budget(max_tokens, routing_contract),
                 temperature=temperature if temperature is not None else lane.temperature,
                 reasoning_effort=effective_effort,
                 extra_params=lane.extra_params,

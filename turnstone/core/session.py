@@ -3343,6 +3343,188 @@ class ChatSession:
             )
         return lane
 
+    # ------------------------------------------------------------------ #
+    # Compaction lane (dedicated non-thinking lane — incident 2026-08-23)
+    # ------------------------------------------------------------------ #
+    # Compaction is mechanical summarization: it must never consume a
+    # thinking/reasoning lane, and it must be able to compact very large
+    # sessions in one pass.  The canonical non-thinking compaction identities
+    # (all Switchyard-routed) are the ``deepseek/flash-nt`` route (alias
+    # ``deepseek-flash-nt``, ~1M context) and the ``openai/luna`` route
+    # (alias ``openai-luna``, 266K usable).  Every candidate is admitted
+    # exclusively when it is available AND the complete compaction request
+    # truthfully fits that lane's usable context envelope.  Anything else
+    # fails closed — never silently fall back to a thinking lane.
+    #
+    # Family doctrine (operator directive 2026-08-23):
+    #   * GPT family (all gpt models share the same ctx)  → compact with LUNA
+    #   * DeepSeek family (all 1M)                       → compact with FLASH-NT
+    #   * Local Qwen models                               → compact with
+    #     THEMSELVES in NT mode (their own non-thinking Switchyard route),
+    #     then the canonical cloud NT fallbacks.
+    _COMPACTION_PRIMARY_ALIAS = "deepseek-flash-nt"
+    _COMPACTION_FALLBACK_ALIAS = "openai-luna"
+    _COMPACTION_LANE_UNAVAILABLE_REASON = "compaction_nonthinking_lane_unavailable"
+    # Canonical non-thinking Switchyard aliases for the local Qwen fleet.
+    _COMPACTION_LOCAL_NT_ALIASES: tuple[tuple[str, str], ...] = (
+        ("qwen3.8-27b", "comfyninja-qwen3.8-27b"),
+        ("qwen3.5-9b", "htpc-qwen3.5-9b"),
+        ("qwen3.5-4b", "switchyard-htpc-qwen3.5-4b-mtp"),
+        ("qwen3.6-35b", "htpc-qwen3.5-9b"),
+    )
+
+    def _lane_family(self, lane: ModelLane | None) -> str:
+        """Semantic family of a lane for compaction preference: ``"deepseek"``,
+        ``"openai"``, ``"local"``, or ``""`` (unknown / other).
+
+        Reads the bound alias and physical model id so both Switchyard-routed
+        canonical identities (``deepseek/flash-nt``, ``openai/luna``) and
+        direct-registry aliases (``deepseek-deepseek-v4-*``, ``gpt-5.6-luna``,
+        local qwen definitions) classify correctly.  The provider name is
+        deliberately NOT used — ``openai-compatible`` is a generic protocol
+        shared by every Switchyard-routed lane, not a family signal.  DeepSeek
+        is checked first so the ``deepseek-*`` names never fall through to the
+        OpenAI match.
+        """
+        if lane is None:
+            return ""
+        alias = (lane.alias or "").lower()
+        model = (lane.model or "").lower()
+        haystack = " ".join((alias, model))
+        if "deepseek" in haystack:
+            return "deepseek"
+        if "luna" in haystack or "openai" in haystack or "gpt-" in haystack:
+            return "openai"
+        if "qwen" in haystack or "gemma" in haystack or "htpc" in haystack:
+            return "local"
+        return ""
+
+    def _local_nt_alias_for(self) -> str | None:
+        """Canonical non-thinking Switchyard alias for the session's own local
+        model family ("local qwen models use THEMSELVES in NT mode for
+        compaction"), or ``None`` when the session is not a known local model.
+        """
+        lane = self._model_binding.lane if self._model_binding else None
+        if lane is None:
+            return None
+        model = (lane.model or "").lower()
+        alias = (lane.alias or "").lower()
+        haystack = f"{alias} {model}"
+        for needle, nt_alias in self._COMPACTION_LOCAL_NT_ALIASES:
+            if needle in haystack:
+                return nt_alias
+        return None
+
+    def _try_resolve_lane(self, alias: str) -> ModelLane | None:
+        """Resolve *alias* to a lane without rebinding; ``None`` when unavailable."""
+        registry = self._registry
+        if registry is None:
+            return None
+        try:
+            binding = resolve_model_binding(
+                registry,
+                alias,
+                config_store=self._config_store,
+                backend_auth_resolver=self._model_backend_auth_token,
+            )
+        except (ModelClientConstructionError, ValueError, KeyError):
+            return None
+        if binding.config is None or binding.lane is None:
+            return None
+        return binding.lane
+
+    def _compaction_lane_preference(self) -> list[str]:
+        """Non-thinking compaction aliases in preference order, family-matched.
+
+        Operator doctrine (2026-08-23):
+        * GPT family (all gpt models, same ctx) → ``openai-luna`` first;
+        * DeepSeek family (all 1M) → ``deepseek-flash-nt`` first;
+        * Local Qwen models → THEMSELVES in NT mode first, then the canonical
+          cloud NT fallbacks (deepseek-flash-nt, then openai-luna);
+        * Unknown/switchyard-smart primaries keep the canonical
+          ``deepseek-flash-nt`` (1M) primary with ``openai-luna`` fallback.
+        """
+        fam = self._lane_family(self._model_binding.lane if self._model_binding else None)
+        if fam == "openai":
+            return [self._COMPACTION_FALLBACK_ALIAS, self._COMPACTION_PRIMARY_ALIAS]
+        if fam == "local":
+            local = self._local_nt_alias_for()
+            pref = [local] if local else []
+            pref += [self._COMPACTION_PRIMARY_ALIAS, self._COMPACTION_FALLBACK_ALIAS]
+            return pref
+        return [self._COMPACTION_PRIMARY_ALIAS, self._COMPACTION_FALLBACK_ALIAS]
+
+    def _resolve_compaction_lane(self, *, request_chars: int) -> ModelLane | None:
+        """Resolve the dedicated non-thinking compaction lane.
+
+        Preference order is family-matched (:meth:`_compaction_lane_preference`):
+        GPT-family sessions try ``openai/luna`` (266K) first; DeepSeek-family
+        and unknown/switchyard-smart sessions try ``deepseek/flash-nt``
+        (canonical Switchyard route, non-thinking, ~1M context) first; local
+        Qwen sessions try their OWN non-thinking route first (themselves in NT
+        mode), then the canonical cloud NT fallbacks.  Every candidate is
+        admitted ONLY when the complete compaction request (blocks + compactor
+        prompt) truthfully fits that lane's usable context envelope (raw window
+        minus output reserve and safety margin, using the same admission terms
+        as :func:`_usable_input_capacity`).  ``None`` (fail closed) when no
+        candidate is available/admissible — the caller surfaces the typed
+        ``compaction_nonthinking_lane_unavailable`` bail.  Never falls back to
+        a thinking lane.
+
+        Registry-less degradation: a session with NO registry (``None`` —
+        direct-construction hosts, test fixtures; production interactive /
+        coordinator / CLI sessions are always registry-backed) has no alias
+        set to prefer and no way to resolve the canonical aliases, so it
+        keeps the caller's bound primary lane (the only lane it has).  The
+        utility-completion seam still applies its own non-thinking pin to
+        that lane where the provider declares one.  The strict resolver
+        governs every registry-backed (production) session.
+        """
+        if self._registry is None:
+            return self._primary_lane()
+        for alias in self._compaction_lane_preference():
+            lane = self._try_resolve_lane(alias)
+            if lane is None:
+                continue
+            caps = lane.capabilities
+            window = int(getattr(caps, "context_window", 0) or self.context_window)
+            # Truthful admission: the full request (already-bounded blocks +
+            # fixed compactor prompt) must fit the candidate's usable input
+            # capacity — the same reserve/margin terms the real summary call
+            # will size against.  Do not truncate merely to force a fallback.
+            output_reserve = self._summary_output_tokens(lane)
+            prompt_chars = len(self._COMPACTOR_SYSTEM_PROMPT) + len(self._COMPACT_USER_PREFIX)
+            total_chars = prompt_chars + request_chars
+            est_tokens = int(total_chars / self._chars_per_token)
+            usable = _usable_input_capacity(window, output_reserve)
+            if est_tokens <= usable:
+                return lane
+        return None
+
+    def _lane_context_window(self, lane: ModelLane | None) -> int:
+        """Context window that sizes a lane's calls: the dedicated compaction
+        lane's own declared window when *lane* is one, else the session window.
+
+        Compaction runs on the dedicated compaction lane (not the primary), so
+        every summary-call sizing term must fit THAT lane's window rather than
+        the session's — the whole point of the 1M compaction lane is a budget
+        the 266K primary could not hold.  Only the dedicated compaction
+        aliases' operator-declared windows are authoritative here: any OTHER
+        lane (the session primary, a mock/static provider lane whose static
+        ``ModelCapabilities`` default disagrees with the session window) keeps
+        the session window, preserving pre-incident sizing semantics.
+        """
+        if lane is not None and lane.alias in (
+            self._COMPACTION_PRIMARY_ALIAS,
+            self._COMPACTION_FALLBACK_ALIAS,
+        ):
+            caps = lane.capabilities
+            if caps is not None:
+                window = int(getattr(caps, "context_window", 0) or 0)
+                if window > 0:
+                    return window
+        return self.context_window
+
     @property
     def _mem_cfg(self) -> MemoryConfig:
         """Live memory config — reads from ConfigStore when available."""
@@ -14374,7 +14556,7 @@ class ChatSession:
             if caps.max_output_tokens
             else self.compact_max_tokens
         )
-        window_cap = max(self._MIN_SUMMARY_OUTPUT_TOKENS, self.context_window // 2)
+        window_cap = max(self._MIN_SUMMARY_OUTPUT_TOKENS, self._lane_context_window(lane) // 2)
         return min(hard_cap, window_cap)
 
     def _carry_budget_chars(self, carries: int = 1, lane: ModelLane | None = None) -> int:
@@ -14401,11 +14583,12 @@ class ChatSession:
         the worst case.  Chars via the calibrated ``_chars_per_token``.
         """
         reserve = self._summary_output_tokens(lane)
-        margin = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
+        window = self._lane_context_window(lane)
+        margin = int(window * self._SUMMARY_SAFETY_MARGIN)
         lane_caps = require_lane_capabilities(lane) if lane is not None else None
         overhead = self._system_tokens + self._tool_def_tokens(lane_caps)
-        spare = max(0, self.context_window - reserve - margin - overhead)
-        budget_tokens = min(self.context_window // 4, spare // max(1, carries))
+        spare = max(0, window - reserve - margin - overhead)
+        budget_tokens = min(window // 4, spare // max(1, carries))
         return max(self._MIN_CARRY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token))
 
     def _summary_input_budget_chars(self, lane: ModelLane | None = None) -> int:
@@ -14427,10 +14610,11 @@ class ChatSession:
         window (the call bails as "irreducible" instead).
         """
         output_reserve = self._summary_output_tokens(lane)
+        window = self._lane_context_window(lane)
         prompt_chars = len(self._COMPACTOR_SYSTEM_PROMPT) + len(self._COMPACT_USER_PREFIX)
         prompt_tokens = int(prompt_chars / self._chars_per_token)
-        safety = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
-        input_tokens = self.context_window - output_reserve - prompt_tokens - safety
+        safety = int(window * self._SUMMARY_SAFETY_MARGIN)
+        input_tokens = window - output_reserve - prompt_tokens - safety
         budget_tokens = max(0, int(input_tokens * self._SUMMARY_BUDGET_FRACTION))
         budget_chars = max(
             self._MIN_SUMMARY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token)
@@ -15260,12 +15444,26 @@ class ChatSession:
                 my_generation=my_generation,
             )
 
-        # Pin one semantic lane for the complete recursive transaction.  A
-        # reload never splices a different provider/model/config between leaf
-        # summaries and the final merge.  Registry transport retirement can
-        # still abort the old client's in-flight transaction; failure leaves
-        # history untouched, and the next compaction resolves the new lane.
-        compaction_lane = self._primary_lane()
+        # Pin one semantic lane for the complete recursive transaction: the
+        # dedicated NON-THINKING compaction lane (deepseek/flash-nt primary,
+        # openai/luna context-admitted fallback).  A reload never splices a
+        # different provider/model/config between leaf summaries and the final
+        # merge.  Registry transport retirement can still abort the old
+        # client's in-flight transaction; failure leaves history untouched,
+        # and the next compaction resolves the new lane.
+        compaction_lane = self._resolve_compaction_lane(
+            request_chars=sum(len(b) for b in blocks)
+        )
+        if compaction_lane is None:
+            return self._compaction_bailed(
+                self._COMPACTION_LANE_UNAVAILABLE_REASON,
+                "Compaction lane unavailable: deepseek/flash-nt (non-thinking, ~1M) "
+                "not resolvable and openai/luna fallback not admitted (unavailable "
+                "or request exceeds its usable context). Failing closed rather than "
+                "falling back to a thinking lane.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
 
         def _thinking_start() -> None:
             try:

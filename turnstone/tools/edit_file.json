@@ -1,6 +1,6 @@
 {
   "name": "edit_file",
-  "description": "Replace exact strings in a file, or apply multiple replacements atomically. Requires read_file on the same path first. Two modes: (1) Single — old_string + new_string replaces a unique match (fails if multiple matches unless near_line disambiguates). (2) Batch — edits array with multiple old_string/new_string pairs applied atomically. Prefer this over write_file for partial modifications. For multi-file edits when filenames are known, go directly to read_file + edit_file for each file. When asked to change something in a file, follow through with edit_file after reading — reading alone is not enough.",
+  "description": "Replace exact strings in a file, or apply multiple replacements atomically. Requires read_file on the same path first. Two modes: (1) Single - old_string + new_string replaces a unique match (fails if multiple matches unless near_line disambiguates). (2) Batch - edits array with multiple old_string/new_string pairs applied atomically. Prefer this over write_file for partial modifications; when filenames are known for multi-file tasks, go directly to read_file + edit_file per file. When asked to change something in a file, follow through with edit_file after reading - reading alone is not enough.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -26,7 +26,7 @@
       },
       "edits": {
         "type": "array",
-        "description": "Multiple replacements to apply atomically. Each entry has old_string, new_string, and optional near_line. All edits are validated before any are applied. Preferred over multiple edit_file calls when making several changes to the same file.",
+        "description": "Multiple replacements applied atomically; all entries are validated before any change lands. Preferred over several edit_file calls on one file.",
         "items": {
           "type": "object",
           "properties": {

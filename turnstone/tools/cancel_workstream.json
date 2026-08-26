@@ -1,12 +1,12 @@
 {
   "name": "cancel_workstream",
-  "description": "Cancel in-flight generation on a child and unblock any pending approval / plan review. Does not close or delete — state moves to `idle`, so follow up with send_to_workstream or pair with close_workstream to retire. Drops tokens spent on the in-flight call. Use when a child is stuck on an approval you no longer want to grant, gone off the rails on a long thinking turn, or just needs a fresh prompt. Returns `{ws_id, cancelled, status, dropped?}`. `dropped` is included when the node captured forensics: it always carries `was_running: bool` (true mid-generation, false if the cancel arrived idle), and conditionally `pending_approval: {tool_names: [str], call_id: str}` when an approval was pending and `queued_messages: {count: int, first_preview: str}` when messages were queued behind the in-flight call. Read `was_running` first to judge whether the cancel actually interrupted work.",
+  "description": "Cancel in-flight generation on a child and unblock any pending approval / plan review. Does not close or delete - state moves to `idle` (tokens spent on the in-flight call are dropped); pair with send_to_workstream for a fresh prompt or close_workstream to retire. Use when a child is stuck on an approval you no longer want to grant or off the rails on a long thinking turn. Returns `{ws_id, cancelled, status}` plus `dropped` when the node captured forensics: always `was_running` (true = mid-generation), plus `pending_approval` {tool_names, call_id} and/or `queued_messages` {count, first_preview} when present. Read `was_running` first to judge whether the cancel actually interrupted work.",
   "parameters": {
     "type": "object",
     "properties": {
       "ws_id": {
         "type": "string",
-        "description": "Workstream id to cancel — exactly 32 hex chars, copied verbatim. Unknown or malformed ids error with did-you-mean suggestions; nothing is ever guessed."
+        "description": "Workstream id to cancel - exactly 32 hex chars, copied verbatim. Unknown or malformed ids error with did-you-mean suggestions; nothing is ever guessed."
       }
     },
     "required": ["ws_id"]

@@ -1,6 +1,6 @@
 {
   "name": "notify",
-  "description": "Send a notification to a user or channel on an external platform (Discord, etc.). Use this to proactively alert people about task completion, errors, or important updates. Provide either 'username' for user-based targeting (sends to all linked channels) or 'channel_type' + 'channel_id' for direct targeting. Do not combine both.",
+  "description": "Send a notification to a user or channel on an external platform (Discord, etc.) - proactively alert people about task completion, errors, or important updates. Target either by 'username' (all linked channels) or 'channel_type'+'channel_id' direct; never both.",
   "parameters": {
     "type": "object",
     "properties": {

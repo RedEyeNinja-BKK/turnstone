@@ -1,6 +1,6 @@
 {
   "name": "bash",
-  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks — e.g. bash(command='python --version'). For file creation use write_file instead. Long output is truncated (head+tail preserved, middle elided). Stderr lines prefixed with [stderr]. Runs to completion and returns: any process the command leaves running in the background (e.g. 'server &') is terminated when the command returns — nothing persists across calls. To keep a long-lived process (dev server, watcher) running across calls, set run_in_background=true instead of using '&'.",
+  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks - e.g. bash(command='python --version'). For file creation use write_file instead. Long output is truncated (head+tail preserved, middle elided); stderr lines prefixed with [stderr]. Any process left running in the background (e.g. 'server &') is terminated when the call returns - nothing persists across calls; set run_in_background=true for long-lived processes (dev server, watcher) instead of using '&'.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -18,7 +18,7 @@
       },
       "run_in_background": {
         "type": "boolean",
-        "description": "If true, start the command as a detached background shell and return immediately with a shell id (e.g. bash_1). Default false. Read new output later with bash_output(id=...); stop it with kill_shell(id=...). The shell runs until it exits, is killed, or the workstream closes; in the main session a system notice announces its exit. Inside a task agent there is no exit notice — poll bash_output — and the shell is also terminated when the agent finishes. The timeout parameter does not apply. Use for long-lived processes like dev servers — not for ordinary commands whose result you want now."
+        "description": "If true, start the command as a detached background shell and return immediately with a shell id (e.g. bash_1). Default false. Read new output later with bash_output(id=...); stop it with kill_shell(id=...). The shell runs until it exits, is killed, or the workstream closes; in the main session a system notice announces its exit. Inside a task agent there is no exit notice - poll bash_output - and the shell is terminated when the agent finishes. The timeout parameter does not apply. Use for long-lived processes like dev servers - not ordinary commands whose result you want now."
       }
     },
     "required": ["command"]

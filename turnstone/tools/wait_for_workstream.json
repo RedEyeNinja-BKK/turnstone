@@ -1,27 +1,27 @@
 {
   "name": "wait_for_workstream",
-  "description": "Block until one or all named child workstreams reach a terminal state. Prefer this over busy-polling inspect_workstream after a fan-out: the tool absorbs the wait, so you get one call + one result regardless of duration. Returns `{results: {ws_id: {state, tokens, updated, name, message, truncated}}, elapsed, complete, mode}` — `results` is keyed by ws_id (not top-level), `complete` is true when the wait condition fired before the timeout. `message` is the child's last assistant text for `idle`/`error`, a short sentinel for `closed`/`not_found`, and `null` for non-terminal rows so a follow-up read knows which children still need work; capped at 10 KiB UTF-8, with `truncated=true` when the cap fires (call inspect_workstream for the rest). Real terminal states: `idle`, `error`, `closed`, `deleted` (the last is unobservable since hard-delete cascades the row out of storage). `mode='any'` returns when the first child hits a real terminal; `mode='all'` returns once every id is real-terminal. Ids are validated up front — ws_ids are exactly 32 hex chars, copy them VERBATIM from spawn_batch/list_workstreams results; a malformed id (truncated/garbled/non-hex) errors immediately with `did_you_mean` suggestions and a roster of your children, and an id that can't be observed (foreign / nonexistent / hard-deleted mid-wait) aborts the wait on the tick that sees it with `state='not_found'` plus top-level `error`/`not_found`/`children` fields. When that happens, fix the id and re-issue — do NOT assume the child is dead; check `did_you_mean` or re-list. Child display names are labels, not addresses; always target ids. Capped at 32 ws_ids and 600s; both overflows error rather than silently truncating.",
+  "description": "Block until one or all named child workstreams reach a terminal state. Prefer this over busy-polling inspect_workstream after a fan-out - one call + one result regardless of duration. Real terminal states: `idle`, `error`, `closed`, `deleted` (unobservable - hard-delete cascades the row out of storage). Returns `{results: {ws_id: {state, tokens, updated, name, message, truncated}}, elapsed, complete, mode}`; `complete` = the wait condition fired before timeout. `message` is non-null only on real-terminal rows (child's last assistant text for idle/error, a short sentinel for closed/not_found), capped at 10 KiB UTF-8 with `truncated=true` when capped - re-read via inspect_workstream. Ids are validated up front - copy them VERBATIM from spawn_batch/list_workstreams results. A malformed id errors immediately with `did_you_mean` suggestions and your children roster; an unobservable id (foreign / nonexistent / hard-deleted mid-wait) aborts the wait on the tick that sees it with `state='not_found'` plus top-level `error`/`not_found`/`children`. When that happens fix the id and re-issue - do NOT assume the child is dead. Child display names are labels, not addresses; always target ids. Caps: 32 ws_ids, 600s - over-cap errors rather than truncating.",
   "parameters": {
     "type": "object",
     "properties": {
       "ws_ids": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Workstream ids to wait on (each exactly 32 hex chars, copied verbatim from spawn_batch / list_workstreams results). Accepts 1 or more; capped at 32 per call. Malformed ids fail the call before any waiting; well-formed ids that can't be observed abort it on the first tick — both return did-you-mean suggestions."
+        "description": "Workstream ids to wait on (each exactly 32 hex chars, copied verbatim from spawn_batch / list_workstreams results). Accepts 1 or more; capped at 32 per call. Malformed ids fail the call before any waiting; well-formed ids that can't be observed abort it on the first tick - both return did-you-mean suggestions."
       },
       "timeout": {
         "type": "number",
-        "description": "Maximum seconds to block. Default 60. Capped at 600 — for longer waits, call again with the same ws_ids."
+        "description": "Maximum seconds to block, capped at 600. Default 60 - for longer waits, call again with the same ws_ids."
       },
       "mode": {
         "type": "string",
         "enum": ["any", "all"],
         "default": "any",
-        "description": "'any' (default) returns when the first child reaches a real terminal state (idle / error / closed / deleted); 'all' returns once every named child is real-terminal. An id that can't be observed (foreign / nonexistent / deleted mid-wait) aborts the wait immediately with state='not_found' and a top-level error, regardless of mode."
+        "description": "'any' (default) returns when the first child reaches a real terminal state (`idle` / `error` / `closed` / `deleted`); 'all' once every named child is real-terminal. An unobservable id (foreign / nonexistent / deleted mid-wait) aborts the wait immediately with state='not_found' and a top-level error, regardless of mode."
       },
       "since": {
         "type": "object",
-        "description": "Optional prior snapshot (typically the `results` dict from an earlier wait_for_workstream call). When provided, the wait exits as soon as ANY polled ws_id that ALSO has a `since` entry differs from that prior snapshot (state/tokens/updated), regardless of mode. Skip re-counting already-terminal children on follow-up waits. ws_ids absent from `since` do NOT trigger the diff-based early exit — they fall back to the normal `mode` condition, so a disjoint `since` dict doesn't silently exit on tick one. Omit for the default terminal-state behaviour.",
+        "description": "Optional prior snapshot (typically the `results` dict from an earlier call): the wait exits early when ANY polled ws_id having a `since` entry differs from it (state/tokens/updated), regardless of mode - skips re-counting already-terminal children on follow-up waits. Ids absent from `since` fall back to the normal `mode` condition, so a disjoint `since` dict never exits on tick one. Omit for default terminal-state behavior.",
         "additionalProperties": {
           "type": "object",
           "properties": {

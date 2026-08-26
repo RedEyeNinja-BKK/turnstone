@@ -1,6 +1,6 @@
 {
   "name": "spawn_workstream",
-  "description": "Create a new child workstream, optionally dispatching an initial message. Kick off a focused sub-task on a different skill / model / node while the coordinator stays in charge. The child runs independently — drive it with send_to_workstream / inspect_workstream / close_workstream. Returns `{child_ws_id, name, node_id, routing_strategy}` — pass `child_ws_id` into `wait_for_workstream(ws_ids=[...])` and the other `ws_id`-taking tools. For this tool, `routing_strategy` is `rendezvous` (default placement on the live-node set) or `target_node` (your hint was honored). The returned `node_id` is the spawn-time binding; subsequent ops re-route via rendezvous over the live-node set, so a node join or drop after spawn can shift the active owner. Conversation state lives in storage (the new owner rehydrates lazily). Don't cache `node_id` for long-running callbacks — re-read with inspect_workstream. Lifecycle state (idle / running / etc.) is not in this response — read it via inspect_workstream.",
+  "description": "Create a new child workstream, optionally dispatching an initial message. Kick off a focused sub-task on a different skill / model / node while the coordinator stays in charge; drive the child with send_to_workstream / inspect_workstream / close_workstream. Returns `{child_ws_id, name, node_id, routing_strategy}` - pass `child_ws_id` into `wait_for_workstream(ws_ids=[...])` and the other ws_id-taking tools. `routing_strategy` is `rendezvous` (default placement on the live-node set) or `target_node` (your hint was honored). The returned `node_id` is the spawn-time binding; subsequent ops re-route via rendezvous over the live-node set and conversation state rehydrates lazily from storage, so don't cache `node_id` for long-running callbacks - re-read with inspect_workstream. Lifecycle state isn't in this response - read it via inspect_workstream.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       },
       "skill": {
         "type": "string",
-        "description": "Optional skill name to apply to the new workstream (overrides default skills, may select a model)."
+        "description": "Optional skill name to apply to the child (overrides default skills, may select a model)."
       },
       "name": {
         "type": "string",
@@ -18,15 +18,15 @@
       },
       "model": {
         "type": "string",
-        "description": "Optional model alias from the registry. Discover available aliases per node via `list_nodes` (the `model_aliases` field on each row lists the healthy aliases that node will accept). Omit to use the coordinator's default model (or the one the skill prescribes)."
+        "description": "Optional model alias from the registry - see the `model_aliases` field per row in `list_nodes` (healthy aliases that node accepts). Omit to use the coordinator's default model (or the one the skill prescribes)."
       },
       "target_node": {
         "type": "string",
-        "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node by generating a ws_id that rendezvous-hashes onto it. Otherwise rendezvous picks deterministically from the live-node set. CAVEAT: pinning is a hard constraint — if the named node has dropped out of the 120s service-registry heartbeat window between your `list_nodes` call and this spawn, the spawn fails with \"No available node for routing\" rather than falling back. Omit `target_node` if you can tolerate landing on any node; pin only when the workload truly requires that specific node's capabilities/region/tenancy."
+        "description": "Optional node_id hint: routing pins the workstream to that node by generating a ws_id that rendezvous-hashes onto it; otherwise rendezvous picks deterministically from the live-node set. CAVEAT: pinning is a hard constraint - if the named node has dropped out of the 120s service-registry heartbeat window between your `list_nodes` call and this spawn, the spawn fails with \"No available node for routing\" rather than falling back. Omit if you can tolerate landing on any node; pin only when the workload truly requires that specific node's capabilities/region/tenancy."
       },
       "project": {
         "type": "string",
-        "description": "Optional project_id to attach the child to, overriding the project it would otherwise inherit from this coordinator. Omit to inherit the coordinator's project (the common case). The child only gains project access if its owning user can access the project."
+        "description": "Optional project_id to attach the child to, overriding what it would inherit from this coordinator. The child only gains project access if its owning user can access the project. Omit to inherit (the common case)."
       },
       "persona": {
         "type": "string",

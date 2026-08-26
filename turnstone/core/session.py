@@ -3369,7 +3369,6 @@ class ChatSession:
     _COMPACTION_LOCAL_NT_ALIASES: tuple[tuple[str, str], ...] = (
         ("qwen3.8-27b", "comfyninja-qwen3.8-27b"),
         ("qwen3.5-9b", "htpc-qwen3.5-9b"),
-        ("qwen3.5-4b", "switchyard-htpc-qwen3.5-4b-mtp"),
         ("qwen3.6-35b", "htpc-qwen3.5-9b"),
     )
 

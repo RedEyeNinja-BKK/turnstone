@@ -6930,8 +6930,15 @@ class MCPClientManager:
         the dispatch path's ``_record_and_evict_on_dead_transport``:
 
           * a genuinely DEAD transport (``_is_dead_transport``) is evicted
-            (``session = None``) so the next tick reconnects it, and its breaker
-            records a failure so dispatch fails fast meanwhile;
+            (``session = None``) so the next tick reconnects it. The liveness
+            ping itself does NOT record a breaker failure — a ping death is a
+            "reconnect me" event (idle close / keep-alive expiry / server
+            lifecycle rotation all classify as dead), so counting it would
+            open the breaker for a healthy server whose connection merely
+            expired. Genuine outages still record a failure when the reconnect
+            itself fails (``_ensure_static_connected``) or when a dispatch hits
+            the dead transport (``_record_and_evict_on_dead_transport``), so
+            dispatch still fails fast meanwhile;
           * a protocol ``McpError``, an ``httpx.PoolTimeout``, or a plain ping
             TIMEOUT is "slow, not dead" — the ping is rescheduled WITHOUT evicting
             or tripping the breaker (a strict 5s ping vs a 120s dispatch would
@@ -6994,7 +7001,15 @@ class MCPClientManager:
             evict = self._static_servers.get(name)
             busy = evict is not None and evict.in_flight > 0
             if dead and evict is not None and not busy and evict.session is session:
-                self._cb_record_failure(name)
+                # Gate E-A: a liveness-ping death is a "reconnect me" event, not
+                # a backend failure (see ``_is_dead_transport`` — idle close /
+                # keep-alive expiry / server lifecycle rotation all land here).
+                # Evict and reconnect asap WITHOUT tripping the breaker: genuine
+                # outages still record a failure when the reconnect itself fails
+                # (``_ensure_static_connected``) or when a dispatch hits the dead
+                # transport (``_record_and_evict_on_dead_transport``). Counting
+                # an expected lifecycle closure here opened the dockhand circuit
+                # every 600s.
                 self._drop_static_session_and_stamp(name, evict)
                 asap = time.monotonic()
                 self._static_reconnect_next[name] = asap  # reconnect asap

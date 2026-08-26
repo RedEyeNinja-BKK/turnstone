@@ -411,6 +411,37 @@ def _raise_if_aborted(cancel_ref: Any) -> None:
         raise DeadlineCancelledError("rerank cancelled")
 
 
+def _log_sanitized_failure(lane: RerankLane, exc: BaseException) -> None:
+    """Log one sanitized rerank dispatch failure (Gate E-A diagnostics).
+
+    Fields are deliberately restricted to actionable diagnostics — backend
+    alias, model identifier, exception class, HTTP status, and the contract
+    stage. Query text, document contents, and response bodies are never
+    logged (a response body can echo request material). One record per failed
+    dispatch plus the existing circuit-transition record is enough to answer
+    "why did the failure counter increment?" without log amplification.
+    """
+    exc_class = type(exc).__name__
+    stage = "dispatch"
+    http_status: int | None = None
+    if isinstance(exc, httpx.HTTPStatusError):
+        stage = "http_status"
+        http_status = getattr(exc.response, "status_code", None)
+    elif isinstance(exc, httpx.TimeoutException):
+        stage = "timeout"
+    elif isinstance(exc, RerankError):
+        # Raised when a 200 response parses to no usable scores.
+        stage = "parse"
+    log.warning(
+        "rerank.failure alias=%s model=%s exc_class=%s stage=%s http_status=%s",
+        lane.alias,
+        lane.model,
+        exc_class,
+        stage,
+        http_status,
+    )
+
+
 def rerank(
     lane: RerankLane,
     query: str,
@@ -453,7 +484,7 @@ def rerank(
     except (DeadlineCancelledError, RerankCircuitOpenError, RerankRuntimeRetiredError):
         lane.runtime.circuit_abandon(permit)
         raise
-    except Exception:
+    except Exception as exc:
         try:
             # Stop/supersession owns the outcome even when the dispatched
             # transport fails while cancellation is landing. Do not charge a
@@ -464,6 +495,10 @@ def rerank(
             lane.runtime.circuit_abandon(permit)
             raise
         if dispatched:
+            # E-A diagnostics: record WHY before the breaker increments, so a
+            # future circuit_open has the underlying error (class/HTTP status/
+            # stage) beside it. No query/doc/body content is included.
+            _log_sanitized_failure(lane, exc)
             lane.runtime.circuit_fail(permit)
         else:
             # Admission and lifecycle failures say nothing about endpoint

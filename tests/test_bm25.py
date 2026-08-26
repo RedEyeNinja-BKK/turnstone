@@ -147,6 +147,27 @@ class TestBM25Reranking:
         assert index.search("two", k=5) == []
         assert calls["n"] == 1
 
+    def test_pool_cap_respects_endpoint_max_candidates(self):
+        """Gate E-A: the recall pool must never exceed Switchyard's
+        ``max_candidates`` cap (32). The client was sending up to 50 documents
+        and receiving HTTP 400 ``too_many_candidates``, tripping the rerank
+        circuit."""
+        assert _RERANK_POOL == 32
+
+    def test_reranker_receives_at_most_pool_cap_documents(self):
+        """Gate E-A: with more matching docs than the cap, the reranker
+        receives exactly the capped pool, never the full match set."""
+        docs = [f"alpha doc {i} beta gamma delta" for i in range(50)]
+        seen: dict[str, int] = {}
+
+        def spy(q, d):
+            seen["n"] = len(d)
+            return list(range(len(d)))
+
+        index = BM25Index(docs, reranker=spy)
+        index.search("alpha", k=5)
+        assert seen["n"] == 32  # pool == top-32 BM25 hits, not all 50
+
     def test_reorder_mode_empty_falls_back_to_bm25(self):
         # REORDER MODE (default rerank_filters=False, reactive tool/skill
         # search): an empty reranker result means the endpoint failed, so fall

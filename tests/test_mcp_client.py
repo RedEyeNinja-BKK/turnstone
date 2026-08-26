@@ -5149,7 +5149,15 @@ class TestStaticHealthLoop:
     def test_ping_one_dead_session_evicts_for_reconnect(self, running_loop_mgr) -> None:
         """The Turnstone case: a connected-but-dead session that nothing else
         would notice is detected by the ping and evicted so the next tick
-        reconnects it."""
+        reconnects it.
+
+        Gate E-A correction: a liveness-ping death is a "reconnect me" event
+        (idle close / keep-alive expiry / server lifecycle rotation), NOT a
+        backend failure — it must NOT trip the breaker. A healthy server whose
+        connection merely expired (e.g. a 600s server-side connection lifetime)
+        previously opened the circuit every rotation. Genuine outages still
+        record a failure when the reconnect itself fails (``_connect_one``).
+        """
         mgr, loop, _ = running_loop_mgr
         sess = MagicMock()
         sess.send_ping = AsyncMock(side_effect=ConnectionResetError("peer gone"))
@@ -5159,7 +5167,51 @@ class TestStaticHealthLoop:
         assert mgr._static_servers["up"].session is None  # evicted
         # "Reconnect asap": the (fresh-clock) deadline is already due.
         assert now <= mgr._static_reconnect_next["up"] <= time.monotonic()
-        assert "up" in mgr._consecutive_failures  # breaker recorded a failure
+        assert "up" not in mgr._consecutive_failures  # breaker NOT tripped (E-A)
+
+    def test_ping_death_successful_reconnect_records_no_failure(self, running_loop_mgr) -> None:
+        """Gate E-A: eviction is a reconnect-me event; a successful reconnect
+        must not add breaker state (a healthy server whose connection merely
+        expired stays circuit-clean)."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._server_configs["up"] = {"type": "stdio", "command": "echo"}
+        sess = MagicMock()
+        sess.send_ping = AsyncMock(side_effect=ConnectionResetError("peer gone"))
+        _seed_static_state(mgr, "up", session=sess)
+        _run_on_loop(loop, mgr._static_ping_one("up", time.monotonic()))
+        assert mgr._static_servers["up"].session is None  # evicted
+        assert "up" not in mgr._consecutive_failures
+
+        async def _fake_connect(name: str, _cfg: dict[str, Any]) -> None:
+            _seed_static_state(mgr, name, session=MagicMock())
+
+        with patch.object(mgr, "_connect_one_locked", side_effect=_fake_connect):
+            _run_on_loop(loop, mgr._static_reconnect_one("up"))
+        assert mgr._static_servers["up"].session is not None  # reconnected
+        assert "up" not in mgr._consecutive_failures  # no failure recorded
+
+    def test_ping_death_reconnect_failure_still_records(self, running_loop_mgr) -> None:
+        """Gate E-A: the liveness ping itself never trips the breaker, but a
+        genuinely failing reconnect (the primitive's connect failure) still
+        records a breaker failure so real outages escalate."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._server_configs["down"] = {"type": "stdio", "command": "echo"}
+        sess = MagicMock()
+        sess.send_ping = AsyncMock(side_effect=ConnectionResetError("peer gone"))
+        _seed_static_state(mgr, "down", session=sess)
+        _run_on_loop(loop, mgr._static_ping_one("down", time.monotonic()))
+        assert mgr._static_servers["down"].session is None  # evicted
+        assert "down" not in mgr._consecutive_failures  # ping death alone: no trip
+
+        async def _boom_connect(name: str, cfg: dict[str, Any]) -> None:
+            # The real ``_ensure_static_connected`` records the breaker failure
+            # before raising; simulate that primitive contract.
+            mgr._cb_record_failure(name)
+            raise ConnectionError("cannot reach server")
+
+        with patch.object(mgr, "_ensure_static_connected", side_effect=_boom_connect):
+            _run_on_loop(loop, mgr._static_reconnect_one("down"))
+        assert "down" in mgr._consecutive_failures  # reconnect failure: recorded
 
     def test_ping_one_timeout_does_not_evict(self, running_loop_mgr) -> None:
         """A ping TIMEOUT means 'slow', not 'dead': the session is kept and the

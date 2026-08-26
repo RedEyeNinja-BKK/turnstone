@@ -690,3 +690,61 @@ class TestModelCapabilitiesRerankFields:
         assert not hasattr(caps, "not_a_field")
         # Sanity: the dataclasses module is genuinely exercised.
         assert dataclasses.is_dataclass(caps)
+
+
+class TestSanitizedFailureDiagnostics:
+    """Gate E-A: circuit-fail diagnostics record metadata only - never request
+    or response content (no query, document, body, URL, or credential data)."""
+
+    def test_http_status_failure_logs_metadata_only(self, monkeypatch, caplog) -> None:
+        import logging
+
+        from turnstone.core.admission import ModelAdmission
+        from turnstone.core.rerank import RerankLane, RerankRuntime, rerank
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "documents exceeds max_candidates 32",
+                        "code": "too_many_candidates",
+                    },
+                    "secret_marker": "SECRET-LEAK-MARKER",
+                },
+            )
+
+        _install_mock_httpx_client(monkeypatch, handler)
+        client = CohereJinaRerankClient(
+            "http://switchyard/v1/rerank", model="localclaw/rerank"
+        )
+        runtime = RerankRuntime(client, alias="localclaw-rerank", model="localclaw/rerank")
+        lane = RerankLane(
+            runtime,
+            "localclaw-rerank",
+            "localclaw/rerank",
+            ModelAdmission("localclaw-rerank"),
+            0,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.rerank"):
+            with pytest.raises(httpx.HTTPStatusError):
+                rerank(lane, "q", ["d0", "d1"], timeout=2.0)
+
+        failures = [r for r in caplog.records if "rerank.failure" in r.getMessage()]
+        assert failures, "expected a rerank.failure record before circuit_fail"
+        msg = failures[0].getMessage()
+        # structlog renders the sanitized values into the message as
+        # positional_args — metadata only, no content.
+        assert (
+            "positional_args=('localclaw-rerank', 'localclaw/rerank', 'HTTPStatusError', 'http_status', 400)"
+            in msg
+        )
+        # No request/response content or user material leaks anywhere.
+        assert "SECRET-LEAK-MARKER" not in msg
+        assert "too_many_candidates" not in msg
+        assert "documents exceeds" not in msg
+        assert "'q'" not in msg  # query text
+        assert "'d0'" not in msg and "'d1'" not in msg  # document text
+        # One dispatched failure advanced the breaker count.
+        assert runtime.snapshot().circuit.consecutive_failures == 1

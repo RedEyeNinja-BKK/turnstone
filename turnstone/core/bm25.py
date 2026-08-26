@@ -19,7 +19,10 @@ _SPLIT_RE = re.compile(r"[_\-./\s]+")
 # top-k the reranker reorders before the caller's ``k`` slice. Deliberately a
 # private copy (not shared from rerank.py) so this module stays import-light and
 # httpx-free; web_search.py defines the same cap independently — keep them in sync.
-_RERANK_POOL = 50
+# 32 is the Switchyard /v1/rerank ``max_candidates`` cap (HTTP 400
+# too_many_candidates above it, Gate E-A root cause); the client must never
+# exceed the endpoint's documented candidate limit.
+_RERANK_POOL = 32
 
 
 def _tokenize(text: str) -> list[str]:

@@ -360,6 +360,24 @@ class TestWebSearchReranking:
         assert seen["query"] == "find me"
         assert seen["docs"][0] == "Py\nPy snippet"
 
+    def test_pool_cap_respects_endpoint_max_candidates(self):
+        """Gate E-A: web rerank sends at most Switchyard's 32-candidate cap.
+        A 50-result page previously produced HTTP 400 ``too_many_candidates``
+        and tripped the rerank circuit."""
+        from turnstone.core.web_search import _RERANK_POOL
+
+        assert _RERANK_POOL == 32
+        seen: dict[str, int] = {}
+
+        def rr(query, docs):
+            seen["n"] = len(docs)
+            return list(range(len(docs)))
+
+        _format_searxng(
+            _results(*(f"R{i}" for i in range(50))), "q", max_results=5, reranker=rr
+        )
+        assert seen["n"] == 32
+
     def test_error_falls_back_to_native_order(self):
         def boom(query, docs):
             raise RuntimeError("rerank endpoint down")
@@ -419,19 +437,20 @@ class TestWebSearchReranking:
 
         assert out.index("[B]") < out.index("[A]")  # reranker applied via search()
 
-    def test_pool_cap_preserves_tail_beyond_50(self):
-        # >_RERANK_POOL (50) results: only the first 50 are reranked; the tail
-        # must survive, appended in native order after the reranked pool.
+    def test_pool_cap_preserves_tail_beyond_32(self):
+        # >_RERANK_POOL (32, Switchyard max_candidates — Gate E-A) results: only
+        # the first 32 are reranked; the tail must survive, appended in native
+        # order after the reranked pool.
         data = {
             "results": [
                 {"title": f"R{i}", "url": f"http://r/{i}", "content": f"c{i}"} for i in range(60)
             ]
         }
-        # Reranker reverses the 50-item pool it is handed.
+        # Reranker reverses the 32-item pool it is handed.
         out = _format_searxng(
             data, "q", max_results=60, reranker=lambda q, d: list(range(len(d)))[::-1]
         )
         assert all(f"[R{i}]" in out for i in range(60))  # nothing dropped
-        assert out.index("[R49]") < out.index("[R0]")  # pool reversed
-        assert out.index("[R0]") < out.index("[R50]")  # reranked pool before the tail
-        assert out.index("[R50]") < out.index("[R59]")  # tail kept in native order
+        assert out.index("[R31]") < out.index("[R0]")  # pool reversed
+        assert out.index("[R0]") < out.index("[R32]")  # reranked pool before the tail
+        assert out.index("[R32]") < out.index("[R59]")  # tail kept in native order

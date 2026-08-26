@@ -748,3 +748,19 @@ class TestSanitizedFailureDiagnostics:
         assert "'d0'" not in msg and "'d1'" not in msg  # document text
         # One dispatched failure advanced the breaker count.
         assert runtime.snapshot().circuit.consecutive_failures == 1
+
+
+class TestRerankTimeoutCap:
+    """Gate E-A: the rerank timeout cap must accommodate the 32-doc pool's
+    measured latency envelope (~10s p50, ~22s outliers under Switchyard load).
+    A cap below the observed outliers would trip the circuit on legitimate
+    slow responses, undoing the pool-size fix."""
+
+    def test_cap_is_30s(self) -> None:
+        from turnstone.core.session import _RERANK_TIMEOUT_CAP_S
+
+        assert _RERANK_TIMEOUT_CAP_S == 30.0
+        # Sanity: above the observed p90 (~10s) and worst outlier (~22s).
+        assert _RERANK_TIMEOUT_CAP_S > 22.0
+        # Still bounded (a hung endpoint falls back in seconds, not minutes).
+        assert _RERANK_TIMEOUT_CAP_S <= 30.0

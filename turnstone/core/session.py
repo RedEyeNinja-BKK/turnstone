@@ -2315,52 +2315,12 @@ _WATCH_QUEUE_SOFT_CAP = 50
 # Sized to the perception describe cap (max_tokens ~4096 -> ~16K chars).
 _DOC_BUDGET_CHAR_CAP = 16_000
 
-# Fetched and locally extracted document text is presentation data, so size it
-# to the exact serving lane instead of freezing it to today's model class.
-# Stored PDFs and web_fetch documents use at most half the lane context; prompt
-# history, response/reasoning, and provider framing consume the rest.
-_PDF_ATTACHMENT_CONTEXT_SHARE = 0.5
-_WEB_FETCH_DOCUMENT_CONTEXT_SHARE = 0.5
-_DOCUMENT_BUDGET_PLANNING_MARGIN_PCT = 0.01
-_WEB_FETCH_TEXT_CHAR_CAP = 10 * 1024 * 1024
-_PDF_CACHE_CAP_INDEPENDENT: Literal["independent"] = "independent"
-
-_WireContentPart = dict[str, Any] | list[dict[str, Any]]
-_PdfCacheCapKey = int | Literal["independent"] | None
-_WirePartCache = dict[
-    tuple[str, tuple[bool, bool, bool, _PdfCacheCapKey]],
-    _WireContentPart,
-]
-
-
-def _document_text_budget_chars(
-    budget: _UtilityBudgetSnapshot,
-    *,
-    context_share: float,
-    reserved_input_tokens: int = 0,
-    share_includes_reserved: bool = False,
-    hard_char_cap: int | None = None,
-) -> int:
-    """Return a lane-scaled allowance after non-document and output reserves.
-
-    Attachment text receives up to ``context_share`` on its own, limited by
-    remaining usable input. For one-shot web extraction, the share is the total
-    document-input envelope, so fixed prompt tokens are also subtracted from
-    that share. ``hard_char_cap`` layers a host-safety ceiling over that model
-    presentation budget when the source requires one.
-    """
-    share_tokens = int(budget.context_window * context_share)
-    usable_tokens = _usable_input_capacity(budget.context_window, budget.max_tokens)
-    if share_includes_reserved:
-        available_tokens = min(share_tokens, usable_tokens) - reserved_input_tokens
-    else:
-        available_tokens = min(share_tokens, usable_tokens - reserved_input_tokens)
-    scaled = max(int(max(available_tokens, 0) * budget.chars_per_token), 0)
-    return min(scaled, hard_char_cap) if hard_char_cap is not None else scaled
-
-
-_RERANK_TIMEOUT_CAP_S = 15.0  # reranking <=50 short docs is fast; cap so a hung
-# endpoint falls back to BM25 in seconds, not up to tools.timeout (120s default).
+_RERANK_TIMEOUT_CAP_S = 30.0  # rerank cap so a hung endpoint falls back to BM25
+# in bounded seconds, not up to tools.timeout (120s default). Raised from 15s in
+# Gate E-A: the valid pool is now 32 docs (Switchyard max_candidates), and
+# measured 32-doc latency is ~10s p50 with occasional ~22s outliers under load
+# (Switchyard/ComfyNinja contention); 15s tripped the circuit on those outliers.
+# 30s bounds a hung endpoint while accommodating the observed envelope.
 # Per-turn memory rerank makes the long timeout a turn-stall hazard.
 
 

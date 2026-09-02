@@ -3886,6 +3886,321 @@ class ChatSession:
             )
         return lane
 
+    # ------------------------------------------------------------------ #
+    # Compaction lane (dedicated non-thinking lane — incident 2026-08-23)
+    # ------------------------------------------------------------------ #
+    # Compaction is mechanical summarization: it must never consume a
+    # thinking/reasoning lane, and it must be able to compact very large
+    # sessions in one pass.  The canonical non-thinking compaction identities
+    # (all Switchyard-routed) are the ``deepseek/flash-nt`` route (alias
+    # ``deepseek-flash-nt``, ~1M context) and the ``openai/luna`` route
+    # (alias ``openai-luna``, 266K usable).  Every candidate is admitted
+    # exclusively when it is available AND the complete compaction request
+    # truthfully fits that lane's usable context envelope.  Anything else
+    # fails closed — never silently fall back to a thinking lane.
+    #
+    # Family doctrine (operator directive 2026-08-23):
+    #   * GPT family (all gpt models share the same ctx)  → compact with LUNA
+    #   * DeepSeek family (all 1M)                       → compact with FLASH-NT
+    #   * Local Qwen models                               → compact with
+    #     THEMSELVES in NT mode (their own non-thinking Switchyard route),
+    #     then the canonical cloud NT fallbacks.
+    _COMPACTION_PRIMARY_ALIAS = "deepseek-flash-nt"
+    _COMPACTION_FALLBACK_ALIAS = "openai-luna"
+    _COMPACTION_LANE_UNAVAILABLE_REASON = "compaction_nonthinking_lane_unavailable"
+    # Operator compaction-routing policy (2026-09-02, supersedes the blanket
+    # "compact on yourself in NT" for smart lanes): maps a session's CURRENT
+    # source lane identity — registry alias first, then physical model id —
+    # to the compaction lane alias.  The special target "@self" means the
+    # session's own alias (same route/lane identity; the utility-completion
+    # seam supplies the non-thinking posture where the backend declares a
+    # toggle).  This is ROUTE/LANE-IDENTITY mapping, deliberately NOT
+    # physical-backend affinity: for smart lanes "self" is the Switchyard
+    # route, never whichever backend Switchyard happened to pick.
+    #
+    # Lookup happens BEFORE the family ladder, which remains the fallback
+    # for unmapped sources (compatibility aliases deepseek-flash-nt /
+    # openai-luna / comfyninja-qwen3.8-27b / htpc-qwen3.5-9b stay live for
+    # that ladder).  A mapped source yields EXACTLY ONE candidate — no
+    # silent cross-class fallback: if the mapped target is unavailable or
+    # the request does not fit, compaction fails closed.
+    _COMPACTION_SOURCE_ROUTE_MAP: dict[str, str] = {
+        # Smart lanes — compact by lane tier (agentic tier; agentic/bounded
+        # tiers compact on themselves).
+        "switchyard-smart-turnstone": "switchyard-smart-agentic-turnstone",
+        "switchyard-smart-agentic-turnstone": "@self",
+        "switchyard-smart-bounded-turnstone": "@self",
+        "switchyard-smart-hermes": "switchyard-smart-agentic-hermes",
+        "switchyard-smart-agentic-hermes": "@self",
+        "switchyard-smart-bounded-hermes": "@self",
+        "switchyard-smart-openclaw": "switchyard-smart-agentic-openclaw",
+        "switchyard-smart-agentic-openclaw": "@self",
+        "switchyard-smart-bounded-openclaw": "@self",
+        "switchyard-smart-remoteopenclaw": "switchyard-smart-agentic-remoteopenclaw",
+        "switchyard-smart-agentic-remoteopenclaw": "@self",
+        "switchyard-smart-bounded-remoteopenclaw": "@self",
+        "switchyard-smart-dsh": "switchyard-smart-agentic-dsh",
+        "switchyard-smart-agentic-dsh": "@self",
+        "switchyard-smart-bounded-dsh": "@self",
+        # Fixed local MTP lanes — exact same serving target in its NT
+        # variant (Switchyard route-level NT pin), never a smart lane.
+        "switchyard-comfyninja-qwen3.8-27b-q3-mtp": "switchyard-comfyninja-qwen3.8-27b-q3-mtp-nt",
+        "switchyard/comfyninja/qwen3.8-27b-q3-mtp": "switchyard-comfyninja-qwen3.8-27b-q3-mtp-nt",
+        "switchyard-comfyninja-qwen3.8-27b-q3-mtp-thinking": "switchyard-comfyninja-qwen3.8-27b-q3-mtp-nt",
+        "switchyard/comfyninja/qwen3.8-27b-q3-mtp-thinking": "switchyard-comfyninja-qwen3.8-27b-q3-mtp-nt",
+        "switchyard-comfyninja-qwen3.8-27b-q3-mtp-nt": "@self",
+        "switchyard/comfyninja/qwen3.8-27b-q3-mtp-nt": "@self",
+        "switchyard-comfyninja-qwen3.8-27b-q4-mtp": "switchyard-comfyninja-qwen3.8-27b-q4-mtp-nt",
+        "switchyard/comfyninja/qwen3.8-27b-q4-mtp": "switchyard-comfyninja-qwen3.8-27b-q4-mtp-nt",
+        "switchyard-comfyninja-qwen3.8-27b-q4-mtp-thinking": "switchyard-comfyninja-qwen3.8-27b-q4-mtp-nt",
+        "switchyard/comfyninja/qwen3.8-27b-q4-mtp-thinking": "switchyard-comfyninja-qwen3.8-27b-q4-mtp-nt",
+        "switchyard-comfyninja-qwen3.8-27b-q4-mtp-nt": "@self",
+        "switchyard/comfyninja/qwen3.8-27b-q4-mtp-nt": "@self",
+        "switchyard-htpc-qwen3.5-9b": "switchyard-htpc-qwen3.5-9b-mtp-nt",
+        "switchyard/htpc/qwen3.5-9b": "switchyard-htpc-qwen3.5-9b-mtp-nt",
+        "switchyard-htpc-qwen3.5-9b-mtp": "switchyard-htpc-qwen3.5-9b-mtp-nt",
+        "switchyard/htpc/qwen3.5-9b-mtp": "switchyard-htpc-qwen3.5-9b-mtp-nt",
+        "switchyard-htpc-qwen3.5-9b-mtp-thinking": "switchyard-htpc-qwen3.5-9b-mtp-nt",
+        "switchyard/htpc/qwen3.5-9b-mtp-thinking": "switchyard-htpc-qwen3.5-9b-mtp-nt",
+        "switchyard-htpc-qwen3.5-9b-mtp-nt": "@self",
+        "switchyard/htpc/qwen3.5-9b-mtp-nt": "@self",
+        # Direct/emergency providers — same provider/transport failure
+        # domain, never through Switchyard.  DeepSeek's API ignores
+        # ``enable_thinking`` (probe-proven 2026-09-02); its production NT
+        # shape is ``thinking: {type: "disabled"}``, carried by the NT twin
+        # rows via server_compat.extra_body.  DeepSeek direct rows themselves
+        # are NEVER mutated (they are emergency session primaries).
+        "deepseek-deepseek-v4-flash": "deepseek-v4-flash-nt",
+        "deepseek/deepseek-v4-flash": "deepseek-v4-flash-nt",
+        "deepseek-deepseek-v4-pro": "deepseek-v4-pro-nt",
+        "deepseek/deepseek-v4-pro": "deepseek-v4-pro-nt",
+        # Direct OpenAI (Codex transport, :8645) — dedicated NT twin rows
+        # (reasoning_effort=none) so the emergency path stays on the same
+        # direct provider with thinking disabled.
+        "gpt-5.4-mini": "gpt-5.4-mini-nt",
+        "gpt-5.6-luna": "gpt-5.6-luna-nt",
+        "gpt-5.6-sol": "gpt-5.6-sol-nt",
+        "gpt-5.6-terra": "gpt-5.6-terra-nt",
+        # Direct OpenRouter — GLM-5.3-flash has NO NT mode (reasoning is
+        # mandatory upstream): compacts on itself normally, no emulation.
+        "glm-5.3-flash": "@self",
+        "z-ai/glm-5.3-flash": "@self",
+        # Direct OpenRouter Qwen3.8-flash — same direct path, thinking
+        # disabled via the dedicated direct NT twin row (production pin
+        # ``reasoning: {enabled: false}`` via server_compat.extra_body; the
+        # base row declares server_parses_reasoning, which exempts it from
+        # the seam's no-reasoning posture).
+        "qwen3.8-flash": "qwen3.8-flash-nt",
+        "qwen/qwen3.8-flash": "qwen3.8-flash-nt",
+    }
+    # Canonical non-thinking Switchyard aliases for the local Qwen fleet.
+    _COMPACTION_LOCAL_NT_ALIASES: tuple[tuple[str, str], ...] = (
+        ("qwen3.8-27b", "comfyninja-qwen3.8-27b"),
+        ("qwen3.5-9b", "htpc-qwen3.5-9b"),
+        ("qwen3.6-35b", "htpc-qwen3.5-9b"),
+    )
+
+    def _lane_family(self, lane: ModelLane | None) -> str:
+        """Semantic family of a lane for compaction preference: ``"deepseek"``,
+        ``"openai"``, ``"local"``, or ``""`` (unknown / other).
+
+        Reads the bound alias and physical model id so both Switchyard-routed
+        canonical identities (``deepseek/flash-nt``, ``openai/luna``) and
+        direct-registry aliases (``deepseek-deepseek-v4-*``, ``gpt-5.6-luna``,
+        local qwen definitions) classify correctly.  The provider name is
+        deliberately NOT used — ``openai-compatible`` is a generic protocol
+        shared by every Switchyard-routed lane, not a family signal.  DeepSeek
+        is checked first so the ``deepseek-*`` names never fall through to the
+        OpenAI match.
+        """
+        if lane is None:
+            return ""
+        alias = (lane.alias or "").lower()
+        model = (lane.model or "").lower()
+        haystack = " ".join((alias, model))
+        if "deepseek" in haystack:
+            return "deepseek"
+        if "luna" in haystack or "openai" in haystack or "gpt-" in haystack:
+            return "openai"
+        if "qwen" in haystack or "gemma" in haystack or "htpc" in haystack:
+            return "local"
+        return ""
+
+    def _local_nt_alias_for(self) -> str | None:
+        """Canonical non-thinking Switchyard alias for the session's own local
+        model family ("local qwen models use THEMSELVES in NT mode for
+        compaction"), or ``None`` when the session is not a known local model.
+        """
+        lane = self._model_binding.lane if self._model_binding else None
+        if lane is None:
+            return None
+        model = (lane.model or "").lower()
+        alias = (lane.alias or "").lower()
+        haystack = f"{alias} {model}"
+        for needle, nt_alias in self._COMPACTION_LOCAL_NT_ALIASES:
+            if needle in haystack:
+                return nt_alias
+        return None
+
+    def _try_resolve_lane(self, alias: str) -> ModelLane | None:
+        """Resolve *alias* to a lane without rebinding; ``None`` when unavailable."""
+        registry = self._registry
+        if registry is None:
+            return None
+        try:
+            binding = resolve_model_binding(
+                registry,
+                alias,
+                config_store=self._config_store,
+                backend_auth_resolver=self._model_backend_auth_token,
+            )
+        except (ModelClientConstructionError, ValueError, KeyError):
+            return None
+        if binding.config is None or binding.lane is None:
+            return None
+        return binding.lane
+
+    def _compaction_source_route_target(self) -> str | None:
+        """Operator policy map lookup for the CURRENT source lane.
+
+        Returns the compaction alias for this session's bound lane per
+        :attr:`_COMPACTION_SOURCE_ROUTE_MAP` (alias key first, then model
+        id), ``"@self"`` resolving to the session's own alias.  ``None``
+        when the session has no lane or the source is unmapped — the
+        family ladder then applies unchanged.
+
+        Reload semantics (intentional, matching the pre-existing ladder
+        design): the SOURCE is read from the session's bound lane while
+        the TARGET is resolved against the CURRENT registry generation.
+        A reload between binding and compaction re-resolves the target —
+        the existing resolver already accepts this ("failure leaves
+        history untouched, and the next compaction resolves the new
+        lane"); this map introduces no new mixed-generation surface.
+        """
+        lane = self._model_binding.lane if self._model_binding else None
+        if lane is None:
+            return None
+        # Note: a mapped "@self" hit with an EMPTY alias cannot occur for
+        # production sessions — resolve_model_binding resolves an empty
+        # alias to registry.default, so every registry-backed lane carries
+        # a concrete alias (the resolver refuses registry-less sessions
+        # upstream).  A fixture-manufactured empty alias falls through to
+        # the ladder here rather than inventing a target.
+        for key in ((lane.alias or "").lower(), (lane.model or "").lower()):
+            if not key:
+                continue
+            mapped = self._COMPACTION_SOURCE_ROUTE_MAP.get(key)
+            if not mapped:
+                continue
+            if mapped == "@self":
+                return (lane.alias or "").lower() or None
+            return mapped
+        return None
+
+    def _compaction_lane_preference(self) -> list[str]:
+        """Non-thinking compaction aliases in preference order, family-matched.
+
+        Operator policy (2026-09-02, supersedes the 2026-08-23 family
+        doctrine for mapped sources): sessions whose source lane appears
+        in :attr:`_COMPACTION_SOURCE_ROUTE_MAP` compact on EXACTLY the
+        mapped target — smart lanes by tier identity, fixed local MTP
+        lanes on their own NT variant, direct/emergency providers on the
+        same direct path.  The family ladder below remains solely as the
+        fallback for UNMAPPED sources:
+
+        * GPT family (all gpt models, same ctx) → ``openai-luna`` first;
+        * DeepSeek family (all 1M) → ``deepseek-flash-nt`` first;
+        * Local Qwen models → THEMSELVES in NT mode first, then the
+          canonical cloud NT fallbacks (deepseek-flash-nt, then
+          openai-luna);
+        * Unknown/switchyard-smart primaries keep the canonical
+          ``deepseek-flash-nt`` (1M) primary with ``openai-luna``
+          fallback.
+        """
+        mapped = self._compaction_source_route_target()
+        if mapped:
+            return [mapped]
+        fam = self._lane_family(self._model_binding.lane if self._model_binding else None)
+        if fam == "openai":
+            return [self._COMPACTION_FALLBACK_ALIAS, self._COMPACTION_PRIMARY_ALIAS]
+        if fam == "local":
+            local = self._local_nt_alias_for()
+            pref = [local] if local else []
+            pref += [self._COMPACTION_PRIMARY_ALIAS, self._COMPACTION_FALLBACK_ALIAS]
+            return pref
+        return [self._COMPACTION_PRIMARY_ALIAS, self._COMPACTION_FALLBACK_ALIAS]
+
+    def _resolve_compaction_lane(self, *, request_chars: int) -> ModelLane | None:
+        """Resolve the dedicated non-thinking compaction lane.
+
+        Preference order is family-matched (:meth:`_compaction_lane_preference`):
+        GPT-family sessions try ``openai/luna`` (266K) first; DeepSeek-family
+        and unknown/switchyard-smart sessions try ``deepseek/flash-nt``
+        (canonical Switchyard route, non-thinking, ~1M context) first; local
+        Qwen sessions try their OWN non-thinking route first (themselves in NT
+        mode), then the canonical cloud NT fallbacks.  Every candidate is
+        admitted ONLY when the complete compaction request (blocks + compactor
+        prompt) truthfully fits that lane's usable context envelope (raw window
+        minus output reserve and safety margin, using the same admission terms
+        as :func:`_usable_input_capacity`).  ``None`` (fail closed) when no
+        candidate is available/admissible — the caller surfaces the typed
+        ``compaction_nonthinking_lane_unavailable`` bail.  Never falls back to
+        a thinking lane.
+
+        Registry-less degradation: a session with NO registry (``None`` —
+        direct-construction hosts, test fixtures; production interactive /
+        coordinator / CLI sessions are always registry-backed) has no alias
+        set to prefer and no way to resolve the canonical aliases, so it
+        keeps the caller's bound primary lane (the only lane it has).  The
+        utility-completion seam still applies its own non-thinking pin to
+        that lane where the provider declares one.  The strict resolver
+        governs every registry-backed (production) session.
+        """
+        if self._registry is None:
+            return self._primary_lane()
+        for alias in self._compaction_lane_preference():
+            lane = self._try_resolve_lane(alias)
+            if lane is None:
+                continue
+            caps = lane.capabilities
+            window = int(getattr(caps, "context_window", 0) or self.context_window)
+            # Truthful admission: the full request (already-bounded blocks +
+            # fixed compactor prompt) must fit the candidate's usable input
+            # capacity — the same reserve/margin terms the real summary call
+            # will size against.  Do not truncate merely to force a fallback.
+            output_reserve = self._summary_output_tokens(lane)
+            prompt_chars = len(self._COMPACTOR_SYSTEM_PROMPT) + len(self._COMPACT_USER_PREFIX)
+            total_chars = prompt_chars + request_chars
+            est_tokens = int(total_chars / self._chars_per_token)
+            usable = _usable_input_capacity(window, output_reserve)
+            if est_tokens <= usable:
+                return lane
+        return None
+
+    def _lane_context_window(self, lane: ModelLane | None) -> int:
+        """Context window that sizes a lane's calls: the dedicated compaction
+        lane's own declared window when *lane* is one, else the session window.
+
+        Compaction runs on the dedicated compaction lane (not the primary), so
+        every summary-call sizing term must fit THAT lane's window rather than
+        the session's — the whole point of the 1M compaction lane is a budget
+        the 266K primary could not hold.  Only the dedicated compaction
+        aliases' operator-declared windows are authoritative here: any OTHER
+        lane (the session primary, a mock/static provider lane whose static
+        ``ModelCapabilities`` default disagrees with the session window) keeps
+        the session window, preserving pre-incident sizing semantics.
+        """
+        if lane is not None and lane.alias in (
+            self._COMPACTION_PRIMARY_ALIAS,
+            self._COMPACTION_FALLBACK_ALIAS,
+        ):
+            caps = lane.capabilities
+            if caps is not None:
+                window = int(getattr(caps, "context_window", 0) or 0)
+                if window > 0:
+                    return window
+        return self.context_window
+
     @property
     def _mem_cfg(self) -> MemoryConfig:
         """Live memory config — reads from ConfigStore when available."""

@@ -5616,6 +5616,23 @@ def _record_coord_key_refusal(app_state: Any, key_err: str) -> None:
     app_state.coord_registry_error = key_err
 
 
+
+def _console_registry_api_key() -> str:
+    """Default api_key for registry rows that store none.
+
+    Mirrors the node boot path (``server.py``: ``args.api_key or env or
+    "dummy"``): the OpenAI-shaped SDKs refuse an EMPTY key outright, and
+    keyless rows are a legitimate configuration for auth-free upstreams
+    (e.g. the local Switchyard proxy).  Without this fallback the console
+    cannot construct clients for those rows, which broke coordinator
+    workstream creation and the model picker for every switchyard alias
+    once keyless routes became the coordinator default (2026-09-02).
+    """
+    import os as _os
+
+    return _os.environ.get("OPENAI_API_KEY") or "dummy"
+
+
 def _refuse_keyless_registry(app_state: Any, registry: Any) -> bool:
     """Refuse a freshly-loaded registry whose dynamic aliases lack the key.
 
@@ -5656,7 +5673,7 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
     coord_registry: Any | None = None
     try:
         try:
-            coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
+            coord_registry = load_model_registry(storage=storage, api_key=_console_registry_api_key())
         except ValueError as exc:
             # No model rows configured.  Endpoint returns 503 with the
             # error text so admin sees remediation in the UI; the
@@ -13110,12 +13127,7 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # Without it, the loader degrades to a config.toml-only registry
         # and ``existing.reload()`` would silently drop every DB-sourced
         # alias.
-        new_registry = load_model_registry(
-            storage=storage,
-            strict=True,
-            detect_context_windows=True,
-            prior=existing.models,
-        )
+        new_registry = load_model_registry(storage=storage, strict=True, api_key=_console_registry_api_key())
     except ValueError as exc:
         # ModelRegistry.__init__ raises ValueError for several distinct
         # config issues — empty models, default/fallback/agent/task
@@ -13211,7 +13223,7 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         if getattr(app.state, "coord_mgr", None) is not None:
             return
         try:
-            coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
+            coord_registry = load_model_registry(storage=storage, api_key=_console_registry_api_key())
         except ValueError as exc:
             # Still no usable rows (e.g. all disabled).  Surface the
             # reason via the same channel the lifespan path uses so

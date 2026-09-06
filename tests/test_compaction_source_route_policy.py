@@ -72,6 +72,14 @@ _ROWS: dict[str, tuple[str, int]] = {
     "switchyard-smart-hermes": ("switchyard-smart-hermes", 524_288),
     "switchyard-smart-agentic-hermes": ("switchyard-smart-agentic-hermes", 524_288),
     "switchyard-smart-bounded-hermes": ("switchyard-smart-bounded-hermes", 266_000),
+    # Option-2 canonical (2026-09-06)
+    "switchyard-smart-openclaw-local": ("switchyard-smart-openclaw-local", 524_288),
+    "switchyard-smart-agentic-openclaw-local": ("switchyard-smart-agentic-openclaw-local", 524_288),
+    "switchyard-smart-bounded-openclaw-local": ("switchyard-smart-bounded-openclaw-local", 266_000),
+    "switchyard-smart-openclaw-remote": ("switchyard-smart-openclaw-remote", 524_288),
+    "switchyard-smart-agentic-openclaw-remote": ("switchyard-smart-agentic-openclaw-remote", 524_288),
+    "switchyard-smart-bounded-openclaw-remote": ("switchyard-smart-bounded-openclaw-remote", 266_000),
+    # legacy rows retained as source keys for historical sessions
     "switchyard-smart-openclaw": ("switchyard-smart-openclaw", 524_288),
     "switchyard-smart-agentic-openclaw": ("switchyard-smart-agentic-openclaw", 524_288),
     "switchyard-smart-bounded-openclaw": ("switchyard-smart-bounded-openclaw", 266_000),
@@ -168,16 +176,42 @@ class TestSmartLaneTierMapping:
         assert lane.alias == "switchyard-smart-agentic-hermes"
 
     def test_smart_openclaw_compacts_on_agentic(self):
+        # Legacy universal openclaw -> canonical agentic-openclaw-local (Option-2)
         reg = _registry()
         lane = _compaction_lane(reg, "switchyard-smart-openclaw")
         assert lane is not None
-        assert lane.alias == "switchyard-smart-agentic-openclaw"
+        assert lane.alias == "switchyard-smart-agentic-openclaw-local"
+
+    def test_smart_openclaw_local_compacts_on_agentic_local(self):
+        reg = _registry()
+        lane = _compaction_lane(reg, "switchyard-smart-openclaw-local")
+        assert lane is not None
+        assert lane.alias == "switchyard-smart-agentic-openclaw-local"
 
     def test_smart_remoteopenclaw_compacts_on_agentic(self):
+        # Legacy remoteopenclaw family -> canonical agentic-openclaw-remote (Option-2)
         reg = _registry()
         lane = _compaction_lane(reg, "switchyard-smart-remoteopenclaw")
         assert lane is not None
-        assert lane.alias == "switchyard-smart-agentic-remoteopenclaw"
+        assert lane.alias == "switchyard-smart-agentic-openclaw-remote"
+
+    def test_smart_openclaw_remote_compacts_on_agentic_remote(self):
+        reg = _registry()
+        lane = _compaction_lane(reg, "switchyard-smart-openclaw-remote")
+        assert lane is not None
+        assert lane.alias == "switchyard-smart-agentic-openclaw-remote"
+
+    def test_bounded_openclaw_local_compacts_on_itself(self):
+        reg = _registry()
+        lane = _compaction_lane(reg, "switchyard-smart-bounded-openclaw-local")
+        assert lane is not None
+        assert lane.alias == "switchyard-smart-bounded-openclaw-local"
+
+    def test_bounded_openclaw_remote_compacts_on_itself(self):
+        reg = _registry()
+        lane = _compaction_lane(reg, "switchyard-smart-bounded-openclaw-remote")
+        assert lane is not None
+        assert lane.alias == "switchyard-smart-bounded-openclaw-remote"
 
     def test_bounded_dsh_compacts_on_itself(self):
         reg = _registry()

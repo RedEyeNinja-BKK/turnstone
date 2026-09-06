@@ -3933,10 +3933,20 @@ class ChatSession:
         "switchyard-smart-hermes": "switchyard-smart-agentic-hermes",
         "switchyard-smart-agentic-hermes": "@self",
         "switchyard-smart-bounded-hermes": "@self",
-        "switchyard-smart-openclaw": "switchyard-smart-agentic-openclaw",
+        # Option-2 OC rename (2026-09-06): openclaw-local / openclaw-remote
+        # families are the canonical lanes.
+        "switchyard-smart-openclaw-local": "switchyard-smart-agentic-openclaw-local",
+        "switchyard-smart-agentic-openclaw-local": "@self",
+        "switchyard-smart-bounded-openclaw-local": "@self",
+        "switchyard-smart-openclaw-remote": "switchyard-smart-agentic-openclaw-remote",
+        "switchyard-smart-agentic-openclaw-remote": "@self",
+        "switchyard-smart-bounded-openclaw-remote": "@self",
+        # Retired legacy ids - source keys only, for historical sessions.
+        "switchyard-smart-openclaw": "switchyard-smart-agentic-openclaw-local",
+        "switchyard-smart-localai-remoteopenclaw": "switchyard-smart-agentic-openclaw-remote",
+        "switchyard-smart-remoteopenclaw": "switchyard-smart-agentic-openclaw-remote",
         "switchyard-smart-agentic-openclaw": "@self",
         "switchyard-smart-bounded-openclaw": "@self",
-        "switchyard-smart-remoteopenclaw": "switchyard-smart-agentic-remoteopenclaw",
         "switchyard-smart-agentic-remoteopenclaw": "@self",
         "switchyard-smart-bounded-remoteopenclaw": "@self",
         "switchyard-smart-dsh": "switchyard-smart-agentic-dsh",

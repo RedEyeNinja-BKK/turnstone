@@ -732,3 +732,46 @@ def project_history_messages(
                 break
 
     return history
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPORARY v1.8.4 TRANSITION COMPATIBILITY - post-cutover removal candidate.
+# Ported for the bootstrap only; not part of the durable LocalClaw delta.
+# ─────────────────────────────────────────────────────────────────────────────
+def ensure_round_reasoning_content_field(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Satisfy the strict-thinking replay contract for the CURRENT ROUND only.
+
+    Upstream's own replay attachment (:func:`attach_vllm_chat_reasoning_field`) is gated
+    to ``server_type == "vllm"``.  A strict-thinking OpenAI-compatible lane (DeepSeek)
+    rejects a request with HTTP 400 ("The `reasoning_content` in the thinking mode must
+    be passed back to the API") when any ``assistant`` message positioned AFTER the last
+    ``user`` message lacks the key.  The mid-turn compaction summary marker is written by
+    the NON-thinking compaction lane, so it can never carry ``reasoning_content``; an
+    assistant turn whose upstream reply carried no reasoning text has nothing to replay
+    either.
+
+    The repair stamps the key with the EMPTY STRING -- it invents no reasoning text, it
+    asserts only that this turn has nothing to hand back.  An existing non-empty value is
+    never overwritten; a key present with ``None`` is repaired, since ``None`` is not a
+    value the contract accepts.  Idempotent, producer-agnostic, pure transform (returns a
+    new list; the input is never mutated).  A request with no ``user`` message is
+    returned unchanged.
+
+    Removal condition: delete this function and its single call site once upstream
+    provides the current-round contract for non-vLLM reasoning-bearing lanes.
+    """
+    last_user = -1
+    for index, msg in enumerate(messages):
+        if msg.get("role") == "user":
+            last_user = index
+    if last_user < 0:
+        return messages
+    out = list(messages)
+    for index in range(last_user + 1, len(out)):
+        msg = out[index]
+        if msg.get("role") != "assistant":
+            continue
+        if "reasoning_content" not in msg or msg["reasoning_content"] is None:
+            out[index] = {**msg, "reasoning_content": ""}
+    return out

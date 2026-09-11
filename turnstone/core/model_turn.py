@@ -53,7 +53,10 @@ if TYPE_CHECKING:
 
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError
-from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+from turnstone.core.history_decoration import (
+    attach_vllm_chat_reasoning_field,
+    ensure_round_reasoning_content_field,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     restore_provider_tool_ids,
@@ -454,6 +457,14 @@ def maybe_attach_vllm_chat_reasoning(
     # Both gate fields read off the single ``cfg`` fetch (no second
     # ``get_config`` round-trip); the field path is owned by _server_type_of.
     if _server_type_of(cfg) != "vllm":
+        # TEMPORARY v1.8.4 TRANSITION COMPATIBILITY - post-cutover removal candidate.
+        # The replay attachment above is vLLM-only.  Strict-thinking OpenAI-compatible
+        # lanes reject a request when any assistant turn AFTER the last user turn lacks
+        # ``reasoning_content`` - the topology a mid-turn compaction marker produces, and
+        # a topology with no stored reasoning to replay.  Behind the same operator gate,
+        # satisfy the current-round contract.
+        if bool(getattr(cfg, "replay_reasoning_to_model", False)):
+            return ensure_round_reasoning_content_field(messages)
         return messages
     if not bool(getattr(cfg, "replay_reasoning_to_model", False)):
         return messages

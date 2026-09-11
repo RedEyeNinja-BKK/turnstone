@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.history_decoration import (
+    attach_openai_reasoning_content_field,
     attach_vllm_chat_reasoning_field,
     ensure_round_reasoning_content_field,
 )
@@ -457,15 +458,21 @@ def maybe_attach_vllm_chat_reasoning(
     # Both gate fields read off the single ``cfg`` fetch (no second
     # ``get_config`` round-trip); the field path is owned by _server_type_of.
     if _server_type_of(cfg) != "vllm":
-        # TEMPORARY v1.8.4 TRANSITION COMPATIBILITY - post-cutover removal candidate.
-        # The replay attachment above is vLLM-only.  Strict-thinking OpenAI-compatible
-        # lanes reject a request when any assistant turn AFTER the last user turn lacks
-        # ``reasoning_content`` - the topology a mid-turn compaction marker produces, and
-        # a topology with no stored reasoning to replay.  Behind the same operator gate,
-        # satisfy the current-round contract.
-        if bool(getattr(cfg, "replay_reasoning_to_model", False)):
-            return ensure_round_reasoning_content_field(messages)
-        return messages
+        # Non-vLLM OpenAI-compatible reasoning lane.  Two passes, in order, both behind the
+        # operator gate above:
+        #  1. replay the STORED reasoning payload onto every assistant turn that has one
+        #     (never regenerated/fabricated).  Without this pass `replay_reasoning_to_model`
+        #     is a no-op on these lanes -- the flag would change nothing on the wire.
+        #  2. make the CURRENT ROUND protocol-valid -- an assistant turn with no stored
+        #     reasoning at all (compaction summary marker; an upstream reply that carried
+        #     none) gets the key with an empty value, because the API validates every
+        #     assistant turn after the last user turn and 400s otherwise.  Pass 2 invents no
+        #     text; see ``ensure_round_reasoning_content_field``.
+        if not bool(getattr(cfg, "replay_reasoning_to_model", False)):
+            return messages
+        return ensure_round_reasoning_content_field(
+            attach_openai_reasoning_content_field(messages)
+        )
     if not bool(getattr(cfg, "replay_reasoning_to_model", False)):
         return messages
     return attach_vllm_chat_reasoning_field(messages)

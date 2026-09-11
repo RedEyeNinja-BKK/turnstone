@@ -419,6 +419,66 @@ def attach_vllm_chat_reasoning_field(
     return out
 
 
+def attach_openai_reasoning_content_field(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project persisted reasoning onto outgoing assistant messages as the
+    OpenAI-compatible ``reasoning_content`` field (DeepSeek thinking contract).
+
+    Companion to the vLLM helper above for OpenAI-compatible reasoning lanes.
+    The vLLM path writes the non-standard ``reasoning`` field and is reachable
+    only when ``server_type == "vllm"``; this one writes the field a strict
+    OpenAI-compatible reasoning API actually validates, and is reachable only on
+    the NON-vLLM branch.  Without it the operator's ``replay_reasoning_to_model``
+    flag changes nothing on those lanes: the current-round pass alone satisfies
+    the protocol but replays no stored reasoning material.
+
+    This helper replays the STORED provider reasoning payload
+    (``_provider_content`` reasoning blocks) -- it never regenerates,
+    summarizes, fabricates, or infers missing reasoning material.  It is
+    history-wide by design: upstream does not validate a pre-last-user
+    assistant turn, but a replayed value there is harmless and is what the
+    operator asked for by enabling the flag.
+
+    Target-scoping is the CALLER's contract (see
+    ``model_turn.maybe_attach_vllm_chat_reasoning``): the field is only attached
+    when the target model definition declares the replay contract
+    (``replay_reasoning_to_model``) and the lane is not vLLM.  No global
+    "historical message has reasoning_content => always send it" behavior is
+    introduced here -- an assistant turn lacking the provider replay material is
+    passed through unchanged, and this helper never invents text.
+
+    Pure transform: returns a new list with new dict copies for the assistant
+    messages that get a ``reasoning_content`` field attached.  Other messages
+    and assistant messages without reasoning text pass through by reference.
+    The original messages are never mutated.  Tool-call assistant messages keep
+    their ``tool_calls`` intact -- the field is added alongside the normal
+    assistant representation, never replacing it.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            out.append(msg)
+            continue
+        provider_content = msg.get("_provider_content")
+        if not provider_content:
+            out.append(msg)
+            continue
+        text = extract_reasoning_text_from_provider_content(provider_content)
+        if not text:
+            out.append(msg)
+            continue
+        # Same fence-defanging rationale as the vLLM helper: the persisted
+        # provider blocks stay byte-exact; only the derived, unsigned replay
+        # field is neutralized so a trusted marker echoed into captured
+        # reasoning cannot re-enter the next request as an exact operator or
+        # participant fence.
+        safe_text = fence.neutralize(text, fence.SYSTEM_REMINDER_TAG, opening=True)
+        safe_text = fence.neutralize(safe_text, fence.SENDER_LABEL_TAG, opening=True)
+        out.append({**msg, "reasoning_content": safe_text})
+    return out
+
+
 def decorate_history_messages(
     messages: list[dict[str, Any]],
     verdicts_by_call_id: dict[str, dict[str, Any]],

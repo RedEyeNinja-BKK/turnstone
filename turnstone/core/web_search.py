@@ -92,7 +92,13 @@ class SearXNGClient:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        return _format_searxng(resp.json(), query, max_results, reranker=kwargs.get("reranker"))
+        return _format_searxng(
+            resp.json(),
+            query,
+            max_results,
+            reranker=kwargs.get("reranker"),
+            rerank_pool=kwargs.get("rerank_pool"),
+        )
 
 
 class MCPSearchClient:
@@ -125,6 +131,7 @@ def _format_searxng(
     query: str,
     max_results: int = 5,
     reranker: Reranker | None = None,
+    rerank_pool: int | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -150,7 +157,7 @@ def _format_searxng(
     results = data.get("results") or []
     if results:
         if reranker is not None and len(results) > 1:
-            results = _rerank_results(query, results, reranker)
+            results = _rerank_results(query, results, reranker, rerank_pool)
         lines = []
         for i, r in enumerate(results[:max_results], 1):
             title = r.get("title", "")
@@ -175,7 +182,10 @@ def _format_searxng(
 
 
 def _rerank_results(
-    query: str, results: list[dict[str, Any]], reranker: Reranker
+    query: str,
+    results: list[dict[str, Any]],
+    reranker: Reranker,
+    rerank_pool: int | None = None,
 ) -> list[dict[str, Any]]:
     """Reorder SearxNG ``results`` by query relevance using ``reranker``.
 
@@ -184,8 +194,9 @@ def _rerank_results(
     error or if the reranker returns nothing usable — reranking must never make
     web_search fail or silently drop results.
     """
-    pool = results[:_RERANK_POOL]
-    tail = results[_RERANK_POOL:]
+    _pool_n = int(rerank_pool) if rerank_pool else _RERANK_POOL
+    pool = results[:_pool_n]
+    tail = results[_pool_n:]
     try:
         docs = [f"{r.get('title', '')}\n{r.get('content') or ''}".strip() for r in pool]
         # Materialize inside the try so a None / non-iterable / lazily-raising

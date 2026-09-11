@@ -380,6 +380,33 @@ def _build_registry() -> dict[str, SettingDef]:
             "provider (Cohere/Jina/Voyage) sends it off-box.",
         ),
         SettingDef(
+            "tools.rerank_candidate_pool",
+            "int",
+            50,
+            "Maximum candidates sent to the rerank endpoint per request",
+            "tools",
+            min_value=1,
+            max_value=1000,
+            help="How many retrieval candidates are sent to the configured rerank "
+            "endpoint in one request. The endpoint must accept this many documents; a "
+            "lower cap than the endpoint's limit silently degrades reranking to the "
+            "backing order, because a rejected batch is caught and ignored. Raise it "
+            "only up to what the endpoint actually accepts.",
+        ),
+        SettingDef(
+            "tools.rerank_timeout_cap_s",
+            "float",
+            15.0,
+            "Upper bound (seconds) on a single rerank call",
+            "tools",
+            min_value=1.0,
+            max_value=600.0,
+            help="Ceiling applied to the rerank HTTP call, independent of the general "
+            "tool timeout. Reranking a full candidate batch can take seconds; the cap "
+            "exists so a hung rerank endpoint cannot stall a turn. Set it above the "
+            "observed latency of a full batch at the configured candidate pool.",
+        ),
+        SettingDef(
             "tools.rerank_bm25_threshold",
             "float",
             0.0,

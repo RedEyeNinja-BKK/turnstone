@@ -106,6 +106,7 @@ class ToolSearchManager:
         max_results: int = 5,
         reranker: Reranker | None = None,
         status_provider: Callable[[], dict[str, dict[str, Any]]] | None = None,
+        rerank_pool: int | None = None,
     ) -> None:
         self._always_on: list[dict[str, Any]] = []
         self._deferred: list[dict[str, Any]] = []
@@ -131,7 +132,7 @@ class ToolSearchManager:
 
         # BM25 index over deferred tools
         texts = [_tool_text(t) for t in self._deferred]
-        self._index = BM25Index(texts, reranker=reranker)
+        self._index = BM25Index(texts, reranker=reranker, rerank_pool=rerank_pool)
 
         # Pre-compute server summary for the search tool description
         self._server_hint = _mcp_server_summary(self._deferred)

@@ -19,6 +19,9 @@ _SPLIT_RE = re.compile(r"[_\-./\s]+")
 # top-k the reranker reorders before the caller's ``k`` slice. Deliberately a
 # private copy (not shared from rerank.py) so this module stays import-light and
 # httpx-free; web_search.py defines the same cap independently — keep them in sync.
+# Default recall pool. The EFFECTIVE value is the ``tools.rerank_candidate_pool``
+# setting; this remains the fallback for callers that pass no explicit pool (tests,
+# embedders). Keep it equal to the registry default so the two cannot drift silently.
 _RERANK_POOL = 50
 
 
@@ -38,11 +41,14 @@ class BM25Index:
         b: float = 0.75,
         reranker: Reranker | None = None,
         rerank_filters: bool = False,
+        rerank_pool: int | None = None,
     ) -> None:
         self.k1 = k1
         self.b = b
         self._reranker = reranker
         self._rerank_filters = rerank_filters
+        # Explicit pool wins; otherwise the module default (upstream behaviour).
+        self._rerank_pool = int(rerank_pool) if rerank_pool else _RERANK_POOL
         self._docs = documents
         self._doc_tokens: list[list[str]] = [_tokenize(d) for d in documents]
         self._doc_lens = [len(t) for t in self._doc_tokens]
@@ -78,7 +84,7 @@ class BM25Index:
         ranked = self._bm25_rank(query)
         if self._reranker is None:
             return ranked[:k]  # no reranker: today's behavior, byte-for-byte
-        pool = ranked[:_RERANK_POOL]
+        pool = ranked[: self._rerank_pool]
         if not pool:
             return []
         docs = [self._docs[i] for i in pool]

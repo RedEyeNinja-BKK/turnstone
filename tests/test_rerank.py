@@ -530,6 +530,11 @@ class TestSessionBM25Reranker:
         )
         stub._check_cancelled = MethodType(ChatSession._check_cancelled, stub)
         stub._rerank_hits = MethodType(ChatSession._rerank_hits, stub)
+        # Wave 2: the timeout cap is now resolved from settings. This partial stub has no
+        # _config_store, so bind the real resolver too - otherwise the AttributeError would
+        # mask the GenerationCancelled path under test. Behaviour is unchanged: the resolver
+        # returns the registry default (15.0) when no store is present.
+        stub._rerank_timeout_cap_s = MethodType(ChatSession._rerank_timeout_cap_s, stub)
         rank = ChatSession._bm25_reranker(stub, origin_generation=1)
 
         with pytest.raises(GenerationCancelled):

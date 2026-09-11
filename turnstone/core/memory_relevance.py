@@ -29,6 +29,7 @@ def score_memories(
     k: int = 5,
     reranker: Reranker | None = None,
     rerank_filters: bool = False,
+    rerank_pool: int | None = None,
 ) -> list[dict[str, str]]:
     """Return the top-k memories most relevant to *query*.
 
@@ -41,6 +42,7 @@ def score_memories(
         return []
 
     documents = [f"{m.get('name', '')} {m.get('description', '')}" for m in memories]
-    index = BM25Index(documents, reranker=reranker, rerank_filters=rerank_filters)
+    index = BM25Index(documents, reranker=reranker, rerank_filters=rerank_filters,
+                      rerank_pool=rerank_pool)
     top_indices = index.search(query, k)
     return [memories[i] for i in top_indices]

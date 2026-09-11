@@ -3813,6 +3813,7 @@ class ChatSession:
                 max_results=tool_search_max_results,
                 reranker=self._bm25_reranker(),
                 status_provider=self._mcp_status_snapshot,
+                rerank_pool=self._rerank_candidate_pool(),
             )
         # Converge with any MCP catalog change that fired during
         # construction: a listener callback landing between the
@@ -4146,7 +4147,9 @@ class ChatSession:
                 lane,
                 query,
                 documents,
-                timeout=min(float(getattr(self, "tool_timeout", 30.0)), _RERANK_TIMEOUT_CAP_S),
+                timeout=min(
+                    float(getattr(self, "tool_timeout", 30.0)), self._rerank_timeout_cap_s()
+                ),
                 cancel_ref=cancel_ref,
             )
         except DeadlineCancelledError:
@@ -4263,6 +4266,39 @@ class ChatSession:
             return float(cs.get("tools.rerank_bm25_threshold") or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    def _rerank_candidate_pool(self) -> int:
+        """Effective rerank candidate pool (``tools.rerank_candidate_pool``).
+
+        The endpoint must accept this many documents; a rejected batch is caught by
+        the retrieval fallbacks and silently degrades reranking to the backing order,
+        so this value must not exceed the endpoint's actual limit.
+        """
+        from turnstone.core.settings_registry import SETTINGS
+
+        default = int(SETTINGS["tools.rerank_candidate_pool"].default)
+        cs = getattr(self, "_config_store", None)
+        if cs is None:
+            return default
+        try:
+            value = int(cs.get("tools.rerank_candidate_pool"))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _rerank_timeout_cap_s(self) -> float:
+        """Effective rerank call cap (``tools.rerank_timeout_cap_s``)."""
+        from turnstone.core.settings_registry import SETTINGS
+
+        default = float(SETTINGS["tools.rerank_timeout_cap_s"].default)
+        cs = getattr(self, "_config_store", None)
+        if cs is None:
+            return default
+        try:
+            value = float(cs.get("tools.rerank_timeout_cap_s"))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
 
     def _get_capabilities(self) -> ModelCapabilities:
         """Capabilities from the current coherent primary lane."""
@@ -20465,6 +20501,7 @@ class ChatSession:
                     else None
                 ),
                 rerank_filters=threshold > 0,
+                rerank_pool=self._rerank_candidate_pool(),
             )
         except Exception:
             log.warning("memory.pointer_planning_failed", exc_info=True)
@@ -22297,7 +22334,8 @@ class ChatSession:
                 )
                 for r in rows
             ]
-            index = BM25Index(corpus, reranker=self._bm25_reranker())
+            index = BM25Index(corpus, reranker=self._bm25_reranker(),
+                              rerank_pool=self._rerank_candidate_pool())
             top = index.search(query, k=min(len(rows), 50))
             rows = [rows[i] for i in top]
         skills = [self._skills_project_row(r) for r in rows]
@@ -28028,6 +28066,7 @@ class ChatSession:
                 max_results=max_results,
                 category=category,
                 reranker=self._web_search_reranker(),
+                rerank_pool=self._rerank_candidate_pool(),
             )
         except Exception as e:
             msg = f"Error: web search failed: {e}"

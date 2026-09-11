@@ -313,6 +313,66 @@ def provider_extra_params(
     return extra or None
 
 
+# Providers whose SDK entry point accepts a per-request ``extra_headers`` dict.
+#
+# Verified empirically against the DEPLOYED factory (2026-09-11): every provider
+# name ``create_provider`` accepts (``openai``, ``openai-compatible``, ``xai``,
+# ``anthropic``, ``anthropic-compatible``, ``google``) reports that name as its
+# ``provider_name`` AND exposes ``extra_headers`` on ``create_streaming`` -- xAI
+# and google inherit it from their OpenAI-shaped bases, and the Anthropic SDK
+# takes it natively.  Note this is WIDER than EXTRA_BODY_PROVIDERS, which is a
+# deliberate exclusion for xai/google/anthropic: that tuple answers "does this
+# lane take operator *body* pins", whereas this one answers "does this entry
+# point accept *headers*".  Headers are meaningful on every one of the six:
+# four are driven by the OpenAI SDK (whose default ``User-Agent:
+# OpenAI/Python <version>`` is exactly the header a WAF tends to reject) and the
+# two Anthropic lanes take the dict through their own SDK.
+#
+# The tuple still GATES: an unrecognised provider name resolves to ``None``
+# rather than being handed an argument its signature may not accept.
+EXTRA_HEADERS_PROVIDERS: tuple[str, ...] = (
+    "openai",
+    "openai-compatible",
+    "xai",
+    "anthropic",
+    "anthropic-compatible",
+    "google",
+)
+
+
+def provider_extra_headers(
+    provider: LLMProvider,
+    registry: ModelRegistry | None,
+    alias: str,
+    *,
+    cfg: Any | EllipsisType = ...,
+) -> dict[str, str] | None:
+    """Operator ``server_compat["extra_headers"]`` pins for the OpenAI-shaped
+    lanes (and the anthropic-compatible lane).
+
+    The twin of :func:`provider_extra_params`, and deliberately separate from
+    it: ``extra_body`` shapes the request BODY, ``extra_headers`` shapes the
+    request HEADERS.  Some upstreams sit behind a WAF that rejects the vendor
+    SDK's identifying ``User-Agent`` before authentication, and overriding the
+    header is the only fix that does not mean abandoning the SDK client.
+
+    *cfg* accepts a pre-fetched ModelConfig (see :func:`resolve_lane`) so both
+    facets of one call read ONE registry snapshot.  Header values are treated
+    as secrets: they are never logged here or by the provider layer.
+    """
+    from turnstone.core.server_compat import merge_server_compat_headers
+
+    if provider.provider_name not in EXTRA_HEADERS_PROVIDERS:
+        return None
+    if cfg is ...:
+        cfg = _get_config_or_none(registry, alias)
+    server_compat = getattr(cfg, "server_compat", None) if cfg is not None else None
+    headers = merge_server_compat_headers(
+        server_compat if isinstance(server_compat, dict) else None
+    )
+    return headers or None
+
+
 def _server_type_of(cfg: Any) -> str:
     """``server_compat.server_type`` off a fetched ModelConfig (``""`` on miss).
 
@@ -518,6 +578,10 @@ class ModelLane:
     alias: str = ""
     capabilities: ModelCapabilities | None = None
     extra_params: dict[str, Any] | None = None
+    # Per-request HTTP headers (``server_compat["extra_headers"]``).  Kept off
+    # ``extra_params`` because the two ride different SDK channels; values may
+    # be secrets, so this field must never be projected into diagnostics.
+    extra_headers: dict[str, str] | None = None
     registry: ModelRegistry | None = None
     # Registry snapshot paired atomically with alias/client/model/config by
     # ``resolve_model_binding``.  Zero is the explicit non-registry value.
@@ -728,6 +792,7 @@ def resolve_lane(
     registry_generation: int = 0,
     capabilities: ModelCapabilities | None = None,
     extra_params: dict[str, Any] | None | EllipsisType = ...,
+    extra_headers: dict[str, str] | None | EllipsisType = ...,
     cfg: ModelConfig | None | EllipsisType = ...,
     config_store: Any | None = None,
     backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
@@ -735,11 +800,12 @@ def resolve_lane(
 ) -> ModelLane:
     """Build a :class:`ModelLane`, resolving what the caller didn't supply.
 
-    *capabilities* / *extra_params* accept pre-resolved values so callers
-    that already ran the resolution (the session's cached primary caps, an
-    agent run's per-alias resolution) don't pay for or drift from a second
-    pass.  ``...`` (the sentinel default) means "resolve for me" —
-    ``None`` is a valid resolved value for *extra_params*.
+    *capabilities* / *extra_params* / *extra_headers* accept pre-resolved
+    values so callers that already ran the resolution (the session's cached
+    primary caps, an agent run's per-alias resolution) don't pay for or drift
+    from a second pass.  ``...`` (the sentinel default) means "resolve for
+    me" — ``None`` is a valid resolved value for *extra_params* and
+    *extra_headers*.
 
     The lane sampling knobs resolve through the shared operator rungs
     (:func:`resolve_temperature_setting` / :func:`resolve_effort_setting`
@@ -764,6 +830,11 @@ def resolve_lane(
         if extra_params is ...
         else extra_params
     )
+    headers = (
+        provider_extra_headers(provider, registry, alias, cfg=resolved_cfg)
+        if extra_headers is ...
+        else extra_headers
+    )
     if admission is None and registry is not None and alias:
         # Direct registry-backed lane rebuilds (notably judge sampling lanes)
         # still join the alias's stable gate.  Duck-typed test registries may
@@ -781,6 +852,7 @@ def resolve_lane(
         alias=alias,
         capabilities=caps,
         extra_params=extra,
+        extra_headers=headers,
         registry=registry,
         registry_generation=registry_generation,
         temperature=resolve_temperature_setting(resolved_cfg, config_store),
@@ -1459,6 +1531,15 @@ def model_turn(
             # ``create_streaming`` stays OUTSIDE the drain-error catch: every
             # adapter issues eagerly in its body, so a request-time failure has
             # already received the SDK's own retries and propagates unchanged.
+            # ``extra_headers`` is passed ONLY when an operator actually
+            # configured headers for this lane.  Every other lane keeps the
+            # exact call shape it had before this feature existed — including
+            # the backend-auth lanes, whose "dynamic credentials ride
+            # ``with_options``, never an override header" property is pinned by
+            # test_backend_auth_token_binds_sdk_credential_once.
+            header_kwargs = (
+                {"extra_headers": lane.extra_headers} if lane.extra_headers else {}
+            )
             chunks = lane.provider.create_streaming(
                 client=call_client,
                 model=lane.model,
@@ -1478,6 +1559,7 @@ def model_turn(
                 # translators retain their no-op fallback for direct callers.
                 resolve_attachments=None,
                 request_metrics_ref=request_metrics,
+                **header_kwargs,
             )
             try:
                 result = drain_stream(

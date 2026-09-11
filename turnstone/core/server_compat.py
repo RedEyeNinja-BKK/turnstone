@@ -29,7 +29,12 @@ actually gets used at request time.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
+
+import structlog
+
+log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Profile suggestions
@@ -236,3 +241,89 @@ def merge_server_compat(
             extra[key] = value
 
     return extra
+
+
+# ---------------------------------------------------------------------------
+# Request headers
+# ---------------------------------------------------------------------------
+
+# RFC 7230 ``tchar`` — the only characters legal in a header FIELD NAME.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+# Control characters (C0 plus DEL) are rejected in header values: those are the
+# characters that let a stored value forge a second header, split the request,
+# or confuse an intermediary.  Obsolete line folding is not worth supporting.
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def merge_server_compat_headers(server_compat: dict[str, Any] | None) -> dict[str, str]:
+    """Extract operator ``server_compat["extra_headers"]`` request headers.
+
+    Some upstreams sit behind a gateway/WAF that rejects the vendor SDK's own
+    identifying headers -- most sharply the OpenAI Python SDK's
+    ``User-Agent: OpenAI/Python <version>``, which some WAFs answer with a hard
+    403 before authentication ever runs.  A per-lane way to override those
+    headers is the only fix that does not require bypassing the SDK's client
+    (and with it timeout/retry/streaming behaviour).
+
+    Headers are a *request-shaping* property of the ENDPOINT, exactly like
+    ``extra_body``, so they live under the same ``server_compat`` namespace:
+
+        "server_compat": {
+            "server_type": "openai-compatible",
+            "extra_headers": {"User-Agent": "my-client/1.0"},
+        }
+
+    Returns the accepted ``{name: value}`` mapping, or ``{}`` when the key is
+    absent, is not a mapping, or yields nothing valid.  **Values are treated as
+    secrets and are never logged** -- an invalid entry is reported by NAME
+    only.  Invalid entries are dropped individually (a malformed header must
+    never take a lane down), and each drop is logged loudly rather than
+    silently, so a typo cannot hide.
+
+    Operator values WIN over provider-generated headers of the same name -- that
+    is the point of the feature (overriding the SDK's identifying headers).  A
+    provider may still merge where it has a reason to rather than clobber (the
+    Anthropic lane joins ``anthropic-beta`` case-insensitively instead of
+    dropping it).  If a future provider introduces a security- or feature-bearing
+    generated header, document the precedence there.
+
+    Profiles stay *suggestions*: this only reports what the operator stored.
+    """
+    if not isinstance(server_compat, dict):
+        return {}
+    raw = server_compat.get("extra_headers")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        log.warning(
+            "server_compat.extra_headers.ignored",
+            reason="not_a_mapping",
+            stored_type=type(raw).__name__,
+        )
+        return {}
+
+    headers: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not _HEADER_NAME_RE.match(name):
+            log.warning(
+                "server_compat.extra_headers.dropped",
+                reason="invalid_name",
+                name=name if isinstance(name, str) else type(name).__name__,
+            )
+            continue
+        if not isinstance(value, str):
+            log.warning(
+                "server_compat.extra_headers.dropped", reason="non_string_value", name=name
+            )
+            continue
+        if _has_control_chars(value):
+            log.warning(
+                "server_compat.extra_headers.dropped", reason="control_character", name=name
+            )
+            continue
+        headers[name] = value
+    return headers

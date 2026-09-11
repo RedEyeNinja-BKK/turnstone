@@ -419,6 +419,126 @@ def attach_vllm_chat_reasoning_field(
     return out
 
 
+def attach_openai_reasoning_content_field(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project persisted reasoning onto outgoing assistant messages as the
+    OpenAI-compatible ``reasoning_content`` field (DeepSeek thinking contract).
+
+    DeepSeek's Chat-Completions API REQUIRES that an assistant turn which was
+    produced in thinking mode carries its ``reasoning_content`` back on the
+    next request; omitting it returns HTTP 400 ("The `reasoning_content` in
+    the thinking mode must be passed back to the API").  This helper replays
+    the STORED provider reasoning payload (``_provider_content`` reasoning
+    blocks) — it never regenerates, summarizes, fabricates, or infers missing
+    reasoning material.
+
+    Target-scoping is the CALLER's contract (see
+    ``model_turn.maybe_attach_openai_reasoning_content``): the field is only
+    attached when the target model definition explicitly declares the replay
+    contract (``replay_reasoning_to_model``) AND the target capabilities
+    declare ``supports_reasoning_replay``.  No global "historical message has
+    reasoning_content ⇒ always send it" behavior is introduced here — a
+    historical assistant turn that lacks the required provider replay material
+    is passed through unchanged (the caller/upstream decide the disposition;
+    this helper never invents text).
+
+    Pure transform: returns a new list with new dict copies for the
+    assistant messages that get a ``reasoning_content`` field attached.  Other
+    messages and assistant messages without reasoning text pass through by
+    reference.  The original messages are never mutated.  Tool-call assistant
+    messages keep their ``tool_calls`` intact — the field is added alongside
+    the normal assistant representation, never replacing it.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            out.append(msg)
+            continue
+        provider_content = msg.get("_provider_content")
+        if not provider_content:
+            out.append(msg)
+            continue
+        text = extract_reasoning_text_from_provider_content(provider_content)
+        if not text:
+            out.append(msg)
+            continue
+        # Same fence-defanging rationale as the vLLM helper: the persisted
+        # provider blocks stay byte-exact; only the derived, unsigned replay
+        # field is neutralized so a trusted marker echoed into captured
+        # reasoning cannot re-enter the next request as an exact operator or
+        # participant fence.
+        safe_text = fence.neutralize(text, fence.SYSTEM_REMINDER_TAG, opening=True)
+        safe_text = fence.neutralize(safe_text, fence.SENDER_LABEL_TAG, opening=True)
+        out.append({**msg, "reasoning_content": safe_text})
+    return out
+
+
+def ensure_round_reasoning_content_field(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Satisfy the DeepSeek thinking contract for the CURRENT ROUND only.
+
+    Measured upstream contract (2026-09-11, shape matrix over the production
+    lane): with the DeepSeek thinking lane in use, the API rejects a request
+    with HTTP 400 ("The `reasoning_content` in the thinking mode must be
+    passed back to the API") when any ``assistant`` message positioned AFTER
+    the last ``user`` message lacks the ``reasoning_content`` key.  Assistant
+    turns that sit before the last ``user`` message are not validated, so a
+    replayed reasoning-less turn is harmless there.
+
+    That asymmetry is why this is a separate pass from
+    :func:`attach_openai_reasoning_content_field`, which only ever replays
+    *stored* reasoning and is correctly history-wide: the turns this pass
+    targets have no stored reasoning to replay at all.  Two real producers:
+
+    * the compaction summary marker -- the summary is written by the
+      dedicated NON-thinking compaction lane, so it can never carry
+      ``reasoning_content``; a mid-turn compaction leaves it inside the
+      current round (the synthetic ``[Conversation summary]`` user label is
+      then the last user turn) and the very next send 400s.  This is the
+      recorded production failure that killed the stream three times on
+      2026-09-11;
+    * an assistant turn whose upstream reply carried no reasoning text (and
+      no client tool-call block) -- ``model_turn`` correctly persists
+      ``native=None`` for it, since there is nothing to store.
+
+    The repair stamps the key with the EMPTY STRING.  It invents no reasoning
+    text -- it asserts only that this turn has no reasoning to hand back,
+    which is exactly true for both producers above.  An existing NON-EMPTY
+    value is never overwritten; a key present with value ``None`` IS repaired,
+    because ``None`` is not a value the upstream contract accepts (and the
+    measured matrix only ever proved the empty string).
+
+    The producer list above is the *observed* one, not a closed set: the pass
+    is deliberately producer-agnostic (any ``assistant`` mapping lacking a
+    usable value), so a new producer cannot reintroduce the 400 by being
+    forgotten here.
+
+    A request with no ``user`` message is returned unchanged -- a defensive
+    no-op, because no round boundary is detectable.  This helper does not
+    enforce the wire contract's leading-user-turn rule; it declines to guess
+    without one.
+
+    Pure transform: returns a new list; messages that need no field pass
+    through by reference and the input is never mutated.
+    """
+    last_user = -1
+    for index, msg in enumerate(messages):
+        if msg.get("role") == "user":
+            last_user = index
+    if last_user < 0:
+        return messages
+    out = list(messages)
+    for index in range(last_user + 1, len(out)):
+        msg = out[index]
+        if msg.get("role") != "assistant":
+            continue
+        if "reasoning_content" not in msg or msg["reasoning_content"] is None:
+            out[index] = {**msg, "reasoning_content": ""}
+    return out
+
+
 def decorate_history_messages(
     messages: list[dict[str, Any]],
     verdicts_by_call_id: dict[str, dict[str, Any]],

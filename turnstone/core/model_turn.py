@@ -53,7 +53,11 @@ if TYPE_CHECKING:
 
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError
-from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
+from turnstone.core.history_decoration import (
+    attach_openai_reasoning_content_field,
+    attach_vllm_chat_reasoning_field,
+    ensure_round_reasoning_content_field,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     restore_provider_tool_ids,
@@ -458,6 +462,112 @@ def maybe_attach_vllm_chat_reasoning(
     if not bool(getattr(cfg, "replay_reasoning_to_model", False)):
         return messages
     return attach_vllm_chat_reasoning_field(messages)
+
+
+def maybe_attach_openai_reasoning_content(
+    messages: list[dict[str, Any]],
+    provider: LLMProvider,
+    registry: ModelRegistry | None,
+    alias: str,
+    *,
+    cfg: Any | EllipsisType = ...,
+    caps: ModelCapabilities | None = None,
+) -> list[dict[str, Any]]:
+    """Phase 5b of reasoning persistence: replay stored provider reasoning as
+    the OpenAI-compatible ``reasoning_content`` field on outgoing assistant
+    messages when the TARGET contract requires it (DeepSeek thinking).
+
+    DeepSeek's Chat-Completions API requires an assistant turn that was
+    produced in thinking mode to carry its ``reasoning_content`` back on the
+    next request; omitting it 400s upstream.  This is the provider replay
+    contract fix (incident 2026-08-23): it is strictly capability/definition
+    scoped — the field is attached ONLY when ALL gates pass:
+
+    1. Chat-Completions provider (Responses and Anthropic have their own
+       native replay paths);
+    2. the target model definition explicitly requires reasoning replay
+       (``replay_reasoning_to_model``);
+    3. the target capabilities declare ``supports_reasoning_replay`` (set on
+       the DeepSeek thinking definitions — OpenAI Chat Completions in general
+       is NOT replay-capable, so Luna/NT/other openai-compatible targets
+       without the declaration never receive the field);
+    4. the server is NOT vLLM — vLLM uses the non-standard ``reasoning``
+       field handled by :func:`maybe_attach_vllm_chat_reasoning`, and
+       sending both fields would be redundant.
+
+    *caps* is the target's RESOLVED capabilities (``ModelCapabilities`` after
+    operator overrides — the same object ``resolve_replay_reasoning_to_model``
+    reads, so both gates stay aligned on one shape).  When the caller omits it
+    the capabilities are resolved from the provider static table merged with
+    the operator-declared ``cfg.capabilities`` overrides.  The gate reads the
+    capability through :func:`capability_flag` which tolerates both the
+    ``ModelCapabilities`` attribute shape and a raw dict shape, so a
+    hand-built config cannot crash the wire path.
+
+    The replayed value is the STORED provider reasoning payload only — never
+    regenerated, summarized, fabricated, or inferred.  A historical assistant
+    turn lacking the material is passed through unchanged by pass 1 (no
+    invented text).  Pass 2 (``ensure_round_reasoning_content_field``) then
+    stamps the KEY with an empty value on assistant turns in the CURRENT ROUND
+    that have no stored reasoning at all — required because the API validates
+    every assistant turn after the last user turn; it supplies no reasoning
+    text, only the presence the contract demands.
+
+    Returns *messages* unchanged when any gate fails.
+    """
+    from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+    if not isinstance(provider, OpenAIChatCompletionsProvider):
+        return messages
+    if cfg is ...:
+        cfg = _get_config_or_none(registry, alias)
+    if cfg is None:
+        return messages
+    if not bool(getattr(cfg, "replay_reasoning_to_model", False)):
+        return messages
+    if caps is None:
+        caps = resolve_capabilities(
+            provider,
+            getattr(cfg, "model", "") or "",
+            alias,
+            registry,
+            cfg=cfg,
+        )
+    if not capability_flag(caps, "supports_reasoning_replay"):
+        return messages
+    if _server_type_of(cfg) == "vllm":
+        return messages
+    # Two passes, in order and both gated above:
+    #  1. replay the STORED reasoning payload (never regenerated/fabricated);
+    #  2. make the CURRENT ROUND contract-valid — a turn with no stored
+    #     reasoning at all (compaction summary marker; an upstream reply that
+    #     carried none) gets the key with an empty value, because the API
+    #     validates every assistant turn after the last user turn and 400s
+    #     otherwise.  Pass 2 invents no text; see
+    #     ``ensure_round_reasoning_content_field``.
+    return ensure_round_reasoning_content_field(
+        attach_openai_reasoning_content_field(messages)
+    )
+
+
+def capability_flag(
+    caps: ModelCapabilities | dict[str, Any] | None,
+    name: str,
+) -> bool:
+    """Read a boolean capability flag from either the resolved
+    ``ModelCapabilities`` object or a raw capability dict.
+
+    The production registry carries ``ModelConfig.capabilities`` as a dict
+    (the operator-declared JSON) and the resolved lane carries
+    ``ModelCapabilities`` (static table merged with that dict).  Both shapes
+    must be readable without raising so the replay gate cannot crash the wire
+    path on a hand-built or registry-miss config.
+    """
+    if caps is None:
+        return False
+    if isinstance(caps, dict):
+        return bool(caps.get(name))
+    return bool(getattr(caps, name, False))
 
 
 @dataclass(frozen=True)

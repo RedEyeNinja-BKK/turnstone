@@ -411,19 +411,38 @@ def _raise_if_aborted(cancel_ref: Any) -> None:
         raise DeadlineCancelledError("rerank cancelled")
 
 
+_ERROR_CODE_MAX_BODY_BYTES = 8192
+_ERROR_CODE_MAX_CHARS = 128
+
+
 def _response_error_code(response: Any) -> str | None:
     """Switchyard/executor error ``code`` when the failure carries one, else None.
 
-    Reads only the enum-like ``code`` field; never logs response bodies.
+    Accepts either a top-level ``code`` or the nested ``error.code`` shape that
+    Switchyard actually returns. The parsed body is bounded before it is read
+    and only the enum-like ``code`` string is returned; response bodies and
+    messages are never logged.
     """
     if response is None:
         return None
     try:
+        content = getattr(response, "content", None)
+        if not isinstance(content, (bytes, bytearray)):
+            return None
+        if len(content) > _ERROR_CODE_MAX_BODY_BYTES:
+            return None
         payload = response.json()
     except Exception:
         return None
-    code = payload.get("code") if isinstance(payload, dict) else None
-    return str(code) if isinstance(code, str) else None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if not isinstance(code, str):
+        nested = payload.get("error")
+        code = nested.get("code") if isinstance(nested, dict) else None
+    if not isinstance(code, str):
+        return None
+    return code[:_ERROR_CODE_MAX_CHARS]
 
 
 def _log_dispatched_failure(

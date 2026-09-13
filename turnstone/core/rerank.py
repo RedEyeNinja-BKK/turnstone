@@ -411,6 +411,63 @@ def _raise_if_aborted(cancel_ref: Any) -> None:
         raise DeadlineCancelledError("rerank cancelled")
 
 
+def _response_error_code(response: Any) -> str | None:
+    """Switchyard/executor error ``code`` when the failure carries one, else None.
+
+    Reads only the enum-like ``code`` field; never logs response bodies.
+    """
+    if response is None:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    code = payload.get("code") if isinstance(payload, dict) else None
+    return str(code) if isinstance(code, str) else None
+
+
+def _log_dispatched_failure(
+    lane: RerankLane,
+    exc: BaseException,
+    total_started: float,
+    dispatch_started: float | None,
+    timeout: float,
+    documents: list[str],
+    query: str,
+) -> None:
+    """Record one payload-free failure record for a dispatched rerank attempt.
+
+    ``call_elapsed_ms`` measures the executor call itself (set immediately
+    before the HTTP dispatch), so upstream/client timeouts are distinguishable
+    from admission, lease or circuit waiting; ``total_elapsed_ms`` measures the
+    whole operation from entry. Deliberately excludes query/document content,
+    response bodies, credentials and headers: only identifiers, an error code
+    enum, lengths and durations are recorded. Emitted immediately before the
+    corresponding ``circuit_fail()`` so the breaker increment is explainable.
+    """
+    response = getattr(exc, "response", None)
+    client = getattr(getattr(lane, "runtime", None), "client", None)
+    now = time.monotonic()
+    log.warning(
+        "rerank.call_failed alias=%s model=%s host=%s exception_class=%s "
+        "http_status=%s error_code=%s call_elapsed_ms=%.1f total_elapsed_ms=%.1f "
+        "timeout_s=%s candidates=%d doc_bytes_total=%d doc_bytes_max=%d query_chars=%d",
+        getattr(lane, "alias", ""),
+        getattr(lane, "model", ""),
+        getattr(client, "endpoint_host", None),
+        type(exc).__name__,
+        getattr(response, "status_code", None),
+        _response_error_code(response),
+        (now - dispatch_started) * 1000.0 if dispatch_started is not None else -1.0,
+        (now - total_started) * 1000.0,
+        timeout,
+        len(documents),
+        sum(len(d) for d in documents),
+        max((len(d) for d in documents), default=0),
+        len(query),
+    )
+
+
 def rerank(
     lane: RerankLane,
     query: str,
@@ -424,6 +481,8 @@ def rerank(
     if not documents:
         return []
     _raise_if_aborted(cancel_ref)
+    total_started = time.monotonic()
+    dispatch_started: float | None = None
     permit = lane.runtime.circuit_acquire()
     admission: AdmissionLease | None = None
     runtime_lease: _RerankRuntimeLease | None = None
@@ -441,6 +500,7 @@ def rerank(
             with contextlib.suppress(Exception):
                 mark_dispatch()
         dispatched = True
+        dispatch_started = time.monotonic()
         hits = lane.runtime.client.rerank(
             query,
             documents,
@@ -453,7 +513,7 @@ def rerank(
     except (DeadlineCancelledError, RerankCircuitOpenError, RerankRuntimeRetiredError):
         lane.runtime.circuit_abandon(permit)
         raise
-    except Exception:
+    except Exception as exc:
         try:
             # Stop/supersession owns the outcome even when the dispatched
             # transport fails while cancellation is landing. Do not charge a
@@ -464,6 +524,9 @@ def rerank(
             lane.runtime.circuit_abandon(permit)
             raise
         if dispatched:
+            _log_dispatched_failure(
+                lane, exc, total_started, dispatch_started, timeout, documents, query
+            )
             lane.runtime.circuit_fail(permit)
         else:
             # Admission and lifecycle failures say nothing about endpoint
@@ -508,6 +571,11 @@ class CohereJinaRerankClient:
         self._client = httpx.Client()
         self._close_lock = threading.Lock()
         self._closed = False
+
+    @property
+    def endpoint_host(self) -> str:
+        """Host of the configured rerank endpoint (never the full URL)."""
+        return httpx.URL(self._url).host
 
     def rerank(
         self,

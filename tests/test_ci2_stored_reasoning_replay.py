@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from turnstone.core.history_decoration import (
+    _ROUND_REASONING_PLACEHOLDER,
     attach_openai_reasoning_content_field,
     ensure_round_reasoning_content_field,
     extract_reasoning_text_from_provider_content,
@@ -226,14 +227,14 @@ class TestABMatrix:
     def test_stored_reasoning_post_last_user(self):
         msgs = [U(), A("a", pc=pc_openai_chat(SENTINEL_POST))]
         current, full = self._ab(msgs)
-        assert current[1]["reasoning_content"] == ""           # current: empty stamp
+        assert current[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER           # current: empty stamp
         assert full[1]["reasoning_content"] == SENTINEL_POST   # full: replayed
 
     def test_no_stored_reasoning_post_last_user(self):
         msgs = [U(), marker()]
         current, full = self._ab(msgs)
-        assert current[1]["reasoning_content"] == ""
-        assert full[1]["reasoning_content"] == ""              # CI-1 still supplies ""
+        assert current[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+        assert full[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER              # CI-1 still supplies ""
 
     def test_existing_reasoning_content_preserved_when_no_stored_material(self):
         msgs = [U(), A("a", rc="EXPLICIT")]
@@ -250,14 +251,14 @@ class TestABMatrix:
     def test_malformed_provider_data_is_safe(self, bad):
         msgs = [U(), A("a", pc=bad)]
         current, full = self._ab(msgs)
-        assert current[1]["reasoning_content"] == ""
-        assert full[1]["reasoning_content"] == ""
+        assert current[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+        assert full[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_no_provider_data_is_safe(self):
         msgs = [U(), A("a")]
         current, full = self._ab(msgs)
-        assert current[1]["reasoning_content"] == ""
-        assert full[1]["reasoning_content"] == ""
+        assert current[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+        assert full[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_replay_flag_false_is_untouched(self):
         msgs = [U(), A("a", pc=pc_openai_chat(SENTINEL_POST))]
@@ -312,19 +313,19 @@ class TestCI1NonRegression:
         out = compose_direct(msgs)
         assert "reasoning_content" not in out[1]
 
-    def test_marker_inside_round_still_gets_empty(self):
+    def test_marker_inside_round_still_gets_non_empty_placeholder(self):
         out = compose_direct([U(), marker()])
-        assert out[1]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_composition_never_invents_for_marker(self):
         out = compose_direct([U(), marker()])
-        assert out[1]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_replay_and_stamp_coexist_in_one_round(self):
         msgs = [U(), A("a1", pc=pc_openai_chat(SENTINEL_POST)), marker()]
         out = compose_direct(msgs)
         assert out[1]["reasoning_content"] == SENTINEL_POST   # replayed
-        assert out[2]["reasoning_content"] == ""              # stamped
+        assert out[2]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER              # stamped
 
     def test_tool_boundary_shape_replays_and_stamps(self):
         msgs = [
@@ -354,4 +355,4 @@ class TestPassOrdering:
         assert forward[1]["reasoning_content"] == SENTINEL_POST
         # and a turn with nothing stored still ends with the empty stamp
         msgs2 = [U(), A("b")]
-        assert compose_direct(msgs2)[1]["reasoning_content"] == ""
+        assert compose_direct(msgs2)[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER

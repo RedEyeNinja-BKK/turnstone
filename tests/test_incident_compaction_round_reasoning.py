@@ -36,6 +36,7 @@ from types import SimpleNamespace
 import pytest
 
 from turnstone.core.history_decoration import (
+    _ROUND_REASONING_PLACEHOLDER,
     attach_openai_reasoning_content_field,
     ensure_round_reasoning_content_field,
 )
@@ -97,12 +98,12 @@ U = {"role": "user", "content": "go"}
 
 
 class TestMidTurnCompactionResume:
-    def test_marker_inside_current_round_gets_empty_key(self):
+    def test_marker_inside_current_round_gets_non_empty_placeholder(self):
         """The exact 400 body: marker after the last user, tool result trailing."""
         msgs = [U, _marker(), _tool_call_assistant("c1", reasoning="stored chain"),
                 _tool_result("c1")]
         out = _replay(msgs)
-        assert out[1]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
         # The stored-reasoning turn keeps its real payload, not the empty stamp.
         assert out[2]["reasoning_content"] == "stored chain"
         # No content or tool_calls were disturbed.
@@ -116,11 +117,11 @@ class TestMidTurnCompactionResume:
         out = _replay(msgs)
         assert "reasoning_content" not in out[1]
 
-    def test_reasoning_less_tool_call_turn_in_round_gets_empty_key(self):
+    def test_reasoning_less_tool_call_turn_in_round_gets_non_empty_placeholder(self):
         """A turn whose upstream reply carried no reasoning (native=None)."""
         msgs = [U, _tool_call_assistant("c1"), _tool_result("c1")]
         out = _replay(msgs)
-        assert out[1]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_second_round_repair(self):
         msgs = [U, _tool_call_assistant("c1", reasoning="r"), _tool_result("c1"),
@@ -128,7 +129,7 @@ class TestMidTurnCompactionResume:
                 _tool_call_assistant("c2"), _tool_result("c2")]
         out = _replay(msgs)
         assert out[1]["reasoning_content"] == "r"      # first round untouched
-        assert out[4]["reasoning_content"] == ""       # current round repaired
+        assert out[4]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER       # current round repaired
 
     def test_trailing_user_turn_means_no_field_added(self):
         msgs = [U, _marker(), _tool_call_assistant("c1", reasoning="r"),
@@ -144,9 +145,9 @@ class TestMidTurnCompactionResume:
 
 
 class TestNoFabrication:
-    def test_stamp_is_empty_never_invented_text(self):
+    def test_stamp_is_non_empty_and_carries_no_invented_reasoning(self):
         out = ensure_round_reasoning_content_field([U, _marker()])
-        assert out[1]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_no_user_boundary_returns_input_unchanged(self):
         """No detectable round ⇒ no boundary ⇒ untouched (and identical object)."""
@@ -277,7 +278,7 @@ class TestReachesTheWire:
         body = [U, _marker(), _tool_call_assistant("c1", reasoning="stored chain"),
                 _tool_result("c1")]
         prepared = OpenAIChatCompletionsProvider()._prepare_messages(_replay(body))
-        assert prepared[1]["reasoning_content"] == ""
+        assert prepared[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
         assert prepared[2]["reasoning_content"] == "stored chain"
         # internal sibling keys are gone; tool pairing intact
         assert all(not any(k.startswith("_") for k in m) for m in prepared)
@@ -289,7 +290,7 @@ class TestReachesTheWire:
 
         prepared = _replay([U, _marker()])
         payload = _json.loads(_json.dumps(prepared))
-        assert payload[1]["reasoning_content"] == ""
+        assert payload[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +312,7 @@ class TestBoundaryStrictness:
         out = ensure_round_reasoning_content_field(msgs)
         assert "reasoning_content" not in out[1]
         assert "reasoning_content" not in out[3]
-        assert out[5]["reasoning_content"] == ""
+        assert out[5]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
         # every user row itself is untouched
         assert all("reasoning_content" not in out[i] for i in (0, 2, 4))
 
@@ -319,9 +320,9 @@ class TestBoundaryStrictness:
         msgs = [U, _marker("s1"), _marker("s2"),
                 _tool_call_assistant("c1"), _tool_result("c1")]
         out = ensure_round_reasoning_content_field(msgs)
-        assert out[1]["reasoning_content"] == ""
-        assert out[2]["reasoning_content"] == ""
-        assert out[3]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+        assert out[2]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+        assert out[3]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_reasoning_less_assistant_before_later_user_untouched(self):
         msgs = [U, {"role": "assistant", "content": "old"},
@@ -334,12 +335,12 @@ class TestExistingValuePolicy:
     def test_none_value_is_repaired(self):
         msgs = [U, {"role": "assistant", "content": "a", "reasoning_content": None}]
         out = ensure_round_reasoning_content_field(msgs)
-        assert out[1]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
-    def test_empty_string_is_left_as_is(self):
+    def test_empty_string_is_repaired_to_the_placeholder(self):
         msgs = [U, {"role": "assistant", "content": "a", "reasoning_content": ""}]
         out = ensure_round_reasoning_content_field(msgs)
-        assert out[1]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_real_value_preserved(self):
         msgs = [U, {"role": "assistant", "content": "a", "reasoning_content": "real"}]
@@ -361,11 +362,69 @@ class TestNonAssistantPreservation:
                                             "assistant", "tool"]
         assert "reasoning_content" not in out[2]     # the system row
         assert "reasoning_content" not in out[4]     # the tool row
-        assert out[1]["reasoning_content"] == ""
-        assert out[3]["reasoning_content"] == ""
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+        assert out[3]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
     def test_empty_and_system_only_inputs_are_no_ops(self):
         for msgs in ([], [{"role": "system", "content": "s"}],
                      [{"role": "assistant", "content": "a"}],
                      [{"role": "tool", "tool_call_id": "c", "content": "r"}]):
             assert ensure_round_reasoning_content_field(msgs) == msgs
+
+
+class TestMeasuredUpstreamContract20260915:
+    """The contract this shim exists to satisfy, re-measured on the LIVE lane 2026-09-15.
+
+    The 2026-09-11 measurement accepted an EMPTY value for the in-round assistant turns.
+    Upstream tightened: with history ending on a tool result (the mid-turn-compaction
+    shape) the lane now returns HTTP 400
+
+        "The `reasoning_text` in the thinking mode must be passed back to the API."
+
+    for a missing key, ``None``, ``""`` in any spelling of the field, or a round with no
+    non-empty reasoning at all -- while a single space, a single character, or real
+    stored text is accepted.  Production impact: two session-fatal deaths on workstream
+    71f26c97377241e6a4e7b1a68a25c48f.  These tests pin the property that prevents a
+    repeat: every in-round assistant turn must end up non-empty.
+    """
+
+    def test_every_in_round_assistant_ends_up_non_empty(self):
+        msgs = [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "before the round"},
+            {"role": "user", "content": "[Conversation summary] compacted"},
+            {"role": "assistant", "content": "marker"},                       # no reasoning
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        out = ensure_round_reasoning_content_field(msgs)
+        stamped = [m for m in out[3:]]
+        assert stamped, "expected the round to be stamped"
+        for msg in stamped:
+            if msg.get("role") != "assistant":
+                continue
+            value = msg.get("reasoning_content")
+            assert isinstance(value, str) and value, (msg, value)
+
+    def test_placeholder_is_a_documented_non_empty_constant(self):
+        assert _ROUND_REASONING_PLACEHOLDER
+        assert _ROUND_REASONING_PLACEHOLDER.strip() == _ROUND_REASONING_PLACEHOLDER
+        assert _ROUND_REASONING_PLACEHOLDER
+        # it describes what is true -- that no reasoning text was recorded
+        assert "no reasoning text" in _ROUND_REASONING_PLACEHOLDER
+
+    def test_existing_empty_string_no_longer_survives(self):
+        msgs = [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a", "reasoning_content": ""},
+        ]
+        out = ensure_round_reasoning_content_field(msgs)
+        assert out[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+
+    def test_real_reasoning_is_never_replaced_by_the_placeholder(self):
+        msgs = [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a", "reasoning_content": "real chain"},
+        ]
+        out = ensure_round_reasoning_content_field(msgs)
+        assert out[1]["reasoning_content"] == "real chain"

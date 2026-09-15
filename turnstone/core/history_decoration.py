@@ -793,6 +793,15 @@ def project_history_messages(
 
     return history
 
+# Non-empty stand-in for an in-round assistant turn that has no reasoning text to hand
+# back.  It MUST be non-empty: upstream moved from "the key must be present" -- an empty
+# string satisfied it on 2026-09-11 -- to "non-empty reasoning must be replayed",
+# measured 2026-09-15 (empty string, in every spelling, now returns HTTP 400; a single
+# space or a single character is accepted).  Sentence form is deliberate: it is
+# self-documenting in wire logs and session transcripts.
+_ROUND_REASONING_PLACEHOLDER = "(no reasoning text was recorded for this turn)"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPORARY v1.8.4 TRANSITION COMPATIBILITY - post-cutover removal candidate.
 # Ported for the bootstrap only; not part of the durable LocalClaw delta.
@@ -804,19 +813,26 @@ def ensure_round_reasoning_content_field(
 
     Upstream's own replay attachment (:func:`attach_vllm_chat_reasoning_field`) is gated
     to ``server_type == "vllm"``.  A strict-thinking OpenAI-compatible lane (DeepSeek)
-    rejects a request with HTTP 400 ("The `reasoning_content` in the thinking mode must
-    be passed back to the API") when any ``assistant`` message positioned AFTER the last
-    ``user`` message lacks the key.  The mid-turn compaction summary marker is written by
-    the NON-thinking compaction lane, so it can never carry ``reasoning_content``; an
+    rejects a request with HTTP 400 ("The `reasoning_text` in the thinking mode must be
+    passed back to the API") when NO ``assistant`` message positioned AFTER the last
+    ``user`` message carries non-empty reasoning.  The mid-turn compaction summary marker
+    is written by the NON-thinking compaction lane, so it can never carry reasoning; an
     assistant turn whose upstream reply carried no reasoning text has nothing to replay
-    either.
+    either -- and a round made only of such turns is refused.
 
-    The repair stamps the key with the EMPTY STRING -- it invents no reasoning text, it
-    asserts only that this turn has nothing to hand back.  An existing non-empty value is
-    never overwritten; a key present with ``None`` is repaired, since ``None`` is not a
-    value the contract accepts.  Idempotent, producer-agnostic, pure transform (returns a
-    new list; the input is never mutated).  A request with no ``user`` message is
-    returned unchanged.
+    Measured contract (live lane, 2026-09-15; shapes in the incident report):
+    missing key, ``None``, ``""`` in any spelling, or no in-round assistant turn at all
+    -> HTTP 400.  At least ONE in-round assistant turn with non-empty reasoning -> 200;
+    a single space or a single character is accepted.  (On 2026-09-11 the empty string
+    was accepted, which is why this function used to stamp ``""``.)
+
+    The repair therefore stamps :data:`_ROUND_REASONING_PLACEHOLDER` on every in-round
+    assistant turn that has no USABLE reasoning text -- absent, ``None``, or empty.  It
+    invents no reasoning content; it asserts what is true, that this turn has nothing to
+    hand back.  An existing non-empty value is never overwritten, and a non-string value
+    is left alone (not ours to rewrite).  Idempotent, producer-agnostic, pure transform
+    (returns a new list; the input is never mutated).  A request with no ``user`` message
+    is returned unchanged.
 
     Removal condition: delete this function and its single call site once upstream
     provides the current-round contract for non-vLLM reasoning-bearing lanes.
@@ -832,6 +848,10 @@ def ensure_round_reasoning_content_field(
         msg = out[index]
         if msg.get("role") != "assistant":
             continue
-        if "reasoning_content" not in msg or msg["reasoning_content"] is None:
-            out[index] = {**msg, "reasoning_content": ""}
+        value = msg.get("reasoning_content")
+        if isinstance(value, str):
+            if not value:
+                out[index] = {**msg, "reasoning_content": _ROUND_REASONING_PLACEHOLDER}
+        elif value is None:
+            out[index] = {**msg, "reasoning_content": _ROUND_REASONING_PLACEHOLDER}
     return out

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 
-from turnstone.core.history_decoration import ensure_round_reasoning_content_field
+from turnstone.core.history_decoration import (
+    _ROUND_REASONING_PLACEHOLDER,
+    ensure_round_reasoning_content_field,
+)
 from turnstone.core.model_turn import maybe_attach_vllm_chat_reasoning
 
 U = {"role": "user", "content": "u"}
@@ -28,7 +31,7 @@ def test_a_no_assistant_after_last_user_is_unchanged():
 def test_b_single_post_user_assistant_is_stamped():
     msgs = [U, {"role": "assistant", "content": "trailing"}]
     out = ensure_round_reasoning_content_field(msgs)
-    assert out[-1]["reasoning_content"] == ""
+    assert out[-1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
     assert "reasoning_content" not in out[0]
 
 
@@ -37,8 +40,8 @@ def test_c_all_post_user_assistants_are_stamped():
     msgs = [U, A, U, {"role": "assistant", "content": "x"},
             {"role": "tool", "content": "t"}, {"role": "assistant", "content": "y"}]
     out = ensure_round_reasoning_content_field(msgs)
-    assert out[3]["reasoning_content"] == ""
-    assert out[5]["reasoning_content"] == ""
+    assert out[3]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+    assert out[5]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
     assert out[2 - 1].get("reasoning_content") is None  # pre-boundary untouched
     assert out[4]["role"] == "tool" and "reasoning_content" not in out[4]
 
@@ -50,8 +53,8 @@ def test_d_existing_value_is_never_overwritten():
             {"role": "assistant", "content": "c"}]
     out = ensure_round_reasoning_content_field(msgs)
     assert out[1]["reasoning_content"] == "REAL"
-    assert out[2]["reasoning_content"] == ""
-    assert out[3]["reasoning_content"] == ""
+    assert out[2]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
+    assert out[3]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
 
 
 # ── E. pre-boundary assistant turns are not modified ──────────────────────────────────
@@ -101,7 +104,8 @@ def test_g_real_wire_payload_carries_the_field():
     msgs = [U, {"role": "assistant", "content": "trailing turn"}]
     out = maybe_attach_vllm_chat_reasoning(msgs, _provider(), None, "lane", cfg=_Cfg())
     payload = json.dumps(out)
-    assert '"reasoning_content": ""' in payload, payload
+    # 2026-09-15: the stamped value must be non-empty -- upstream rejects an empty string.
+    assert '"reasoning_content": "(no reasoning text was recorded for this turn)"' in payload, payload
     # and the pre-boundary turn must not have gained the field
     assert json.dumps(out).count("reasoning_content") == 1
 

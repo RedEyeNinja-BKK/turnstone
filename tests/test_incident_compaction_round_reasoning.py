@@ -19,7 +19,8 @@ Measured contract (shape matrix, 19 bodies, production lane):
   ``user`` message;
 * an assistant turn before the last user message is NOT validated (a replayed
   reasoning-less turn is harmless there);
-* ``reasoning_content: ""`` satisfies the contract for BOTH a reasoning-less
+* ``reasoning_content: ""`` satisfied the contract until 2026-09-15 (it no
+longer does -- see ``TestMeasuredUpstreamContract20260915``) for BOTH a reasoning-less
   content turn and a reasoning-less tool-call turn;
 * ``reasoning_content`` is NOT required on a turn the model has not been asked
   to continue past -- appending a trailing user turn also cleared the 400.
@@ -388,7 +389,10 @@ class TestMeasuredUpstreamContract20260915:
     repeat: every in-round assistant turn must end up non-empty.
     """
 
-    def test_every_in_round_assistant_ends_up_non_empty(self):
+    def test_every_in_round_assistant_ends_up_non_empty_for_string_or_absent(self):
+        """Scope: string-or-absent values.  A NON-STRING field is out of scope by policy
+        (see test_non_string_values_are_preserved_and_out_of_scope) -- the invariant is not
+        claimed for it."""
         msgs = [
             {"role": "user", "content": "u"},
             {"role": "assistant", "content": "before the round"},
@@ -405,6 +409,22 @@ class TestMeasuredUpstreamContract20260915:
                 continue
             value = msg.get("reasoning_content")
             assert isinstance(value, str) and value, (msg, value)
+
+    def test_non_string_values_are_preserved_and_out_of_scope(self):
+        """A non-string reasoning field is a producer error, not ours to rewrite.
+
+        The function must leave it exactly as it found it, and the "non-empty" invariant
+        is NOT asserted for it -- upstream may still reject such a payload, and that would
+        be a defect at the producer.
+        """
+        for bad in ([], {}, 0, 1.5, True):
+            msgs = [
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "a", "reasoning_content": bad},
+            ]
+            out = ensure_round_reasoning_content_field(msgs)
+            assert out[1]["reasoning_content"] is bad
+            assert out[1]["reasoning_content"] == bad
 
     def test_placeholder_is_a_documented_non_empty_constant(self):
         assert _ROUND_REASONING_PLACEHOLDER

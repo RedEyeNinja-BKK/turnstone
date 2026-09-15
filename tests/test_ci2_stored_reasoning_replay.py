@@ -227,14 +227,14 @@ class TestABMatrix:
     def test_stored_reasoning_post_last_user(self):
         msgs = [U(), A("a", pc=pc_openai_chat(SENTINEL_POST))]
         current, full = self._ab(msgs)
-        assert current[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER           # current: empty stamp
+        assert current[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER           # current: non-empty placeholder (empty until 2026-09-15)
         assert full[1]["reasoning_content"] == SENTINEL_POST   # full: replayed
 
     def test_no_stored_reasoning_post_last_user(self):
         msgs = [U(), marker()]
         current, full = self._ab(msgs)
         assert current[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER
-        assert full[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER              # CI-1 still supplies ""
+        assert full[1]["reasoning_content"] == _ROUND_REASONING_PLACEHOLDER              # CI-1 still supplies the placeholder
 
     def test_existing_reasoning_content_preserved_when_no_stored_material(self):
         msgs = [U(), A("a", rc="EXPLICIT")]

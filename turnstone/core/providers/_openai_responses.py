@@ -610,6 +610,11 @@ class OpenAIResponsesProvider:
         reasoning_len = 0
         tool_call_count = 0
         last_finish: str | None = None
+        # C0: the provider's own reason for an incomplete run, preserved
+        # verbatim and never synthesized.  Rides the terminal chunk beside
+        # ``finish_reason``; the event type / ``status`` above stays the
+        # authority for complete-vs-incomplete.
+        last_incomplete_reason: str | None = None
         completion_tokens: int | None = None
         # Track tool call indices by item_id for consistent ToolCallDelta.index.
         # ``next_tool_idx`` mints slots (NOT len(dict): duplicate/empty item
@@ -745,6 +750,18 @@ class OpenAIResponsesProvider:
                 if not status:
                     status = "completed" if event_type == "response.completed" else "incomplete"
                 last_finish = "stop" if status == "completed" else "length"
+                # C0: carry the provider's stated reason through untouched.
+                # Reset per terminal event so a later completion cannot
+                # inherit an earlier incomplete's reason.  Absent stays
+                # None — the local context wall sends no reason, and that
+                # absence is what separates it from a content filter.
+                last_incomplete_reason = None
+                if event_type == "response.incomplete" and response is not None:
+                    details = getattr(response, "incomplete_details", None)
+                    if isinstance(details, dict):
+                        last_incomplete_reason = details.get("reason")
+                    elif details is not None:
+                        last_incomplete_reason = getattr(details, "reason", None)
                 usage = extract_usage(getattr(response, "usage", None)) if response else None
                 if usage:
                     completion_tokens = usage.completion_tokens
@@ -825,6 +842,7 @@ class OpenAIResponsesProvider:
                         yield tc_chunk
                 sc = StreamChunk(
                     finish_reason=last_finish,
+                    incomplete_reason=last_incomplete_reason,
                     usage=usage,
                 )
                 if provider_blocks:

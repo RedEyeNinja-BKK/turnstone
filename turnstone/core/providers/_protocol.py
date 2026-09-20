@@ -80,6 +80,18 @@ class StreamChunk:
     is_first: bool = False
     info_delta: str = ""
     provider_blocks: list[dict[str, Any]] = field(default_factory=list)
+    # Provider-supplied *why* a run ended incomplete, verbatim (C0).
+    # Only meaningful alongside ``finish_reason == "length"`` and strictly
+    # subordinate to it — the terminal event type / ``status`` field remain
+    # the authority for complete-vs-incomplete.  NEVER synthesized: a
+    # provider supplying nothing leaves this None, and that absence is
+    # itself load-bearing (a local context wall vs a hosted content
+    # filter are not interchangeable).  Rides the terminal chunk only.
+    #
+    # Appended LAST on purpose: a dataclass's field order IS its positional
+    # signature, so inserting this beside ``finish_reason`` silently
+    # re-pointed every positional construction.  Caught by the C0 battery.
+    incomplete_reason: str | None = None
 
 
 @dataclass
@@ -97,6 +109,12 @@ class CompletionResult:
     # reasoning rides ``provider_blocks`` natively (Anthropic ``thinking``,
     # OpenAI Responses ``reasoning`` items) leave it empty.
     reasoning: str = ""
+    # Verbatim provider reason for an incomplete run, mirroring
+    # ``StreamChunk.incomplete_reason`` (C0).  None when the provider
+    # supplied none (or the run completed).  Callers that only inspect
+    # ``finish_reason`` are unaffected.  Appended LAST to keep the
+    # positional signature stable (see ``StreamChunk.incomplete_reason``).
+    incomplete_reason: str | None = None
 
 
 class IncompleteStreamError(RuntimeError):
@@ -369,6 +387,9 @@ def drain_stream(
     tool_calls_acc: dict[int, dict[str, Any]] = {}
     usage: UsageInfo | None = None
     finish_reason: str | None = None
+    # C0: verbatim provider reason for an incomplete run, tracked beside
+    # ``finish_reason`` so the cause survives the drain unchanged.
+    incomplete_reason: str | None = None
     provider_blocks: list[dict[str, Any]] = []
     tag_carry = ""
 
@@ -416,6 +437,8 @@ def drain_stream(
             usage = merge_usage(usage, sc.usage)
         if sc.finish_reason:
             finish_reason = sc.finish_reason
+        if sc.incomplete_reason:
+            incomplete_reason = sc.incomplete_reason
         if sc.provider_blocks:
             provider_blocks = sc.provider_blocks
         # Pre-finish info is transient status — intentionally dropped;
@@ -474,6 +497,7 @@ def drain_stream(
         content=content,
         tool_calls=tool_calls or None,
         finish_reason=finish_reason,
+        incomplete_reason=incomplete_reason,
         usage=usage,
         provider_blocks=provider_blocks,
         reasoning=reasoning,

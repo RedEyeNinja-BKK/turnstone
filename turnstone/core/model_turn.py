@@ -1099,7 +1099,14 @@ class ModelTurnResult:
     serving_model: str = ""
     tool_def_chars: int | None = None
     # None means the adapter did not report its final request's tool posture.
+    # (production, 83377813)
     native_tools_enabled: bool | None = None
+    # C0: verbatim provider reason for an incomplete run (mirrors
+    # ``CompletionResult.incomplete_reason``).  Subordinate to
+    # ``finish_reason`` — see ``StreamChunk.incomplete_reason`` for the
+    # contract.  Appended last so every existing positional construction
+    # stays valid.
+    incomplete_reason: str | None = None
 
     @property
     def content(self) -> str:
@@ -1666,6 +1673,7 @@ def model_turn(
     return ModelTurnResult(
         turn=turn,
         finish_reason=result.finish_reason,
+        incomplete_reason=result.incomplete_reason,
         usage=result.usage,
         tool_calls=raw_calls,
         provenance=provenance,

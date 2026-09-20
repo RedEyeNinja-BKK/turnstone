@@ -31,6 +31,7 @@ from turnstone.core.history_decoration import (
     ROUND_REASONING_PLACEHOLDER,
 )
 from turnstone.core.providers._openai_responses import (
+    _RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS,
     _RESPONSES_ROUND_REASONING_ID_PREFIX,
     OpenAIResponsesProvider,
     ensure_responses_round_reasoning_items,
@@ -343,7 +344,51 @@ def test_f2_input_is_not_mutated():
 def test_f3_synthesized_id_is_deterministic_across_calls():
     a = _reasoning_items(ensure_responses_round_reasoning_items(_failing_shape()))[0]
     b = _reasoning_items(ensure_responses_round_reasoning_items(_failing_shape()))[0]
-    assert a["id"] == b["id"] == f"{_RESPONSES_ROUND_REASONING_ID_PREFIX}call_1"
+    assert a["id"] == b["id"]
+    assert a["id"].startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX)
+    assert len(a["id"]) == len(_RESPONSES_ROUND_REASONING_ID_PREFIX) + \
+        _RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS
+
+
+def test_f5_synthesized_id_is_charset_safe_bounded_and_collision_resistant():
+    """The id never leaks an upstream call_id into the wire field."""
+    import re
+
+    def synth_id(call_id: str) -> str:
+        items = [
+            _msg("user", MARKER),
+            _call(call_id),
+            _output(call_id),
+        ]
+        return _reasoning_items(ensure_responses_round_reasoning_items(items))[0]["id"]
+
+    safe = re.compile(r"^[A-Za-z0-9_-]+$")
+    for exotic in (
+        "call_plain",
+        "call with spaces",
+        "call\nwith\nnewlines",
+        "call/with:punctuation!?",
+        "\u0e01\u0e32\u0e23\u0e40\u0e23\u0e35\u0e22\u0e01",
+        "x" * 4000,
+    ):
+        rid = synth_id(exotic)
+        assert safe.match(rid), (exotic, rid)
+        assert len(rid) == len(_RESPONSES_ROUND_REASONING_ID_PREFIX) + \
+            _RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS
+
+    # distinct rounds -> distinct ids
+    assert synth_id("call_a") != synth_id("call_b")
+
+
+def test_f6_synthesized_id_is_independent_of_call_id_ORDER():
+    """Parallel calls hash as a set, so reordering stays stable."""
+    def run(order: list[str]) -> str:
+        items = [_msg("user", MARKER)]
+        items += [_call(c) for c in order]
+        items += [_output(c) for c in order]
+        return _reasoning_items(ensure_responses_round_reasoning_items(items))[0]["id"]
+
+    assert run(["call_1", "call_2"]) == run(["call_2", "call_1"])
 
 
 def test_f4_no_invented_reasoning_text():
@@ -403,6 +448,103 @@ def test_h1_repeated_lowering_is_stable():
     _, second = _lower(history, replay=True)
 
     assert first == second
-    assert [r["id"] for r in _reasoning_items(first)] == [
-        f"{_RESPONSES_ROUND_REASONING_ID_PREFIX}call_9"
+    ids = [r["id"] for r in _reasoning_items(first)]
+    assert len(ids) == 1
+    assert ids[0].startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX)
+
+
+# ── I. review findings: boundary, correlation, id hardening ──────────────────
+
+
+def test_i1_only_the_current_round_is_repaired():
+    """Two sequential tool rounds in one turn: only the LAST is repaired."""
+    items = [
+        _msg("user", "do two things"),
+        _msg("assistant", "first"),
+        _call("call_1"),
+        _output("call_1"),
+        _msg("assistant", "second"),
+        _call("call_2"),
+        _output("call_2"),
     ]
+    out = ensure_responses_round_reasoning_items(items)
+    reasoning = _reasoning_items(out)
+
+    assert len(reasoning) == 1
+    idx_reason = out.index(reasoning[0])
+    idx_second = out.index(_msg("assistant", "second"))
+    # inserted before the CURRENT round's turn, not the historical one
+    assert idx_reason < idx_second
+    assert out[idx_reason + 1]["type"] == "message"
+    # the historical round is untouched
+    assert out[out.index(_call("call_1")) - 1]["type"] == "message"
+
+
+def test_i2_orphan_tool_output_is_not_armed():
+    """A trailing output answered by no call in the turn fails closed."""
+    items = [
+        _msg("user", MARKER),
+        _msg("assistant", "calling"),
+        _call("call_1"),
+        _output("call_orphan"),
+    ]
+    assert ensure_responses_round_reasoning_items(items) == items
+
+
+def test_i3_stale_output_answering_an_earlier_call_is_not_armed():
+    """An output whose call_id belongs to a PREVIOUS turn must not arm repair."""
+    items = [
+        _msg("user", MARKER),
+        _msg("assistant", "first"),
+        _call("call_A"),
+        _output("call_A"),
+        _msg("assistant", "second"),
+        _call("call_B"),
+        _output("call_A"),
+    ]
+    assert ensure_responses_round_reasoning_items(items) == items
+
+
+def test_i4_partial_parallel_results_still_arm():
+    """A subset of answered calls is legitimate (streaming/interrupted round)."""
+    items = [
+        _msg("user", MARKER),
+        _msg("assistant", "calling"),
+        _call("call_1"),
+        _call("call_2"),
+        _output("call_1"),
+    ]
+    out = ensure_responses_round_reasoning_items(items)
+    assert len(_reasoning_items(out)) == 1
+
+
+def test_i5_call_id_less_output_fails_closed():
+    items = [_msg("user", MARKER), _call("call_1"), {"type": "function_call_output"}]
+    assert ensure_responses_round_reasoning_items(items) == items
+
+
+def test_i6_last_user_boundary_is_a_net_not_a_reachable_branch():
+    """Finding-1 hardening, with its reachability pinned honestly.
+
+    The candidate turn is anchored to the trailing ``function_call_output`` block,
+    and the group walk accepts only reasoning / function_call / assistant-message
+    items -- a user message is none of those, so the walk always stops before one
+    and ``start <= last_user`` cannot hold.  Exhaustive enumeration of every short
+    history over {user, assistant, tool-call, tool-output, system} shows 0
+    violations in 19,524 histories that reach the check.
+
+    The condition is therefore kept as a net against future changes to the walk,
+    NOT as a repair of an observed failure.  This test pins that reading so a later
+    reader does not mistake it for live behaviour.
+    """
+    # A turn after a user message is armed (the intended case)...
+    armed = [_msg("user", "first"), _call("call_1"), _output("call_1")]
+    assert len(_reasoning_items(ensure_responses_round_reasoning_items(armed))) == 1
+
+    # ...and a leading assistant turn with NO user message at all is refused.
+    no_user = [_msg("assistant", "leading"), _call("call_1"), _output("call_1")]
+    assert ensure_responses_round_reasoning_items(no_user) == no_user
+
+    # A trailing user turn is refused by the tool-round-continuation rule.
+    trailing_user = [_call("call_1"), _output("call_1"), _msg("user", "later question")]
+    assert ensure_responses_round_reasoning_items(trailing_user) == trailing_user

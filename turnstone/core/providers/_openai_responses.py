@@ -7,6 +7,7 @@ of the Chat Completions endpoint.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -1055,11 +1056,15 @@ def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:
 #: Deterministic id namespace for reasoning items synthesized by
 #: :func:`ensure_responses_round_reasoning_items`.  A synthesized item needs a
 #: non-empty string ``id`` -- ``ResponseReasoningItemParam.id`` is required, and
-#: :func:`_reasoning_item_for_input` skips stored items without one.  The id is
-#: derived from the continued turn's tool-call id, so it is STABLE across retries of
-#: the same round: an empty or random value would make replay non-deterministic, or
-#: make the item silently disappear.
+#: :func:`_reasoning_item_for_input` skips stored items without one.  The id binds a
+#: digest of the continued turn's answered tool-call ids, so it is STABLE across
+#: retries of the same round, fixed-length and charset-safe regardless of what the
+#: upstream put in ``call_id``.  An empty or random value would make replay
+#: non-deterministic, or make the item silently disappear.
 _RESPONSES_ROUND_REASONING_ID_PREFIX = "rs_roundrepair_"
+
+#: Hex characters of the digest carried in the synthesized id (96 bits).
+_RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS = 24
 
 
 def ensure_responses_round_reasoning_items(
@@ -1097,7 +1102,10 @@ def ensure_responses_round_reasoning_items(
     * that turn carries NO ``reasoning`` item already.  Stored reasoning is preserved
       exactly and never replaced, and the pass is idempotent because its own output
       satisfies this condition;
-    * the turn lies INSIDE the current round, i.e. after the last user message, so
+    * every trailing tool output is answered by a ``function_call`` IN THAT TURN.  An
+      orphaned, stale or reordered output fails closed rather than repairing the wrong
+      turn;
+    * the turn lies INSIDE the current round, i.e. after the LAST user message, so
       unrelated historical assistant turns are never touched.
 
     Only then is ONE reasoning item synthesized immediately before the turn.  It
@@ -1105,8 +1113,8 @@ def ensure_responses_round_reasoning_items(
     invents no reasoning content, it asserts what is true -- this turn has nothing to
     hand back.  The item carries a ``content`` part of type ``reasoning_text`` because a
     ``summary``-only item does NOT satisfy the contract (measured 2026-09-20: summary
-    only -> 400; ``reasoning_text`` content -> 200), and a stable id derived from the
-    turn's first tool-call id.
+    only -> 400; ``reasoning_text`` content -> 200), and a stable, fixed-length id
+    derived from a digest of the turn's answered tool-call ids.
 
     Pure transform: returns a new list and never mutates *items*.  The caller gates this
     on the operator flag ``replay_reasoning_to_model``, so lanes that do not carry the
@@ -1146,20 +1154,38 @@ def ensure_responses_round_reasoning_items(
     if not calls:
         return items
 
-    # (5) It must lie inside the current round: after the last user message.
-    if not any(
-        item.get("type") == "message" and item.get("role") == "user"
-        for item in items[:start]
-    ):
+    # (5) Every trailing tool output must be answered by a call IN THIS TURN.
+    #     Fail closed on an orphan, stale or reordered output: repairing the wrong
+    #     turn is worse than leaving the contract unsatisfied (the request then
+    #     fails loudly upstream instead of silently replaying bogus reasoning).
+    call_ids = [item.get("call_id") for item in calls]
+    if not all(isinstance(cid, str) and cid for cid in call_ids):
+        return items
+    output_ids = [item.get("call_id") for item in items[tail:]]
+    if not all(isinstance(oid, str) and oid for oid in output_ids):
+        return items
+    if not set(output_ids).issubset(set(call_ids)):
         return items
 
-    call_id = calls[0].get("call_id")
-    if not isinstance(call_id, str) or not call_id:
+    # (6) The turn must lie inside the CURRENT round -- after the LAST user
+    #     message, not merely after some earlier one.  (Anchoring to the trailing
+    #     tool-output block already makes this turn the last one in the history;
+    #     this makes the boundary explicit rather than incidental.)
+    last_user = -1
+    for index in range(start):
+        item = items[index]
+        if item.get("type") == "message" and item.get("role") == "user":
+            last_user = index
+    if last_user < 0 or start <= last_user:
         return items
 
+    # (7) Deterministic, charset-safe, fixed-length id.  Binding it to a digest of
+    #     the answered call ids keeps it stable across retries of the same round
+    #     while never leaking an unbounded or exotic call_id into a wire field.
+    digest = hashlib.sha256("\x00".join(sorted(call_ids)).encode()).hexdigest()
     synthesized = {
         "type": "reasoning",
-        "id": f"{_RESPONSES_ROUND_REASONING_ID_PREFIX}{call_id}",
+        "id": f"{_RESPONSES_ROUND_REASONING_ID_PREFIX}{digest[:_RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS]}",
         "summary": [{"type": "summary_text", "text": ROUND_REASONING_PLACEHOLDER}],
         "content": [{"type": "reasoning_text", "text": ROUND_REASONING_PLACEHOLDER}],
     }

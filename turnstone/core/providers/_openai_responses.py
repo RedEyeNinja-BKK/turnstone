@@ -7,6 +7,7 @@ of the Chat Completions endpoint.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -65,6 +66,20 @@ _TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
 # the measured member (2.04x on a three-search turn) and the only server tool
 # the session injects; the other hosted tools' usage shapes are #1194.
 _SERVER_EXECUTED_ITEM_TYPES = frozenset({"web_search_call"})
+
+# Text carried by a reasoning item synthesized for a resumed tool round whose
+# interrupted turn recorded no reasoning.  It ASSERTS what is true -- this turn
+# has nothing to hand back -- rather than inventing reasoning content the
+# upstream never produced.
+_ROUND_REASONING_PLACEHOLDER = "(no reasoning text was recorded for this turn)"
+
+# Deterministic id namespace for those synthesized items.  ``id`` is required on
+# a replayed reasoning item (see :func:`_reasoning_item_for_input`), and an empty
+# or random value would make the replay either malformed or non-deterministic.
+_ROUND_REASONING_ID_PREFIX = "rs_roundrepair_"
+
+# Hex characters of the digest carried in the synthesized id (96 bits).
+_ROUND_REASONING_ID_DIGEST_CHARS = 24
 
 
 def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
@@ -297,6 +312,11 @@ class OpenAIResponsesProvider:
                 )
 
         instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+        # Responses-wire counterpart of the chat-wire round repair.  Gated on the
+        # same operator flag that governs reasoning replay on this wire, so lanes
+        # without it (cloud lanes with replay off) keep their exact item list.
+        if replay_reasoning_to_model:
+            items = _ensure_responses_round_reasoning_items(items)
         return instructions, items
 
     # -- tool conversion -----------------------------------------------------
@@ -1068,3 +1088,130 @@ def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:
     if encrypted:
         out["encrypted_content"] = encrypted
     return out
+
+
+def _ensure_responses_round_reasoning_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Synthesize a native reasoning item for a resumed TOOL ROUND that has none.
+
+    Reasoning is replayed on this wire only from a stored native ``reasoning``
+    block (see :func:`_assistant_items_for_input`).  A round interrupted in band
+    and then resumed therefore has nothing to replay when the interrupted
+    assistant turn recorded no reasoning at all -- and a strict-thinking upstream
+    refuses the reconstructed round:
+
+        HTTP 400 "The `reasoning_text` in the thinking mode must be passed back
+        to the API."
+
+    The trigger is the compaction-shaped resume: the summary marker is written by
+    a NON-thinking lane, so the resumed history continues from an assistant turn
+    (tool calls plus their results) that carries no reasoning.  Replaying that
+    round unchanged asks the upstream to continue a thinking turn whose reasoning
+    it cannot see.
+
+    This pass asserts the same claim in native Responses item form.  It is
+    deliberately NARROW -- every condition below must hold before anything is
+    synthesized:
+
+    * the history must be a TOOL-ROUND CONTINUATION, i.e. it ends on
+      ``function_call_output`` item(s).  A round that does not end on a tool
+      result does not carry the requirement, so "the conversation mentions tools
+      somewhere" is not a trigger;
+    * the turn immediately preceding that output block must contain at least one
+      ``function_call`` -- a plain assistant turn needs no reasoning;
+    * that turn must carry NO ``reasoning`` item already.  Stored reasoning is
+      preserved exactly and never replaced, and this branch is also what makes
+      the pass idempotent;
+    * every trailing tool output must be answered by a ``function_call`` IN THAT
+      TURN.  An orphaned, stale or reordered output fails closed instead of
+      repairing the wrong turn;
+    * the turn must lie inside a real round, i.e. at least one ``message`` with
+      ``role == "user"`` must precede it, so unrelated assistant turns are never
+      decorated.
+
+    Only then is ONE reasoning item synthesized immediately before that turn.  It
+    carries :data:`_ROUND_REASONING_PLACEHOLDER`: it invents no reasoning, it
+    states what is true.  The item carries a ``content`` part of type
+    ``reasoning_text`` as well as the ``summary`` text, because a summary-only
+    item does NOT satisfy the contract (measured against a strict-thinking
+    upstream: summary only -> 400; ``reasoning_text`` content -> 200).  Its ``id``
+    is a fixed-length digest of the turn's answered tool-call ids, so retries of
+    the same round replay the identical item.
+
+    Pure transform: returns a new list and never mutates *items*.  Callers gate
+    this on ``replay_reasoning_to_model``, so a lane that does not replay
+    reasoning sees a byte-for-byte unchanged ``input`` array.
+    """
+    if not items:
+        return items
+
+    # (1) Tool-round continuation only: the trailing block must be tool output(s).
+    tail = len(items)
+    while tail > 0 and items[tail - 1].get("type") == "function_call_output":
+        tail -= 1
+    if tail == len(items) or tail == 0:
+        return items
+
+    # (2) The turn being continued: the maximal run of assistant-emitted items
+    #     (reasoning / assistant message / function_call) directly before the
+    #     trailing output block.
+    start = tail
+    while start > 0:
+        prev = items[start - 1]
+        prev_type = prev.get("type")
+        if prev_type in ("reasoning", "function_call") or (
+            prev_type == "message" and prev.get("role") == "assistant"
+        ):
+            start -= 1
+        else:
+            break
+    turn = items[start:tail]
+
+    # (3) Already satisfied -- stored reasoning is replayed as-is, and this branch
+    #     also makes the pass idempotent.
+    if any(item.get("type") == "reasoning" for item in turn):
+        return items
+
+    # (4) It must be a tool-call turn (negative control: no tool call, no synth).
+    calls = [item for item in turn if item.get("type") == "function_call"]
+    if not calls:
+        return items
+
+    # (5) Every trailing tool output must be answered by a call IN THIS TURN.  Fail
+    #     closed on an orphan, stale or reordered output: repairing the wrong turn
+    #     is worse than leaving the contract unsatisfied, because the request then
+    #     fails loudly upstream instead of silently replaying bogus reasoning.
+    call_ids: list[str] = []
+    for item in calls:
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return items
+        call_ids.append(call_id)
+    output_ids: list[str] = []
+    for item in items[tail:]:
+        output_id = item.get("call_id")
+        if not isinstance(output_id, str) or not output_id:
+            return items
+        output_ids.append(output_id)
+    if not set(output_ids).issubset(set(call_ids)):
+        return items
+
+    # (6) The turn must lie inside a real round -- a preceding user message marks
+    #     the round boundary, so historical assistant turns are never touched.
+    if not any(
+        item.get("type") == "message" and item.get("role") == "user" for item in items[:start]
+    ):
+        return items
+
+    # (7) Deterministic, charset-safe, fixed-length id.  Binding it to a digest of
+    #     the answered call ids keeps it stable across retries of the same round
+    #     while never leaking an unbounded or exotic call_id into a wire field.
+    digest = hashlib.sha256("\x00".join(sorted(call_ids)).encode()).hexdigest()
+    synthesized = {
+        "type": "reasoning",
+        "id": f"{_ROUND_REASONING_ID_PREFIX}{digest[:_ROUND_REASONING_ID_DIGEST_CHARS]}",
+        "summary": [{"type": "summary_text", "text": _ROUND_REASONING_PLACEHOLDER}],
+        "content": [{"type": "reasoning_text", "text": _ROUND_REASONING_PLACEHOLDER}],
+    }
+    return [*items[:start], synthesized, *items[start:]]

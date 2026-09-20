@@ -801,6 +801,11 @@ def project_history_messages(
 # self-documenting in wire logs and session transcripts.
 _ROUND_REASONING_PLACEHOLDER = "(no reasoning text was recorded for this turn)"
 
+# Public alias, so the Responses-wire repair (which asserts the same claim in native
+# Responses item form) reuses THIS text rather than a copy.  A divergent duplicate is
+# precisely the drift class that repair exists to remove.
+ROUND_REASONING_PLACEHOLDER = _ROUND_REASONING_PLACEHOLDER
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPORARY v1.8.4 TRANSITION COMPATIBILITY - post-cutover removal candidate.

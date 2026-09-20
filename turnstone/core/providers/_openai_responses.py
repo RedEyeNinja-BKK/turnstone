@@ -47,6 +47,7 @@ from turnstone.core.providers._protocol import (
     resolve_reasoning_effort,
     serialized_tool_chars,
 )
+from turnstone.core.history_decoration import ROUND_REASONING_PLACEHOLDER
 from turnstone.core.trajectory import materialize_attachments
 
 log = structlog.get_logger(__name__)
@@ -288,6 +289,11 @@ class OpenAIResponsesProvider:
                 )
 
         instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+        # Responses-wire twin of CI-1's round-validity repair.  Gated here on the same
+        # operator flag that already governs reasoning replay on this wire, so lanes
+        # without the flag (cloud/OpenAI) keep their exact current item list.
+        if replay_reasoning_to_model:
+            items = ensure_responses_round_reasoning_items(items)
         return instructions, items
 
     # -- tool conversion -----------------------------------------------------
@@ -1044,3 +1050,117 @@ def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:
     if encrypted:
         out["encrypted_content"] = encrypted
     return out
+
+
+#: Deterministic id namespace for reasoning items synthesized by
+#: :func:`ensure_responses_round_reasoning_items`.  A synthesized item needs a
+#: non-empty string ``id`` -- ``ResponseReasoningItemParam.id`` is required, and
+#: :func:`_reasoning_item_for_input` skips stored items without one.  The id is
+#: derived from the continued turn's tool-call id, so it is STABLE across retries of
+#: the same round: an empty or random value would make replay non-deterministic, or
+#: make the item silently disappear.
+_RESPONSES_ROUND_REASONING_ID_PREFIX = "rs_roundrepair_"
+
+
+def ensure_responses_round_reasoning_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Satisfy the strict-thinking replay contract on the RESPONSES wire.
+
+    CI-1's chat-wire repair
+    (:func:`turnstone.core.history_decoration.ensure_round_reasoning_content_field`)
+    is composed inside ``model_turn.maybe_attach_vllm_chat_reasoning``, whose first
+    gate admits Chat-Completions providers only -- legitimately, because the Responses
+    wire carries reasoning as native ``reasoning`` items rather than the
+    ``reasoning_content`` key.  The Responses path replayed reasoning only from a
+    stored native ``reasoning`` block (:func:`_assistant_items_for_input`), so a
+    current round whose tool-call turn had no stored reasoning emitted none at all,
+    and a strict-thinking upstream refused the request:
+
+        HTTP 400 "The `reasoning_text` in the thinking mode must be passed back to the API."
+
+    That is the post-compaction session death: the mid-turn compaction summary marker
+    is written by the NON-thinking compaction lane, so the resumed round contains an
+    assistant turn with nothing to replay.
+
+    This pass reproduces CI-1's semantics in native Responses item form.  It is
+    deliberately NARROW -- every one of the following must hold before anything is
+    synthesized:
+
+    * the history is a TOOL-ROUND CONTINUATION, i.e. it ends on ``function_call_output``
+      item(s).  A round that does not end on a tool result does not carry the
+      requirement (measured 2026-09-20 on the live lane: such shapes are accepted with
+      no reasoning at all), so "the conversation contains tools somewhere" is not a
+      trigger;
+    * the turn immediately preceding that output block contains at least one
+      ``function_call`` -- a plain assistant turn needs no reasoning;
+    * that turn carries NO ``reasoning`` item already.  Stored reasoning is preserved
+      exactly and never replaced, and the pass is idempotent because its own output
+      satisfies this condition;
+    * the turn lies INSIDE the current round, i.e. after the last user message, so
+      unrelated historical assistant turns are never touched.
+
+    Only then is ONE reasoning item synthesized immediately before the turn.  It
+    carries :data:`turnstone.core.history_decoration.ROUND_REASONING_PLACEHOLDER`: it
+    invents no reasoning content, it asserts what is true -- this turn has nothing to
+    hand back.  The item carries a ``content`` part of type ``reasoning_text`` because a
+    ``summary``-only item does NOT satisfy the contract (measured 2026-09-20: summary
+    only -> 400; ``reasoning_text`` content -> 200), and a stable id derived from the
+    turn's first tool-call id.
+
+    Pure transform: returns a new list and never mutates *items*.  The caller gates this
+    on the operator flag ``replay_reasoning_to_model``, so lanes that do not carry the
+    flag (cloud/OpenAI) are byte-for-byte unchanged.
+    """
+    if not items:
+        return items
+
+    # (1) Tool-round continuation only: the trailing block must be tool output(s).
+    tail = len(items)
+    while tail > 0 and items[tail - 1].get("type") == "function_call_output":
+        tail -= 1
+    if tail == len(items) or tail == 0:
+        return items
+
+    # (2) The turn being continued: the maximal run of assistant-emitted items
+    #     (reasoning / assistant message / function_call) directly before that block.
+    start = tail
+    while start > 0:
+        prev = items[start - 1]
+        prev_type = prev.get("type")
+        if prev_type in ("reasoning", "function_call") or (
+            prev_type == "message" and prev.get("role") == "assistant"
+        ):
+            start -= 1
+        else:
+            break
+    turn = items[start:tail]
+
+    # (3) Already satisfied -- a stored reasoning item is replayed as-is, and this
+    #     branch also makes the pass idempotent.
+    if any(item.get("type") == "reasoning" for item in turn):
+        return items
+
+    # (4) It must be a tool-call turn (negative control: no tool call, no synthesis).
+    calls = [item for item in turn if item.get("type") == "function_call"]
+    if not calls:
+        return items
+
+    # (5) It must lie inside the current round: after the last user message.
+    if not any(
+        item.get("type") == "message" and item.get("role") == "user"
+        for item in items[:start]
+    ):
+        return items
+
+    call_id = calls[0].get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return items
+
+    synthesized = {
+        "type": "reasoning",
+        "id": f"{_RESPONSES_ROUND_REASONING_ID_PREFIX}{call_id}",
+        "summary": [{"type": "summary_text", "text": ROUND_REASONING_PLACEHOLDER}],
+        "content": [{"type": "reasoning_text", "text": ROUND_REASONING_PLACEHOLDER}],
+    }
+    return [*items[:start], synthesized, *items[start:]]

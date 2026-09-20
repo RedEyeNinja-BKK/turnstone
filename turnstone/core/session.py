@@ -74,6 +74,16 @@ from turnstone.core.compaction import (
     calibrated_chars_per_token,
 )
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
+from turnstone.core.continuation import (
+    C2_ENDPOINT_CONTEXT_TOKENS,
+    C2_REQUIRED_INCOMPLETE_REASON,
+    ContinuationBudget,
+    ContinuationLegResult,
+    ContinuationMode,
+    ContinuationRunner,
+    continuation_capability_ok,
+    validated_suffix,
+)
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.ip_classify import AddressLane
@@ -171,6 +181,7 @@ from turnstone.core.model_turn import (
     create_provider,
     finalize_provider_blocks,
     folds_trailing_info,
+    has_reasoning_bearing_block,
     is_empty_completion,
     lane_diagnostics,
     lane_error_is_retryable,
@@ -188,6 +199,7 @@ from turnstone.core.model_turn import (
     same_model_lane_binding,
     serialized_tool_chars,
 )
+from turnstone.core.model_turn import StreamChunk
 from turnstone.core.nudge_queue import (
     QUIET_CHANNEL,
     QUIET_DRAIN,
@@ -1086,6 +1098,62 @@ class _StreamTurnConsumer:
             self._my_generation,
             _record,
             allow_cancelled=True,
+        )
+
+
+class _SilentLegConsumer(_StreamTurnConsumer):
+    """Chunk sink for a C2 continuation leg — same lifecycle, no rendering.
+
+    A SUBCLASS on purpose, never a standalone stub.  The leg must inherit the
+    stream-arming hook, the per-attempt ``_CancelRef`` and ``attempt_armed``,
+    or a mid-stream death inside a leg would classify as a CREATION failure:
+    the ladder would then silently re-issue the same lane, running the leg
+    twice and charging its tokens twice.  Control flow — cancellation,
+    fallback, health — is inherited untouched; only the rendering surface is
+    overridden.
+
+    Overridden, and deliberately nothing else:
+
+    * ``_publish_chunk`` — the whole emission path, which also means the leg
+      never writes the SESSION usage slot (``_last_usage``) that the status
+      bar and the next turn's estimate read.  A leg's small isolated usage
+      must not replace the logical turn's.
+    * ``_flush_text`` / ``_stop_spinner_once`` — the live spinner latch and
+      the accumulated display text belong to the INITIAL turn's stream.
+    * ``on_stream_armed`` — keeps the generation-gated health success record,
+      drops the two session-slot resets.
+
+    The leg's canonical text is read from the returned ``ModelTurnResult``,
+    never from this consumer's display state, so nothing is accumulated here.
+    """
+
+    def _flush_text(self, text: str, is_reasoning: bool) -> None:
+        """Swallowed: a leg renders nothing and accumulates nothing."""
+
+    def _stop_spinner_once(self) -> None:
+        """Swallowed: the spinner belongs to the initial turn's stream."""
+
+    def _publish_chunk(self, chunk: StreamChunk) -> None:
+        """Swallowed: every render path, and the session usage slot, is
+        suppressed here rather than filtered downstream."""
+
+    def on_stream_armed(self) -> None:
+        """Health-only arm hook.
+
+        The base records the serving lane's success AND clears the session
+        usage slots; a leg must do the first without the second, or a
+        continuation would blank the status bar mid-turn.  Generation
+        ownership is still revalidated first, exactly as the base does.
+        """
+
+        def _publish_armed() -> None:
+            if self.tracker:
+                self.tracker.record_success()
+
+        self._session._publish_for_generation(
+            self._my_generation,
+            _publish_armed,
+            allow_cancelled=False,
         )
 
 
@@ -9828,6 +9896,7 @@ class ChatSession:
         my_generation: int = 0,
         *,
         principal_id: str | None = None,
+        max_tokens: int | None = None,
     ) -> ModelTurnResult:
         """Run one plant call with lane-swap fallback: one ``model_turn``
         ladder per lane.
@@ -9850,6 +9919,7 @@ class ChatSession:
                 prepare_wire,
                 my_generation,
                 principal_id=principal_id,
+                max_tokens=max_tokens,
             )
         except BackendAuthUnavailableError:
             # Explicit fail-closed policy: never reinterpret an authentication
@@ -9886,6 +9956,7 @@ class ChatSession:
                     prepare_wire,
                     my_generation,
                     principal_id=principal_id,
+                    max_tokens=max_tokens,
                 )
                 if result is not None:
                     return result
@@ -9906,6 +9977,7 @@ class ChatSession:
                     prepare_wire,
                     my_generation,
                     principal_id=principal_id,
+                    max_tokens=max_tokens,
                 )
                 if result is not None:
                     return result
@@ -9919,6 +9991,7 @@ class ChatSession:
         my_generation: int,
         *,
         principal_id: str | None = None,
+        max_tokens: int | None = None,
     ) -> ModelTurnResult | None:
         """Attempt a single fallback lane.  Returns the result or ``None``.
 
@@ -9966,6 +10039,7 @@ class ChatSession:
                 prepare_wire,
                 my_generation,
                 principal_id=principal_id,
+                max_tokens=max_tokens,
             )
         except BackendAuthUnavailableError:
             # Fail-closed policy — never another lane's business.
@@ -10023,6 +10097,7 @@ class ChatSession:
         my_generation: int = 0,
         *,
         principal_id: str | None = None,
+        max_tokens: int | None = None,
     ) -> ModelTurnResult:
         """One lane's creation ladder around ``model_turn``.
 
@@ -10074,7 +10149,11 @@ class ChatSession:
                     lane,
                     self.messages,
                     tools=active_tools,
-                    max_tokens=self.max_tokens,
+                    # ``max_tokens`` is the caller's per-call override, used by
+                    # the C2 continuation legs to send their own (smaller)
+                    # ``leg_budget``.  ``None`` means the session setting, so
+                    # every non-C2 caller keeps today's value byte-for-byte.
+                    max_tokens=self.max_tokens if max_tokens is None else max_tokens,
                     deferred_names=self._get_deferred_names(caps),
                     prepare_wire=prepare_wire,
                     admit_request=functools.partial(
@@ -14631,6 +14710,217 @@ class ChatSession:
         if discard is not None:
             discard()
 
+    def _continuation_enabled(self) -> bool:
+        """Whether the operator has switched C2 on (``False`` by default).
+
+        The gate is the ENABLE half only: the capability scope is checked
+        separately and independently, so switching this on while running an
+        unproven lane is a no-op rather than a fault.
+        """
+        cs = getattr(self, "_config_store", None)
+        if cs is None:
+            return False
+        return bool(cs.get("model.auto_continue_truncated"))
+
+    def _continuation_capable(self, lane: ModelLane) -> bool:
+        """Whether *lane* is the ONE capability C2 v1 is enabled for."""
+        provider_name = type(lane.provider).__name__ if lane.provider is not None else ""
+        return continuation_capability_ok(
+            backend_model_id=lane.model or "",
+            provider_name=provider_name,
+        )
+
+    def _maybe_continue_truncated(
+        self,
+        result: ModelTurnResult,
+        consumer: _StreamTurnConsumer,
+        prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]],
+        my_generation: int,
+        principal_id: str | None,
+    ) -> ModelTurnResult:
+        """C2 v1 — extend a truncated Mode-1 answer, then hand the turn on.
+
+        Runs at the ``_stream_response`` seam: after the initial result exists
+        and BEFORE the visible consumer is finalized, so a validated suffix can
+        be committed onto the still-open stream.  It performs no provider I/O
+        of its own — every leg re-enters ``_model_turn_with_fallback``, which
+        brings cancellation, the fallback walk, generation scoping and the
+        provider abstraction with it.
+
+        Fails closed everywhere.  Every eligibility clause, a missing usage
+        count, an unusable context measurement or an unusable window returns
+        the ORIGINAL result unchanged, which is exactly today's truncated
+        behaviour.  Mode 1 only: a reasoning-bearing turn performs no
+        continuation at all (deferred, not rejected), and a partial tool
+        construction is never continued and never executed.
+        """
+        if not self._continuation_enabled():
+            return result
+        lane = consumer.lane
+        if lane is None or not self._continuation_capable(lane):
+            return result
+
+        visible = result.content
+        native_blocks = list(result.turn.native.blocks) if result.turn.native is not None else []
+        if (
+            result.finish_reason != "length"
+            or result.incomplete_reason != C2_REQUIRED_INCOMPLETE_REASON
+            or result.tool_calls
+            or not visible
+            or has_reasoning_bearing_block(native_blocks)
+        ):
+            # ``length`` alone is never sufficient: only a TRUTHFUL
+            # output-budget reason authorizes autonomous extra work, which is
+            # why the pre-A serializer's unlabelled stop continues nothing.
+            return result
+
+        if result.usage is None:
+            # No trustworthy accounting => no continuation.  Character counts
+            # are not a counter.
+            return result
+
+        # The interactive rail passes ``self.max_tokens`` to ``model_turn``
+        # unclamped, so this IS the value that went on the wire.  The row's
+        # advertised context is deliberately not consulted.
+        budget = ContinuationBudget(
+            r_effective=self.max_tokens,
+            mode=ContinuationMode.MODE1_VISIBLE_ONLY,
+        )
+        budget.used_total = max(0, result.usage.completion_tokens)
+        if budget.remaining <= 0:
+            return result
+
+        # The prompt grows with every accepted suffix, so the endpoint's
+        # remaining room is recomputed per leg rather than once for the run.
+        # The leg's own allowance also rides the prefill it must resend.
+        prefill_chars = len(visible)
+
+        def _context_remaining(leg_index: int) -> int | None:
+            prompt_tokens = self._estimated_prompt_tokens() + int(
+                prefill_chars / self._chars_per_token
+            )
+            room = C2_ENDPOINT_CONTEXT_TOKENS - prompt_tokens
+            return room if room > 0 else None
+
+        def _issue_leg(
+            leg_index: int, prefill: str, reasoning_prefill: str, leg_budget: int
+        ) -> ContinuationLegResult:
+            nonlocal prefill_chars
+            prefill_chars = len(prefill)
+            leg_consumer = _SilentLegConsumer(self, my_generation)
+            # The sanctioned rail reads ``self.messages``, so the continuation
+            # input is installed as TEMPORARY state and always restored —
+            # including on every failure path — or a failed leg would strand
+            # synthetic history in the session.
+            saved_messages = self.messages
+            saved_last_usage = self._last_usage
+            saved_pending_tokens = self._assistant_pending_tokens
+            try:
+                self.messages = [*saved_messages, turn_to_dict(Turn.assistant(prefill))]
+                leg_result = self._model_turn_with_fallback(
+                    leg_consumer,
+                    prepare_wire,
+                    my_generation,
+                    principal_id=principal_id,
+                    max_tokens=leg_budget,
+                )
+            except GenerationCancelled:
+                # An operator Stop is never a continuation outcome.
+                raise
+            except Exception as e:
+                # A leg that dies leaves the answer we already have intact;
+                # ``completion_tokens=None`` ends the run as a provider
+                # failure without charging the budget.
+                log.warning(
+                    "c2.leg_failed",
+                    leg=leg_index,
+                    error=type(e).__name__,
+                )
+                return ContinuationLegResult(completion_tokens=None, finish_reason=None)
+            finally:
+                self.messages = saved_messages
+                self._last_usage = saved_last_usage
+                self._assistant_pending_tokens = saved_pending_tokens
+
+            suffix = validated_suffix(returned=leg_result.content, prefill=prefill)
+            return ContinuationLegResult(
+                visible_content=leg_result.content,
+                reasoning_content="",
+                completion_tokens=(
+                    leg_result.usage.completion_tokens if leg_result.usage is not None else None
+                ),
+                finish_reason=leg_result.finish_reason,
+                incomplete_reason=leg_result.incomplete_reason,
+            )
+
+        def _commit_accepted_leg(leg_index: int, suffix: str) -> None:
+            """Reveal one leg's suffix on the SAME live assistant stream.
+
+            Only the executor calls this, and only for a leg that was both
+            prefix-validated and successfully charged, so a whole leg stays
+            transactional: nothing of it reaches the operator before it
+            validates, and a leg that fails shows none of itself. The initial
+            stream is never closed or restarted here, and the prefix is never
+            re-emitted — only the new suffix.
+            """
+            consumer(StreamChunk(content_delta=suffix))
+
+        runner = ContinuationRunner(
+            budget=budget,
+            issue_leg=_issue_leg,
+            context_remaining_for_leg=_context_remaining,
+            initial_visible=visible,
+            on_leg_accepted=_commit_accepted_leg,
+        )
+        outcome = runner.run()
+
+        delta = validated_suffix(returned=outcome.visible_content, prefill=visible)
+        if not delta:
+            return result
+
+        log.info(
+            "c2.continuation",
+            legs=outcome.legs_used,
+            used_total=outcome.used_total,
+            c_total=budget.c_total,
+            stop=outcome.stop.value,
+            added_chars=len(delta),
+        )
+
+        # Extend the LAST text block so the block structure is preserved and
+        # the committed text stays exactly prefix + suffix (the join is
+        # per-block, so only the final block's tail moved).
+        blocks = list(result.turn.content)
+        for index in range(len(blocks) - 1, -1, -1):
+            if isinstance(blocks[index], TextBlock):
+                blocks[index] = TextBlock(blocks[index].text + delta)
+                break
+        else:
+            blocks.append(TextBlock(delta))
+        new_result = dataclasses.replace(
+            result,
+            turn=dataclasses.replace(result.turn, content=tuple(blocks)),
+        )
+
+        # The logical turn's usage is the initial generation PLUS every
+        # accepted leg — never merely the last leg.  ``outcome.used_total``
+        # was seeded with the initial count, so it already IS that aggregate.
+        if result.usage is not None:
+            prompt = result.usage.prompt_tokens
+            new_result = dataclasses.replace(
+                new_result,
+                usage=dataclasses.replace(
+                    result.usage,
+                    completion_tokens=outcome.used_total,
+                    total_tokens=prompt + outcome.used_total,
+                ),
+            )
+            slot = self._last_usage
+            if isinstance(slot, dict):
+                slot["completion_tokens"] = outcome.used_total
+                slot["total_tokens"] = prompt + outcome.used_total
+        return new_result
+
     def _stream_response(self, my_generation: int = 0) -> ModelTurnResult:
         """Run one resilient streaming turn: sample, surface, re-issue on death.
 
@@ -14766,6 +15056,16 @@ class ChatSession:
                     # ended it CLEANLY, so without this re-check the turn
                     # commits as complete and its tool calls execute.
                     self._check_cancelled(my_generation)
+                    # C2: extend a truncated answer before the visible stream
+                    # is closed.  Gate-OFF (and every ineligible case) returns
+                    # the result untouched, so this is a no-op by default.
+                    result = self._maybe_continue_truncated(
+                        result,
+                        consumer,
+                        _prepare,
+                        my_generation,
+                        principal_id,
+                    )
                     consumer.finish_stream()
                     if is_empty_completion(result):
                         raise _EmptyCompletionError(result)

@@ -105,6 +105,22 @@ def _build_registry() -> dict[str, SettingDef]:
             "of English text. Per-model overrides can be set in the Models tab.",
         ),
         SettingDef(
+            "model.auto_continue_truncated",
+            "bool",
+            False,
+            "Automatically continue a response that was cut off by the output limit",
+            "model",
+            help="When a reply stops because it reached the output-token limit (not because "
+            "the model finished, and not because it was blocked or ran out of context), the "
+            "harness can ask the model to carry on from exactly where it stopped, instead of "
+            "handing you a half-finished answer. The extra work is hard-bounded: the whole "
+            "reply, original part included, may not exceed twice what you asked for (capped "
+            "at 65536 tokens), split across at most 3 further requests. Continuation only "
+            "happens on models and connections where it has been proven to work, and is "
+            "skipped entirely - the current behaviour is kept - everywhere else. Leave this "
+            "off unless you specifically want longer answers completed for you.",
+        ),
+        SettingDef(
             "model.reasoning_effort",
             "str",
             "",

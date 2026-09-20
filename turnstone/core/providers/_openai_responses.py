@@ -312,9 +312,9 @@ class OpenAIResponsesProvider:
                 )
 
         instructions = "\n\n".join(instructions_parts) if instructions_parts else None
-        # Responses-wire counterpart of the chat-wire round repair.  Gated on the
-        # same operator flag that governs reasoning replay on this wire, so lanes
-        # without it (cloud lanes with replay off) keep their exact item list.
+        # Repair replay-sensitive resumed tool rounds on the Responses wire.
+        # Gated on the operator flag that governs reasoning replay on this wire,
+        # so lanes without it keep their exact item list.
         if replay_reasoning_to_model:
             items = _ensure_responses_round_reasoning_items(items)
         return instructions, items

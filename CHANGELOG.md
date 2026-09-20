@@ -72,6 +72,17 @@ frozen.
 
 ### Fixed
 
+- **Reasoning replay on a resumed Responses tool round.** A Responses request that resumes a tool
+  round — history ending on a tool result — has to carry the reasoning item for the turn that made
+  those calls. That wire replayed reasoning only from a stored native `reasoning` block, so a round
+  whose interrupted turn recorded no reasoning was sent with none at all, and a strict-thinking
+  upstream refused it with `The reasoning_text in the thinking mode must be passed back to the API`,
+  ending the workstream. This is what an in-band compaction leaves behind: the summary is written by
+  a non-thinking lane, so the resumed turn has nothing to replay. The provider now synthesizes the
+  missing item for that turn alone — only when the history is a tool-round continuation, only when
+  the turn carries no reasoning item of its own, and only when every trailing tool result is
+  answered by a call in that turn — with a stable id and text that states the reasoning was not
+  recorded rather than inventing it. A lane that does not replay reasoning is unchanged.
 - **Context gauge after a server-side tool loop.** When the model ran several web searches inside
   one response, the provider's closing usage reported billing totals summed across its sampling
   passes, and the session took them as its context size. On the Anthropic lane a four-search turn

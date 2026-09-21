@@ -165,6 +165,9 @@ class _FakeLane:
         self.model = model
         self.provider = provider
         self.alias = model
+        # Declared serving identity, as the real lane factory captures it;
+        # "" when the provider declares nothing.
+        self.provider_name = getattr(provider, "provider_name", "") or ""
 
 
 def _result(

@@ -52,12 +52,16 @@ class _FakeStore:
 
 
 class _FakeLane:
-    """A lane stand-in carrying only the two facets the capability check reads."""
+    """A lane stand-in carrying only the neutral facets the capability check reads."""
 
     def __init__(self, model: str, provider) -> None:
         self.model = model
         self.provider = provider
         self.alias = model
+        # The lane's declared serving identity, as the real lane factory
+        # captures it.  A provider that declares nothing yields "" — an
+        # unproven lane, which the capability check refuses.
+        self.provider_name = getattr(provider, "provider_name", "") or ""
 
 
 def _result(
@@ -310,6 +314,27 @@ def test_max_tokens_override_does_not_mutate_the_session_setting():
     session, _, consumer = _setup(max_tokens=4096)
     _run_with_rail(session, consumer, _result(), [_leg(PARTIAL + "x")])
     assert session.max_tokens == 4096
+
+
+def test_max_tokens_override_is_per_call_and_never_leaks_to_the_next_turn():
+    """The continuation budget rides ONE driver call; it is never state.
+
+    The session setting is the only persistent budget, so the next call — a
+    normal turn — must go back to it.  Otherwise a small leg budget would
+    quietly become every later call's ceiling.
+    """
+    session, _, consumer = _setup(max_tokens=8192)
+    calls: list[dict] = []
+    _install_rail(session, [_result(), _result()], calls)
+
+    def prepare(wire: list[dict], _lane: object) -> list[dict]:
+        return wire
+
+    session._model_turn_with_fallback(consumer, prepare, max_tokens=1234)
+    session._model_turn_with_fallback(consumer, prepare)
+
+    assert [c["max_tokens"] for c in calls] == [1234, None]
+    assert session.max_tokens == 8192
 
 
 # --------------------------------------------------------------------------

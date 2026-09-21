@@ -59,6 +59,13 @@ def replace_session_lane(
     old_lane = binding.lane
     next_provider = old_lane.provider if provider is _UNCHANGED else provider
     next_model = old_lane.model if model is _UNCHANGED else model
+    # The declared serving identity travels WITH the handle: swapping a
+    # provider re-derives it, exactly as ``resolve_model_binding`` does when it
+    # builds a lane.  Otherwise a lane would report one provider and identify
+    # as another.
+    next_provider_name = (
+        old_lane.provider_name if provider is _UNCHANGED else next_provider.provider_name
+    )
     if capabilities is _UNCHANGED:
         next_capabilities = old_lane.capabilities
         if provider is not _UNCHANGED:
@@ -71,6 +78,7 @@ def replace_session_lane(
         client=old_lane.client if client is _UNCHANGED else client,
         model=next_model,
         alias=old_lane.alias if alias is _UNCHANGED else alias,
+        provider_name=next_provider_name,
         capabilities=next_capabilities,
     )
     session._model_binding = dataclasses.replace(binding, lane=lane)

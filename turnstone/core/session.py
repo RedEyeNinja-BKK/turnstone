@@ -19,6 +19,7 @@ import difflib
 import functools
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -12765,21 +12766,54 @@ class ChatSession:
 
         # The prompt grows with every accepted suffix, so the endpoint's
         # remaining room is recomputed per leg rather than once for the run.
-        # The leg's own allowance also rides the prefill it must resend.
-        prefill_chars = len(visible)
+        #
+        # It is NOT a guess about the whole conversation.  The number that
+        # decides safety is the real size of the request about to be sent, so
+        # the measurement is ANCHORED to a truthful provider figure —
+        # ``usage.prompt_tokens`` of the initial call, re-anchored after every
+        # completed leg — and only the text added SINCE that anchor is
+        # converted at all.  The converted increment is one suffix (itself
+        # bounded by the leg's own allowance), never the accumulated history.
+        anchor_prompt_tokens = result.usage.prompt_tokens
+        anchor_prefill_chars = 0
+        if anchor_prompt_tokens <= 0:
+            # An untrustworthy anchor is not a measurement; no safe number
+            # exists, so C2 does not run.
+            return result
 
-        def _context_remaining(leg_index: int) -> int | None:
-            prompt_tokens = self._estimated_prompt_tokens() + int(
-                prefill_chars / self._chars_per_token
+        chars_per_token = float(self._chars_per_token)
+        if not chars_per_token > 0:
+            chars_per_token = 4.0
+        # The prefill the NEXT leg will submit: leg 1 gets the initial answer,
+        # leg N gets that plus every suffix accepted so far.
+        current_prefill = visible
+
+        def _room_for(prefill: str) -> int | None:
+            """Endpoint room for a leg submitting *prefill*, or None.
+
+            The increment is rounded UP, which biases the prompt estimate up
+            and therefore the room — the value that caps the leg's output —
+            down.  The error direction is deliberately the safe one.
+            """
+            added_chars = len(prefill) - anchor_prefill_chars
+            if added_chars < 0:
+                # The submitted text can only ever grow.  A shrink means the
+                # anchor and the caller disagree about what was sent, so
+                # there is no number here worth trusting.
+                return None
+            prompt_tokens = anchor_prompt_tokens + math.ceil(
+                added_chars / chars_per_token
             )
             room = C2_ENDPOINT_CONTEXT_TOKENS - prompt_tokens
             return room if room > 0 else None
 
+        def _context_remaining(leg_index: int) -> int | None:
+            return _room_for(current_prefill)
+
         def _issue_leg(
-            leg_index: int, prefill: str, reasoning_prefill: str, leg_budget: int
+            leg_index: int, prefill: str, leg_budget: int
         ) -> ContinuationLegResult:
-            nonlocal prefill_chars
-            prefill_chars = len(prefill)
+            nonlocal anchor_prompt_tokens, anchor_prefill_chars
             leg_consumer = _SilentLegConsumer(self, my_generation)
             # The sanctioned rail reads ``self.messages``, so the continuation
             # input is installed as TEMPORARY state and always restored —
@@ -12815,10 +12849,15 @@ class ChatSession:
                 self._last_usage = saved_last_usage
                 self._assistant_pending_tokens = saved_pending_tokens
 
-            suffix = validated_suffix(returned=leg_result.content, prefill=prefill)
+            # Re-anchor to THIS leg's real measurement: the request it just
+            # sent is the largest one that is known to have been accepted, so
+            # the next leg only has to convert the text added on top of it.
+            if leg_result.usage is not None and leg_result.usage.prompt_tokens > 0:
+                anchor_prompt_tokens = leg_result.usage.prompt_tokens
+                anchor_prefill_chars = len(prefill)
+
             return ContinuationLegResult(
                 visible_content=leg_result.content,
-                reasoning_content="",
                 completion_tokens=(
                     leg_result.usage.completion_tokens if leg_result.usage is not None else None
                 ),
@@ -12836,6 +12875,8 @@ class ChatSession:
             stream is never closed or restarted here, and the prefix is never
             re-emitted — only the new suffix.
             """
+            nonlocal current_prefill
+            current_prefill = current_prefill + suffix
             consumer(StreamChunk(content_delta=suffix))
 
         runner = ContinuationRunner(
@@ -12892,6 +12933,12 @@ class ChatSession:
             if isinstance(slot, dict):
                 slot["completion_tokens"] = outcome.used_total
                 slot["total_tokens"] = prompt + outcome.used_total
+            # The pending-token figure tracks the SAME quantity (see the
+            # initial set in ``_finalize_stream_result``).  Leaving it at the
+            # initial generation's count would under-report this turn's
+            # completion tokens by every accepted leg, and it is read on the
+            # next turn's estimate path.
+            self._assistant_pending_tokens = outcome.used_total
         return new_result
 
     def _stream_response(self, my_generation: int = 0) -> ModelTurnResult:

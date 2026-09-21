@@ -13,6 +13,7 @@ what keeps cancellation, the fallback walk and generation scoping in play.
 
 from __future__ import annotations
 
+import math
 from unittest.mock import patch
 
 import pytest
@@ -390,9 +391,15 @@ def test_session_usage_slots_survive_a_leg():
     session, _, consumer = _setup()
     session._last_usage = {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}
     session._assistant_pending_tokens = 7
-    _run_with_rail(session, consumer, _result(), [_leg(PARTIAL + "z", completion_tokens=9)])
+    out, _ = _run_with_rail(
+        session, consumer, _result(), [_leg(PARTIAL + "z", completion_tokens=9)]
+    )
     # The leg's isolated 9 tokens must not have replaced the logical turn's.
     assert session._last_usage["completion_tokens"] == 40 + 9
+    # ``_assistant_pending_tokens`` tracks the SAME quantity, and a stale
+    # value here under-reports the turn on the next estimate path.
+    assert session._assistant_pending_tokens == 40 + 9
+    assert session._assistant_pending_tokens == out.usage.completion_tokens
 
 
 def test_committed_usage_is_initial_plus_continuation():
@@ -485,25 +492,61 @@ def test_at_most_three_legs_and_the_budget_can_bind_first():
 
 
 def test_endpoint_context_room_can_bind_a_leg():
+    """The anchor is the provider's OWN figure for the request it accepted."""
     session, _, consumer = _setup(max_tokens=4096)
-    with patch.object(
-        session, "_estimated_prompt_tokens", return_value=C2_ENDPOINT_CONTEXT_TOKENS - 120
-    ):
-        _, calls = _run_with_rail(
-            session, consumer, _result(), [_leg(PARTIAL + "small")]
-        )
+    _, calls = _run_with_rail(
+        session,
+        consumer,
+        _result(prompt_tokens=C2_ENDPOINT_CONTEXT_TOKENS - 120),
+        [_leg(PARTIAL + "small")],
+    )
     assert calls, "a leg is still allowed while some room remains"
     assert calls[0]["max_tokens"] < 4096, "the endpoint wall binds before R_effective"
 
 
+def test_the_leg_anchor_is_a_real_measurement_not_a_guess():
+    """Leg 2's room is built from leg 1's OWN reported prompt size.
+
+    A character-estimate over the whole history would never land on exactly
+    the wall minus leg 1's real prompt plus leg 1's own suffix, so landing
+    there is the property that proves the anchor is measured.
+    """
+    session, _, consumer = _setup(max_tokens=32768)
+    wall = C2_ENDPOINT_CONTEXT_TOKENS
+    suffix = "x" * 40
+    _, calls = _run_with_rail(
+        session,
+        consumer,
+        _result(prompt_tokens=100),
+        [
+            _leg(PARTIAL + suffix, prompt_tokens=wall - 50, finish_reason="length"),
+            _leg(PARTIAL + suffix + "y"),
+        ],
+    )
+    assert len(calls) == 2
+    assert calls[0]["max_tokens"] == 32768, "R_effective binds the first leg"
+    # 50 tokens of wall, less the 40-char suffix leg 2 appends (ceil -> 10).
+    assert calls[1]["max_tokens"] == 50 - math.ceil(len(suffix) / 4.0)
+
+
 def test_no_endpoint_room_fails_closed_without_a_leg():
     session, _, consumer = _setup()
-    with patch.object(
-        session, "_estimated_prompt_tokens", return_value=C2_ENDPOINT_CONTEXT_TOKENS + 1
-    ):
-        out, calls = _run_with_rail(session, consumer, _result(), [])
+    out, calls = _run_with_rail(
+        session,
+        consumer,
+        _result(prompt_tokens=C2_ENDPOINT_CONTEXT_TOKENS + 1),
+        [],
+    )
     assert calls == []
     assert out is not None and out.content == PARTIAL
+
+
+def test_an_untrustworthy_anchor_fails_closed():
+    """No real measurement => no continuation, rather than a guess."""
+    session, _, consumer = _setup()
+    out, calls = _run_with_rail(session, consumer, _result(prompt_tokens=0), [])
+    assert calls == []
+    assert out.content == PARTIAL
 
 
 # --------------------------------------------------------------------------

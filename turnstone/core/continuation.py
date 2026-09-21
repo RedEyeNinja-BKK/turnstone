@@ -24,8 +24,11 @@ Contract (operator ruling 2026-09-21, v1):
   * At most ``MAX_CONTINUATION_LEGS`` further legs, but the token budget is
     independently authoritative: whichever binds first stops the run.
   * A continuation leg never receives a fresh unbounded ``R``.
-  * Context safety is recomputed **per leg** from that leg's actual request
-    representation; if it cannot be computed safely we fail closed.
+  * Context safety is recomputed **per leg** and is ANCHORED to a real
+    provider prompt measurement — ``usage.prompt_tokens`` of the request that
+    was actually accepted — so only the text added since that measurement is
+    ever converted from characters.  With no trustworthy anchor there is no
+    number worth acting on, and the run fails closed rather than guessing.
 
 Accounting (proven live 2026-09-21 — see
 ``operations/c2-token-accounting-proof-2026-09-21.md``): the canonical
@@ -215,11 +218,12 @@ def leg_budget(
 
     ``endpoint_context_remaining`` is **required** and is intentionally not
     defaulted: it must be recomputed for each leg from that leg's actual
-    request representation (history + replayed reasoning + accumulated
-    prefill), because each continuation carries more state than the last.  It
-    is never a value computed once for the run.  A caller that cannot compute
-    it safely must not call this function — there is no context shifting to
-    rescue an overrun, so the only safe answer is to stop.
+    request representation (the real measured prompt of the last accepted
+    call plus the text accumulated on top of it), because each continuation
+    carries more state than the last.  It is never a value computed once for
+    the run.  A caller that cannot compute it safely must not call this
+    function — there is no context shifting to rescue an overrun, so the only
+    safe answer is to stop.
     """
     if endpoint_context_remaining is None:
         return 0
@@ -433,14 +437,31 @@ def reasoning_case(
 # The policy section above owns the arithmetic; the executor owns the loop
 # that spends it.  It is deliberately dependency-injected: the caller
 # supplies a callable that actually issues a leg, so the whole loop —
-# prefix validation, suffix merge, reasoning-item ordering, accounting, stop
-# selection — is testable with fakes and contains no provider, no session
-# and no I/O.
+# prefix validation, suffix merge, accounting, stop selection — is testable
+# with fakes and contains no provider, no session and no I/O.
 #
 # Why a separate object rather than logic inside ``session.py``: the operator
 # ruling requires the policy module stay the accounting authority and the
 # session integration stay thin.  Everything that could be got wrong
 # numerically or structurally lives here, where it has direct tests.
+#
+# MODE 1 ONLY.  Mode 2 (reasoning-bearing continuation) is DEFERRED, and the
+# executor cannot reach it in two independent ways rather than one:
+#
+#   1. ``ContinuationRunner.__init__`` REFUSES any budget whose mode is not
+#      ``MODE1_VISIBLE_ONLY`` — an unreachable-by-construction guard.
+#   2. The executor carries no reasoning machinery at all: no replayed
+#      reasoning prefill, no per-leg reasoning block, and no reasoning field
+#      on :class:`ContinuationOutcome`.  There is nothing for a Mode-2 run to
+#      do, which is why the guard can only ever raise.
+#
+# The Mode-2 POLICY is retained (``ContinuationMode``,
+# ``MAX_MODE2_CONTINUATION_LEGS``, :func:`reasoning_case`, and the mode rule
+# in ``ContinuationBudget.max_legs``) because it is pure arithmetic with its
+# own tests and a future ruling re-uses it verbatim.  Retaining the arithmetic
+# is not the same as shipping an execution path: nothing in the turn loop
+# consults :func:`reasoning_case`, so a reasoning-bearing turn performs no
+# continuation at all.
 
 
 @dataclass(frozen=True)
@@ -451,10 +472,13 @@ class ContinuationLegResult:
     the submitted prefill** (proven behaviour: the provider echoes the
     prefill and appends the new suffix), so the caller must NOT treat it as
     the new output.
+
+    There is deliberately NO reasoning field: a C2 v1 leg is visible-text
+    only, and a leg that returned reasoning is not a leg this executor may
+    accept.
     """
 
     visible_content: str = ""
-    reasoning_content: str = ""
     completion_tokens: int | None = None
     finish_reason: str | None = None
     incomplete_reason: str | None = None
@@ -462,26 +486,28 @@ class ContinuationLegResult:
 
 @dataclass
 class ContinuationOutcome:
-    """Merged result of a C2 run."""
+    """Merged result of a Mode-1 C2 run.
+
+    Visible text only.  A reasoning-carrying outcome is not expressible here,
+    so a caller cannot mistake a Mode-2 merge for a Mode-1 one.
+    """
 
     visible_content: str
-    #: Ordered ``(kind, text)`` reasoning items, original leg first then each
-    #: continuation leg's own native block.  Never flattened into visible
-    #: text, never overwritten, never merged into one guessed block.
-    reasoning_items: list[tuple[str, str]] = field(default_factory=list)
     used_total: int = 0
     legs_used: int = 0
     stop: ContinuationStop = ContinuationStop.COMPLETED
 
 
-#: ``issue_leg(leg_index, visible_prefill, reasoning_prefill, leg_budget)
-#: -> ContinuationLegResult``.  ``leg_index`` is 1-based.
-IssueLeg = Callable[[int, str, str, int], ContinuationLegResult]
+#: ``issue_leg(leg_index, visible_prefill, leg_budget) ->
+#: ContinuationLegResult``.  ``leg_index`` is 1-based.  The leg re-enters the
+#: caller's own sanctioned turn rail; the executor never reaches a provider.
+IssueLeg = Callable[[int, str, int], ContinuationLegResult]
 
 #: ``context_remaining_for_leg(leg_index) -> int | None``.  MUST be computed
-#: from that leg's actual request representation (history + replayed
-#: reasoning + accumulated prefill), and MUST return None when it cannot be
-#: computed safely.
+#: from that leg's actual request representation — a REAL provider prompt
+#: measurement for everything that was already sent, plus only the text added
+#: since that measurement — and MUST return None when it cannot be computed
+#: safely.
 ContextRemaining = Callable[[int], int | None]
 
 
@@ -501,17 +527,22 @@ class ContinuationRunner:
         issue_leg: IssueLeg,
         context_remaining_for_leg: ContextRemaining,
         initial_visible: str,
-        initial_reasoning: str = "",
         on_leg_accepted: OnLegAccepted | None = None,
     ) -> None:
+        # Mode 2 is not implemented by this executor and must not be
+        # reachable through it.  Refusing at construction means a Mode-2
+        # budget can never produce a running runner, whatever a future
+        # caller believes — the guard is structural, not a policy check.
+        if budget.mode is not ContinuationMode.MODE1_VISIBLE_ONLY:
+            raise ValueError(
+                "ContinuationRunner executes Mode 1 only "
+                f"(got mode={budget.mode.value!r}); Mode 2 is deferred"
+            )
         self._budget = budget
         self._issue_leg = issue_leg
         self._context_remaining = context_remaining_for_leg
         self._visible = initial_visible
-        self._reasoning_items: list[tuple[str, str]] = []
         self._on_leg_accepted = on_leg_accepted
-        if initial_reasoning:
-            self._reasoning_items.append(("original", initial_reasoning))
 
     @property
     def budget(self) -> ContinuationBudget:
@@ -531,9 +562,8 @@ class ContinuationRunner:
             # The exact submitted visible text IS the prefill for this leg;
             # the accumulated answer grows by one suffix per leg.
             prefill = self._visible
-            reasoning_prefill = "".join(t for _, t in self._reasoning_items)
 
-            leg = self._issue_leg(leg_index, prefill, reasoning_prefill, leg_budget)
+            leg = self._issue_leg(leg_index, prefill, leg_budget)
 
             # --- exact-prefix invariant: non-negotiable -------------------
             # No fuzzy overlap, no semantic repair, no longest-prefix
@@ -564,13 +594,6 @@ class ContinuationRunner:
 
             if accepted:
                 self._visible += suffix
-                # Preserve the provider's own ordering and identity: the
-                # continuation's reasoning is a DISTINCT native block appended
-                # after the replayed one, never a replacement for it.
-                if leg.reasoning_content:
-                    self._reasoning_items.append(
-                        (f"continuation-{leg_index}", leg.reasoning_content)
-                    )
                 if self._on_leg_accepted is not None:
                     self._on_leg_accepted(leg_index, suffix)
 
@@ -584,7 +607,6 @@ class ContinuationRunner:
 
         return ContinuationOutcome(
             visible_content=self._visible,
-            reasoning_items=list(self._reasoning_items),
             used_total=self._budget.used_total,
             legs_used=self._budget.legs_used,
             stop=self._budget.stop or ContinuationStop.COMPLETED,

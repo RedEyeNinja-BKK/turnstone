@@ -85,12 +85,20 @@ MAX_MODE2_CONTINUATION_LEGS = 1
 #: vocabulary in exactly one place; this module never broadens it silently.
 C2_REQUIRED_INCOMPLETE_REASON = "max_output_tokens"
 
-#: The ONE provider implementation C2 v1 is enabled for.  Turnstone's
+#: The ONE provider identity C2 v1 is enabled for.
+#:
+#: This is the provider's own stable INTERFACE value
+#: (``LLMProvider.provider_name``), NOT a Python class name: a session must
+#: never identify a provider by introspecting its implementation.  The
+#: Responses arm declares ``"openai"``; the ``openai-compatible`` chat arm
+#: declares ``"openai-compatible"`` and the xAI subclass declares ``"xai"``,
+#: so this clause excludes both exactly as the class-name comparison did.
+#: Turnstone's
 #: Responses provider is shared by OpenAI, DeepSeek and every migrated local
 #: consumer, so the wire format alone cannot scope this — see
 #: :func:`continuation_capability_ok`, which requires the backend model id as
 #: well.  The code is reusable; the ENABLEMENT is not generic.
-C2_PROVEN_PROVIDER = "OpenAIResponsesProvider"
+C2_PROVEN_PROVIDER = "openai"
 
 #: Backend model id prefix of the lane the D-cell proved the continuation
 #: contract on: the local ComfyNinja Qwen3.8-27B family.
@@ -109,7 +117,13 @@ C2_ENDPOINT_CONTEXT_TOKENS = 155_648
 def continuation_capability_ok(*, backend_model_id: str, provider_name: str) -> bool:
     """Whether *this* serving lane is inside the ONE proven C2 v1 capability.
 
-    Fails closed: anything not positively matched returns False, so an
+    ``provider_name`` is a lane's DECLARED provider identity
+    (``LLMProvider.provider_name``), never a Python class name -- see
+    :data:`C2_PROVEN_PROVIDER`.  Both arguments are neutral lane values, so
+    the session layer can scope this without touching a plant handle.
+
+    Fails closed: anything not positively matched returns False -- including
+    an empty ``provider_name`` or an empty ``backend_model_id`` -- so an
     unrelated Responses lane, a cloud provider, or an unproven local model
     is never continued.
     """

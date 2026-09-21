@@ -9911,6 +9911,13 @@ class ChatSession:
         """
         tracker = self._get_health_tracker()
         primary_lane = self._primary_lane()
+        # Per-call output budget, used by the C2 continuation legs to send
+        # their own (smaller) leg budget.  Carried ONLY when the caller
+        # supplied one: with no override the driver call must stay
+        # shape-identical to the established contract (the OBO lane-selection
+        # guard asserts that exact call), so the keyword is OMITTED rather
+        # than passed as ``None``.
+        override_kwargs: dict[str, Any] = {} if max_tokens is None else {"max_tokens": max_tokens}
         try:
             return self._model_turn_with_retry(
                 primary_lane,
@@ -9919,7 +9926,7 @@ class ChatSession:
                 prepare_wire,
                 my_generation,
                 principal_id=principal_id,
-                max_tokens=max_tokens,
+                **override_kwargs,
             )
         except BackendAuthUnavailableError:
             # Explicit fail-closed policy: never reinterpret an authentication
@@ -9956,7 +9963,7 @@ class ChatSession:
                     prepare_wire,
                     my_generation,
                     principal_id=principal_id,
-                    max_tokens=max_tokens,
+                    **override_kwargs,
                 )
                 if result is not None:
                     return result
@@ -9977,7 +9984,7 @@ class ChatSession:
                     prepare_wire,
                     my_generation,
                     principal_id=principal_id,
-                    max_tokens=max_tokens,
+                    **override_kwargs,
                 )
                 if result is not None:
                     return result
@@ -10010,6 +10017,9 @@ class ChatSession:
             if self._health_registry
             else None
         )
+        # Same per-call override rule as ``_model_turn_with_fallback``: omitted
+        # when absent, so a fallback attempt's driver call keeps its shape.
+        override_kwargs: dict[str, Any] = {} if max_tokens is None else {"max_tokens": max_tokens}
         try:
             backend_auth_resolver = (
                 self._model_backend_auth_resolver_for_principal(principal_id)
@@ -10039,7 +10049,7 @@ class ChatSession:
                 prepare_wire,
                 my_generation,
                 principal_id=principal_id,
-                max_tokens=max_tokens,
+                **override_kwargs,
             )
         except BackendAuthUnavailableError:
             # Fail-closed policy — never another lane's business.
@@ -14723,11 +14733,20 @@ class ChatSession:
         return bool(cs.get("model.auto_continue_truncated"))
 
     def _continuation_capable(self, lane: ModelLane) -> bool:
-        """Whether *lane* is the ONE capability C2 v1 is enabled for."""
-        provider_name = type(lane.provider).__name__ if lane.provider is not None else ""
+        """Whether *lane* is the ONE capability C2 v1 is enabled for.
+
+        Decided from NEUTRAL lane values only: ``lane.model`` plus
+        ``lane.provider_name``, the provider's DECLARED identity captured on
+        the lane when it was built.  ChatSession never introspects the plant
+        handle — provider implementations stay swappable behind the identity
+        they declare, which is the house direction IR -> lowering ->
+        provider.  An empty value on either input is unproven, hence refused.
+        A lane built without a declared identity carries ``""`` and fails
+        closed rather than being guessed at.
+        """
         return continuation_capability_ok(
             backend_model_id=lane.model or "",
-            provider_name=provider_name,
+            provider_name=lane.provider_name or "",
         )
 
     def _maybe_continue_truncated(

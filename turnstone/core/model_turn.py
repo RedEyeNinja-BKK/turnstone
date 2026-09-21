@@ -576,6 +576,14 @@ class ModelLane:
     client: Any
     model: str
     alias: str = ""
+    # The provider's DECLARED identity (``LLMProvider.provider_name``) captured
+    # with the rest of the binding.  A stable interface VALUE, deliberately
+    # carried on the lane so a caller that must scope behaviour by the serving
+    # semantics it was proven against can read a plain lane value instead of
+    # introspecting the plant handle (house direction: IR -> lowering ->
+    # provider).  "" means the lane was built without one, and every such lane
+    # is unproven by construction.
+    provider_name: str = ""
     capabilities: ModelCapabilities | None = None
     extra_params: dict[str, Any] | None = None
     # Per-request HTTP headers (``server_compat["extra_headers"]``).  Kept off
@@ -850,6 +858,7 @@ def resolve_lane(
         client=client,
         model=model,
         alias=alias,
+        provider_name=provider.provider_name,
         capabilities=caps,
         extra_params=extra,
         extra_headers=headers,

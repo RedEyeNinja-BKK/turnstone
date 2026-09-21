@@ -1,8 +1,14 @@
-"""C2 runner — prefix invariant, merge, reasoning ordering, stop selection.
+"""C2 runner — prefix invariant, merge, accounting, stop selection.
 
 Fakes only: the runner is dependency-injected, so every structural clause of
 the ruling is exercised without a provider or a session.
+
+This file is deliberately Mode 1 only.  The executor has no Mode-2 machinery
+at all, and the class below exists to hold that line: a Mode-2 budget must not
+be able to produce a running runner.
 """
+
+import pytest
 
 from turnstone.core.continuation import (
     ContinuationBudget,
@@ -22,12 +28,11 @@ class FakeIssuer:
         self._legs = list(legs)
         self.calls = []
 
-    def __call__(self, leg_index, prefill, reasoning_prefill, leg_budget):
+    def __call__(self, leg_index, prefill, leg_budget):
         self.calls.append(
             {
                 "leg_index": leg_index,
                 "prefill": prefill,
-                "reasoning_prefill": reasoning_prefill,
                 "leg_budget": leg_budget,
             }
         )
@@ -38,11 +43,11 @@ def make_runner(
     legs,
     *,
     initial_visible="1\n2\n3\n",
-    initial_reasoning="",
     r_effective=32_768,
     mode=ContinuationMode.MODE1_VISIBLE_ONLY,
     used_total=0,
     context=BIG,
+    on_leg_accepted=None,
 ):
     budget = ContinuationBudget(r_effective=r_effective, mode=mode)
     budget.used_total = used_total
@@ -52,7 +57,7 @@ def make_runner(
         issue_leg=issuer,
         context_remaining_for_leg=lambda i: context,
         initial_visible=initial_visible,
-        initial_reasoning=initial_reasoning,
+        on_leg_accepted=on_leg_accepted,
     )
     return runner, issuer
 
@@ -114,6 +119,18 @@ class TestMode1Runner:
         assert out.stop is ContinuationStop.PREFIX_MISMATCH
         assert out.legs_used == 0
 
+    def test_a_failed_leg_suffix_is_never_committed(self):
+        """Fail-closed covers the TEXT, not only the budget."""
+        committed: list[tuple[int, str]] = []
+        runner, _ = make_runner(
+            [ContinuationLegResult(visible_content="1\n2\n3\n4\n", completion_tokens=None)],
+            on_leg_accepted=lambda i, s: committed.append((i, s)),
+        )
+        out = runner.run()
+        assert out.stop is ContinuationStop.PROVIDER_FAILURE
+        assert committed == [], "an unaccountable leg must not be shown"
+        assert out.visible_content == "1\n2\n3\n"
+
     def test_zero_progress_stops(self):
         runner, _ = make_runner([leg("1\n2\n3\n", "", completion_tokens=7)])
         out = runner.run()
@@ -151,103 +168,69 @@ class TestMode1Runner:
         assert issuer.calls[0]["prefill"] == "1\n2\n3\n"
         assert issuer.calls[1]["prefill"] == "1\n2\n3\n4\n"
 
-
-class TestMode2Runner:
-    def _mode2(self, legs, **kw):
-        kw.setdefault("initial_reasoning", "leg0 reasoning")
-        return make_runner(
-            legs, mode=ContinuationMode.MODE2_REASONING_CONTINUATION, **kw
-        )
-
-    def test_completed_reasoning_plus_partial_yields_one_continuation(self):
-        runner, _ = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="leg1 reasoning",
-                 finish_reason="stop")]
-        )
-        out = runner.run()
-        assert out.visible_content == "1\n2\n3\n4\n"
-        assert out.legs_used == 1
-        assert out.stop is ContinuationStop.COMPLETED
-
-    def test_new_distinct_reasoning_item_is_accepted_and_ordered(self):
-        runner, _ = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="leg1 reasoning",
-                 finish_reason="stop")]
-        )
-        out = runner.run()
-        assert [k for k, _ in out.reasoning_items] == ["original", "continuation-1"]
-        assert out.reasoning_items[0][1] == "leg0 reasoning"
-        assert out.reasoning_items[1][1] == "leg1 reasoning"
-
-    def test_replayed_reasoning_is_not_duplicated(self):
-        runner, _ = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="leg1 reasoning",
-                 finish_reason="stop")]
-        )
-        out = runner.run()
-        texts = [t for _, t in out.reasoning_items]
-        assert texts.count("leg0 reasoning") == 1
-        assert texts.count("leg1 reasoning") == 1
-
-    def test_continuation_reasoning_identity_is_distinct(self):
-        runner, _ = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="leg0 reasoning",
-                 finish_reason="stop")]
-        )
-        out = runner.run()
-        # Same text, different identity: the original is never overwritten.
-        assert out.reasoning_items[0][0] == "original"
-        assert out.reasoning_items[1][0] == "continuation-1"
-
-    def test_reasoning_is_never_flattened_into_visible_text(self):
-        runner, _ = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="SECRET COT",
-                 finish_reason="stop")]
-        )
-        out = runner.run()
-        assert "SECRET COT" not in out.visible_content
-
-    def test_visible_output_has_no_duplicated_prefill(self):
-        runner, _ = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="r", finish_reason="stop")]
-        )
-        out = runner.run()
-        assert out.visible_content == "1\n2\n3\n4\n"
-        assert out.visible_content.count("1\n2\n3\n") == 1
-
-    def test_original_reasoning_is_replayed_to_the_leg(self):
-        runner, issuer = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="r", finish_reason="stop")]
+    def test_accepted_suffix_is_committed_once_per_leg(self):
+        committed: list[tuple[int, str]] = []
+        runner, _ = make_runner(
+            [leg("1\n2\n3\n", "4\n"), leg("1\n2\n3\n4\n", "5\n", finish_reason="stop")],
+            on_leg_accepted=lambda i, s: committed.append((i, s)),
         )
         runner.run()
-        assert issuer.calls[0]["reasoning_prefill"] == "leg0 reasoning"
+        assert committed == [(1, "4\n"), (2, "5\n")]
 
-    def test_mode2_second_leg_refused_at_one_leg_boundary(self):
-        """The continuation itself truncated -> STOP, do not respawn."""
-        runner, issuer = self._mode2(
-            [leg("1\n2\n3\n", "4\n", reasoning_content="r", finish_reason="length")]
-        )
-        out = runner.run()
-        assert out.legs_used == 1
-        assert out.stop is ContinuationStop.LEG_LIMIT
-        assert len(issuer.calls) == 1
+    def test_context_is_recomputed_for_every_leg(self):
+        """Never once per run: each leg carries more state than the last."""
+        seen: list[int] = []
 
-    def test_reasoning_but_no_visible_suffix_is_zero_progress(self):
-        runner, _ = self._mode2(
-            [leg("1\n2\n3\n", "", reasoning_content="MORE COT", completion_tokens=900)]
-        )
-        out = runner.run()
-        assert out.stop is ContinuationStop.ZERO_PROGRESS
-        assert out.used_total == 900
-        assert len(out.reasoning_items) == 1  # no new block recorded for a no-op leg
+        def context(leg_index):
+            seen.append(leg_index)
+            return BIG
 
-    def test_mode2_still_never_downgrades_prefix_mismatch(self):
-        runner, _ = self._mode2(
-            [ContinuationLegResult(visible_content="nope", completion_tokens=5,
-                                   reasoning_content="r")]
+        budget = ContinuationBudget(r_effective=32_768)
+        issuer = FakeIssuer(
+            [leg("1\n2\n3\n", "4\n"), leg("1\n2\n3\n4\n", "5\n", finish_reason="stop")]
         )
-        out = runner.run()
-        assert out.stop is ContinuationStop.PREFIX_MISMATCH
+        ContinuationRunner(
+            budget=budget,
+            issue_leg=issuer,
+            context_remaining_for_leg=context,
+            initial_visible="1\n2\n3\n",
+        ).run()
+        assert seen == [1, 2]
+
+
+class TestMode2IsNotExecutable:
+    """Mode 2 is deferred, so it must be unreachable through the executor."""
+
+    def test_mode2_budget_cannot_construct_a_runner(self):
+        budget = ContinuationBudget(
+            r_effective=32_768, mode=ContinuationMode.MODE2_REASONING_CONTINUATION
+        )
+        with pytest.raises(ValueError, match="Mode 1 only"):
+            ContinuationRunner(
+                budget=budget,
+                issue_leg=FakeIssuer([]),
+                context_remaining_for_leg=lambda i: BIG,
+                initial_visible="1\n2\n3\n",
+            )
+
+    def test_the_default_mode_is_mode1(self):
+        assert ContinuationBudget(r_effective=32_768).mode is (
+            ContinuationMode.MODE1_VISIBLE_ONLY
+        )
+
+    def test_the_executor_takes_no_reasoning_input(self):
+        """No reasoning prefill parameter, so no caller can inject one."""
+        import inspect
+
+        params = inspect.signature(ContinuationRunner.__init__).parameters
+        assert "initial_reasoning" not in params
+        assert "issue_leg" in params
+
+    def test_the_outcome_has_no_reasoning_surface(self):
+        from turnstone.core.continuation import ContinuationOutcome
+
+        assert "reasoning_items" not in ContinuationOutcome.__dataclass_fields__
+        assert "reasoning_content" not in ContinuationLegResult.__dataclass_fields__
 
 
 class TestRunnerAccounting:
@@ -259,12 +242,11 @@ class TestRunnerAccounting:
         out = runner.run()
         assert out.used_total == 3  # not len("1\n2\n3\n4\n")
 
-    def test_reasoning_tokens_are_counted(self):
+    def test_reasoning_tokens_are_still_counted_by_the_counter(self):
+        """The counter includes everything the leg generated, so a thinking
+        backend stays correctly charged even though C2 is Mode 1 only."""
         runner, _ = make_runner(
-            [leg("1\n2\n3\n", "4\n", completion_tokens=900,
-                 reasoning_content="cot", finish_reason="stop")],
-            mode=ContinuationMode.MODE2_REASONING_CONTINUATION,
-            initial_reasoning="leg0",
+            [leg("1\n2\n3\n", "4\n", completion_tokens=900, finish_reason="stop")]
         )
         out = runner.run()
         assert out.used_total == 900

@@ -1075,9 +1075,10 @@ def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:
 #: :func:`ensure_responses_round_reasoning_items`.  A synthesized item needs a
 #: non-empty string ``id`` -- ``ResponseReasoningItemParam.id`` is required, and
 #: :func:`_reasoning_item_for_input` skips stored items without one.  The id binds a
-#: digest of the continued turn's answered tool-call ids, so it is STABLE across
-#: retries of the same round, fixed-length and charset-safe regardless of what the
-#: upstream put in ``call_id``.  An empty or random value would make replay
+#: digest of the trailing block it covers (item ids / tool call ids when present,
+#: type and role otherwise -- see :func:`_round_block_digest_source`), so it is STABLE
+#: across retries of the same round, fixed-length and charset-safe regardless of what
+#: the upstream put in ``call_id``.  An empty or random value would make replay
 #: non-deterministic, or make the item silently disappear.
 _RESPONSES_ROUND_REASONING_ID_PREFIX = "rs_roundrepair_"
 
@@ -1088,123 +1089,181 @@ _RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS = 24
 def ensure_responses_round_reasoning_items(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Satisfy the strict-thinking replay contract on the RESPONSES wire.
+    """Satisfy the strict-thinking upstream's per-turn reasoning replay contract.
 
-    CI-1's chat-wire repair
-    (:func:`turnstone.core.history_decoration.ensure_round_reasoning_content_field`)
-    is composed inside ``model_turn.maybe_attach_vllm_chat_reasoning``, whose first
-    gate admits Chat-Completions providers only -- legitimately, because the Responses
-    wire carries reasoning as native ``reasoning`` items rather than the
-    ``reasoning_content`` key.  The Responses path replayed reasoning only from a
-    stored native ``reasoning`` block (:func:`_assistant_items_for_input`), so a
-    current round whose tool-call turn had no stored reasoning emitted none at all,
-    and a strict-thinking upstream refused the request:
+    The ``openai_responses`` lane carries reasoning as native ``reasoning`` items
+    rather than the ``reasoning_content`` key, and the Chat-Completions repair in
+    :mod:`turnstone.core.history_decoration` does not apply here.  Reasoning is
+    replayed only from a stored native ``reasoning`` block, so a resumed round whose
+    assistant turns have nothing stored emitted none at all and the upstream refused
+    the request:
 
         HTTP 400 "The `reasoning_text` in the thinking mode must be passed back to the API."
 
-    That is the post-compaction session death: the mid-turn compaction summary marker
-    is written by the NON-thinking compaction lane, so the resumed round contains an
-    assistant turn with nothing to replay.
+    That is the post-compaction session death: the compaction summary marker is an
+    assistant turn written by the NON-thinking compaction lane, so the resumed round
+    contains assistant content with nothing to replay.
 
-    This pass reproduces CI-1's semantics in native Responses item form.  It is
-    deliberately NARROW -- every one of the following must hold before anything is
-    synthesized:
+    MEASURED CONTRACT (live lane, 2026-09-22; shape probes in ``/opt/turnstone/tmp``).
 
-    * the history is a TOOL-ROUND CONTINUATION, i.e. it ends on ``function_call_output``
-      item(s).  A round that does not end on a tool result does not carry the
-      requirement (measured 2026-09-20 on the live lane: such shapes are accepted with
-      no reasoning at all), so "the conversation contains tools somewhere" is not a
-      trigger;
-    * the turn immediately preceding that output block contains at least one
-      ``function_call`` -- a plain assistant turn needs no reasoning;
-    * that turn carries NO ``reasoning`` item already.  Stored reasoning is preserved
-      exactly and never replaced, and the pass is idempotent because its own output
-      satisfies this condition;
-    * every trailing tool output is answered by a ``function_call`` IN THAT TURN.  An
-      orphaned, stale or reordered output fails closed rather than repairing the wrong
-      turn;
-    * the turn lies INSIDE the current round, i.e. after the LAST user message, so
-      unrelated historical assistant turns are never touched.
+    The requirement is a property of the TRAILING BLOCK -- the items after the LAST
+    ``user`` message -- and, INSIDE that block, of EACH ASSISTANT TURN:
 
-    Only then is ONE reasoning item synthesized immediately before the turn.  It
-    carries :data:`turnstone.core.history_decoration.ROUND_REASONING_PLACEHOLDER`: it
-    invents no reasoning content, it asserts what is true -- this turn has nothing to
-    hand back.  The item carries a ``content`` part of type ``reasoning_text`` because a
-    ``summary``-only item does NOT satisfy the contract (measured 2026-09-20: summary
-    only -> 400; ``reasoning_text`` content -> 200), and a stable, fixed-length id
-    derived from a digest of the turn's answered tool-call ids.
+    * block empty (history ends on a user turn) -> not engaged, 200;
+    * every assistant turn must be PRECEDED by a ``reasoning`` item carrying a
+      non-empty ``reasoning_text`` content part -> 200;
+    * a block whose first assistant turn is covered but whose LATER turns are not
+      -> 400.  Measured: three tool rounds with one reasoning item at the head of the
+      block -> 400; the same three rounds each covered -> 200.  A previous revision of
+      this pass synthesized a single item for the block and therefore did not hold;
+    * a call-only turn needs its own cover (an un-covered extra function call after a
+      covered round -> 400);
+    * one item covers a maximal RUN of assistant content: assistant message(s) and
+      the function call(s) that follow them in the same run -> 200 with a single item
+      placed before the run;
+    * ``summary``-only items and empty ``reasoning_text`` are refused (400), so
+      neither counts as satisfying a turn;
+    * placement must PRECEDE the content: an item placed after the assistant message
+      it should cover -> 400;
+    * a bare ``[assistant]`` list (no user turn anywhere) is refused too, so the whole
+      list is treated as the trailing block.
 
-    Pure transform: returns a new list and never mutates *items*.  The caller gates this
-    on the operator flag ``replay_reasoning_to_model``, so lanes that do not carry the
-    flag (cloud/OpenAI) are byte-for-byte unchanged.
+    This pass makes exactly one thing true per turn: for every assistant turn in the
+    trailing block that is not already covered, ONE reasoning item is synthesized
+    immediately before it.  It invents no reasoning content -- it asserts what is
+    true, that this turn has nothing to hand back -- and it never touches an
+    already-covered turn, which also makes the pass idempotent.  Pure transform:
+    returns a new list and never mutates *items*.  The caller gates this on the
+    operator flag ``replay_reasoning_to_model``, so lanes without the flag
+    (cloud/OpenAI) keep their exact current item list (returned unchanged, by
+    identity).
     """
     if not items:
         return items
 
-    # (1) Tool-round continuation only: the trailing block must be tool output(s).
-    tail = len(items)
-    while tail > 0 and items[tail - 1].get("type") == "function_call_output":
-        tail -= 1
-    if tail == len(items) or tail == 0:
-        return items
-
-    # (2) The turn being continued: the maximal run of assistant-emitted items
-    #     (reasoning / assistant message / function_call) directly before that block.
-    start = tail
-    while start > 0:
-        prev = items[start - 1]
-        prev_type = prev.get("type")
-        if prev_type in ("reasoning", "function_call") or (
-            prev_type == "message" and prev.get("role") == "assistant"
-        ):
-            start -= 1
-        else:
-            break
-    turn = items[start:tail]
-
-    # (3) Already satisfied -- a stored reasoning item is replayed as-is, and this
-    #     branch also makes the pass idempotent.
-    if any(item.get("type") == "reasoning" for item in turn):
-        return items
-
-    # (4) It must be a tool-call turn (negative control: no tool call, no synthesis).
-    calls = [item for item in turn if item.get("type") == "function_call"]
-    if not calls:
-        return items
-
-    # (5) Every trailing tool output must be answered by a call IN THIS TURN.
-    #     Fail closed on an orphan, stale or reordered output: repairing the wrong
-    #     turn is worse than leaving the contract unsatisfied (the request then
-    #     fails loudly upstream instead of silently replaying bogus reasoning).
-    call_ids = [item.get("call_id") for item in calls]
-    if not all(isinstance(cid, str) and cid for cid in call_ids):
-        return items
-    output_ids = [item.get("call_id") for item in items[tail:]]
-    if not all(isinstance(oid, str) and oid for oid in output_ids):
-        return items
-    if not set(output_ids).issubset(set(call_ids)):
-        return items
-
-    # (6) The turn must lie inside the CURRENT round -- after the LAST user
-    #     message, not merely after some earlier one.  (Anchoring to the trailing
-    #     tool-output block already makes this turn the last one in the history;
-    #     this makes the boundary explicit rather than incidental.)
+    # (1) The trailing block: everything after the LAST user message.  With no user
+    #     turn anywhere the round boundary cannot be established, and the lane refuses
+    #     uncovered assistant content even then, so the whole list is the block.
     last_user = -1
-    for index in range(start):
-        item = items[index]
-        if item.get("type") == "message" and item.get("role") == "user":
+    for index, item in enumerate(items):
+        # Non-dict items are outside the declared ``list[dict[str, Any]]`` contract but
+        # do reach this pass, so the scan is guarded like every other accessor here: a
+        # non-dict cannot be a user message, so skipping it leaves the boundary exactly
+        # where the well-formed items put it.
+        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user":
             last_user = index
-    if last_user < 0 or start <= last_user:
+    block_start = last_user + 1
+    if block_start >= len(items):
+        # Requirement not engaged: the history ends on the user turn.
         return items
 
-    # (7) Deterministic, charset-safe, fixed-length id.  Binding it to a digest of
-    #     the answered call ids keeps it stable across retries of the same round
-    #     while never leaking an unbounded or exotic call_id into a wire field.
-    digest = hashlib.sha256("\x00".join(sorted(call_ids)).encode()).hexdigest()
-    synthesized = {
+    block = items[block_start:]
+    out: list[dict[str, Any]] = list(items[:block_start])
+    covered = False
+    added = 0
+    for offset, item in enumerate(block):
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            out.append(item)
+            # A usable stored item is replayed as-is and covers the run that follows;
+            # a summary-only or empty one covers nothing (and is left in place -- the
+            # lane accepts the synthesized item beside it, measured).
+            covered = _has_usable_reasoning_text(item)
+            continue
+        if _is_assistant_output(item):
+            if not covered:
+                out.append(_round_reasoning_item(block, offset))
+                added += 1
+                covered = True
+            out.append(item)
+            continue
+        # Any other item (tool output, mid-conversation system message, ...) ends the
+        # current assistant run, so the next assistant content needs its own cover.
+        out.append(item)
+        covered = False
+
+    if not added:
+        # Nothing to do -- return the caller's own list so untouched lanes are
+        # byte-for-byte and identity-identical.
+        return items
+    return out
+
+
+def _is_assistant_output(item: Any) -> bool:
+    """True for the items the upstream attributes to the assistant's own output.
+
+    Assistant messages and function calls.  A maximal run of them counts as ONE turn
+    for the reasoning contract: a single usable reasoning item placed before the run
+    covers the whole run (measured 2026-09-22), so the pass must not insert one item
+    per message inside such a run.
+    """
+    if not isinstance(item, dict):
+        return False
+    kind = item.get("type")
+    if kind == "function_call":
+        return True
+    return kind == "message" and item.get("role") == "assistant"
+
+
+def _round_reasoning_item(block: list[Any], offset: int) -> dict[str, Any]:
+    """The synthesized satisfier for the assistant turn that starts at *offset*.
+
+    The id is a digest of the block plus the turn's own offset: STABLE across retries
+    of the same round, and unique among the items synthesized by one pass, so the wire
+    never sees one id attached to two items.  Fixed-length and charset-safe regardless
+    of what the upstream put in ``call_id``.
+    """
+    source = f"{_round_block_digest_source(block)}#{offset}"
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    return {
         "type": "reasoning",
-        "id": f"{_RESPONSES_ROUND_REASONING_ID_PREFIX}{digest[:_RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS]}",
+        "id": (
+            f"{_RESPONSES_ROUND_REASONING_ID_PREFIX}"
+            f"{digest[:_RESPONSES_ROUND_REASONING_ID_DIGEST_CHARS]}"
+        ),
         "summary": [{"type": "summary_text", "text": ROUND_REASONING_PLACEHOLDER}],
         "content": [{"type": "reasoning_text", "text": ROUND_REASONING_PLACEHOLDER}],
     }
-    return [*items[:start], synthesized, *items[start:]]
+
+
+def _has_usable_reasoning_text(item: Any) -> bool:
+    """True when *item* is a reasoning item carrying non-empty ``reasoning_text``.
+
+    The measured contract needs the ``reasoning_text`` content part: a
+    ``summary``-only item and an empty ``reasoning_text`` are both refused (400), so
+    neither counts as satisfying the round.
+    """
+    if not isinstance(item, dict) or item.get("type") != "reasoning":
+        return False
+    content = item.get("content")
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "reasoning_text":
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                return True
+    return False
+
+
+def _round_block_digest_source(block: list[Any]) -> str:
+    """Stable identity of a trailing block, for the synthesized item's id.
+
+    Item ids and tool call ids when present, type and role otherwise: enough to tell
+    rounds apart without depending on any unbounded or exotic upstream value.
+    """
+    parts: list[str] = []
+    for item in block:
+        if not isinstance(item, dict):
+            parts.append("?")
+            continue
+        parts.append(
+            "\x1f".join(
+                [
+                    str(item.get("type") or ""),
+                    str(item.get("role") or ""),
+                    str(item.get("call_id") or ""),
+                    str(item.get("id") or ""),
+                ]
+            )
+        )
+    return "\x1e".join(parts)

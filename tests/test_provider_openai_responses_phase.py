@@ -7,8 +7,12 @@ import json
 
 import pytest
 
+from turnstone.core.history_decoration import ROUND_REASONING_PLACEHOLDER
 from turnstone.core.lowering import neutralize_message_fence_markers
-from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+from turnstone.core.providers._openai_responses import (
+    _RESPONSES_ROUND_REASONING_ID_PREFIX,
+    OpenAIResponsesProvider,
+)
 from turnstone.core.providers._xai import XAIProvider
 
 
@@ -72,7 +76,25 @@ def test_ordered_phases_and_canonical_tool_arguments(replay_reasoning):
     ]
     if not replay_reasoning:
         expected = [item for item in expected if item["type"] != "reasoning"]
-    assert items == expected
+        assert items == expected
+    else:
+        # The stored reasoning items carry ``encrypted_content`` but no
+        # ``reasoning_text``, and the measured contract counts only a non-empty
+        # ``reasoning_text`` as covering a turn -- so one cover is synthesized before
+        # EACH maximal assistant run: before the commentary message and before the
+        # function_call.  The function_call and the final_answer message are one run,
+        # so no third cover is added.  The insertion points are asserted rather than
+        # recomputed here: recomputing the digest would replicate the implementation
+        # inside the test, and a replica that agrees with itself proves nothing.
+        covers = [
+            index for index, item in enumerate(items)
+            if str(item.get("id", "")).startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX)
+        ]
+        assert covers == [1, 4], items
+        for index in covers:
+            assert ROUND_REASONING_PLACEHOLDER in json.dumps(items[index])
+        # every canonical item survives, in order and unchanged
+        assert [item for index, item in enumerate(items) if index not in covers] == expected
     assert messages == before
 
 
@@ -129,7 +151,20 @@ def test_native_metadata_is_scoped_to_producer_with_legacy_fallback(producer):
     _, items = OpenAIResponsesProvider._convert_messages(messages, replay_reasoning_to_model=True)
     eligible = producer in (None, "", "openai")
     assert any("phase" in item for item in items) == eligible
-    assert any(item["type"] == "reasoning" for item in items) == eligible
+    # A reasoning item is now present on BOTH branches: this pass synthesizes a cover
+    # for the block's assistant turn, and that cover carries none of the provider's
+    # metadata.  Presence alone therefore no longer expresses producer scoping -- what
+    # must stay scoped is the NATIVE metadata, so that is what is asserted.
+    native = [
+        item for item in items
+        if item["type"] == "reasoning"
+        and not str(item.get("id", "")).startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX)
+    ]
+    assert bool(native) == eligible, items
+    for item in items:
+        if str(item.get("id", "")).startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX):
+            assert ROUND_REASONING_PLACEHOLDER in json.dumps(item)
+            assert "encrypted_content" not in item   # no foreign metadata adopted
 
 
 def test_xai_subclass_replays_its_own_native_metadata():

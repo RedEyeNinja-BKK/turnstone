@@ -9,6 +9,22 @@
       "type": "message"
     },
     {
+      "content": [
+        {
+          "text": "(no reasoning text was recorded for this turn)",
+          "type": "reasoning_text"
+        }
+      ],
+      "id": "rs_roundrepair_66c8274a392111fe8635b0b3",
+      "summary": [
+        {
+          "text": "(no reasoning text was recorded for this turn)",
+          "type": "summary_text"
+        }
+      ],
+      "type": "reasoning"
+    },
+    {
       "arguments": "{\"city\": \"Paris\"}",
       "call_id": "call_1",
       "name": "get_weather",
@@ -18,6 +34,22 @@
       "call_id": "call_1",
       "output": "18C, clear.",
       "type": "function_call_output"
+    },
+    {
+      "content": [
+        {
+          "text": "(no reasoning text was recorded for this turn)",
+          "type": "reasoning_text"
+        }
+      ],
+      "id": "rs_roundrepair_1ad411f6f4dbb20bd8f2c9fa",
+      "summary": [
+        {
+          "text": "(no reasoning text was recorded for this turn)",
+          "type": "summary_text"
+        }
+      ],
+      "type": "reasoning"
     },
     {
       "content": "It's 18C and clear in Paris.",

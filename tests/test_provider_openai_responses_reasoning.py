@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import pytest
 
+from turnstone.core.history_decoration import ROUND_REASONING_PLACEHOLDER
 from turnstone.core.providers._openai_responses import (
     OpenAIResponsesProvider,
+    _RESPONSES_ROUND_REASONING_ID_PREFIX,
     _reasoning_item_for_input,
 )
 from turnstone.core.providers._protocol import (
@@ -307,18 +309,45 @@ class TestConvertMessagesReasoningReplay:
         ]
         _, items = provider._convert_messages(messages, replay_reasoning_to_model=True)
         types = [it.get("type") for it in items]
-        assert types == ["message", "reasoning", "function_call", "function_call_output"]
-        assert items[1]["id"] == "rs_1"
-        assert items[1]["encrypted_content"] == "enc"
-        assert items[2]["call_id"] == "call_orig1"
-        assert items[3]["call_id"] == "call_orig1"
+
+        # The stored item rides through with its own id and encrypted_content...
+        stored = [it for it in items if it.get("id") == "rs_1"]
+        assert len(stored) == 1, items
+        assert stored[0]["encrypted_content"] == "enc"
+        # ...but it carries no ``reasoning_text``, and the measured contract counts
+        # only a non-empty ``reasoning_text`` as covering a turn, so the pass
+        # synthesizes one cover before the function_call.  The stored item keeps its
+        # position; the cover is ADDED beside it rather than replacing it.
+        assert types == [
+            "message",
+            "reasoning",
+            "reasoning",
+            "function_call",
+            "function_call_output",
+        ], items
+        covers = [
+            it for it in items
+            if str(it.get("id", "")).startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX)
+        ]
+        assert len(covers) == 1, items
+        assert items.index(covers[0]) == 2
+        assert ROUND_REASONING_PLACEHOLDER in str(covers[0])
+        # the ordering + id agreement the Responses API needs across an agent's own
+        # tool loop is intact: the rebuilt call and its output still pair
+        call = [it for it in items if it["type"] == "function_call"][0]
+        output = [it for it in items if it["type"] == "function_call_output"][0]
+        assert call["call_id"] == "call_orig1"
+        assert output["call_id"] == "call_orig1"
 
     def test_no_reasoning_items_when_provider_content_lacks_reasoning(
         self, provider: OpenAIResponsesProvider
     ) -> None:
         # Anthropic-shaped _provider_content reaching OpenAI Responses
         # (cross-provider — operator switch from Anthropic to GPT-5):
-        # no type=="reasoning" items, so nothing emitted.
+        # no ``type=="reasoning"`` item is CONVERTED, so no Anthropic thinking
+        # metadata crosses over.  The pass still covers the block's assistant turn
+        # with its own placeholder: there is no user message, so the whole list is the
+        # block, and the lane refuses an uncovered assistant turn there (measured).
         messages = [
             {
                 "role": "assistant",
@@ -329,8 +358,19 @@ class TestConvertMessagesReasoningReplay:
             },
         ]
         _, items = provider._convert_messages(messages, replay_reasoning_to_model=True)
-        types = [it.get("type") for it in items]
-        assert "reasoning" not in types
+        native = [
+            it for it in items
+            if it.get("type") == "reasoning"
+            and not str(it.get("id", "")).startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX)
+        ]
+        assert native == [], items          # no Anthropic thinking metadata crossed over
+        covers = [
+            it for it in items
+            if str(it.get("id", "")).startswith(_RESPONSES_ROUND_REASONING_ID_PREFIX)
+        ]
+        assert len(covers) == 1, items
+        assert ROUND_REASONING_PLACEHOLDER in str(covers[0])
+        assert items.index(covers[0]) == 0   # precedes the assistant turn
 
     def test_default_replay_reasoning_false_omits_reasoning(
         self, provider: OpenAIResponsesProvider

@@ -34,7 +34,7 @@ from turnstone.core.session import (
     _is_ctx_overflow,
 )
 from turnstone.core.storage import get_storage
-from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
+from turnstone.core.trajectory import ToolCall, Turn, dicts_from_turns, turns_from_dicts
 
 
 @pytest.fixture
@@ -190,8 +190,9 @@ class TestMidturnCompactionPolicy:
             patch.object(session, "_append_system_turn") as advise,
         ):
             session._maybe_compact_midturn(my_generation=7)
-        # my_generation threads through so the compaction swap stays generation-guarded.
-        compact.assert_called_once_with("mid-turn", my_generation=7)
+        # my_generation threads through so the compaction swap stays generation-guarded,
+        # and the boundary clamp rides with it (0 here: the fixture has no open round).
+        compact.assert_called_once_with("mid-turn", preserve_tail=0, my_generation=7)
         advise.assert_not_called()
 
     def test_hard_ceiling_compacts_without_advisory(self, session):
@@ -205,7 +206,7 @@ class TestMidturnCompactionPolicy:
             patch.object(session, "_append_system_turn") as advise,
         ):
             session._maybe_compact_midturn(my_generation=7)
-        compact.assert_called_once_with("mid-turn", my_generation=7)
+        compact.assert_called_once_with("mid-turn", preserve_tail=0, my_generation=7)
         advise.assert_not_called()
 
     def test_cancel_before_midturn_advisory_refuses_publication(self, session):
@@ -3431,3 +3432,121 @@ class TestCompactionActivityPill:
         assert not ui._compaction_activity_live
         assert ui._ws_current_activity == ""  # idle pair, not the orphan's text
         assert ui._ws_activity_state == ""
+
+
+# ---------------------------------------------------------------------------
+# _safe_compaction_preserve_tail — the summary boundary cannot split a round
+# ---------------------------------------------------------------------------
+
+
+class TestSafeCompactionPreserveTail:
+    """Compact completed history; keep the round that is still in flight.
+
+    ``_compact_messages_impl`` replaces ``messages[:split]`` with a summary turn,
+    where ``split = len(messages) - preserve_tail``.  The split is only safe BETWEEN
+    logical rounds.  It lands inside one two ways, both reachable while a tool loop
+    is running:
+
+    * the summarized prefix ends on a ``tool_use`` whose results have not arrived —
+      the results appended next answer a call the model can no longer see;
+    * the retained tail begins with a tool result whose ``tool_use`` was summarized
+      away — the wire carries a result answering a call that is not in the
+      transcript.
+
+    The mid-turn callers used to pass a bare 0 (the policy site) or a hard 1 (the two
+    tool-result drain sites), neither of which can see the tail shape, so the clamp is
+    what makes the boundary placement safe rather than incidental.
+    """
+
+    def test_open_call_is_kept_out_of_the_summary(self, session):
+        """The reported shape: a tool-call turn still waiting for its results."""
+        session.messages = [
+            Turn.user("go"),
+            Turn.assistant("", tool_calls=(ToolCall(id="c1", name="f", arguments="{}"),)),
+        ]
+        assert session._safe_compaction_preserve_tail() == 1
+
+    def test_partially_answered_round_is_retained_whole(self, session):
+        """Parallel calls with one result still owed: the round crosses intact."""
+        session.messages = [
+            Turn.user("go"),
+            Turn.assistant(
+                "",
+                tool_calls=(
+                    ToolCall(id="c1", name="f", arguments="{}"),
+                    ToolCall(id="c2", name="g", arguments="{}"),
+                ),
+            ),
+            Turn.tool("c1", "first result"),
+        ]
+        assert session._safe_compaction_preserve_tail() == 2
+
+    def test_completed_tail_needs_no_retention(self, session):
+        """A fully answered round may be summarized: nothing is in flight."""
+        session.messages = [
+            Turn.user("go"),
+            Turn.assistant("", tool_calls=(ToolCall(id="c1", name="f", arguments="{}"),)),
+            Turn.tool("c1", "result"),
+        ]
+        assert session._safe_compaction_preserve_tail() == 0
+
+    def test_requested_tail_keeps_a_result_with_its_call(self, session):
+        """A caller asking for the result alone gets the producing turn too."""
+        session.messages = [
+            Turn.user("go"),
+            Turn.assistant("", tool_calls=(ToolCall(id="c1", name="f", arguments="{}"),)),
+            Turn.tool("c1", "result"),
+        ]
+        # preserve_tail=1 alone would retain only the result, severing the pair.
+        assert session._safe_compaction_preserve_tail(1) == 2
+
+    def test_abandoned_call_in_completed_history_does_not_drag_the_tail(self, session):
+        """An unanswered call behind a user turn is history, not an active round:
+        nothing will ever arrive to answer it, so retaining it would defeat
+        compaction for no benefit."""
+        session.messages = [
+            Turn.assistant("", tool_calls=(ToolCall(id="c_old", name="f", arguments="{}"),)),
+            Turn.user("next question"),
+            Turn.assistant("answer"),
+        ]
+        assert session._safe_compaction_preserve_tail() == 0
+
+    def test_clamp_is_idempotent_and_only_ever_retains_more(self, session):
+        session.messages = [
+            Turn.user("go"),
+            Turn.assistant(
+                "",
+                tool_calls=(
+                    ToolCall(id="c1", name="f", arguments="{}"),
+                    ToolCall(id="c2", name="g", arguments="{}"),
+                ),
+            ),
+        ]
+        first = session._safe_compaction_preserve_tail()
+        assert first == 1
+        # Re-clamping its own answer must be a fixed point...
+        assert session._safe_compaction_preserve_tail(first) == first
+        # ...and the clamp may only ever RETAIN MORE, never less, for any request the
+        # history can honour (a request longer than the history is length-clamped by
+        # ``messages[-preserve_tail:]``, which is not this helper's business).
+        for requested in range(len(session.messages) + 1):
+            assert session._safe_compaction_preserve_tail(requested) >= requested
+
+    def test_empty_history_is_zero(self, session):
+        session.messages = []
+        assert session._safe_compaction_preserve_tail() == 0
+
+    def test_midturn_compaction_forwards_the_clamped_tail(self, session):
+        """The defect site itself: the policy path used to pass a bare 0."""
+        session._generation = 7
+        session._compaction_advised = False
+        session.messages = [
+            Turn.user("go"),
+            Turn.assistant("", tool_calls=(ToolCall(id="c1", name="f", arguments="{}"),)),
+        ]
+        with (
+            patch.object(session, "_estimated_prompt_tokens", return_value=9_500),
+            patch.object(session, "_do_auto_compact") as compact,
+        ):
+            session._maybe_compact_midturn(my_generation=7)
+        compact.assert_called_once_with("mid-turn", preserve_tail=1, my_generation=7)

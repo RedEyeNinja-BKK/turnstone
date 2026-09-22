@@ -6201,6 +6201,68 @@ class ChatSession:
         used = self._estimated_prompt_tokens()
         return max(0, _usable_input_capacity(self.context_window, self.max_tokens) - used)
 
+    def _safe_compaction_preserve_tail(self, preserve_tail: int = 0) -> int:
+        """Clamp ``preserve_tail`` so the summary boundary cannot split a tool round.
+
+        Compaction replaces ``messages[:split]`` with a summary turn, where
+        ``split = len(messages) - preserve_tail``.  The split is only safe BETWEEN
+        logical rounds.  Two ways it can land inside one, both reachable while a tool
+        loop is running:
+
+        * the summarized prefix ends with a ``tool_use`` whose results have not
+          arrived yet -- the results appended next answer a call the model can no
+          longer see;
+        * the retained tail begins with a tool result whose ``tool_use`` was
+          summarized away -- the wire carries a result answering a call that is not in
+          the transcript.
+
+        Returns the ``preserve_tail`` that puts the boundary outside the ACTIVE round,
+        so compaction summarizes completed history *before* that round and retains the
+        round itself.  Equal to the argument when the boundary is already safe, so a
+        caller that reasons about its own boundary keeps it.  Nothing is synthesized
+        and no round is completed on the model's behalf: the retained messages are the
+        real turns, and a genuinely abandoned call is summarized like any other
+        history once a later round closes over it.
+        """
+        total = len(self.messages)
+        split = max(0, total - max(0, preserve_tail))
+
+        # (1) An unfinished round must not be summarized: its results can still be
+        #     appended.  Results arrive in round order, so the last tool-call turn
+        #     before the split is the one that can be open.  A call answered by a
+        #     message on the RETAINED side counts as unanswered here, which keeps the
+        #     producing turn with its results rather than cutting between them.
+        for index in range(split - 1, -1, -1):
+            msg = self.messages[index]
+            if msg.tool_calls:
+                answered = {
+                    later.tool_call_id
+                    for later in self.messages[index + 1 : split]
+                    if later.tool_call_id is not None
+                }
+                if any(call.id not in answered for call in msg.tool_calls):
+                    split = index
+                break
+            if msg.role is Role.USER:
+                break
+
+        # (2) A retained tool result must keep its producing call.  Bounded by the
+        #     retained tail, which is small by construction.
+        for index in range(split, total):
+            msg = self.messages[index]
+            if msg.role is not Role.TOOL or msg.tool_call_id is None:
+                continue
+            for producer in range(index - 1, -1, -1):
+                if any(
+                    call.id == msg.tool_call_id
+                    for call in self.messages[producer].tool_calls
+                ):
+                    if producer < split:
+                        split = producer
+                    break
+
+        return total - split
+
     def _maybe_compact_midturn(self, my_generation: int = 0) -> None:
         """Cooperative mid-turn compaction policy.
 
@@ -6224,7 +6286,15 @@ class ChatSession:
         est = self._estimated_prompt_tokens()
         policy = self._compaction_policy()
         if policy.owed(est, advised=self._compaction_advised):
-            self._do_auto_compact("mid-turn", my_generation=my_generation)
+            # Summarize completed history, keep the round that is still in flight:
+            # a bare preserve_tail=0 here can cut between an assistant tool-call turn
+            # and the results still owed to it, so the results would be appended into
+            # a transcript that no longer holds their tool_use.
+            self._do_auto_compact(
+                "mid-turn",
+                preserve_tail=self._safe_compaction_preserve_tail(),
+                my_generation=my_generation,
+            )
         elif policy.over_soft(est):
 
             def _publish_advisory(durable: list[Callable[[], None]]) -> None:
@@ -13370,7 +13440,11 @@ class ChatSession:
                 if self._generation == my_generation and self._compaction_policy().owed(
                     self._estimated_prompt_tokens(), advised=self._compaction_advised
                 ):
-                    self._do_auto_compact("mid-turn", preserve_tail=1, my_generation=my_generation)
+                    self._do_auto_compact(
+                        "mid-turn",
+                        preserve_tail=self._safe_compaction_preserve_tail(1),
+                        my_generation=my_generation,
+                    )
                     pre_attempted_compact = True
                 truncation_budget = self._remaining_token_budget()
                 if (
@@ -13401,7 +13475,7 @@ class ChatSession:
                     # floor/drop-notice path below is the backstop.
                     self._compact_messages(
                         auto=True,
-                        preserve_tail=1,
+                        preserve_tail=self._safe_compaction_preserve_tail(1),
                         my_generation=my_generation,
                         where="mid-turn, tool-result budget exhausted",
                     )

@@ -70,8 +70,14 @@ _TOOLS: list[dict[str, Any]] = [
 ]
 
 
-def _caps() -> ModelCapabilities:
-    """Capability row for a reasoning-replay-capable model."""
+def _caps(*, synthesizes_round_reasoning: bool = True) -> ModelCapabilities:
+    """Capability row for a replay-capable Responses endpoint.
+
+    ``synthesizes_round_reasoning=True`` is the declared value on the
+    self-hosted Responses lanes this repair was written for.  Pass ``False`` for
+    an endpoint that replays reasoning but rejects a synthesized reasoning item
+    -- the commercial OpenAI path, measured under ``store: false``.
+    """
     return ModelCapabilities(
         context_window=400000,
         max_output_tokens=128000,
@@ -79,6 +85,7 @@ def _caps() -> ModelCapabilities:
         reasoning_effort_values=("low", "medium", "high"),
         default_reasoning_effort="medium",
         supports_reasoning_replay=True,
+        synthesizes_round_reasoning=synthesizes_round_reasoning,
     )
 
 
@@ -100,6 +107,7 @@ def _payload(
     messages: list[dict[str, Any]],
     *,
     replay: bool = True,
+    caps: ModelCapabilities | None = None,
 ) -> dict[str, Any]:
     """Compose the real ``responses.create`` kwargs for *messages*."""
     return provider._build_kwargs(
@@ -110,7 +118,7 @@ def _payload(
         temperature=None,
         reasoning_effort=None,
         deferred_names=None,
-        capabilities=_caps(),
+        capabilities=caps or _caps(),
         replay_reasoning_to_model=replay,
     )
 
@@ -540,3 +548,81 @@ class TestSynthesizedItemSchema:
             "function_call_output",
         ]
         assert items[-1]["call_id"] == _CALL_1
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint selection.  The repair is a property of the ENDPOINT, not of the
+# replay flag.  The commercial OpenAI Responses path replays reasoning happily
+# and still rejects a synthesized item under ``store: false`` -- 400
+# ``array_above_max_length`` when the item carries ``content``, 404 when it does
+# not (a fabricated ``rs_roundrepair_...`` id cannot be resolved) -- while the
+# same tool continuation is ACCEPTED with valid encrypted reasoning, or with the
+# reasoning item omitted.  These tests pin the selection so a replay-enabled
+# lane can never be handed the repair by accident.
+# --------------------------------------------------------------------------- #
+
+
+def _commercial_upstream_rejection(payload: dict[str, Any]) -> str | None:
+    """Reason the commercial path would reject *payload*, or ``None`` if accepted.
+
+    Encodes the measured rule for gpt-6-astra / gpt-5.6-sol with ``store: false``.
+    A PROXY for that endpoint class: it reproduces the rejection shapes, it is not
+    the live server.
+    """
+    for item in payload.get("input") or []:
+        if item.get("type") != "reasoning":
+            continue
+        if not str(item.get("id") or "").startswith(_ID_PREFIX):
+            continue
+        if item.get("content"):
+            return "400 array_above_max_length: input[1].content must have a maximum length of zero"
+        return f"404: reasoning item {item['id']} not found (store: false)"
+    return None
+
+
+class TestRepairIsSelectedByEndpointCapability:
+    def test_capability_off_leaves_the_tool_round_untouched(
+        self, provider: OpenAIResponsesProvider
+    ) -> None:
+        """No declaration -> no repair, even with replay enabled."""
+        payload = _payload(
+            provider, _resumed_round(), caps=_caps(synthesizes_round_reasoning=False)
+        )
+        assert _reasoning_items(payload["input"]) == []
+
+    def test_capability_off_keeps_the_item_list_byte_for_byte(
+        self, provider: OpenAIResponsesProvider
+    ) -> None:
+        no_cap = _payload(
+            provider,
+            _resumed_round(with_text=True),
+            caps=_caps(synthesizes_round_reasoning=False),
+        )["input"]
+        no_replay = _payload(
+            provider,
+            _resumed_round(with_text=True),
+            replay=False,
+            caps=_caps(synthesizes_round_reasoning=False),
+        )["input"]
+        assert no_cap == no_replay
+
+    def test_capability_on_is_what_makes_the_commercial_path_reject(
+        self, provider: OpenAIResponsesProvider
+    ) -> None:
+        """The defect this gate exists to prevent: an ungated repair 400s upstream."""
+        ungated = _payload(provider, _resumed_round())  # capability declared on
+        assert _commercial_upstream_rejection(ungated) is not None
+        gated = _payload(provider, _resumed_round(), caps=_caps(synthesizes_round_reasoning=False))
+        assert _commercial_upstream_rejection(gated) is None
+
+    def test_replay_off_wins_over_the_capability(self, provider: OpenAIResponsesProvider) -> None:
+        payload = _payload(provider, _resumed_round(), replay=False)
+        assert _reasoning_items(payload["input"]) == []
+
+    def test_capability_is_off_by_default(self) -> None:
+        """An undeclared endpoint keeps the exact upstream item list."""
+        assert ModelCapabilities().synthesizes_round_reasoning is False
+
+    def test_declared_by_capability_not_by_replay_flag(self) -> None:
+        """The two questions are independent: replay can be on with the repair off."""
+        assert _caps(synthesizes_round_reasoning=False).supports_reasoning_replay is True

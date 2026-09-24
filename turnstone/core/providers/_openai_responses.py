@@ -211,6 +211,7 @@ class OpenAIResponsesProvider:
         *,
         replay_reasoning_to_model: bool = False,
         supports_mid_conversation_system: bool = False,
+        synthesizes_round_reasoning: bool = False,
         native_producer: str = "openai",
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert Chat Completions messages to Responses API input items.
@@ -223,9 +224,12 @@ class OpenAIResponsesProvider:
 
         Native assistant message boundaries and ``phase`` survive when they
         still match canonical text and call order. Reasoning items are replayed
-        only when *replay_reasoning_to_model* is True; phase is independent of
-        that toggle. Explicitly foreign producer metadata is ignored, while
-        untagged legacy native blocks retain shape-based replay.
+        only when *replay_reasoning_to_model* is True, and a resumed tool round
+        whose reasoning is missing is repaired only when
+        *synthesizes_round_reasoning* declares that this endpoint accepts a
+        synthesized item; phase is independent of both toggles. Explicitly
+        foreign producer metadata is ignored, while untagged legacy native
+        blocks retain shape-based replay.
         """
         # Save native blocks before sanitization strips private fields. Key by
         # assistant ordinal: sanitizer repair inserts/drops tool results, so raw
@@ -313,9 +317,13 @@ class OpenAIResponsesProvider:
 
         instructions = "\n\n".join(instructions_parts) if instructions_parts else None
         # Repair replay-sensitive resumed tool rounds on the Responses wire.
-        # Gated on the operator flag that governs reasoning replay on this wire,
-        # so lanes without it keep their exact item list.
-        if replay_reasoning_to_model:
+        # Two independent gates: the operator flag that governs reasoning replay
+        # on this wire, and the endpoint capability declaring that this server
+        # ACCEPTS a synthesized reasoning item.  They are not the same question --
+        # the commercial OpenAI path replays fine and rejects the synthesized
+        # item (400 with ``content``, 404 without, under ``store: false``) -- so
+        # without both gates the repair breaks a request that otherwise works.
+        if replay_reasoning_to_model and synthesizes_round_reasoning:
             items = _ensure_responses_round_reasoning_items(items)
         return instructions, items
 
@@ -417,6 +425,7 @@ class OpenAIResponsesProvider:
             messages,
             replay_reasoning_to_model=replay_reasoning_to_model,
             supports_mid_conversation_system=caps.supports_mid_conversation_system,
+            synthesizes_round_reasoning=caps.synthesizes_round_reasoning,
             native_producer=self.provider_name,
         )
         tools = apply_tool_search(caps, tools, deferred_names)
@@ -1140,8 +1149,10 @@ def _ensure_responses_round_reasoning_items(
     the same round replay the identical item.
 
     Pure transform: returns a new list and never mutates *items*.  Callers gate
-    this on ``replay_reasoning_to_model``, so a lane that does not replay
-    reasoning sees a byte-for-byte unchanged ``input`` array.
+    this on ``replay_reasoning_to_model`` AND on the endpoint capability
+    ``synthesizes_round_reasoning``, so a lane that does not replay reasoning --
+    or an endpoint that replays but rejects a synthesized item -- sees a
+    byte-for-byte unchanged ``input`` array.
     """
     if not items:
         return items

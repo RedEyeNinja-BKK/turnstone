@@ -82,7 +82,12 @@ frozen.
   missing item for that turn alone — only when the history is a tool-round continuation, only when
   the turn carries no reasoning item of its own, and only when every trailing tool result is
   answered by a call in that turn — with a stable id and text that states the reasoning was not
-  recorded rather than inventing it. A lane that does not replay reasoning is unchanged.
+  recorded rather than inventing it. The repair is selected by an explicit endpoint capability
+  (`synthesizes_round_reasoning`), because replaying reasoning and accepting a synthesized item are
+  different questions: on the commercial OpenAI path with `store: false`, the same continuation is
+  accepted with valid encrypted reasoning or with the item omitted, and the synthesized item is
+  rejected — `400 array_above_max_length` when it carries `content`, `404` when it does not. A lane
+  that does not replay reasoning, or an endpoint that does not declare the capability, is unchanged.
 - **Context gauge after a server-side tool loop.** When the model ran several web searches inside
   one response, the provider's closing usage reported billing totals summed across its sampling
   passes, and the session took them as its context size. On the Anthropic lane a four-search turn

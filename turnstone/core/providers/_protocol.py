@@ -744,6 +744,22 @@ class ModelCapabilities:
     # 0.116 through a mock transport -- the control is untyped below 1.x
     # and rides the plain ``thinking`` dict.  Never set on a compat lane.
     thinking_prefix_bound: bool = False
+    # Explicit ENDPOINT capability for the Responses-wire resumed-tool-round
+    # repair (``_ensure_responses_round_reasoning_items``): this server ACCEPTS
+    # a synthesized reasoning item where no reasoning was recorded for a
+    # resumed tool round.  It is deliberately not derived from
+    # ``supports_reasoning_replay`` -- replay and acceptance are different
+    # questions, and on the commercial OpenAI path they have different answers.
+    # Measured there with ``store: false`` (gpt-6-astra, gpt-5.6-sol): the
+    # synthesized item is rejected with 400 ``array_above_max_length`` when it
+    # carries ``content`` and with 404 when it does not (a fabricated
+    # ``rs_roundrepair_...`` id cannot be resolved), while the same tool
+    # continuation is ACCEPTED with valid encrypted reasoning or with the
+    # reasoning item omitted.  Enabling this there therefore breaks a request
+    # that otherwise works, so the repair is selected by this capability.
+    # Default False: with no declaration the item list is untouched, which is
+    # the upstream behaviour for every endpoint that has not opted in.
+    synthesizes_round_reasoning: bool = False
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.

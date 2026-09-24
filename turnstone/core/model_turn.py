@@ -284,7 +284,12 @@ def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> M
 # membership test — shared by :func:`provider_extra_params` and the
 # callers that layer their own pins onto a resolved lane, so the two
 # cannot disagree about which lanes accept extra_body at all.
-EXTRA_BODY_PROVIDERS: tuple[str, ...] = ("openai", "openai-compatible", "anthropic-compatible")
+EXTRA_BODY_PROVIDERS: tuple[str, ...] = (
+    "openai",
+    "openai-compatible",
+    "switchyard",
+    "anthropic-compatible",
+)
 
 
 def provider_extra_params(
@@ -320,11 +325,13 @@ def provider_extra_params(
 # ``anthropic``, ``anthropic-compatible``, ``google``) reports that name as its
 # ``provider_name`` AND exposes ``extra_headers`` on ``create_streaming`` -- xAI
 # and google inherit it from their OpenAI-shaped bases, and the Anthropic SDK
-# takes it natively.  Note this is WIDER than EXTRA_BODY_PROVIDERS, which is a
+# takes it natively.  ``switchyard`` joined the list on 2026-09-25 by inheriting
+# the same OpenAI-shaped bases, and reports its own name.
+# Note this is WIDER than EXTRA_BODY_PROVIDERS, which is a
 # deliberate exclusion for xai/google/anthropic: that tuple answers "does this
 # lane take operator *body* pins", whereas this one answers "does this entry
-# point accept *headers*".  Headers are meaningful on every one of the six:
-# four are driven by the OpenAI SDK (whose default ``User-Agent:
+# point accept *headers*".  Headers are meaningful on every one of the seven:
+# five are driven by the OpenAI SDK (whose default ``User-Agent:
 # OpenAI/Python <version>`` is exactly the header a WAF tends to reject) and the
 # two Anthropic lanes take the dict through their own SDK.
 #
@@ -333,6 +340,7 @@ def provider_extra_params(
 EXTRA_HEADERS_PROVIDERS: tuple[str, ...] = (
     "openai",
     "openai-compatible",
+    "switchyard",
     "xai",
     "anthropic",
     "anthropic-compatible",

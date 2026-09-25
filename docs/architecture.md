@@ -1031,7 +1031,26 @@ agent_model = "claude"
 
 Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
 (default: `"openai"`). Supported values: `"openai"`, `"anthropic"`, `"google"`,
-`"openai-compatible"`, and `"anthropic-compatible"`.
+`"openai-compatible"`, `"anthropic-compatible"`, `"switchyard"`, and `"xai"`.
+
+`"switchyard"` is the adapter for a Switchyard gateway: the row names the
+gateway's `base_url` (required — an empty value fails at client construction
+rather than falling back to the commercial endpoint) and a route id as the
+model. The adapter owns no routing decision; it lowers the session ledger onto
+the surface the gateway serves and reports what the crossing cost. A binding
+another endpoint cannot resolve — a foreign encrypted blob or a native signature
+— is removed rather than forwarded, and what that removal costs depends on the
+surface, because the two surfaces do not represent reasoning the same way: a
+Responses surface carries the reasoning item itself and that item is built from
+its `id`, so a block that lost the `id` is reported as dropped and its readable
+text does not reach the wire either; a Chat surface carries the readable text in
+the canonical message field and never projects the private block list, so the
+text still crosses and a binding it could never carry costs nothing. What
+crossed, what was dropped, and the observed loss classes are reported on
+`last_reasoning_transfer`, and a block with no readable text does not cross at
+all. `api_surface` selects chat or responses exactly as it does for
+`"openai-compatible"`, and `provider_name` reports `"switchyard"`, so a lane can
+tell which adapter served it.
 
 **Atomic bindings and reloads:** `ModelConfig` is frozen. Registry
 `resolve_binding()` acquires the registry lock once and returns the client,

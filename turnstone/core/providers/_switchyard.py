@@ -15,28 +15,30 @@ left behind when reasoning material cannot cross the provider boundary.
 
 Cross-provider reasoning rule
 -----------------------------
-Encrypted or native-signed reasoning is not interchangeable with plain
-``reasoning_text``: such an item is bound server-side, either to an id only the
-issuing endpoint can resolve or to a signature over the exact prefix that
-produced it.  Handing the binding to a different provider either fails or
-silently changes the model's context, so this adapter does not forward it.  It
-removes the binding and reports the crossing the way the surface's wire actually
-carries it, so the caller can record what the boundary cost.  Nothing is
-substituted for what was removed, and a block that held no readable text does not
-cross at all.
+A Switchyard lane is one provider boundary.  An item that lane's own surface
+returned is that provider's object, so it crosses back whole: its id and its
+encrypted payload are the provider's own replay state, resolvable only at the
+endpoints behind that boundary, and those are the endpoints being called.  Removing
+them would cost the replay without protecting anything, so a native item is handed
+on untouched and the surface's own projection decides what the wire carries.  An
+item attributed to a different producer is not that provider's object: it does not
+cross as native, and it is reported as dropped rather than forwarded carrying a
+foreign binding.  An item with no handle to build the surface's item from is
+dropped as well, since that surface's projection would not emit it whatever the
+block held.  Nothing is substituted for what does not cross.
 
-What removing a binding costs depends on the surface, because the two surfaces do
-not represent reasoning the same way.  A Responses surface carries the reasoning
-item itself, and the parent's own projection cannot build one without a string
-``id`` (``_openai_responses._reasoning_item_for_input`` returns ``None`` and the
-caller skips appending), so on that surface a removed binding does not leave a
-text-only item behind: it removes the item, and the block is reported as dropped
-rather than as a strip.  A Chat surface has no reasoning-item representation at
-all -- its wire carries the readable text through the canonical message field and
-sanitization drops the private block list -- so a binding it could never carry is
-not a cost, and the block is reported as kept.  ``_SURFACE_CARRIERS`` states this
-per surface; the count is only ever ``kept`` or ``stripped`` when that surface's
-own projection will emit the material.
+What the boundary does depends on the surface, because the two surfaces do not
+represent reasoning the same way.  A Responses surface carries the reasoning item
+itself, bindings and all, and the parent's own projection builds one only from what
+the item already holds (a string ``id``, plus whatever ``summary``/``content``/
+``encrypted_content`` arrived with it) -- so a native item passes through with
+nothing removed, and ``_openai_responses._reasoning_item_for_input`` returning
+``None`` for want of a string ``id`` is reported as a drop, because no item is
+emitted for it at all.  A Chat surface has no reasoning-item representation at all
+-- its wire carries the readable text through the canonical message field and
+sanitization drops the private block list -- so a binding that wire could never have
+carried is removed and costs nothing, and the block is reported as kept.
+``_SURFACE_CARRIERS`` states this per surface.
 
 Round-repair (``synthesizes_round_reasoning``) is proposed in an unmerged upstream
 change (#1201) and is not present in this tree: no code, capability flag or
@@ -61,24 +63,22 @@ if TYPE_CHECKING:
 PROVIDER_NAME = "switchyard"
 
 # ─── Information-loss classification ────────────────────────────────────────
-# Verified against Switchyard's own translation codecs (RedEyeNinja-BKK/Switchyard
-# @ 7a23989): a Responses reasoning item is decoded for its text — ``content``,
-# ``summary`` and a top-level ``text`` (see
-# ``crates/switchyard-translation/src/codecs/responses/buffered.rs:649``) — and the
-# binding it arrived with is not carried anywhere downstream
-# (``ContentBlock::Reasoning { signature: None, details: [] }``); ``grep -rn
-# encrypted_content crates/`` has no hits at all.  Text is therefore the part that
-# transfers and the binding is the part that is lost, so this adapter keeps the
-# text, removes the binding and reports which binding went missing, instead of
-# letting the loss happen unannounced.
+# Switchyard's own translation codecs decode a Responses reasoning item for its text
+# -- ``content``, ``summary`` and a top-level ``text`` (see
+# ``crates/switchyard-translation/src/codecs/responses/buffered.rs:649``) -- and carry
+# no binding into the internal ``ContentBlock::Reasoning``.  That describes the
+# codec's internal shape, not what the lane's Responses surface does end to end: a
+# live turn on a DeepSeek-backed lane returns items carrying ``id`` and
+# ``encrypted_content`` and accepts them back unchanged on the resumed round, so the
+# binding is this provider's own replay state and belongs on the wire.  Text is the
+# part a Chat wire carries; an item is the part a Responses wire carries.
 
 LOSS_FOREIGN_ENCRYPTED = "foreign_encrypted_binding_dropped"
 LOSS_NATIVE_SIGNED = "native_signed_binding_dropped"
 LOSS_UNREPRESENTABLE = "reasoning_content_unrepresentable"
-# The readable text survived the lowering, but the surface's own projection reads a
-# handle that the lowering removed, so there is no item left to emit: the text does
-# not cross either, and reporting it as a strip would name a cost that is not the
-# one the wire paid.
+# The surface's own projection cannot build an item from this block, so no item is
+# emitted and the block does not cross -- reporting it as carried would name a
+# crossing the wire never performed.
 LOSS_ITEM_UNREPRESENTABLE = "reasoning_item_unrepresentable_without_binding"
 # The calling parent projects native blocks only for the producer that recorded them
 # (``_openai_responses._convert_messages`` keeps a block whose ``_producer`` is absent
@@ -105,9 +105,10 @@ class _SurfaceCarrier:
     ``required_bindings`` are the string handles that surface's projection reads to
     build an item.  ``native_producer`` is the producer name whose native blocks that
     surface's parent will project, or ``None`` where the parent does not select native
-    blocks by producer at all.  ``binding_is_carried`` is False where the wire has no
-    field for binding metadata whatsoever, so removing one costs nothing that surface
-    would otherwise have carried.
+    blocks by producer at all.  ``binding_is_carried`` says whether the wire carries
+    binding metadata at all: where it does, a native block is the provider's own
+    object and crosses untouched, and where it does not, a binding is removed because
+    that wire could never have carried it.
     """
 
     required_bindings: tuple[str, ...]
@@ -116,9 +117,10 @@ class _SurfaceCarrier:
 
 
 _SURFACE_CARRIERS: dict[str, _SurfaceCarrier] = {
-    # Responses carries the reasoning item, and the item needs its handle.  It also
-    # round-trips binding metadata itself, which is why a removal an item survived
-    # would be a strip rather than a change that costs nothing.
+    # Responses carries the reasoning item itself, bindings included, and it is the
+    # surface the provider that issued the item is reached through, so a native item
+    # crosses whole.  The handle it needs is the one its own projection reads; a block
+    # without it is a drop, since no item is emitted for it.
     "responses": _SurfaceCarrier(
         required_bindings=("id",), native_producer=PROVIDER_NAME, binding_is_carried=True
     ),
@@ -193,15 +195,19 @@ class ReasoningTransfer:
     """Outcome of one boundary crossing: what crossed and what it cost."""
 
     kept: int = 0
-    """Blocks whose readable reasoning material this surface's wire carries."""
+    """Blocks whose reasoning material this surface's wire carries.
+
+    Readable text where the surface carries reasoning as text, and the provider's own
+    opaque item where the block is that provider's object and crosses back whole.
+    """
     stripped: int = 0
     """Blocks that still cross with binding metadata removed.
 
-    Meaningful only for a surface whose wire both carries bindings and tolerates a
-    missing one, which no surface declares today: every binding this adapter removes
-    is one the surface either needs to build the item (Responses, where the item is
-    then dropped) or cannot carry at all (Chat, where the text still crosses and the
-    removal costs nothing), so a removal lands in ``dropped`` or in ``kept``.
+    No surface reaches this: a wire that carries binding metadata hands the item back
+    to the provider that issued it, so a native block crosses with nothing removed,
+    while a wire with no binding field never carried the binding to begin with.  The
+    field stays in the report so a caller reading the schema does not have to tell a
+    surface that cannot strip apart from a surface that has not stripped yet.
     """
     dropped: int = 0
     """Blocks whose reasoning material this surface's wire does not receive."""
@@ -230,15 +236,17 @@ def retain_transferable_reasoning(
     is never handed a rewritten tool history.
 
     *required_bindings*, *native_producer* and *binding_is_carried* are the surface
-    being lowered for (see ``_SURFACE_CARRIERS``) and they decide what counts as
-    crossed: a block is only ``kept`` or ``stripped`` when that surface's own
-    projection will emit it.  A block that lost a handle the surface's projection
-    reads is a drop, because the readable text does not reach the wire without it; a
-    block whose removed binding is one the wire has no field for stays a crossing,
-    since nothing it would have carried was taken; and a message whose native blocks
-    the calling parent will not project at all -- recorded by a producer other than
-    the surface's own -- is a drop whatever the block's shape was, since that shape is
-    not what decided the outcome.
+    being lowered for (see ``_SURFACE_CARRIERS``) and they decide what the boundary
+    does with each block.  A message whose native blocks the calling parent will not
+    project at all -- recorded by a producer other than the surface's own -- holds
+    nothing that reaches the wire, so its blocks are dropped whole and none of them is
+    lowered on the way: a foreign opaque binding is not re-emitted in any form.  On a
+    surface whose wire carries binding metadata, a native block is that provider's own
+    object and crosses untouched, so nothing is removed and no loss is recorded; the
+    only thing that keeps such a block off the wire is that surface's projection being
+    unable to build its item, which is a drop.  On a surface with no binding field at
+    all, the binding is removed because that wire could never have carried it, the
+    readable text crosses, and the removal is not a cost.
     """
     out: list[dict[str, Any]] = []
     kept = stripped = dropped = 0
@@ -262,28 +270,42 @@ def retain_transferable_reasoning(
             if not isinstance(block, dict) or block.get("type") not in _REASONING_BLOCK_TYPES:
                 surviving.append(block)
                 continue
-            lowered, loss = lower_reasoning_block(block)
-            if lowered is not None:
-                surviving.append(lowered)
-            if lowered is None and loss is None:
-                continue  # nothing to carry, so nothing is lost either
             if foreign_producer:
+                # The parent projects native blocks only for the producer that recorded
+                # them, so this block reaches the wire in no shape at all.  It is
+                # dropped rather than lowered: a foreign opaque binding is not
+                # re-emitted, in this list or any list built from it.
                 dropped += 1
                 _note(LOSS_FOREIGN_PRODUCER)
-            elif lowered is None:
+                continue
+            if binding_is_carried:
+                # This wire carries binding metadata, and the provider it reaches is
+                # the one that issued the block: the block is that provider's own
+                # replay state and crosses untouched.  Whether the wire carries it is
+                # its projection's decision, so a block no item can be built from is
+                # dropped rather than dismantled in the hope of one.
+                if _is_representable(block, required_bindings):
+                    surviving.append(block)
+                    kept += 1
+                else:
+                    dropped += 1
+                    _note(LOSS_ITEM_UNREPRESENTABLE)
+                continue
+            lowered, loss = lower_reasoning_block(block)
+            if lowered is None and loss is None:
+                continue  # nothing to carry, so nothing is lost either
+            if lowered is None:
                 dropped += 1
                 _note(loss)
-            elif not _is_representable(lowered, required_bindings):
+                continue
+            if not _is_representable(lowered, required_bindings):
                 dropped += 1
                 _note(LOSS_ITEM_UNREPRESENTABLE)
-            elif loss is None or not binding_is_carried:
-                # Either the block crossed whole, or the binding that was removed is
-                # one this surface's wire has no field for: nothing it would have
-                # carried was taken, so the readable text crosses at no cost.
-                kept += 1
-            else:
-                stripped += 1
-                _note(loss)
+                continue
+            # No binding field exists on this surface, so a binding it could never
+            # have carried was not taken from it: the readable text crosses.
+            surviving.append(lowered)
+            kept += 1
         if surviving:
             out.append({**message, "_provider_content": surviving})
         else:

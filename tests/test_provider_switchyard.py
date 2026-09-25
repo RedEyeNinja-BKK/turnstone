@@ -3,16 +3,17 @@
 The provider owns no routing decision: it lowers Turnstone's neutral ledger onto
 Switchyard's surface and reports what the ledger could not carry.  What these
 tests pin: the provider identity and surface selection, operator-owned
-capabilities, and the cross-provider reasoning rule -- the readable text crosses
-only where a surface's wire can carry it, a binding another endpoint cannot
-resolve is removed, what crossed and what it cost is reported against the
-surface's own projection, nothing is substituted for what was removed, and the
+capabilities, and the provider-boundary reasoning rule -- an item the lane's own
+surface produced is that provider's object and crosses back whole, bindings
+included, while an item attributed to another producer does not cross as native and
+is reported as dropped, nothing is substituted for what does not cross, and the
 caller's ledger objects are never touched.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import threading
 from typing import Any
 
@@ -49,6 +50,18 @@ _ENCRYPTED = {
     "summary": [{"type": "summary_text", "text": "because"}],
 }
 _SIGNED = {"type": "thinking", "thinking": "because", "signature": "sig-blob"}
+# A reasoning item as a live DeepSeek-backed Switchyard lane returns it: a handle, a
+# readable reasoning_text part, an empty summary and an encrypted payload.  Captured
+# from a real turn rather than written by hand, because the hand-written shapes this
+# file started with were not what the lane emits.
+_LIVE_ITEM = {
+    "type": "reasoning",
+    "id": "84bd62f9-2e89-4fb2-84fe-a401cd68782c",
+    "status": "completed",
+    "content": [{"type": "reasoning_text", "text": "because"}],
+    "summary": [],
+    "encrypted_content": "0441e4bc-f2e1-478b-9dc7-6a12268b59db-0",
+}
 _TOOL_CALL = {"type": "function_call", "call_id": "call_1", "name": "get_weather"}
 _HANDLED = {
     "type": "reasoning",
@@ -145,45 +158,27 @@ class TestTheCrossingRunsOnEverySurface:
     is what these tests watch.
     """
 
-    @pytest.mark.parametrize(
-        ("surface_class", "parent_class", "counts", "losses"),
-        (
-            # Chat carries the readable text in the canonical message field and never
-            # projects the private block list, so both blocks' text stays representable.
-            (SwitchyardChatProvider, OpenAIChatCompletionsProvider, (2, 0, 0), ()),
-            # Responses builds the item from its handle: the encrypted block lost the id
-            # together with its binding, and the untagged plain block never had one.
-            (
-                SwitchyardResponsesProvider,
-                OpenAIResponsesProvider,
-                (0, 0, 2),
-                (LOSS_ITEM_UNREPRESENTABLE,),
-            ),
-        ),
-    )
-    def test_the_parent_receives_the_lowered_messages(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        surface_class: type,
-        parent_class: type,
-        counts: tuple[int, int, int],
-        losses: tuple[str, ...],
+    def _message(self) -> dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": "the ledger text",
+            "_provider_content": [copy.deepcopy(_ENCRYPTED), copy.deepcopy(_PLAINTEXT)],
+        }
+
+    def test_a_chat_surface_hands_its_parent_the_text_without_the_binding(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Chat carries readable text and has no field for a binding to survive in."""
         handed_to_surface: list[list[dict[str, Any]]] = []
 
         def _capture(self: object, **kwargs: Any) -> Any:
             handed_to_surface.append(kwargs["messages"])
             return iter(())
 
-        monkeypatch.setattr(parent_class, "create_streaming", _capture)
-        message = {
-            "role": "assistant",
-            "content": "the ledger text",
-            "_provider_content": [copy.deepcopy(_ENCRYPTED), copy.deepcopy(_PLAINTEXT)],
-        }
+        monkeypatch.setattr(OpenAIChatCompletionsProvider, "create_streaming", _capture)
 
-        provider = surface_class()
-        assert list(provider.create_streaming(messages=[message])) == []
+        provider = SwitchyardChatProvider()
+        assert list(provider.create_streaming(messages=[self._message()])) == []
 
         assert len(handed_to_surface) == 1, "the surface never reached its parent"
         crossed = handed_to_surface[0][0]["_provider_content"]
@@ -192,15 +187,41 @@ class TestTheCrossingRunsOnEverySurface:
         assert crossed[0]["summary"][0]["text"] == "because"
         assert crossed[1] == _PLAINTEXT
         transfer = provider.last_reasoning_transfer
-        assert (transfer.kept, transfer.stripped, transfer.dropped) == counts, (
+        assert (transfer.kept, transfer.stripped, transfer.dropped) == (2, 0, 0), (
             "the retained list and the reported crossing disagree"
         )
-        assert transfer.losses == losses
+        assert not transfer.lossy
+
+    def test_a_responses_surface_hands_its_parent_the_item_whole(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lane's own item is that provider's object, and crosses with nothing removed."""
+        handed_to_surface: list[list[dict[str, Any]]] = []
+
+        def _capture(self: object, **kwargs: Any) -> Any:
+            handed_to_surface.append(kwargs["messages"])
+            return iter(())
+
+        monkeypatch.setattr(OpenAIResponsesProvider, "create_streaming", _capture)
+
+        provider = SwitchyardResponsesProvider()
+        assert list(provider.create_streaming(messages=[self._message()])) == []
+
+        assert len(handed_to_surface) == 1, "the surface never reached its parent"
+        crossed = handed_to_surface[0][0]["_provider_content"]
+        # The bound block keeps every field it arrived with; the untagged plain block
+        # has no handle for the parent to build an item from, so it does not cross.
+        assert crossed == [_ENCRYPTED]
+        transfer = provider.last_reasoning_transfer
+        assert (transfer.kept, transfer.stripped, transfer.dropped) == (1, 0, 1), (
+            "the retained list and the reported crossing disagree"
+        )
+        assert transfer.losses == (LOSS_ITEM_UNREPRESENTABLE,)
 
     def test_a_surface_without_the_crossing_is_caught(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Negative control for the test above: an unresolved binding must fail it."""
+        """Negative control for the tests above: an uncrossed foreign binding must fail them."""
         handed_to_surface: list[list[dict[str, Any]]] = []
 
         def _capture(self: object, **kwargs: Any) -> Any:
@@ -216,15 +237,16 @@ class TestTheCrossingRunsOnEverySurface:
         message = {
             "role": "assistant",
             "content": "the ledger text",
+            "_producer": "openai",
             "_provider_content": [copy.deepcopy(_ENCRYPTED)],
         }
 
         provider = SwitchyardResponsesProvider()
         list(provider.create_streaming(messages=[message]))
 
-        crossed = handed_to_surface[0][0]["_provider_content"]
-        assert [block.get("encrypted_content") for block in crossed] == ["enc-blob"], (
-            "the removed crossing did not reproduce a bypass, so the test above would be vacuous"
+        crossed = handed_to_surface[0][0].get("_provider_content")
+        assert crossed and crossed[0].get("encrypted_content") == "enc-blob", (
+            "the removed crossing did not reproduce a bypass, so the tests above would be vacuous"
         )
 
 
@@ -324,14 +346,14 @@ class TestBoundaryCrossing:
         assert blocks[0]["summary"] == _ENCRYPTED["summary"]
         assert blocks[1] == _PLAINTEXT
 
-    def test_a_responses_surface_drops_what_its_projection_cannot_build(self) -> None:
+    def test_a_responses_surface_keeps_the_item_and_drops_the_handleless_block(self) -> None:
         message = self._message()
         message.pop("_producer", None)  # this surface's own blocks, so the shape decides
         messages, transfer = retain_transferable_reasoning([message], **_AS_RESPONSES)
-        # The lowering hands both blocks on unchanged; the parent is what decides it
-        # cannot build an item from either, which is the outcome being reported.
-        assert len(messages[0]["_provider_content"]) == 2
-        assert (transfer.kept, transfer.stripped, transfer.dropped) == (0, 0, 2)
+        # The bound block is this provider's own object and crosses untouched; the
+        # untagged plain block has no handle, and no item is built without one.
+        assert messages[0]["_provider_content"] == [_ENCRYPTED]
+        assert (transfer.kept, transfer.stripped, transfer.dropped) == (1, 0, 1)
         assert transfer.losses == (LOSS_ITEM_UNREPRESENTABLE,)
 
     def test_no_block_content_is_invented_at_the_boundary(self) -> None:
@@ -396,17 +418,17 @@ class TestBoundaryCrossing:
         assert transfer.kept == 0 and transfer.dropped == 0 and not transfer.lossy
 
     def test_each_distinct_loss_class_is_reported_once(self) -> None:
-        """Two classes, in the order the blocks were seen, each recorded once."""
-        message = self._message()
-        message.pop("_producer", None)  # untagged: this surface's own blocks
-        message["_provider_content"] = [
-            copy.deepcopy(_ENCRYPTED),
-            {"type": "reasoning", "id": "rs_def", "encrypted_content": "other-blob"},
-            copy.deepcopy(_ENCRYPTED),
+        """Two classes, in the order the messages were seen, each recorded once."""
+        old_lineage = self._message()  # both blocks recorded by another producer
+        migrated = self._message()
+        migrated.pop("_producer", None)
+        migrated["_provider_content"] = [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "because"}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "because"}]},
         ]
-        _, transfer = retain_transferable_reasoning([message], **_AS_RESPONSES)
-        assert transfer.losses == (LOSS_ITEM_UNREPRESENTABLE, LOSS_UNREPRESENTABLE)
-        assert (transfer.kept, transfer.stripped, transfer.dropped) == (0, 0, 3)
+        _, transfer = retain_transferable_reasoning([old_lineage, migrated], **_AS_RESPONSES)
+        assert transfer.losses == (LOSS_FOREIGN_PRODUCER, LOSS_ITEM_UNREPRESENTABLE)
+        assert (transfer.kept, transfer.stripped, transfer.dropped) == (0, 0, 4)
 
 
 class TestWhatTheSurfaceWillActuallyEmit:
@@ -415,7 +437,9 @@ class TestWhatTheSurfaceWillActuallyEmit:
     Counting the lowering alone reported blocks as crossed that the parent could not
     build an item from.  These tests read the report against the parent's own
     projection: a Responses item needs a string ``id``, and a Responses parent reads
-    native blocks only from its own producer.
+    native blocks only from its own producer.  On a wire that carries bindings, a
+    native item passes through untouched, so the report's ``kept`` follows what that
+    projection emits rather than what this adapter kept back.
     """
 
     def _one(self, block: dict[str, Any], *, producer: str | None = None) -> dict[str, Any]:
@@ -434,13 +458,38 @@ class TestWhatTheSurfaceWillActuallyEmit:
         )
         assert transfer.kept == 1 and not transfer.lossy
 
-    def test_a_bound_block_is_a_drop_on_the_responses_surface(self) -> None:
-        """The handle the parent reads to build the item is the one the binding took."""
-        _, transfer = retain_transferable_reasoning(
-            [self._one(copy.deepcopy(_ENCRYPTED))], **_AS_RESPONSES
+    def test_a_native_bound_block_crosses_whole(self) -> None:
+        """Its id and encrypted payload are the provider's own replay state."""
+        block = copy.deepcopy(_ENCRYPTED)
+        messages, transfer = retain_transferable_reasoning([self._one(block)], **_AS_RESPONSES)
+        assert (transfer.kept, transfer.stripped, transfer.dropped) == (1, 0, 0)
+        assert not transfer.lossy
+        crossed = messages[0]["_provider_content"][0]
+        assert crossed is block, "the item is handed on, not rebuilt"
+        assert crossed["encrypted_content"] == _ENCRYPTED["encrypted_content"]
+        assert crossed["id"] == _ENCRYPTED["id"]
+
+    def test_the_item_a_live_lane_returns_reaches_the_parent_byte_for_byte(self) -> None:
+        """The shape a real turn captures, handle and payload included, is untouched."""
+        messages, transfer = retain_transferable_reasoning(
+            [self._one(copy.deepcopy(_LIVE_ITEM))], **_AS_RESPONSES
         )
+        assert transfer.kept == 1 and not transfer.lossy
+        crossed = messages[0]["_provider_content"][0]
+        assert json.dumps(crossed) == json.dumps(_LIVE_ITEM), (
+            "a field the endpoint issued was rebuilt or removed on the way through"
+        )
+        for field in ("id", "content", "encrypted_content"):
+            assert crossed[field] == _LIVE_ITEM[field]
+
+    def test_a_foreign_item_leaves_no_binding_behind_in_any_form(self) -> None:
+        """A dropped foreign block is not lowered either: nothing of it is re-emitted."""
+        messages, transfer = retain_transferable_reasoning(
+            [self._one(copy.deepcopy(_LIVE_ITEM), producer="openai")], **_AS_RESPONSES
+        )
+        assert "_provider_content" not in messages[0]
         assert (transfer.kept, transfer.stripped, transfer.dropped) == (0, 0, 1)
-        assert transfer.losses == (LOSS_ITEM_UNREPRESENTABLE,)
+        assert transfer.losses == (LOSS_FOREIGN_PRODUCER,)
 
     def test_a_plain_block_without_a_handle_is_a_drop_too(self) -> None:
         """An untagged legacy shape has no id, and the parent builds no item without one."""
@@ -490,6 +539,9 @@ class TestWhatTheSurfaceWillActuallyEmit:
             (copy.deepcopy(_HANDLED), "openai"),
             (copy.deepcopy(_ENCRYPTED), None),
             (copy.deepcopy(_PLAINTEXT), None),
+            (copy.deepcopy(_LIVE_ITEM), None),
+            (copy.deepcopy(_LIVE_ITEM), PROVIDER_NAME),
+            (copy.deepcopy(_LIVE_ITEM), "openai"),
             # A handle of the wrong type is not a handle: the parent reads a string.
             (
                 {

@@ -91,6 +91,14 @@ def bound_image_for_wire(data: bytes) -> bytes:
 
     Never raises: any decode/encode failure returns the original bytes, so a
     bounded payload is a best effort and never a new way to lose an attachment.
+
+    The bound is enforced for every input this function can safely re-encode,
+    including rasters above ``_MAX_IMAGE_PIXELS``: those are reduced at the
+    DECODER (``Image.draft``) before the ladder runs, so an oversized image is
+    never passed through merely because it is oversized.  Two cases stay
+    genuinely best-effort and are logged when they occur: a decode that raises
+    (including Pillow's own decompression-bomb and allocation guards), and an
+    input whose smallest ladder rung is still above the byte budget.
     """
     if len(data) <= _MAX_WIRE_IMAGE_BYTES:
         return data
@@ -100,11 +108,20 @@ def bound_image_for_wire(data: bytes) -> bytes:
         return data
     try:
         img = Image.open(BytesIO(data))
+        # An oversized raster is reduced at the decoder, not passed through:
+        # returning it unchanged would leave the wire budget unenforced for
+        # exactly the inputs most able to blow it.  draft() is honoured by JPEG
+        # and is a base-class no-op elsewhere; a decoder that cannot produce a
+        # bounded raster raises, and the handler below returns the original
+        # bytes behind a log line rather than an unbounded silent pass.
         if img.size[0] * img.size[1] > _MAX_IMAGE_PIXELS:
-            # Refuse to decode an expansion bomb; Pillow's own bomb guard would
-            # raise anyway.  The stored bytes still reach the provider unchanged.
-            log.warning("wire image bound skipped: image exceeds pixel cap")
-            return data
+            log.info(
+                f"oversized raster {img.size[0]}x{img.size[1]}: reducing at the decoder"
+            )
+            try:
+                img.draft("RGB", (_MAX_WIRE_IMAGE_EDGE, _MAX_WIRE_IMAGE_EDGE))
+            except Exception as exc:
+                log.warning(f"decoder-level reduction unavailable: {exc}")
         has_alpha = img.mode in ("RGBA", "LA", "PA") or (
             img.mode == "P" and "transparency" in img.info
         )
@@ -127,8 +144,9 @@ def bound_image_for_wire(data: bytes) -> bytes:
                     f"at {edge}px ({fmt})"
                 )
                 return encoded
-        # Every rung of the ladder still exceeded the budget: the smallest
-        # attempt still beats sending the original.
+        # Every rung of the ladder still exceeded the budget.  This is a
+        # best-effort reduction, not a guarantee: the smallest attempt is
+        # returned because it is strictly smaller than the input.
         log.warning(
             f"wire image bound settled above budget: {len(data)} -> {len(encoded)} bytes"
         )

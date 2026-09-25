@@ -86,6 +86,7 @@ from turnstone.core.continuation import (
 )
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.images import bound_image_for_wire
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
@@ -8448,6 +8449,16 @@ class ChatSession:
         kind and a capable perception model is configured.  A PDF rasterized to
         images returns several parts."""
         kind = att.get("kind")
+        if kind == "image":
+            # Bound the bytes at the wire boundary.  The stored blob keeps full
+            # resolution for history and previews; only the payload a provider is
+            # billed for is capped, and both the native and the perception path
+            # below build their part from this same attachment.
+            raw_image = att.get("content")
+            if isinstance(raw_image, bytes):
+                bounded_image = bound_image_for_wire(raw_image)
+                if bounded_image is not raw_image:
+                    att = {**att, "content": bounded_image}
         if kind == "pdf":
             materialized = self._materialize_pdf_attachment(
                 att,

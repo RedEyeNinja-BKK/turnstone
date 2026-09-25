@@ -16,9 +16,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from turnstone.core.log import get_logger
 from turnstone.core.model_turn import ModelTurnResult
 from turnstone.core.trajectory import Turn, TurnProvenance
 from turnstone.core.truncation import truncate_text
+
+log = get_logger(__name__)
 
 
 def _compaction_marker(_omitted: int, original: int, _limit: int) -> str:
@@ -66,6 +69,13 @@ class CompactionPolicy:
 
 MessageMeasure = Callable[[dict[str, Any] | Turn], tuple[int, int, int]]
 
+# Plausible band for a provider-anchored text chars/token ratio, applied to
+# image-bearing samples.  Ordinary prose and code measure ~3.5-4.6; dense scripts
+# (Thai, CJK) sit near 1.0.  The band exists to refuse a sample whose image charge
+# is self-inconsistent, not to model a tokenizer, so it is deliberately wide.
+_MIN_CALIBRATED_CHARS_PER_TOKEN = 0.75
+_MAX_CALIBRATED_CHARS_PER_TOKEN = 6.0
+
 
 def calibrated_chars_per_token(
     *,
@@ -82,6 +92,19 @@ def calibrated_chars_per_token(
     without polluting the text ratio, matching the foreground estimator's
     established accounting.  If the provider count cannot yield a positive text
     denominator, retain ``fallback``.
+
+    The fixed per-image charge is an assumption, and when it understates what the
+    provider actually billed, the residual absorbs the whole difference: the
+    ratio collapses toward zero even though the text tokenized normally.  A
+    collapsed ratio is worse than no measurement, because it divides fixed-size
+    inputs (the system prefix, the tool envelope) and so turns a small prompt
+    into an impossible one.
+
+    That assumption is the ONLY term that can inject this error, and it is used
+    only when images are present — with none, ``text_prompt_tokens`` is the
+    provider's own count and the ratio is exactly what the provider measured, so
+    the band is applied to image-bearing samples and text-only samples keep the
+    unchanged arithmetic.
     """
 
     text_chars = tool_def_chars
@@ -93,7 +116,18 @@ def calibrated_chars_per_token(
     text_prompt_tokens = prompt_tokens - image_count * image_tokens
     if text_prompt_tokens <= 0 or text_chars <= 0:
         return fallback
-    return text_chars / text_prompt_tokens
+    ratio = text_chars / text_prompt_tokens
+    if image_count and not (
+        _MIN_CALIBRATED_CHARS_PER_TOKEN <= ratio <= _MAX_CALIBRATED_CHARS_PER_TOKEN
+    ):
+        log.warning(
+            f"chars/token calibration refused: ratio={ratio:.4f} outside "
+            f"[{_MIN_CALIBRATED_CHARS_PER_TOKEN}, {_MAX_CALIBRATED_CHARS_PER_TOKEN}] "
+            f"(prompt_tokens={prompt_tokens} images={image_count} "
+            f"text_chars={text_chars}) — retaining fallback={fallback:.4f}"
+        )
+        return fallback
+    return ratio
 
 
 @dataclass(slots=True)

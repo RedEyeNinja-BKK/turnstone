@@ -14,10 +14,15 @@ import re
 import subprocess
 import sys
 
-ROOT = pathlib.Path("/opt/turnstone/fork/turnstone")
+# Resolve the tree and interpreter from this file's own location so the battery
+# runs in any checkout against any accepted runtime.  Pinning an absolute
+# checkout path and one slot's interpreter made the battery break the moment
+# either moved: it silently targeted a tree and a v1.8.4 runtime that were not
+# the ones under review.  A review instrument must be portable.
+ROOT = pathlib.Path(__file__).resolve().parent
 TD = ROOT / "turnstone/core/typed_decision.py"
 OG = ROOT / "turnstone/core/output_guard_judge.py"
-PY = "/opt/turnstone/runtimes/1.8.4-bbd6c836/venv/bin/python3"
+PY = sys.executable
 
 MUTANTS = [
     (

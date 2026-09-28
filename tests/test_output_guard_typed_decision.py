@@ -658,5 +658,51 @@ def test_typed_branch_error_is_labelled_not_clean():
     assert not (verdict.error == "" and verdict.risk_level == "none")
 
 
+def test_cancelled_typed_branch_does_not_spend_a_decision_call():
+    """A cancelled generation must not BEGIN semantic work on the typed path.
+
+    ``execute_decision`` blocks for up to ``timeout`` on a synchronous HTTP
+    request, so the typed path cannot interrupt an in-flight decision — the
+    bound is the timeout.  What it must do is refuse to START one once the
+    generation is cancelled, matching the generative path's start boundary.
+    """
+    import threading
+    import time
+
+    import turnstone.core.output_guard_judge as og
+    import turnstone.core.typed_decision as td
+
+    calls = []
+    real_exec = td.execute_decision
+
+    def boom(**kw):
+        calls.append(kw)
+        raise td.TypedDecisionError("should not be reached when cancelled")
+
+    td.execute_decision = boom
+    try:
+        judge = og.OutputGuardJudge.__new__(og.OutputGuardJudge)
+        judge._judge_model_alias = ""
+        judge._model = "session-model"
+        judge._typed_spec = SPEC
+        judge._typed_base_url = "http://127.0.0.1:4000"
+        judge._typed_alias = "a"
+        cancel = threading.Event()
+        cancel.set()
+        verdict = og.OutputGuardJudge._evaluate_typed_decision(
+            judge, "out", spec=SPEC, base_url="http://127.0.0.1:4000", alias="a",
+            call_id="c", func_name="f", heuristic_risk="high", cancel_event=cancel,
+            timeout=5, start=time.monotonic(), verdict_id="v",
+        )
+    finally:
+        td.execute_decision = real_exec
+
+    assert calls == [], "a cancelled generation must not issue a decision call"
+    assert not verdict.succeeded
+    assert "cancel" in verdict.error, verdict.error
+    # Still not a clean verdict: a cancelled semantic tier is heuristic-only.
+    assert not (verdict.error == "" and verdict.risk_level == "none")
+
+
 if __name__ == "__main__":
     sys.exit(_run_all())

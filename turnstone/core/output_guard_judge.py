@@ -690,6 +690,14 @@ class OutputGuardJudge:
         )
 
         state = f"Tool {func_name} produced this output:\n{output}"
+        # Honour cancellation before spending the call.  ``execute_decision``
+        # blocks for up to ``timeout`` on a synchronous HTTP request, so this
+        # cannot interrupt an in-flight decision — the bound is the timeout.
+        # Checking at the start boundary keeps the typed path's cancellation
+        # contract aligned with the generative path's: a cancelled or superseded
+        # generation must not BEGIN new semantic work.
+        if cancel_event is not None and cancel_event.is_set():
+            return self._error_verdict(verdict_id, call_id, start, "cancelled")
         try:
             result = execute_decision(
                 base_url=base_url,

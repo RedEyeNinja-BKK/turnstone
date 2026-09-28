@@ -120,6 +120,21 @@ def _clamp_confidence(value: object) -> float | None:
     return max(0.0, min(1.0, number))
 
 
+# A graded noul is mapped onto the guard's risk vocabulary on these bounds.
+# They are deliberately conservative: the top of the range is needed to reach
+# `high`, and a low score still reads as `low` rather than as "clean", so a
+# decision backend can never silently downgrade a suspicious result to `none`.
+_NOUL_RISK_BOUNDS = ((0.50, "high"), (0.20, "medium"), (0.05, "low"))
+
+
+def _risk_from_graded_noul(graded: float) -> str:
+    """Map a graded noul score onto none/low/medium/high."""
+    for threshold, level in _NOUL_RISK_BOUNDS:
+        if graded >= threshold:
+            return level
+    return "none"
+
+
 def _risk_from_choice(choice: object) -> str:
     if not isinstance(choice, str):
         raise TypedDecisionError(f"choice must be a string, got {type(choice).__name__}")
@@ -171,10 +186,19 @@ def normalize_decision(payload: dict, spec: TypedDecisionSpec) -> TypedDecisionR
             if score is not None and (confidence is None or score > confidence):
                 confidence = score
         elif kind == "noul":
-            # `noul` is a graded "nothing of concern" signal, not a risk level.
-            # It is never mapped onto risk: doing so would let a model express
-            # risk through a vocabulary the guard does not validate.
-            continue
+            # A graded noul is the ONLY question type the Respan/Span decision
+            # surface accepts, and it is how risk is actually requested. Map the
+            # graded score onto the guard's vocabulary. The mapping is explicit
+            # and bounded, so a score can never invent a risk level outside it.
+            graded = _clamp_confidence(answer.get("noul", answer.get("value")))
+            if graded is None:
+                raise TypedDecisionError("noul answer carried no usable score")
+            candidate = _risk_from_graded_noul(graded)
+            risk = candidate if risk is None else max(
+                risk, candidate, key=VALID_RISK_LEVELS.index
+            )
+            if confidence is None or graded > confidence:
+                confidence = graded
         else:
             raise TypedDecisionError(f"unsupported decision answer type {kind!r}")
 
@@ -218,20 +242,25 @@ def build_request_body(
     """
     if not state.strip():
         raise TypedDecisionError("decision state must be non-empty")
-    risk_labels = ", ".join(VALID_RISK_LEVELS)
+    # The Respan/Span decision surface accepts ONLY `noul` questions, and
+    # answers with a graded score. A `choice` question is rejected upstream with
+    # HTTP 400, so the risk grade is REQUESTED as a graded noul and mapped onto
+    # the guard's vocabulary here, keeping the wire honest to the provider.
     return {
         "model": decision_id,
         "state": state,
         "questions": {
             "risk": {
-                "type": "choice",
+                "type": "noul",
                 "instructions": (
-                    "Classify the risk this tool output presents. Answer with "
-                    f"exactly one of: {risk_labels}."
+                    "Flag any error, warning, unsafe content or degraded "
+                    "condition in this tool output. Answer with a high score "
+                    "when such a condition is present and a near-zero score "
+                    "when the output is clean."
                 ),
                 "criteria": {
-                    "true": "a risk level of {none, low, medium, high} is present",
-                    "false": "the output is safe and no risk level applies",
+                    "true": "an error, warning, unsafe content or degraded condition is present",
+                    "false": "the output is clean and free of any such condition",
                 },
             },
         },

@@ -57,7 +57,10 @@ from turnstone.core.judge import (
     _positive_window,
 )
 from turnstone.core.log import get_logger
-from turnstone.core.model_registry import ModelClientConstructionError
+from turnstone.core.model_registry import (
+    ModelClientConstructionError,
+    UnknownModelAliasError,
+)
 from turnstone.core.model_turn import (
     ResolvedModelBinding,
     model_turn,
@@ -265,10 +268,15 @@ def _typed_decision_spec(registry: Any, alias: str) -> Any | None:
     """
     if not alias or registry is None:
         return None
-    try:
-        caps = _registry_capabilities(registry, alias)
-    except Exception:  # a registry that cannot be read is not a typed alias
-        return None
+    # No blanket catch here.  ``_registry_config`` already translates the one
+    # benign case (an unregistered alias) into None, so any exception that
+    # escapes it means the registry could not be read.  Swallowing that would
+    # mean "ordinary generative model" and would reproduce this module's central
+    # defect: a row that declared supports_typed_decision silently reaching the
+    # generative path and then the session-model fallback.  Let it propagate to
+    # the caller, which logs output_guard_judge.init_failed and leaves the
+    # semantic guard unset (heuristic tier only).
+    caps = _registry_capabilities(registry, alias)
     if not isinstance(caps, dict) or not caps.get("supports_typed_decision"):
         return None
     from turnstone.core.typed_decision import TypedDecisionSpec
@@ -298,8 +306,18 @@ def _registry_config(registry: Any, alias: str) -> Any:
     if callable(config_getter):
         try:
             return config_getter(alias)
-        except Exception:  # unknown alias / unreadable registry
+        except UnknownModelAliasError:
+            # The only case ``ModelRegistry.get_config`` raises, and it touches
+            # no I/O.  An unregistered alias is genuinely "not a typed row", so
+            # ``None`` is the correct answer.
             return None
+        # Any OTHER failure means the registry could not be read.  Returning
+        # None there would mean "ordinary generative model" — reproducing the
+        # very defect this branch exists to fix, and letting a row that declared
+        # supports_typed_decision reach the session-model fallback the module
+        # forbids.  Propagate instead: the caller's init handler logs
+        # output_guard_judge.init_failed and leaves the semantic guard unset
+        # (heuristic tier only) — fail-closed and loud, never fail-open.
     return None
 
 

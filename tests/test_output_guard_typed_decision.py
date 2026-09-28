@@ -388,7 +388,12 @@ class _RealShapeRegistry:
 
     def get_config(self, alias):
         if alias not in self._cfgs:
-            raise KeyError(alias)
+            # Production raises UnknownModelAliasError (model_registry.py:650).
+            # A bare KeyError would make this stub disagree with the real class
+            # in exactly the direction the fail-closed change cares about.
+            from turnstone.core.model_registry import UnknownModelAliasError
+
+            raise UnknownModelAliasError(alias)
         return self._cfgs[alias]
 
 
@@ -397,7 +402,14 @@ def test_guard_detects_typed_alias_on_real_registry_shape():
     import turnstone.core.output_guard_judge as og
 
     reg = _RealShapeRegistry(_caps())
-    # A production registry exposes no ``get``; prove the stub is faithful.
+    # Anchor the stub's shape to the PRODUCTION class, not to itself: if
+    # ModelRegistry ever grows a ``get``, the stub must follow or this fixture
+    # would go quietly unfaithful while staying green.
+    from turnstone.core.model_registry import ModelRegistry
+
+    assert not callable(getattr(ModelRegistry, "get", None)), (
+        "ModelRegistry grew a .get(); _RealShapeRegistry must be updated to match"
+    )
     assert not callable(getattr(reg, "get", None)), "stub must not expose .get"
 
     spec = og._typed_decision_spec(reg, "switchyard-smartfree-aux-turnstone")
@@ -411,6 +423,53 @@ def test_guard_detects_typed_alias_on_real_registry_shape():
     )
     # An unknown alias must stay unknown rather than raise out of the guard.
     assert og._typed_decision_spec(reg, "no-such-alias") is None
+
+
+def test_unreadable_registry_fails_closed_not_open():
+    """A registry that CANNOT be read must not degrade to the generative path.
+
+    ``None`` from ``_typed_decision_spec`` means "ordinary generative model",
+    so translating a read failure into None would reproduce the very defect
+    this module's invariant forbids: a row declaring supports_typed_decision
+    silently reaching the chat path and then the session-model fallback.  The
+    failure must propagate instead, leaving the caller with no semantic guard
+    (heuristic tier only) and a logged init_failed.
+    """
+    import turnstone.core.output_guard_judge as og
+
+    class _BrokenRegistry:
+        def get_config(self, alias):
+            raise RuntimeError("registry unavailable")
+
+    class _UnreadableGet:
+        def get(self, alias):
+            raise RuntimeError("registry unavailable")
+
+    for broken in (_BrokenRegistry(), _UnreadableGet()):
+        try:
+            spec = og._typed_decision_spec(broken, "switchyard-smartfree-aux-turnstone")
+        except RuntimeError as exc:
+            assert "registry unavailable" in str(exc)
+        else:
+            raise AssertionError(
+                f"unreadable registry must propagate, got {spec!r} (fail-open)"
+            )
+
+
+def test_ordinary_generative_row_stays_generative_on_real_shape():
+    """The fix must not reclassify a plain row as typed-decision."""
+    import turnstone.core.output_guard_judge as og
+
+    reg = _RealShapeRegistry({"api_surface": "responses"})
+    reg._cfgs["switchyard-smartfree-bounded-turnstone"] = types.SimpleNamespace(
+        capabilities={"api_surface": "responses"}, base_url="http://127.0.0.1:4000"
+    )
+    assert og._typed_decision_spec(reg, "switchyard-smartfree-bounded-turnstone") is None
+    # supports_typed_decision explicitly false is also not typed.
+    reg._cfgs["off"] = types.SimpleNamespace(
+        capabilities={"supports_typed_decision": False}, base_url="http://x"
+    )
+    assert og._typed_decision_spec(reg, "off") is None
 
 
 def test_guard_detects_typed_alias_before_provider_construction():
@@ -429,6 +488,69 @@ def test_guard_detects_typed_alias_before_provider_construction():
             "switchyard-smartfree-turnstone",
         )
         is None
+    )
+
+
+def test_constructor_classifies_typed_alias_before_binding_resolution():
+    """``__init__`` must detect a typed alias and never resolve a chat binding.
+
+    The helper-level tests above pin detection; this one exercises the
+    CONSTRUCTOR branch that was actually broken in production, where a typed
+    alias was misread as generative and pushed through
+    ``resolve_model_binding`` (the chat/Responses provider factory).  It also
+    pins the module's "a typed alias never falls back to the session model"
+    invariant: resolution must not be attempted at all for a typed row.
+    """
+    import turnstone.core.output_guard_judge as og
+    from turnstone.core.model_turn import ModelCapabilities, ModelLane, ResolvedModelBinding
+
+    resolved = []
+
+    class _Registry(_RealShapeRegistry):
+        def get_config(self, alias):
+            cfg = super().get_config(alias)
+            resolved.append(alias)
+            return cfg
+
+    reg = _Registry(_caps())
+
+    class _Provider:
+        provider_name = "openai-compatible"
+
+        def get_capabilities(self, model):
+            return ModelCapabilities(context_window=200000)
+
+    session_binding = ResolvedModelBinding(
+        lane=ModelLane(
+            provider=_Provider(),
+            client=object(),
+            model="session-model",
+            alias="session-model",
+            capabilities=ModelCapabilities(context_window=200000),
+            registry=reg,
+        ),
+        config=types.SimpleNamespace(context_window=0),
+        registry_generation=0,
+    )
+    guard_cfg = types.SimpleNamespace(
+        output_guard_model="switchyard-smartfree-aux-turnstone",
+        output_guard_llm_timeout=30.0,
+    )
+    judge = og.OutputGuardJudge.__new__(og.OutputGuardJudge)
+    og.OutputGuardJudge.__init__(
+        judge,
+        config=guard_cfg,
+        session_binding=session_binding,
+        config_store=None,
+    )
+    assert judge._typed_spec is not None, "constructor must classify a typed alias"
+    assert judge._typed_spec.contract == "switchyard-decision:v1"
+    assert judge._typed_base_url == "http://127.0.0.1:4000"
+    assert judge._typed_alias == "switchyard-smartfree-aux-turnstone"
+    # A typed row carries no api_surface, so any generative resolution attempt
+    # would be the bug: it must never be made.
+    assert og.resolve_model_binding not in resolved, (
+        "typed alias must not be run through the generative binding resolver"
     )
 
 

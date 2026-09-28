@@ -417,7 +417,23 @@ class OutputGuardJudge:
                 )
 
         if not resolved:
-            if construction_error is not None:
+            if typed_spec is not None:
+                # Unreachable for dispatch: ``evaluate`` takes the typed branch
+                # before any provider construction, and the generative
+                # resolution above is gated on ``typed_spec is None``.  The
+                # session binding is still materialised below as the object's
+                # immutable lane, so state the situation accurately instead of
+                # claiming a fallback that will never happen.  A misleading
+                # "not a registered alias - falling back to session model"
+                # line here read, in production, as the guard having used the
+                # session model when the typed decision had in fact served.
+                log.warning(
+                    "output_guard_judge.typed_alias_unresolved alias=%r — the "
+                    "typed-decision path is still taken; a typed alias never "
+                    "uses the generative session model.",
+                    requested_alias,
+                )
+            elif construction_error is not None:
                 # The alias IS registered; its binding could not be built.
                 # Same session-model fallback, but name the construction
                 # cause — the register-the-alias advice below would

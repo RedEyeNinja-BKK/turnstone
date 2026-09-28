@@ -288,6 +288,18 @@ def _registry_config(registry: Any, alias: str) -> Any:
         entry = getter(alias)
         if entry is not None:
             return getattr(entry, "config", entry)
+    # ``ModelRegistry`` is not a Mapping and exposes no ``get``; its per-alias
+    # accessor is ``get_config``, which raises for an unknown alias.  Without
+    # this branch every typed-decision row read back as capabilities={} and the
+    # guard fell through to the generative chat path, silently defeating the
+    # invariant that a row declaring ``supports_typed_decision`` is never
+    # treated as generative.
+    config_getter = getattr(registry, "get_config", None)
+    if callable(config_getter):
+        try:
+            return config_getter(alias)
+        except Exception:  # unknown alias / unreadable registry
+            return None
     return None
 
 

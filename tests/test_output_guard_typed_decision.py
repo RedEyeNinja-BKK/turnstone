@@ -115,13 +115,52 @@ def test_confidence_clamped_to_unit_interval():
     assert abs(r.confidence - 0.42) < 1e-9
 
 
-def test_noul_alone_is_refused_not_treated_as_clean():
-    """A `noul`-only answer carries no categorical risk; refusing beats
-    silently downgrading to `none`."""
+def test_graded_noul_maps_onto_the_risk_vocabulary():
+    """Span accepts ONLY graded `noul`; that is how risk is requested.
+
+    The score is mapped onto the guard's own vocabulary on explicit bounds, so a
+    decision backend cannot invent a level outside none/low/medium/high, and a
+    low-but-nonzero score still reads as `low` rather than as clean.
+    """
+    for score, expected in (
+        (0.95, "high"),
+        (0.60, "high"),
+        (0.30, "medium"),
+        (0.10, "low"),
+        (0.01, "none"),
+    ):
+        r = normalize_decision(
+            {
+                "contract": "switchyard-decision:v1",
+                "answers": {"q": {"type": "noul", "noul": score}},
+            },
+            SPEC,
+        )
+        assert r.risk_level == expected, (score, r.risk_level, expected)
+        assert abs(r.confidence - score) < 1e-9
+
+
+def test_graded_noul_without_a_score_is_refused():
     with pytest_raises(TypedDecisionError):
         normalize_decision(
-            {"contract": "switchyard-decision:v1",
-             "answers": {"q1": {"type": "noul", "noul": 0.02}}}, SPEC)
+            {
+                "contract": "switchyard-decision:v1",
+                "answers": {"q": {"type": "noul"}},
+            },
+            SPEC,
+        )
+
+
+def test_noul_never_reaches_below_the_floor_unless_genuinely_negligible():
+    """A decision backend must not be able to say 'clean' too easily."""
+    r = normalize_decision(
+        {
+            "contract": "switchyard-decision:v1",
+            "answers": {"q": {"type": "noul", "noul": 0.06}},
+        },
+        SPEC,
+    )
+    assert r.risk_level == "low", r.risk_level
 
 
 def test_missing_answers_refused():

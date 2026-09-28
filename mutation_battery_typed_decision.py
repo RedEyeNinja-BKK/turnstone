@@ -31,13 +31,12 @@ MUTANTS = [
     ),
     (
         "M2", TD,
-        '    if risk is None:\n        raise TypedDecisionError(\n'
-        '            "decision response carried no categorical risk answer; refusing to "\n'
-        '            "treat it as clean"\n        )',
-        "    if risk is None:\n        return TypedDecisionResult("
-        "risk_level='none', confidence=None, contract=spec.contract)",
-        "test_noul_alone_is_refused_not_treated_as_clean",
-        "missing answer silently treated as clean",
+        '            graded = _clamp_confidence(answer.get("noul", answer.get("value")))\n'
+        '            if graded is None:\n'
+        '                raise TypedDecisionError("noul answer carried no usable score")',
+        '            graded = 0.0',
+        "test_graded_noul_without_a_score_is_refused",
+        "a score-less noul silently becomes 0.0 (clean) instead of being refused",
     ),
     (
         "M3", TD,
@@ -92,6 +91,13 @@ MUTANTS = [
         "            )",
         "test_strongest_choice_wins_across_questions",
         "multi-question decision understates risk by taking the weakest answer",
+    ),
+    (
+        "M10", TD,
+        '    if graded >= threshold:',
+        '    if graded >= 1.0:',
+        "test_graded_noul_maps_onto_the_risk_vocabulary",
+        "graded noul floor removed -> a risky decision reads as clean",
     ),
 ]
 

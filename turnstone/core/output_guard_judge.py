@@ -120,6 +120,10 @@ class OutputJudgeVerdict:
     judge_model: str = ""
     latency_ms: int = 0
     error: str = ""
+    # How a non-chat backend produced this verdict, e.g. the typed-decision
+    # contract and provider leg. Audit metadata only: it is NOT model reasoning
+    # and must never be surfaced as if it were.
+    provenance: str = ""
 
     @property
     def succeeded(self) -> bool:
@@ -252,6 +256,46 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _typed_decision_spec(registry: Any, alias: str) -> Any | None:
+    """Return the typed-decision spec for ``alias``, or ``None``.
+
+    ``None`` means "ordinary generative model, keep the existing path". A row
+    that declares ``supports_typed_decision`` is never treated as generative,
+    even if it also happens to carry an api_surface.
+    """
+    if not alias or registry is None:
+        return None
+    try:
+        caps = _registry_capabilities(registry, alias)
+    except Exception:  # a registry that cannot be read is not a typed alias
+        return None
+    if not isinstance(caps, dict) or not caps.get("supports_typed_decision"):
+        return None
+    from turnstone.core.typed_decision import TypedDecisionSpec
+
+    return TypedDecisionSpec.from_capabilities(caps)
+
+
+def _typed_decision_base_url(registry: Any, alias: str) -> str:
+    """The configured base URL of a typed-decision registry row."""
+    cfg = _registry_config(registry, alias)
+    return str(getattr(cfg, "base_url", "") or "")
+
+
+def _registry_config(registry: Any, alias: str) -> Any:
+    getter = getattr(registry, "get", None)
+    if callable(getter):
+        entry = getter(alias)
+        if entry is not None:
+            return getattr(entry, "config", entry)
+    return None
+
+
+def _registry_capabilities(registry: Any, alias: str) -> dict:
+    cfg = _registry_config(registry, alias)
+    return dict(getattr(cfg, "capabilities", {}) or {})
+
+
 class OutputGuardJudge:
     """Synchronous, single-shot LLM judge for tool output.
 
@@ -302,7 +346,28 @@ class OutputGuardJudge:
         binding = _judge_binding_from_session(session_binding, config_store)
         resolved = False
         construction_error: ModelClientConstructionError | None = None
-        if requested_alias and registry is not None:
+
+        # TYPED-DECISION ALIASES are identified from the registry row BEFORE any
+        # provider construction. Such a row deliberately carries no
+        # ``api_surface``, so letting resolution run would default it to Chat
+        # Completions and silently execute a chat request against a decisions
+        # backend. Detect it first; a typed alias never falls back to the session
+        # model, because a session-model answer recorded as a successful
+        # semantic guard is exactly the failure this prevents.
+        typed_spec = _typed_decision_spec(registry, requested_alias)
+        self._typed_spec = typed_spec
+        self._typed_base_url = (
+            _typed_decision_base_url(registry, requested_alias) if typed_spec else ""
+        )
+        self._typed_alias = requested_alias if typed_spec else ""
+        if typed_spec is not None:
+            log.info(
+                "output_guard_judge.typed_decision_alias",
+                alias=requested_alias,
+                contract=typed_spec.contract,
+            )
+
+        if typed_spec is None and requested_alias and registry is not None:
             try:
                 binding = resolve_model_binding(
                     registry,
@@ -566,6 +631,95 @@ class OutputGuardJudge:
         finally:
             self._end_evaluation()
 
+    def _evaluate_typed_decision(
+        self,
+        output: str,
+        *,
+        spec: Any,
+        base_url: str,
+        alias: str,
+        call_id: str,
+        func_name: str,
+        heuristic_risk: str,
+        cancel_event: threading.Event | None,
+        timeout: float,
+        start: float,
+        verdict_id: str,
+    ) -> OutputJudgeVerdict:
+        """Execute a typed-decision backend and normalize it into a verdict.
+
+        Every failure is a LABELLED error, so the caller degrades to
+        heuristic-only. In particular a ``choice`` of ``none`` here is a real
+        semantic grade, while any error is emphatically NOT ``none`` - the merge
+        keeps ``max(heuristic, semantic)`` and an errored semantic tier must
+        never lower a heuristic finding.
+        """
+        from turnstone.core.typed_decision import (
+            TypedDecisionError,
+            execute_decision,
+        )
+
+        state = f"Tool {func_name} produced this output:\n{output}"
+        try:
+            result = execute_decision(
+                base_url=base_url,
+                model=alias,
+                caps={
+                    "supports_typed_decision": True,
+                    "decision_contract": spec.contract,
+                    "decision_types": list(spec.decision_types),
+                    "decision_endpoint": spec.endpoint,
+                    "max_questions": spec.max_questions,
+                },
+                state=state,
+                decision_id=alias,
+                timeout=timeout,
+            )
+        except TypedDecisionError as exc:
+            log.warning(
+                "output_guard_judge.typed_decision_failed",
+                alias=alias,
+                contract=spec.contract,
+                error=str(exc),
+            )
+            # Explicit typed-stage failure: heuristic-only. NEVER the session
+            # model, and never a silent "clean".
+            return self._error_verdict(verdict_id, call_id, start, f"typed_decision: {exc}")
+        except Exception as exc:  # defensive: adapter bugs must not crash the guard
+            log.warning(
+                "output_guard_judge.typed_decision_error",
+                alias=alias,
+                error=str(exc),
+            )
+            return self._error_verdict(
+                verdict_id, call_id, start, f"typed_decision_error: {exc}"
+            )
+
+        log.info(
+            "output_guard_judge.typed_decision_result",
+            alias=alias,
+            contract=result.contract,
+            provider=result.provider,
+            leg=result.leg or "primary",
+            risk_level=result.risk_level,
+            confidence=result.confidence,
+        )
+        return OutputJudgeVerdict(
+            verdict_id=verdict_id,
+            call_id=call_id,
+            risk_level=result.risk_level,
+            # No free-form semantic flags are manufactured here; the heuristic
+            # stage owns flags and the merge unions them.
+            flags=(),
+            # A typed decision carries no model reasoning. Provenance is recorded
+            # separately and is never presented as reasoning.
+            reasoning="",
+            confidence=0.0 if result.confidence is None else result.confidence,
+            judge_model=alias,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            provenance=result.provenance,
+        )
+
     def _evaluate_active(
         self,
         output: str,
@@ -586,6 +740,24 @@ class OutputGuardJudge:
         timeout = max(self._config.output_guard_llm_timeout, 1.0)
         if cancel_event is not None and cancel_event.is_set():
             return self._error_verdict(verdict_id, call_id, start, "cancelled")
+
+        # TYPED-DECISION PATH. Taken before any provider construction or
+        # model_turn dispatch, so a decisions backend is never handed to a chat
+        # provider and never silently replaced by the session model.
+        if getattr(self, "_typed_spec", None) is not None:
+            return self._evaluate_typed_decision(
+                output,
+                spec=self._typed_spec,
+                base_url=getattr(self, "_typed_base_url", ""),
+                alias=getattr(self, "_typed_alias", ""),
+                call_id=call_id,
+                func_name=func_name,
+                heuristic_risk=heuristic_risk,
+                cancel_event=cancel_event,
+                timeout=timeout,
+                start=start,
+                verdict_id=verdict_id,
+            )
         judge_turns = [
             Turn.system(_SYSTEM_PROMPT),
             Turn.user(

@@ -368,6 +368,51 @@ class _FakeRegistry:
         return self._cfg
 
 
+class _RealShapeRegistry:
+    """Registry stub shaped like the PRODUCTION ``ModelRegistry``.
+
+    ``ModelRegistry`` is a plain class: it is not a Mapping, defines no ``get``,
+    and exposes the per-alias config through ``get_config`` (which raises for an
+    unknown alias).  ``_FakeRegistry`` above implements ``get`` and therefore
+    agreed with the guard's original accessor while production did not — a
+    self-agreeing fixture that let a fully broken dispatch ship green.  This
+    stub pins the real surface so that class of defect fails here instead.
+    """
+
+    def __init__(self, caps, base_url="http://127.0.0.1:4000"):
+        self._cfgs = {
+            "switchyard-smartfree-aux-turnstone": types.SimpleNamespace(
+                capabilities=caps, base_url=base_url
+            )
+        }
+
+    def get_config(self, alias):
+        if alias not in self._cfgs:
+            raise KeyError(alias)
+        return self._cfgs[alias]
+
+
+def test_guard_detects_typed_alias_on_real_registry_shape():
+    """The detector must work against ModelRegistry's ACTUAL accessor surface."""
+    import turnstone.core.output_guard_judge as og
+
+    reg = _RealShapeRegistry(_caps())
+    # A production registry exposes no ``get``; prove the stub is faithful.
+    assert not callable(getattr(reg, "get", None)), "stub must not expose .get"
+
+    spec = og._typed_decision_spec(reg, "switchyard-smartfree-aux-turnstone")
+    assert spec is not None, (
+        "a typed-decision row must be detected on the real registry shape; "
+        "detection failure sends the guard down the generative chat path"
+    )
+    assert spec.contract == "switchyard-decision:v1"
+    assert og._typed_decision_base_url(reg, "switchyard-smartfree-aux-turnstone") == (
+        "http://127.0.0.1:4000"
+    )
+    # An unknown alias must stay unknown rather than raise out of the guard.
+    assert og._typed_decision_spec(reg, "no-such-alias") is None
+
+
 def test_guard_detects_typed_alias_before_provider_construction():
     """The branch point must read registry capabilities, not an api_surface."""
     import turnstone.core.output_guard_judge as og

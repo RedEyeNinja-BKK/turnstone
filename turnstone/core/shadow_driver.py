@@ -170,14 +170,43 @@ class ShadowSensor:
         *,
         event: str | None = None,
         force: bool = False,
+        decided: bool = False,
     ):
         """Take one advisory observation, or record why none was taken.
 
         Never raises. Every failure becomes an unavailable snapshot so the
         calling task is unaffected.
+
+        ``decided=True`` means the CALLER has already made the cadence/dedupe
+        decision for this exact event via :meth:`should_sense` and committed the
+        fingerprint. The gate is then skipped, because re-running it would deny
+        the very event the caller just admitted.
+
+        That is not a hypothetical. It is the defect the first production canary
+        found on 2026-09-30: `SensorHook.observe_event` calls `should_sense()`,
+        which COMMITS ``_last_fingerprint``, and then called `observe()`, which
+        gated on `should_sense()` again and denied itself `unchanged_state`.
+        The hook logged `sensor_call` and the observation store never grew -- a
+        sensor that looked alive and recorded nothing. 253 tests passed because
+        every one of them drove `observe()` directly and none drove the hook
+        with a real `ShadowSensor` behind it.
+
+        The invariant this preserves, in one direction only:
+
+            one material event -> ONE should_sense decision
+                              -> one fingerprint commit
+                              -> if admitted, ONE observation attempt
+
+        ``observe()`` still gates on its own by default, so a direct caller keeps
+        the full dedupe behaviour and the proofs that call it stay honest.
         """
         fingerprint = state_fingerprint(state)
-        allowed, why = self.should_sense(state, event=event, force=force)
+        if decided:
+            # The caller owns cadence and already committed the fingerprint.
+            # Re-gating here is exactly the double-gate defect.
+            allowed, why = True, Trigger.MATERIAL.value
+        else:
+            allowed, why = self.should_sense(state, event=event, force=force)
         if not allowed:
             if why == "unchanged_state":
                 self.metrics.deduplicated_count += 1

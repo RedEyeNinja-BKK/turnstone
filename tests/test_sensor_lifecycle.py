@@ -41,7 +41,7 @@ class _RecordingSensor:
     """Stands in for the real sensor and records what the hook asked for."""
 
     def __init__(self, suppress: bool = False) -> None:
-        self.calls: list[tuple[dict, str, bool]] = []
+        self.calls: list[tuple[dict, str, bool, bool]] = []
         self._suppress = suppress
         self._last = None
 
@@ -50,8 +50,14 @@ class _RecordingSensor:
             return False, "unchanged_state"
         return True, Trigger.MATERIAL.value
 
-    def observe(self, state, *, event=None, force=False):
-        self.calls.append((dict(state), event, force))
+    def observe(self, state, *, event=None, force=False, decided=False):
+        # `decided` mirrors the real ShadowSensor signature. Without it the hook's
+        # `decided=True` call raised TypeError, which the fail-open boundary
+        # swallowed -- so this stub silently recorded ZERO calls and the suite
+        # reported a phantom failure instead of the real one. Test doubles must
+        # track the production signature or they hide defects, which is exactly
+        # the class of bug the real-path test exists to catch.
+        self.calls.append((dict(state), event, force, decided))
         self._last = dict(state)
         return unavailable(
             trigger=Trigger.MATERIAL,
@@ -302,6 +308,27 @@ def test_forced_observation_bypasses_the_material_check():
     hook = lifecycle.SensorHook(sensor=sensor, persist=False)
     hook.observe_event("manual_probe", {"objective": "x"}, force=True)
     assert len(sensor.calls) == 1
+
+
+def test_hook_tells_the_sensor_the_decision_is_already_made():
+    """The double-gate fix, asserted at the seam: the hook passes decided=True.
+
+    `decided` (not `force`) is what tells ShadowSensor.observe() that this
+    event's cadence decision is already committed, so it must not re-gate. If a
+    future change drops this flag, the canary-2026-09-30 defect returns
+    silently: cadence says sensor_call, the store stays empty.
+    """
+    sensor = _RecordingSensor()
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
+    hook.observe_event("operator_instruction", {"objective": "x"})
+
+    assert len(sensor.calls) == 1
+    _state, _event, force, decided = sensor.calls[0]
+    assert decided is True, "the hook must tell the sensor the decision is made"
+    assert force is False, (
+        "force must stay False here: it would bypass is_material() and re-admit "
+        "suppressed states -- the wrong tool for the wrong problem"
+    )
 
 
 def test_hook_counters_are_exposed_for_shadow_health():

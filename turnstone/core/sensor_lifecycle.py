@@ -337,13 +337,21 @@ class SensorHook:
                 self._record_cadence(event, "dedupe_suppressed", workstream, fingerprint)
                 return
             self._record_cadence(event, "sensor_call", workstream, fingerprint)
-            # NOT force=True. The hook has already made the cadence decision via
-            # should_sense(), and that call is the single commit point. Passing
-            # force here was a second, subtler defect: it made observe()'s own
-            # dedupe branch inert AND left the fingerprint un-advanced whenever
-            # the transport failed, so a repeated state kept being re-observed.
+            # `decided=True`: the should_sense() above is the SINGLE cadence
+            # decision and the single fingerprint commit for this event. Without
+            # this flag observe() gated a second time, saw its own just-committed
+            # fingerprint as `unchanged_state`, and returned without recording
+            # anything -- cadence said `sensor_call` while the observation store
+            # stayed empty. Proven live on the 2026-09-30 canary, where the
+            # sensor ran for minutes and wrote zero observations.
+            #
+            # NOT force=True, deliberately. force is the caller's escape hatch
+            # for an unqualified event; using it here would bypass is_material()
+            # and re-admit suppressed states. `decided` expresses WHO owns the
+            # decision, which is the actual defect. force would have hidden it
+            # while leaving the double gate in place.
             # Cadence belongs to the hook, not to the network-facing call.
-            self._sensor.observe(projection, event=event)
+            self._sensor.observe(projection, event=event, decided=True)
         except Exception:  # noqa: BLE001 - a sensor must never fail a task
             try:
                 self._record_cadence(event, "hook_error", workstream, "")

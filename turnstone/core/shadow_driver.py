@@ -27,6 +27,7 @@ from .bounded_state import (
     estimate_tokens,
     serialize_state,
 )
+from .exact_tokens import enforce_budget
 from .shadow_observation import (
     DECISION_CAPABILITY,
     REQUESTED_SIGNALS,
@@ -175,9 +176,31 @@ class ShadowSensor:
             )
 
         serialised: SerializedState | None = None
+        exact_tokens: int | None = None
         started = time.monotonic()
         try:
             serialised = serialize_state(state)
+            # Exact admission. The character ratio is not a token count and
+            # cannot enforce the invariant; the pinned Laya tokenizer is. A count
+            # that cannot be obtained is a refusal, not an estimate: the request
+            # is not dispatched and the observation records why.
+            admission = enforce_budget(serialised.text)
+            exact_tokens = admission.serialized_state_tokens
+            if not admission.admitted:
+                snapshot = unavailable(
+                    trigger=Trigger.MATERIAL,
+                    fingerprint=fingerprint,
+                    serializer_version=SERIALIZER_VERSION,
+                    reason=admission.reason or "state_not_admitted",
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    state_truncated=serialised.state_truncated,
+                    evicted_by_tier=serialised.evicted_by_tier,
+                    overflowed_budget=serialised.overflowed_budget,
+                    serialized_chars=serialised.serialized_chars,
+                    serialized_state_tokens=exact_tokens,
+                    dropped_field_count=len(serialised.fields_dropped),
+                )
+                return self._record(snapshot)
         except Exception as error:  # noqa: BLE001 - fail open, by design
             snapshot = unavailable(
                 trigger=Trigger.MATERIAL,
@@ -204,8 +227,10 @@ class ShadowSensor:
                 reason=transport_error or "invalid_response",
                 latency_ms=latency_ms,
                 state_truncated=serialised.state_truncated,
+                evicted_by_tier=serialised.evicted_by_tier,
+                overflowed_budget=serialised.overflowed_budget,
                 serialized_chars=serialised.serialized_chars,
-                serialized_state_tokens=serialised.estimated_tokens,
+                serialized_state_tokens=exact_tokens,
                 dropped_field_count=len(serialised.fields_dropped),
             )
             return self._record(snapshot)
@@ -219,8 +244,10 @@ class ShadowSensor:
                 reason="invalid_response:no_answers",
                 latency_ms=latency_ms,
                 state_truncated=serialised.state_truncated,
+                evicted_by_tier=serialised.evicted_by_tier,
+                overflowed_budget=serialised.overflowed_budget,
                 serialized_chars=serialised.serialized_chars,
-                serialized_state_tokens=serialised.estimated_tokens,
+                serialized_state_tokens=exact_tokens,
                 dropped_field_count=len(serialised.fields_dropped),
             )
             return self._record(snapshot)
@@ -238,8 +265,10 @@ class ShadowSensor:
             fallback_used=fallback_used,
             latency_ms=latency_ms,
             state_truncated=serialised.state_truncated,
+            evicted_by_tier=serialised.evicted_by_tier,
+            overflowed_budget=serialised.overflowed_budget,
             serialized_chars=serialised.serialized_chars,
-            serialized_state_tokens=serialised.estimated_tokens,
+            serialized_state_tokens=exact_tokens,
             dropped_field_count=len(serialised.fields_dropped),
         )
         self._last_fingerprint = fingerprint

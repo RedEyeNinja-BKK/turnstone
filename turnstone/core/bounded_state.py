@@ -151,7 +151,17 @@ class SerializedState:
     serializer_version: str = SERIALIZER_VERSION
     serialized_chars: int = 0
     estimated_tokens: int = 0
+    #: True when ANY field was dropped, for any reason. This is the umbrella
+    #: flag; read ``evicted_by_tier`` / ``overflowed_budget`` for meaning.
     state_truncated: bool = False
+    #: A lower-tier field (history/noise) was dropped because higher-tier current
+    #: material was present or the low-tier reserve had to be protected. This is
+    #: the policy working as designed, NOT capacity pressure.
+    evicted_by_tier: bool = False
+    #: A field was dropped because the token budget was exhausted, i.e. the
+    #: serializer had to make room. This is the capacity-pressure signal and the
+    #: one worth alerting on.
+    overflowed_budget: bool = False
     fields_in: int = 0
     fields_kept: int = 0
     fields_dropped: tuple[str, ...] = field(default=())
@@ -166,7 +176,9 @@ class SerializedState:
             "serializer_version": self.serializer_version,
             "serialized_chars": self.serialized_chars,
             "serialized_tokens": self.estimated_tokens,
-            "state_truncated": self.state_truncated,
+            "state_reduced": self.state_truncated,
+            "evicted_by_tier": self.evicted_by_tier,
+            "overflowed_budget": self.overflowed_budget,
             "fields_in": self.fields_in,
             "fields_kept": self.fields_kept,
             "fields_dropped": list(self.fields_dropped),
@@ -200,7 +212,6 @@ def serialize_state(state: Mapping[str, Any]) -> SerializedState:
         raise StateBudgetError("state must be a mapping")
 
     lines: list[tuple[int, str, str]] = []
-    dropped: list[str] = []
 
     for name in state:
         if not isinstance(name, str) or not name.strip():
@@ -231,6 +242,12 @@ def serialize_state(state: Mapping[str, Any]) -> SerializedState:
         group.sort(key=lambda item: item[1])
 
     kept: list[tuple[int, str, str]] = []
+    # Drops are attributed to a cause. Tier eviction is the policy selecting
+    # current material; budget overflow is capacity pressure. Reporting both as
+    # one "truncated" flag made a healthy serializer look permanently unhealthy,
+    # so the two are counted separately and the umbrella is derived from them.
+    evicted_by_tier: list[str] = []
+    overflowed_budget: list[str] = []
 
     def used_tokens() -> int:
         return sum(estimate_tokens(line) + 1 for _t, _n, line in kept)
@@ -250,17 +267,17 @@ def serialize_state(state: Mapping[str, Any]) -> SerializedState:
     for tier in (TIER_HISTORY, TIER_NOISE):
         for item in by_tier.get(tier, []):
             if has_high_tier or used_tokens() > STATE_TOKEN_BUDGET - LOW_TIER_RESERVE:
-                dropped.append(item[1])
+                evicted_by_tier.append(item[1])
                 continue
             kept.append(item)
 
     # Pass 3: a final eviction, lowest tier first, in case the high tiers alone
-    # still exceed the budget.
+    # still exceed the budget. These drops are capacity pressure, not policy.
     kept.sort(key=lambda item: (item[0], item[1]))
     while used_tokens() > STATE_TOKEN_BUDGET and kept:
         worst = max(range(len(kept)), key=lambda i: (kept[i][0], kept[i][1]))
         _tier, name, _line = kept.pop(worst)
-        dropped.append(name)
+        overflowed_budget.append(name)
         kept.sort(key=lambda item: (item[0], item[1]))
 
     if not kept:
@@ -268,12 +285,15 @@ def serialize_state(state: Mapping[str, Any]) -> SerializedState:
             "state reduced to nothing; no field fits the bounded budget"
         )
 
+    dropped = evicted_by_tier + overflowed_budget
     text = "\n".join(line for _tier, _name, line in kept)
     return SerializedState(
         text=text,
         serialized_chars=len(text),
         estimated_tokens=estimate_tokens(text),
         state_truncated=bool(dropped),
+        evicted_by_tier=bool(evicted_by_tier),
+        overflowed_budget=bool(overflowed_budget),
         fields_in=len(state),
         fields_kept=len(kept),
         fields_dropped=tuple(sorted(set(dropped))),

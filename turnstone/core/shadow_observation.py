@@ -131,11 +131,18 @@ class SensorSnapshot:
     fallback_used: bool
     latency_ms: int
     timestamp: float
+    #: Umbrella: any field was dropped, for either cause.
     state_truncated: bool
     serialized_chars: int
     serialized_state_tokens: int
     dropped_field_count: int
-    signals: tuple[Signal, ...]
+    #: Dropped because a higher tier was present, or the low-tier reserve had to
+    #: be protected. Policy working as designed; NOT capacity pressure.
+    evicted_by_tier: bool = False
+    #: Dropped because the exact token budget was exhausted. This is the
+    #: capacity-pressure signal and the one worth alerting on.
+    overflowed_budget: bool = False
+    signals: tuple[Signal, ...] = ()
     reason: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -149,7 +156,9 @@ class SensorSnapshot:
             "fallback_used": self.fallback_used,
             "latency_ms": self.latency_ms,
             "timestamp": self.timestamp,
-            "state_truncated": self.state_truncated,
+            "state_reduced": self.state_truncated,
+            "evicted_by_tier": self.evicted_by_tier,
+            "overflowed_budget": self.overflowed_budget,
             "serialized_chars": self.serialized_chars,
             "serialized_state_tokens": self.serialized_state_tokens,
             "dropped_field_count": self.dropped_field_count,
@@ -184,6 +193,8 @@ def unavailable(
     serialized_chars: int = 0,
     serialized_state_tokens: int = 0,
     dropped_field_count: int = 0,
+    evicted_by_tier: bool = False,
+    overflowed_budget: bool = False,
     backend: str = "none",
     fallback_used: bool = False,
 ) -> SensorSnapshot:
@@ -223,6 +234,8 @@ def unavailable(
         latency_ms=latency_ms,
         timestamp=time.time(),
         state_truncated=state_truncated,
+        evicted_by_tier=evicted_by_tier,
+        overflowed_budget=overflowed_budget,
         serialized_chars=serialized_chars,
         serialized_state_tokens=serialized_state_tokens,
         dropped_field_count=dropped_field_count,
@@ -244,6 +257,8 @@ def build_snapshot(
     serialized_chars: int,
     serialized_state_tokens: int,
     dropped_field_count: int,
+    evicted_by_tier: bool = False,
+    overflowed_budget: bool = False,
 ) -> SensorSnapshot:
     """Build a successful observation from a decision response.
 
@@ -290,6 +305,8 @@ def build_snapshot(
         latency_ms=latency_ms,
         timestamp=time.time(),
         state_truncated=state_truncated,
+        evicted_by_tier=evicted_by_tier,
+        overflowed_budget=overflowed_budget,
         serialized_chars=serialized_chars,
         serialized_state_tokens=serialized_state_tokens,
         dropped_field_count=dropped_field_count,

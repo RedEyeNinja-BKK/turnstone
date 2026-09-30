@@ -96,10 +96,138 @@ def test_provenance_carries_version_and_metrics():
     assert payload["serializer_version"] == SERIALIZER_VERSION
     assert payload["serialized_chars"] > 0
     assert payload["serialized_tokens"] > 0
-    assert payload["state_truncated"] is True
+    # The umbrella plus the two distinct causes. Reporting only one flag made a
+    # healthy tier eviction indistinguishable from real capacity pressure.
+    assert payload["state_reduced"] is True
+    assert payload["evicted_by_tier"] is True or payload["overflowed_budget"] is True
     # Provenance must not duplicate the private state text.
     assert "text" not in payload
     assert "objective" not in str(payload)
+
+
+def test_tier_eviction_and_budget_overflow_are_distinguished():
+    """The correction this split exists for: a healthy serializer must not
+    report itself as capacity-pressured.
+
+    A state whose only excess is a low-tier `history` field is *reduced by
+    policy*, with the budget barely touched. A state so large that the current
+    tier alone cannot fit is *overflowed*. Both used to read as
+    `state_truncated=True`, which made a healthy serializer look permanently
+    unhealthy.
+    """
+    tier_only = serialize_state({
+        "objective": "reconcile the failover proof harness with the disposable lane",
+        "history": " ".join(f"routine event {i}" for i in range(400)),
+    })
+    assert tier_only.state_truncated is True, "the history field must be dropped"
+    assert tier_only.evicted_by_tier is True, "the drop is policy, not pressure"
+    assert tier_only.overflowed_budget is False, (
+        "a tier eviction must NOT be reported as budget overflow"
+    )
+    assert tier_only.estimated_tokens < STATE_TOKEN_BUDGET, (
+        "the budget was never approached, so this is not capacity pressure"
+    )
+
+    # Capacity pressure: the CURRENT tier alone cannot fit.
+    #
+    # Measured, not assumed. Per-field clipping at MAX_FIELD_CHARS caps one
+    # field at ~71 tokens, so field SIZE alone cannot overflow 256. It takes
+    # several LONG current-tier fields: 4 fields x 40 chars fits easily, while
+    # 4 fields x 240 chars overflows. So the honest trigger condition is
+    # *aggregate* current material, not a long objective on its own. Worth
+    # knowing when reading the metric: one long objective is clipped, not
+    # pressure; many long distinct facts are pressure.
+    def _current(fields: int, length: int) -> dict:
+        return {f"f{i}": "w" * length for i in range(fields)}
+
+    # Measured on this build: 4x40 -> 50 tokens (no reduction); 6x120 -> 209
+    # tokens (no reduction); 6x200 -> 228 tokens with 4 kept (overflowed). The
+    # ratio is 3.6 chars/token, so the crossing sits between 120 and 200 chars
+    # per field at six fields. These numbers are asserted, not assumed, so a
+    # change to CHARS_PER_TOKEN or MAX_FIELD_CHARS that moves the threshold will
+    # fail here rather than quietly redefining what "pressure" means.
+    small = serialize_state(_current(4, 40))
+    assert small.overflowed_budget is False
+    assert small.state_truncated is False
+    assert small.estimated_tokens < 60
+
+    medium = serialize_state(_current(6, 120))
+    assert medium.overflowed_budget is False, (
+        f"6x120 measured {medium.estimated_tokens} tokens, which fits; "
+        "if this now overflows the budget constants changed"
+    )
+
+    pressured = serialize_state(_current(6, 200))
+    assert pressured.estimated_tokens <= STATE_TOKEN_BUDGET, "the bound must still hold"
+    assert pressured.evicted_by_tier is False, (
+        "with no low-tier fields present there is nothing to evict by tier"
+    )
+    # And one enormous field is clipped, NOT pressure — the distinction the
+    # whole split exists to make.
+    single = serialize_state({"objective": "z" * 5000})
+    assert single.state_truncated is False
+    assert single.overflowed_budget is False
+    assert single.evicted_by_tier is False
+
+
+def test_umbrella_flag_is_exactly_the_union_of_the_two_causes():
+    """`state_reduced` must be true if and only if something was dropped.
+
+    Every case must place the two causes in DIFFERENT combinations, including
+    overflow-without-eviction. A set of cases where both flags agree cannot
+    distinguish a union from either single flag, which is exactly how a
+    mislabelled cause would pass unnoticed.
+    """
+    cases = {
+        # name: (state, expected_evicted, expected_overflowed)
+        "clean": ({"objective": "short objective", "phase": "verify"}, False, False),
+        "tier_only": ({"objective": "x" * 50, "history": "y " * 3000}, True, False),
+        "overflow_only": ({f"f{i}": "w" * 200 for i in range(6)}, False, True),
+        "both": (
+            # Enough current-tier material to overflow AND a low-tier history
+            # field, so both causes fire in one observation. Measured: 1+6
+            # current-tier fields of 200 chars plus history -> both flags true.
+            {
+                "objective": "critical state that must survive",
+                **{f"f{i}": "w" * 200 for i in range(6)},
+                "history": "y " * 3000,
+            },
+            True, True,
+        ),
+    }
+    for name, (state, expect_evicted, expect_overflowed) in cases.items():
+        result = serialize_state(state)
+        assert result.evicted_by_tier is expect_evicted, name
+        assert result.overflowed_budget is expect_overflowed, name
+        assert result.state_truncated == (expect_evicted or expect_overflowed), (
+            f"{name}: state_reduced must be the union of the two causes"
+        )
+
+
+def test_a_drop_is_always_attributed_to_exactly_one_cause():
+    """Every dropped field lands in the union, and the union has no strays."""
+    for state in (
+        {"objective": "x" * 50, "history": "y " * 3000},
+        {f"f{i}": "w" * 200 for i in range(6)},
+        {"objective": "keep me", "history": "h" * 3000, "notes": "n" * 3000,
+         "filler": "f" * 3000, "current_state": "w" * 200, "evidence": "w" * 200,
+         "progress": "w" * 200},
+    ):
+        result = serialize_state(state)
+        assert result.state_truncated == bool(result.fields_dropped)
+        if result.evicted_by_tier:
+            assert result.fields_dropped, "evicted_by_tier implies a dropped field"
+        if result.overflowed_budget:
+            assert result.fields_dropped, "overflowed_budget implies a dropped field"
+
+
+def test_a_clean_state_reports_neither_cause():
+    """No reduction at all means both flags are false, not merely one."""
+    result = serialize_state({"objective": "a normal short objective", "phase": "verify"})
+    assert result.state_truncated is False
+    assert result.evicted_by_tier is False
+    assert result.overflowed_budget is False
+    assert result.fields_dropped == ()
 
 
 def test_history_only_state_is_still_observable():

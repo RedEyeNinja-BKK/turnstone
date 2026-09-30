@@ -275,7 +275,7 @@ def test_a_failing_sensor_cannot_break_the_send_path():
         def observe(self, *_a, **_k):
             raise RuntimeError("boom")
 
-    hook = lifecycle.SensorHook(sensor=_ExplodingSensor())
+    hook = lifecycle.SensorHook(sensor=_ExplodingSensor(), persist=False)
     result = hook.observe_event("operator_instruction", {"objective": "x"})
     assert result is None
     assert hook.counters()["hook_error"] == 1

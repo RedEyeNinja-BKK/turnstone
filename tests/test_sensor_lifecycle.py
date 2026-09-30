@@ -78,7 +78,7 @@ def test_material_events_are_a_whitelist_not_a_blacklist():
 @pytest.mark.parametrize("event", sorted(MATERIAL_EVENTS))
 def test_every_declared_material_event_is_accepted_by_the_hook(event):
     sensor = _RecordingSensor()
-    hook = lifecycle.SensorHook(sensor=sensor)
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
     hook.observe_event(event, {"objective": "real work"})
     assert len(sensor.calls) == 1, f"{event} was not observed"
 
@@ -90,7 +90,7 @@ def test_every_declared_material_event_is_accepted_by_the_hook(event):
 def test_non_material_events_never_reach_the_sensor(event):
     """No every-turn hook: ordinary turn/UI/heartbeat events are refused."""
     sensor = _RecordingSensor()
-    hook = lifecycle.SensorHook(sensor=sensor)
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
     hook.observe_event(event, {"objective": "real work"})
     assert sensor.calls == [], f"{event!r} must not trigger the sensor"
     assert hook.counters()["rejected_not_material"] == 1
@@ -177,7 +177,7 @@ def test_punctuation_only_message_is_not_substantive():
 def test_unchanged_state_suppresses_the_sensor_call():
     """Same meaningful state -> same fingerprint -> no second call."""
     sensor = _RecordingSensor(suppress=True)
-    hook = lifecycle.SensorHook(sensor=sensor)
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
     hook.observe_event("operator_instruction", {"objective": "same work"})
     assert sensor.calls == [], "an unchanged state must not cost a call"
     assert hook.counters()["dedupe_suppressed"] == 1
@@ -267,7 +267,7 @@ def test_hook_swallows_any_sensor_exception():
         def observe(self, *_a, **_k):
             raise RuntimeError("also on fire")
 
-    hook = lifecycle.SensorHook(sensor=_Exploding())
+    hook = lifecycle.SensorHook(sensor=_Exploding(), persist=False)
     hook.observe_event("operator_instruction", {"objective": "x"})  # must not raise
     assert hook.counters()["hook_error"] == 1
 
@@ -289,7 +289,7 @@ def test_hook_swallows_a_failing_state_mapping():
         def __getitem__(self, _key):
             raise ValueError("bad mapping")
 
-    hook = lifecycle.SensorHook(sensor=_RecordingSensor())
+    hook = lifecycle.SensorHook(sensor=_RecordingSensor(), persist=False)
     hook.observe_event("operator_instruction", _Exploding())  # must not raise
     assert hook.counters().get("hook_error") == 1
     assert hook.counters().get("sensor_calls", 0) == 0, (
@@ -299,14 +299,14 @@ def test_hook_swallows_a_failing_state_mapping():
 
 def test_forced_observation_bypasses_the_material_check():
     sensor = _RecordingSensor()
-    hook = lifecycle.SensorHook(sensor=sensor)
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
     hook.observe_event("manual_probe", {"objective": "x"}, force=True)
     assert len(sensor.calls) == 1
 
 
 def test_hook_counters_are_exposed_for_shadow_health():
     sensor = _RecordingSensor()
-    hook = lifecycle.SensorHook(sensor=sensor)
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
     hook.observe_event("operator_instruction", {"objective": "a"})
     hook.observe_event("assistant_turn_committed", {"objective": "a"})
     counters = hook.counters()
@@ -412,7 +412,7 @@ def test_observe_event_returns_none_and_writes_nothing_to_the_task():
     """The call site's entire contract: fire, discard, no effect on the task."""
     assert inspect.signature(lifecycle.observe_event).return_annotation in (None, "None")
     sensor = _RecordingSensor()
-    hook = lifecycle.SensorHook(sensor=sensor)
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
     result = hook.observe_event("operator_instruction", {"objective": "x"})
     assert result is None
 
@@ -599,3 +599,71 @@ def test_workstream_id_is_metadata_not_hashed_state():
     )
     # The hook accepts it separately, and it is absent from the projection.
     assert "ws-1" not in a
+
+
+def test_a_default_hook_persists_and_a_test_hook_does_not():
+    """The production cadence log must be reachable only deliberately.
+
+    Regression guard. The test suite previously constructed hooks with the
+    default, so it wrote 191 fake `sensor_call` rows and 69 `hook_error` rows
+    into the live cadence log - all with no workstream and synthetic
+    fingerprints. Aggregated, they read as 887 calls/hour, which is the exact
+    metric the observation period exists to measure. A measuring instrument
+    that its own tests can inflate is worse than no instrument.
+    """
+    import inspect
+    import pathlib
+
+    signature = inspect.signature(lifecycle.SensorHook.__init__)
+    assert signature.parameters["persist"].default is True
+    assert signature.parameters["cadence_store"].default is None
+
+    # A persist=False hook must not create or touch the production log.
+    production = lifecycle.DEFAULT_CADENCE_STORE
+    before = production.read_bytes() if production.exists() else b""
+    hook = lifecycle.SensorHook(sensor=_RecordingSensor(), persist=False)
+    hook.observe_event("operator_instruction", {"objective": "x"}, workstream="ws")
+    after = production.read_bytes() if production.exists() else b""
+    assert before == after, "a persist=False hook must not write to the log"
+
+
+def test_no_test_constructs_a_hook_that_would_persist_by_default():
+    """Static guard: every hook built in this suite names its store or opts out.
+
+    Parsed with `ast`, not a regex: a regex stops at the first `)` inside a
+    nested call such as `SensorHook(sensor=_RecordingSensor())` and so both
+    misses real constructions and flags the f-string in its own message.
+    """
+    import ast as _ast
+    import pathlib
+
+    # Scan the WHOLE tests tree, not just this file: an offender in a sibling
+    # suite pollutes the same production log, and a single-file guard would
+    # have missed exactly that.
+    offenders: list[str] = []
+    for path in sorted(pathlib.Path(__file__).parent.glob("test_*.py")):
+        tree = _ast.parse(path.read_text())
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            # `lifecycle.SensorHook(...)` is an ast.Attribute, not an ast.Name,
+            # so matching on `id` alone silently finds nothing -- which is how
+            # this guard passed while an offender was present.
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name != "SensorHook":
+                continue
+            keywords = {kw.arg for kw in node.keywords if kw.arg}
+            if "persist" not in keywords and "cadence_store" not in keywords:
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        "hooks constructed without an explicit store or persist opt-out: "
+        + ", ".join(offenders)
+    )
+    # And prove the scan is not vacuous: it must actually see this suite's own
+    # opted-out constructions.
+    seen = 0
+    tree = _ast.parse(pathlib.Path(__file__).read_text())
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call) and getattr(node.func, "attr", None) == "SensorHook":
+            seen += 1
+    assert seen >= 5, f"scan found only {seen} hooks; the guard is not looking"

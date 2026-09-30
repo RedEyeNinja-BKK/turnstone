@@ -226,12 +226,24 @@ class SensorHook:
         sensor: ShadowSensor | None = None,
         *,
         cadence_store: pathlib.Path | None = None,
+        persist: bool = True,
     ) -> None:
         self._sensor = sensor if sensor is not None else ShadowSensor()
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {}
         self._workstreams: dict[str, int] = {}
-        self._cadence_store = cadence_store if cadence_store is not None else DEFAULT_CADENCE_STORE
+        # `persist=False` (or an explicit path) is what a test should pass.
+        # Defaulting every construction to the production log meant the test
+        # suite wrote into it: 191 fake `sensor_call` rows and 69 `hook_error`
+        # rows from a deliberately exploding sensor, all with no workstream and
+        # synthetic fingerprints. Once aggregated they were indistinguishable
+        # from real traffic -- a fake 887 calls/hour. Instrumentation that its
+        # own test suite can pollute is not instrumentation.
+        self._cadence_store = (
+            DEFAULT_CADENCE_STORE
+            if (persist and cadence_store is None)
+            else cadence_store
+        )
         self._started = time.time()
 
     # -- counters -------------------------------------------------------
@@ -273,6 +285,8 @@ class SensorHook:
                     "workstream": workstream,
                     "fingerprint": fingerprint,
                 }
+            if self._cadence_store is None:
+                return
             self._cadence_store.parent.mkdir(parents=True, exist_ok=True)
             with self._cadence_store.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row) + "\n")

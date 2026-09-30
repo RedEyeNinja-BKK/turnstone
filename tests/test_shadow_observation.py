@@ -131,7 +131,13 @@ def test_driver_knows_only_the_one_capability():
 
 
 def test_capability_constant_is_the_only_route_reference():
-    assert DECISION_CAPABILITY == "switchyard-smartlocal-aux-turnstone"
+    # The composite lane (Span R1 -> Laya R2), NOT either direct lane: naming the
+    # composite is what makes the sensor resilient without giving it any failover
+    # knowledge. Pinning the value here means a rename cannot silently point the
+    # sensor at a single-provider lane and quietly remove that resilience.
+    assert DECISION_CAPABILITY == "switchyard-smartfree-aux-turnstone"
+    assert DECISION_CAPABILITY != "switchyard-smart-aux-turnstone"
+    assert DECISION_CAPABILITY != "switchyard-smartlocal-aux-turnstone"
 
 
 # ------------------------------------------------------------------ contract

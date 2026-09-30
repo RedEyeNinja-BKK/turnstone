@@ -267,10 +267,21 @@ class ShadowSensor:
             )
             return self._record(snapshot)
 
+        # Which provider ANSWERED is a fact about the request, not a rank.
+        # The label is derived from the response's own provider field where one
+        # is present, and never hardcodes a provider into the contract: naming
+        # "laya-fallback" here baked a primary/secondary hierarchy into the
+        # telemetry, and read as a quality judgement rather than as "the second
+        # leg was used". Laya and Span are qualified peer providers; `fallback`
+        # describes failover behaviour only.
         fallback_used = bool(payload.get("fallback_used", False))
-        backend = "laya-fallback" if fallback_used else str(
-            payload.get("provider") or "span"
-        )
+        reported = payload.get("provider")
+        if isinstance(reported, str) and reported.strip():
+            backend = reported.strip()
+        else:
+            # No provider field on a failover leg: record the mechanism, not a
+            # provider name, so the value stays truthful if the leg changes.
+            backend = "failover_leg" if fallback_used else "unknown"
         snapshot = build_snapshot(
             trigger=Trigger.MATERIAL,
             fingerprint=fingerprint,

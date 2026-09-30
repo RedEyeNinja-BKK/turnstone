@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import pathlib
 
 import pytest
 
-from turnstone.core import shadow_driver, shadow_observation
+from turnstone.core import exact_tokens, shadow_driver, shadow_observation
 from turnstone.core.shadow_driver import ShadowSensor
 from turnstone.core.shadow_observation import (
     DECISION_CAPABILITY,
@@ -29,6 +30,19 @@ from turnstone.core.shadow_observation import (
 )
 
 CORE = pathlib.Path(shadow_observation.__file__).parent
+
+# Tests run with an isolated HOME, but the pinned Laya tokenizer lives in the
+# real home. Without pinning it here, every driver test that reaches token
+# admission reports "tokenizer interpreter absent" and asserts on the wrong
+# failure -- which reads as a fail-open regression rather than a missing
+# fixture.
+_REAL_HOME = os.environ.get("TURNSTONE_SENSOR_HOME") or os.path.expanduser("~")
+_REAL_TOKENIZER = pathlib.Path(_REAL_HOME) / ".cache" / "turnstone-sensor-tokenizer"
+if (_REAL_TOKENIZER / "tokenizer.json").is_file():
+    exact_tokens.TOKENIZER_DIR = _REAL_TOKENIZER
+    exact_tokens.TOKENIZER_JSON = _REAL_TOKENIZER / "tokenizer.json"
+    exact_tokens.TOKENIZER_VENV_PYTHON = _REAL_TOKENIZER / "venv" / "bin" / "python"
+TOKENIZER_INSTALLED = exact_tokens.TOKENIZER_JSON.is_file()
 
 
 # ---------------------------------------------------------------- authority
@@ -326,3 +340,94 @@ def test_question_set_matches_the_qualified_sensor_layer():
         state=state, decision_id=DECISION_CAPABILITY, signal_names=signals
     )
     assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+# ------------------------------------------------- provider-neutral telemetry
+
+
+def test_backend_label_comes_from_the_response_not_the_driver():
+    """The backend label must be a fact about who answered, not a rank.
+
+    The driver used to compute `backend = "laya-fallback" if fallback_used`,
+    which hardcoded a provider into the contract and read as a quality
+    judgement. Laya and Span are qualified peer providers; the label must
+    report the provider that actually answered.
+
+    Comments and docstrings are stripped so the module's own explanation of the
+    old label cannot satisfy the check. String LITERALS are kept, because that
+    is precisely where a hardcoded provider would live -- an earlier version
+    blanked them too, which made the check pass against the exact mutant it
+    existed to catch.
+    """
+    import io
+    import tokenize as _tokenize
+
+    source = pathlib.Path(shadow_driver.__file__).read_text()
+    # Drop comments and docstrings, keep every other literal.
+    import ast as _ast
+
+    tree = _ast.parse(source)
+    docstrings = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.Module, _ast.FunctionDef, _ast.AsyncFunctionDef,
+                            _ast.ClassDef)):
+            body = _ast.get_docstring(node, clean=False)
+            if body is not None:
+                docstrings.add(body)
+    kept: list[str] = []
+    for token in _tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == _tokenize.COMMENT:
+            continue
+        if token.type == _tokenize.STRING and token.string.strip("\"'rbn") in docstrings:
+            continue
+        kept.append(token.string)
+    code = "".join(kept)
+
+    for provider in ("laya", "span"):
+        assert provider not in code.lower(), (
+            f"executable code must not hardcode the provider name {provider!r} "
+            "into the backend label"
+        )
+
+
+def test_failover_leg_is_labelled_as_a_mechanism_not_a_provider():
+    """A failover leg with no provider field is labelled by mechanism."""
+    snapshot = build_snapshot(
+        trigger=Trigger.MATERIAL, fingerprint="f",
+        serializer_version="turnstone-bounded-state:v1",
+        answers={n: {"noul": 0.5} for n in REQUESTED_SIGNALS},
+        backend="failover_leg", fallback_used=True, latency_ms=5,
+        state_truncated=False, serialized_chars=10,
+        serialized_state_tokens=5, dropped_field_count=0,
+    )
+    assert snapshot.backend == "failover_leg"
+    assert snapshot.fallback_used is True
+    # A mechanism label carries no provider identity at all.
+    assert "laya" not in snapshot.backend.lower()
+    assert "span" not in snapshot.backend.lower()
+
+
+def test_any_provider_name_is_carried_through_verbatim():
+    """A provider the driver has never heard of must still be reported."""
+    for provider in ("Respan", "some-future-provider", "local-laya"):
+        snapshot = build_snapshot(
+            trigger=Trigger.MATERIAL, fingerprint="f",
+            serializer_version="turnstone-bounded-state:v1",
+            answers={n: {"noul": 0.5} for n in REQUESTED_SIGNALS},
+            backend=provider, fallback_used=False, latency_ms=5,
+            state_truncated=False, serialized_chars=10,
+            serialized_state_tokens=5, dropped_field_count=0,
+        )
+        assert snapshot.backend == provider, (
+            f"backend label must not be rewritten: {provider!r} -> "
+            f"{snapshot.backend!r}"
+        )
+
+
+def test_fallback_flag_describes_mechanism_not_rank():
+    """`fallback_used` stays: it is a truthful fact about the request path."""
+    fields = set(shadow_observation.SensorSnapshot.__dataclass_fields__)
+    assert "fallback_used" in fields
+    # But there is no field that encodes a provider hierarchy.
+    for banned in ("primary", "secondary", "tier", "rank", "preferred_provider"):
+        assert banned not in fields, f"contract encodes a ranking: {banned}"

@@ -35,13 +35,17 @@ SENSOR_VERSION = "turnstone-sensor-shadow:v1"
 #: OpenRouter, Span, the HTPC address, Laya, the fallback rule, or any
 #: credential: failover is Switchyard's concern, not the sensor's.
 #:
-#: This is the composite lane: Span R1 with a one-hop Laya R2. Naming the
-#: composite, rather than either direct lane, is what keeps the sensor resilient
-#: to a Span outage without the sensor holding any failover knowledge. The
-#: direct lanes (``switchyard-smart-aux-turnstone`` for Span alone and
-#: ``switchyard-smartlocal-aux-turnstone`` for Laya alone) exist for provider
-#: comparison and diagnostics and are deliberately not named here.
-DECISION_CAPABILITY = "switchyard-smartfree-aux-turnstone"
+#: This is the RESILIENT lane: Span R1 with a one-hop Laya R2. Naming the
+#: resilient lane is what keeps the sensor resilient to a Span outage without
+#: the sensor holding any failover knowledge.
+#:
+#: Operator ruling 2026-10-01 fixes the aux topology as:
+#:   switchyard-smartlocal-aux-turnstone = Laya only
+#:   switchyard-smartfree-aux-turnstone  = Span only (no fallback leg)
+#:   switchyard-smart-aux-turnstone      = Span R1, failover to Laya R2
+#: and names switchyard-smart-aux-turnstone the operational live lane, which is
+#: why the sensor and the Output Guard both resolve here.
+DECISION_CAPABILITY = "switchyard-smart-aux-turnstone"
 
 #: Signals requested on every observation. `local_suitability` is absent by
 #: design — the fallback backend is not qualified for it and inferring it is

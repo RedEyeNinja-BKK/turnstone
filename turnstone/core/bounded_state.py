@@ -1,7 +1,7 @@
 """Bounded, deterministic state serialization for the advisory sensor.
 
 This module turns a workstream state into the ``state`` string sent to
-``switchyard-smartfree-aux-turnstone``. It exists because the fallback backend
+``switchyard-smart-aux-turnstone``. It exists because the fallback backend
 silently truncates: measured live, Laya clamps at exactly 512 state tokens per
 question and discards the excess with no error, keeping the head and dropping
 the tail. A long history of routine text therefore buries the current objective

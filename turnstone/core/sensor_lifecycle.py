@@ -33,11 +33,22 @@ fingerprints identically and dedupe can suppress the call.
 
 from __future__ import annotations
 
+import json
+import pathlib
 import threading
+import time
 from typing import Any, Mapping
 
 from .shadow_driver import ShadowSensor
-from .shadow_observation import is_material
+from .shadow_observation import is_material, state_fingerprint
+
+#: Cadence rows go here, deliberately separate from the observation store. A
+#: suppressed event writes no observation, so counting the calls that did NOT
+#: happen is only possible in its own log.
+DEFAULT_CADENCE_STORE = pathlib.Path(
+    "/home/vincent/shared-workspace/operations/switchyard-sensor-layer-20260929/"
+    "shadow-cadence.jsonl"
+)
 
 #: Triggers in the sensor's whitelist that have NO honest source in Turnstone's
 #: current lifecycle, and are therefore deliberately not emitted:
@@ -192,16 +203,36 @@ def is_substantive_instruction(user_input: str) -> bool:
 
 
 class SensorHook:
-    """Owns the one sensor instance and the whitelist decision.
+    """Owns the one sensor instance, the whitelist decision, and cadence metrics.
 
     Exactly one instance per process, created lazily. A failure anywhere inside
     is contained: sensing is advisory and must never affect a task.
+
+    Cadence is recorded **separately** from the observation, in its own append-only
+    JSONL. Two reasons:
+
+    * A *suppressed* event produces no observation, so if cadence lived only in
+      the observation record it would be permanently invisible and the dedupe
+      rate could never be computed. Counting is the whole point of a shadow
+      sensor: the calls it did NOT make are the measurement.
+    * Observation records stay a clean signal contract. Cadence rows are
+      operational bookkeeping and must not contaminate them.
+
+    Cadence rows carry no state text, no signals, and no control value.
     """
 
-    def __init__(self, sensor: ShadowSensor | None = None) -> None:
+    def __init__(
+        self,
+        sensor: ShadowSensor | None = None,
+        *,
+        cadence_store: pathlib.Path | None = None,
+    ) -> None:
         self._sensor = sensor if sensor is not None else ShadowSensor()
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {}
+        self._workstreams: dict[str, int] = {}
+        self._cadence_store = cadence_store if cadence_store is not None else DEFAULT_CADENCE_STORE
+        self._started = time.time()
 
     # -- counters -------------------------------------------------------
 
@@ -213,6 +244,59 @@ class SensorHook:
         with self._lock:
             return dict(self._counts)
 
+    def workstream_counts(self) -> dict[str, int]:
+        """Sensor calls per workstream id. Empty for events with no workstream."""
+        with self._lock:
+            return dict(self._workstreams)
+
+    def _record_cadence(
+        self,
+        event: str,
+        outcome: str,
+        workstream: str = "",
+        fingerprint: str = "",
+    ) -> None:
+        """Append one cadence row. Best-effort: a storage failure is swallowed.
+
+        Cadence bookkeeping must never become a failure mode of the task, and a
+        dropped counter is strictly better than an exception here.
+        """
+        try:
+            with self._lock:
+                self._counts[outcome] = self._counts.get(outcome, 0) + 1
+                if workstream:
+                    self._workstreams[workstream] = self._workstreams.get(workstream, 0) + 1
+                row = {
+                    "ts": time.time(),
+                    "event": event,
+                    "outcome": outcome,
+                    "workstream": workstream,
+                    "fingerprint": fingerprint,
+                }
+            self._cadence_store.parent.mkdir(parents=True, exist_ok=True)
+            with self._cadence_store.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def cadence_report(self) -> dict[str, Any]:
+        """Aggregate cadence since process start. Used by the review harness."""
+        with self._lock:
+            counts = dict(self._counts)
+            workstreams = dict(self._workstreams)
+        elapsed_hours = max((time.time() - self._started) / 3600.0, 1e-9)
+        calls = counts.get("sensor_calls", 0)
+        return {
+            "counts": counts,
+            "workstreams": workstreams,
+            "distinct_workstreams": len(workstreams),
+            "elapsed_hours": round(elapsed_hours, 4),
+            "calls_per_hour": round(calls / elapsed_hours, 3),
+            "dedupe_suppression_rate": (
+                round(counts.get("dedupe_suppressed", 0) / max(1, calls), 4)
+            ),
+        }
+
     # -- the single call sites make ------------------------------------
 
     def observe_event(
@@ -221,12 +305,14 @@ class SensorHook:
         state: Mapping[str, Any] | None = None,
         *,
         force: bool = False,
+        workstream: str = "",
     ) -> None:
         """Observe one material event. Never raises; the result is discarded."""
         try:
-            self._bump("eligible_events")
+            with self._lock:
+                fingerprint = state_fingerprint(state) if state else ""
             if not force and not is_material(event):
-                self._bump("rejected_not_material")
+                self._record_cadence(event, "rejected_not_material", workstream, fingerprint)
                 return
             # Eager, validated copy. `dict(state)` alone can defer an exploding
             # mapping into the sensor, where a different layer would have to
@@ -234,12 +320,21 @@ class SensorHook:
             projection = {str(name): value for name, value in dict(state or {}).items()}
             allowed, _why = self._sensor.should_sense(projection, event=event, force=force)
             if not allowed:
-                self._bump("dedupe_suppressed")
+                self._record_cadence(event, "dedupe_suppressed", workstream, fingerprint)
                 return
-            self._bump("sensor_calls")
-            self._sensor.observe(projection, event=event, force=True)
+            self._record_cadence(event, "sensor_call", workstream, fingerprint)
+            # NOT force=True. The hook has already made the cadence decision via
+            # should_sense(), and that call is the single commit point. Passing
+            # force here was a second, subtler defect: it made observe()'s own
+            # dedupe branch inert AND left the fingerprint un-advanced whenever
+            # the transport failed, so a repeated state kept being re-observed.
+            # Cadence belongs to the hook, not to the network-facing call.
+            self._sensor.observe(projection, event=event)
         except Exception:  # noqa: BLE001 - a sensor must never fail a task
-            self._bump("hook_error")
+            try:
+                self._record_cadence(event, "hook_error", workstream, "")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 #: Process-wide hook. Created on first use so importing this module has no side
@@ -262,6 +357,7 @@ def observe_event(
     state: Mapping[str, Any] | None = None,
     *,
     force: bool = False,
+    workstream: str = "",
 ) -> None:
     """Module-level convenience wrapper around :func:`hook`."""
-    hook().observe_event(event, state, force=force)
+    hook().observe_event(event, state, force=force, workstream=workstream)

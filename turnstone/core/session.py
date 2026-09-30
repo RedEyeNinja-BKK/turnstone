@@ -12841,8 +12841,9 @@ class ChatSession:
                     _sensor_state(
                         objective=user_input,
                         phase="operator_instruction",
-                        history=getattr(self, "_ws_id", ""),
+                        history="",
                     ),
+                    workstream=getattr(self, "_ws_id", ""),
                 )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
             # can mutate history.  The old code's first in-try act was the loop-top
@@ -15412,8 +15413,9 @@ class ChatSession:
                             objective=cause,
                             phase="retry",
                             blockers=cause,
-                            history=getattr(self, "_ws_id", ""),
+                            history="",
                         ),
+                        workstream=getattr(self, "_ws_id", ""),
                     )
                     log.warning(
                         "stream.retry",
@@ -26969,8 +26971,8 @@ class ChatSession:
                         objective=item.get("prompt", "") if isinstance(item, dict) else str(item),
                         phase="delegation",
                         history=result,
-                        blockers=getattr(self, "_ws_id", ""),
                     ),
+                    workstream=getattr(self, "_ws_id", ""),
                 )
 
             if not self._publish_for_generation(
@@ -27059,8 +27061,9 @@ class ChatSession:
                         objective=item.get("prompt", "") if isinstance(item, dict) else str(item),
                         phase="delegation",
                         blockers=msg,
-                        history=getattr(self, "_ws_id", ""),
+                        history="",
                     ),
+                    workstream=getattr(self, "_ws_id", ""),
                 )
 
             self._publish_for_generation(

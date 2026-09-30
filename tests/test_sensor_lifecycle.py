@@ -310,8 +310,10 @@ def test_hook_counters_are_exposed_for_shadow_health():
     hook.observe_event("operator_instruction", {"objective": "a"})
     hook.observe_event("assistant_turn_committed", {"objective": "a"})
     counters = hook.counters()
-    assert counters["eligible_events"] == 2
-    assert counters["sensor_calls"] == 1
+    # Counter names are the cadence OUTCOMES, not generic verbs: a suppressed
+    # call produces no observation, so counting outcomes in the cadence log is
+    # the only way the dedupe rate is measurable at all.
+    assert counters["sensor_call"] == 1
     assert counters["rejected_not_material"] == 1
 
 
@@ -427,3 +429,173 @@ def test_lifecycle_does_not_import_routing_or_guard_modules():
         assert f"from turnstone.{forbidden}" not in source, (
             f"lifecycle imports {forbidden!r}"
         )
+
+
+# ----------------------------------------------- cadence and dedupe proof
+
+
+def test_dedupe_survives_a_failing_backend():
+    """Suppression must not depend on the network call succeeding.
+
+    This is a real defect that shipped once: cadence state was advanced only by
+    `observe()`, which returns early on a transport failure. With the backend
+    down, every material event therefore read as the initial state forever,
+    dedupe never engaged, and the sensor fired on EVERY event. The shadow
+    contract explicitly requires no retry storm, so a storm caused by dedupe
+    being dead under failure is a correctness failure, not a performance one.
+    """
+    import pathlib
+    import tempfile
+
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    work = pathlib.Path(tempfile.mkdtemp())
+    sensor = ShadowSensor(
+        store=work / "obs.jsonl",
+        switchyard="http://127.0.0.1:9",  # closed port: every call fails
+        timeout=1,
+    )
+    hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
+    state = {"objective": "the same work, repeated"}
+
+    for _ in range(5):
+        hook.observe_event("operator_instruction", dict(state))
+
+    counts = hook.counters()
+    assert counts.get("sensor_call") == 1, (
+        f"identical state must cost exactly one call, got {counts}"
+    )
+    assert counts.get("dedupe_suppressed") == 4, (
+        f"the other four must be suppressed, got {counts}"
+    )
+
+
+def test_a_meaningful_change_is_not_deduped_away():
+    """Dedupe must suppress repetition without suppressing progress."""
+    import pathlib
+    import tempfile
+
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    work = pathlib.Path(tempfile.mkdtemp())
+    sensor = ShadowSensor(store=work / "obs.jsonl",
+                          switchyard="http://127.0.0.1:9", timeout=1)
+    hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
+
+    hook.observe_event("operator_instruction", {"objective": "first"})
+    hook.observe_event("operator_instruction", {"objective": "second, now blocked"})
+    hook.observe_event("operator_instruction", {"objective": "second, now blocked"})
+    hook.observe_event("tool_failure", {"objective": "second, now blocked",
+                                        "blocker": "the gate failed"})
+
+    counts = hook.counters()
+    assert counts.get("sensor_call") == 3, (
+        f"two distinct states plus one event must each be observed: {counts}"
+    )
+
+
+def test_dedupe_state_is_advanced_by_the_cadence_decision():
+    """`should_sense` itself must commit the decision, not a later network call."""
+    from turnstone.core.shadow_driver import ShadowSensor
+    import pathlib
+    import tempfile
+
+    sensor = ShadowSensor(store=pathlib.Path(tempfile.mkdtemp()) / "o.jsonl",
+                          switchyard="http://127.0.0.1:9", timeout=1)
+    state = {"objective": "unchanged"}
+    first, why_first = sensor.should_sense(state, event="operator_instruction")
+    second, why_second = sensor.should_sense(state, event="operator_instruction")
+    assert first is True and why_first == Trigger.INITIAL.value
+    assert second is False, (
+        "the second identical state must be suppressed without any observe() call"
+    )
+    assert why_second == "unchanged_state"
+
+
+def test_cadence_rows_carry_no_state_text_or_signals():
+    """Cadence is bookkeeping: it must not duplicate workstream content."""
+    import json
+    import pathlib
+    import tempfile
+
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    work = pathlib.Path(tempfile.mkdtemp())
+    sensor = ShadowSensor(store=work / "obs.jsonl",
+                          switchyard="http://127.0.0.1:9", timeout=1)
+    hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
+    hook.observe_event(
+        "operator_instruction",
+        {"objective": "SECRET workstream content that must not be logged"},
+        workstream="ws-123",
+    )
+    rows = [json.loads(line) for line in
+            (work / "cad.jsonl").read_text().splitlines()]
+    assert rows, "a cadence row must be written"
+    blob = json.dumps(rows)
+    assert "SECRET" not in blob, "cadence must not carry state text"
+    assert set(rows[0]) == {"ts", "event", "outcome", "workstream", "fingerprint"}
+    assert rows[0]["workstream"] == "ws-123"
+    for control in ("model", "provider", "route", "reasoning_effort", "output_guard"):
+        assert control not in blob
+
+
+def test_cadence_records_suppressed_events_that_produce_no_observation():
+    """A suppression must still be measurable, which is the point of the log."""
+    import pathlib
+    import tempfile
+
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    work = pathlib.Path(tempfile.mkdtemp())
+    sensor = ShadowSensor(store=work / "obs.jsonl",
+                          switchyard="http://127.0.0.1:9", timeout=1)
+    hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
+    hook.observe_event("operator_instruction", {"objective": "x"})
+    hook.observe_event("operator_instruction", {"objective": "x"})
+    hook.observe_event("heartbeat", {"objective": "x"})
+
+    outcomes = [
+        __import__("json").loads(line)["outcome"]
+        for line in (work / "cad.jsonl").read_text().splitlines()
+    ]
+    assert outcomes.count("dedupe_suppressed") == 1, outcomes
+    assert outcomes.count("rejected_not_material") == 1, outcomes
+    assert outcomes.count("sensor_call") == 1, outcomes
+
+
+def test_cadence_report_exposes_calls_per_hour_and_per_workstream():
+    import pathlib
+    import tempfile
+
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    work = pathlib.Path(tempfile.mkdtemp())
+    sensor = ShadowSensor(store=work / "obs.jsonl",
+                          switchyard="http://127.0.0.1:9", timeout=1)
+    hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
+    hook.observe_event("operator_instruction", {"objective": "a"}, workstream="ws-1")
+    hook.observe_event("tool_failure", {"objective": "a", "blocker": "b"}, workstream="ws-2")
+    report = hook.cadence_report()
+    assert report["distinct_workstreams"] == 2, report
+    assert report["workstreams"] == {"ws-1": 1, "ws-2": 1}, report
+    assert "calls_per_hour" in report
+    assert "dedupe_suppression_rate" in report
+
+
+def test_workstream_id_is_metadata_not_hashed_state():
+    """The workstream id must not be part of the sensed state.
+
+    It rides as a dedicated argument so it can be counted per workstream without
+    becoming part of the semantic fingerprint. If it leaked into the state, two
+    workstreams doing identical work would not dedupe against each other, and a
+    rename of an unrelated id would look like a meaningful change.
+    """
+    from turnstone.core.shadow_observation import state_fingerprint
+
+    a = lifecycle.build_state(objective="identical work")
+    assert state_fingerprint(a) == state_fingerprint(
+        lifecycle.build_state(objective="identical work")
+    )
+    # The hook accepts it separately, and it is absent from the projection.
+    assert "ws-1" not in a

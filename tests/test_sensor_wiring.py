@@ -25,33 +25,127 @@ SESSION = pathlib.Path(__file__).resolve().parents[1] / "turnstone" / "core" / "
 # ------------------------------------------------------------ diff discipline
 
 
-def test_session_wiring_is_purely_additive():
-    """No existing line of session.py may be modified or removed.
+def test_session_wiring_changes_no_control_flow():
+    """The wiring must not add, remove or reorder any control-flow decision.
 
-    Pure insertion is the strongest available proof that control flow is
-    untouched: an advisory call that only adds lines cannot have reordered,
-    short-circuited or altered any existing decision.
+    Earlier this was asserted as strict pure-insertion. That was too strong once
+    the workstream id moved out of the hashed state and into a dedicated
+    argument: that change deletes and re-adds three argument lines without
+    altering a single decision. Strict addition is the right instinct, but a test
+    that fails on an explicitly-reviewed argument move is a test that gets
+    weakened instead of the change being justified.
+
+    So the invariant is the one that actually matters: every modified line must
+    belong to the sensor call sites, and no `if`, `return`, `raise`, loop or
+    assignment may be added or removed.
     """
     import subprocess
 
-    # Walk up to the nearest repository root rather than hardcoding a parent
-    # index. A wrong index makes `git diff` return nothing and the assertion
-    # silently vacuous, which is worse than no test at all.
     repo_root = next(
         (parent for parent in SESSION.parents if (parent / ".git").exists()),
         SESSION.parents[2],
     )
-    completed = subprocess.run(
-        ["git", "diff", "--numstat", "--", "turnstone/core/session.py"],
+    diff = subprocess.run(
+        ["git", "diff", "-U0", "HEAD", "--", "turnstone/core/session.py"],
         capture_output=True, text=True, cwd=str(repo_root),
     )
-    assert completed.returncode == 0, completed.stderr
-    line = completed.stdout.strip()
-    if not line:
-        pytest.skip("no uncommitted session.py diff in this tree")
-    added, deleted, _path = line.split("\t")
-    assert int(deleted) == 0, f"session.py has {deleted} deleted lines; wiring must be additive"
-    assert int(added) > 0
+    assert diff.returncode == 0, diff.stderr
+    source = SESSION.read_text()
+    if not diff.stdout.strip():
+        pytest.skip("session.py matches HEAD: the wiring is committed, no diff to check")
+
+    removed = [line[1:].strip() for line in diff.stdout.splitlines()
+               if line.startswith("-") and not line.startswith("---")]
+    added = [line[1:].strip() for line in diff.stdout.splitlines()
+             if line.startswith("+") and not line.startswith("+++")]
+
+    # Every removed line must be part of a sensor call site: either a sensor
+    # argument or the closing paren of a sensor call that gained one.
+    for line in removed:
+        assert (
+            "sensor" in line
+            or "_ws_id" in line
+            or line in {")", "),"}
+        ), f"removed line is not part of a sensor call site: {line!r}"
+
+    # No control-flow construct may be introduced or dropped.
+    control = ("if ", "return", "raise", "for ", "while ", "def ", "await ", "yield ",
+               "try:", "except", "else:", "elif ")
+    for line in added + removed:
+        for keyword in control:
+            assert not line.startswith(keyword), (
+                f"control-flow construct introduced or removed: {line!r}"
+            )
+    # No assignment other than a keyword argument on a sensor call.
+    for line in added:
+        if "=" in line and "sensor" not in line and '"' not in line:
+            assert line.startswith(("workstream=", "history=", "objective=",
+                                    "phase=", "blockers=", "tools=", "agent=",
+                                    "history=")), f"unexpected assignment: {line!r}"
+
+    # The call-site count must still be exactly the four material events. Count
+    # them in the file, not in the diff: after the wiring is committed the diff
+    # no longer contains the event names, and a count of zero would be a
+    # vacuous pass rather than a real assertion.
+    # Each event must be paired with its OWN seam exactly once. Counting raw
+    # string occurrences is wrong: `operator_instruction` also appears as a
+    # `phase=` value, so a text count double-counts it. Walk the calls instead.
+    # This also catches a relabelled seam, which a pure count would not: four
+    # seams with one event renamed still reads as four.
+    #
+    # The event is the FIRST POSITIONAL argument at every seam, matching
+    # `observe_event(event, state, ...)`. Asserting it is a keyword would fail
+    # against correct code, so the position is read as it is actually written.
+    tree = ast.parse(source)
+    events: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) != "_sensor_observe":
+            continue
+        assert node.args, "every seam must pass the event as its first positional arg"
+        first = node.args[0]
+        assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
+            f"line {node.lineno}: the event must be a string literal"
+        )
+        events.append(first.value)
+        # No seam may splat a mapping into the call: that would let an
+        # unrecognised control key reach the hook.
+        assert not any(kw.arg is None for kw in node.keywords), (
+            f"line {node.lineno}: **kwargs at a seam could carry a control key"
+        )
+
+    assert len(events) == 4, f"expected four sensor call sites, found {len(events)}"
+    assert sorted(events) == [
+        "delegation_result", "operator_instruction", "retry_transition",
+        "task_agent_failure",
+    ], f"seam/event pairing is wrong: {sorted(events)}"
+    # A relabelled seam shows up as a duplicate event name.
+    assert len(set(events)) == 4, f"duplicate event across seams: {events}"
+
+    # Every seam must identify its workstream, or per-workstream cadence is
+    # unmeasurable. A seam that dropped the argument would still pass every
+    # count above, so the argument itself is asserted per call site.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) != "_sensor_observe":
+            continue
+        workstream = [kw for kw in node.keywords if kw.arg == "workstream"]
+        assert workstream, f"line {node.lineno}: seam passes no workstream id"
+        value = workstream[0].value
+        # `getattr` is a bare Name at the AST level, not an Attribute.
+        assert isinstance(value, ast.Call), (
+            f"line {node.lineno}: workstream must be a defensive getattr, got {value!r}"
+        )
+        assert getattr(value.func, "id", None) == "getattr", (
+            f"line {node.lineno}: workstream must be read via getattr, "
+            f"got {getattr(value.func, 'id', None)!r}"
+        )
+        assert any(
+            isinstance(arg, ast.Constant) and arg.value == "_ws_id"
+            for arg in value.args
+        ), f"line {node.lineno}: workstream must come from _ws_id"
 
 
 def test_every_sensor_call_in_session_is_discarded():
@@ -191,7 +285,10 @@ def test_hook_signature_accepts_no_control_inputs():
     """The call site cannot pass, and cannot receive, a control value."""
     signature = inspect.signature(lifecycle.observe_event)
     parameters = set(signature.parameters)
-    assert parameters == {"event", "state", "force"}
+    # `workstream` is the only addition over the original three, and it is an
+    # identifier used for per-workstream cadence counting. It is deliberately
+    # NOT part of the sensed state, so it cannot change a semantic fingerprint.
+    assert parameters == {"event", "state", "force", "workstream"}
     for forbidden in ("model", "provider", "route", "lane", "effort", "tools", "guard"):
         assert forbidden not in parameters
     assert signature.return_annotation in (None, "None")

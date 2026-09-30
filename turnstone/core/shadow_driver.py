@@ -135,16 +135,31 @@ class ShadowSensor:
 
         Order matters: an unchanged state is suppressed before anything else,
         because that is the common case and it must not cost a call.
+
+        This method also **commits** the cadence decision. That is deliberate and
+        was a real defect when it did not: dedupe state was only advanced by
+        :meth:`observe`, which returns early on any transport failure. With the
+        backend down, every event therefore read as ``initial_substantive_state``
+        forever, dedupe never engaged, and the sensor fired on every single
+        material event. Committing here means suppression depends only on the
+        caller's own state, never on whether a network call happened to succeed.
         """
         fingerprint = state_fingerprint(state)
         if force:
             return True, "forced"
         if not self._initial_done:
+            self._initial_done = True
+            self._last_fingerprint = fingerprint
             return True, Trigger.INITIAL.value
         if not is_material(event or ""):
             return False, f"not_material:{event}"
         if fingerprint == self._last_fingerprint:
             return False, "unchanged_state"
+        # Commit on the admit branch too. Missing this was the second half of the
+        # dedupe defect: only the INITIAL branch advanced the fingerprint, so
+        # after a successful material observation the state was never recorded
+        # and an identical state was admitted again on every subsequent event.
+        self._last_fingerprint = fingerprint
         return True, Trigger.MATERIAL.value
 
     # -- observation -----------------------------------------------------

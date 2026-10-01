@@ -1,0 +1,47 @@
+[Unit]
+Description=Jev-Style 0.8B Decision v3 typed-decision service (CPU-only, shadow)
+Documentation=file:///opt/jevstyle/src/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jevstyle
+Group=jevstyle
+WorkingDirectory=/opt/jevstyle
+Environment="LD_LIBRARY_PATH=/opt/jevstyle/build/llama.cpp/build/bin"
+Environment="JEVSTYLE_NGL=0"
+Environment="JEVSTYLE_THREADS=6"
+Environment="JEVSTYLE_DEVICE=cpu"
+Environment="PYTHONUNBUFFERED=1"
+# The service speaks a line-delimited JSON protocol on stdin/stdout. Under systemd
+# stdin is /dev/null by default, so the loop saw EOF and exited 0 immediately.
+# A FIFO owned by the service account gives a persistent, private control channel
+# without opening a network port for control traffic.
+# The FIFO lives under /run (tmpfs) because ProtectSystem=strict makes /opt
+# read-only to the service, which would make mkfifo fail with status=1.
+RuntimeDirectory=jevstyle
+RuntimeDirectoryMode=0750
+# RuntimeDirectory is recreated empty by systemd on every start, so mkfifo
+# alone is correct. An `rm -f` here would unlink the FIFO out from under
+# any reader and was the cause of avoidable restart churn.
+ExecStartPre=/bin/sh -c 'mkfifo -m 0660 /run/jevstyle/ctl'
+ExecStart=/bin/sh -c 'exec /opt/jevstyle/venv/bin/python /opt/jevstyle/src/jevstyle_serve.py < /run/jevstyle/ctl'
+Restart=always
+RestartSec=5
+# Bounded footprint: CPU-only by design, must never contend with Laya.
+CPUQuota=250%
+MemoryHigh=3G
+MemoryMax=4G
+# Hardening. The model is read-only and the service needs no writes outside /opt.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/jevstyle/logs
+StandardOutput=journal
+StandardError=append:/opt/jevstyle/logs/jevstyle-serve.err
+StandardError=append:/opt/jevstyle/logs/jevstyle-serve.err
+
+[Install]
+WantedBy=multi-user.target

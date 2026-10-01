@@ -31,6 +31,7 @@ import json
 import os
 import pathlib
 import statistics
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -44,6 +45,7 @@ STORE = pathlib.Path(
 SWITCHYARD = "http://127.0.0.1:4000"
 LAYA = "http://100.105.20.36:8011/v1/systemone"
 AUX_LANE = "switchyard-smart-aux-turnstone"
+JEV_FIFO = "jevstyle:/run/jevstyle/ctl"   # via ssh; private FIFO on the HTPC
 
 SIGNALS = (
     "task_complexity",
@@ -179,6 +181,50 @@ def normalise_laya(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def jev_request(body: dict[str, Any]) -> tuple[int, dict[str, Any], int]:
+    """Send one request to Jev-Style over its private FIFO on the HTPC.
+
+    Jev-Style deliberately binds no network port: its control channel is a FIFO,
+    so the only way in is through the management lane. stdout is the protocol.
+    """
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "htpc", "sudo -n tee /run/jevstyle/ctl > /dev/null"],
+        input=json.dumps(body) + "\n", text=True, capture_output=True, timeout=300,
+    )
+    if proc.returncode != 0:
+        return 1, {"error": proc.stderr[-200:]}, 0
+    time.sleep(float(body.pop("_settle", 14)))
+    out = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "htpc",
+         "sudo -n journalctl -u jevstyle-serve.service -o cat --since -40s --no-pager "
+         "| grep '^{\"ok\"' | tail -1"],
+        capture_output=True, text=True, timeout=120,
+    )
+    started = time.monotonic()
+    line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+    try:
+        return 200, json.loads(line), int((time.monotonic() - started) * 1000)
+    except Exception:  # noqa: BLE001
+        return 0, {"error": "no parsable response"}, 0
+
+
+def normalise_jev(payload: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, ans in (payload.get("answers") or {}).items():
+        probs = ans.get("probabilities") or {}
+        # Native scale: expected score over the option index space.
+        weighted = sum(float(i) * float(p) for i, p in probs.items()) if probs else None
+        out[name] = {
+            "available": True,
+            "value": weighted,
+            "top_probability": ans.get("top_probability"),
+            "entropy_concentration": ans.get("entropy_concentration"),
+            "probabilities": probs,
+            "scale": "expected index over 5 levels, from scorer probabilities",
+        }
+    return out
+
+
 def normalise_span(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for name, ans in (payload.get("answers") or {}).items():
@@ -257,6 +303,17 @@ def main() -> int:
                 "latency_ms": ms,
                 "answers": normalise_laya(payload) if code == 200 else None,
                 "error": (payload.get("detail") or payload.get("error")),
+            }
+        if "jev" in backends:
+            jb = build_laya_body(state)
+            jb["_settle"] = 16
+            code, payload, ms = jev_request(jb)
+            record["backends"]["jev"] = {
+                "http": code, "latency_ms": ms,
+                "answers": normalise_jev(payload["result"]) if code == 200 and payload.get("ok") else None,
+                "scorer_ms": ((payload.get("result") or {}).get("usage") or {}).get("scorer_ms"),
+                "error": payload.get("error"),
+                "scale": "expected index over 5 levels",
             }
         if "span" in backends:
             code, payload, ms = post(

@@ -1,0 +1,38 @@
+{
+  "harness": "B - hosted Jev Router routing oracle",
+  "date": "2026-10-01",
+  "corpus": "14 genuine post-T0 sensor observations, offline replay",
+  "outbound_projection": "5 bounded numeric features + event class; ~301 chars; no prose, no content",
+  "calls_ok": "14/14",
+  "latency_ms": {
+    "p50": 4074,
+    "p95": 5972,
+    "max": 8635
+  },
+  "cost": {
+    "total": 0.007661,
+    "mean": 0.000547,
+    "catalogue_claim": "prompt/completion = -1 (free)",
+    "measured": "charged per call; deepseek selections ~30x the cost of luna ones"
+  },
+  "selected_models": {
+    "openai/gpt-6-luna": 11,
+    "deepseek/deepseek-v4.1-flash": 3
+  },
+  "compute_classes": {
+    "cheap/fast": 14
+  },
+  "effort_exposed": false,
+  "determinism": {
+    "identical_projection_x3": "stable (all luna)",
+    "earlier_trivial_prompt_x3": "stable (all luna)",
+    "note": "router is deterministic per input; variation across corpus rows tracks input differences, not randomness"
+  },
+  "correlation_with_our_signals": {
+    "task_complexity": "0.0910 (deepseek) vs 0.0728 (luna)",
+    "tool_dependency": "0.0634 (deepseek) vs 0.0957 (luna)",
+    "verdict": "NO clean separation - router varied, but our five signals do not explain which it picked"
+  },
+  "switchyard_comparison": "NOT PERFORMED - requires live routing telemetry, out of scope for this pass",
+  "conclusion": "A genuine routing oracle, not free in practice, non-governable, and its selection is not predictable from our current signals. Not promotable."
+}

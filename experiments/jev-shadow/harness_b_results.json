@@ -1,0 +1,408 @@
+[
+  {
+    "index": 1,
+    "fingerprint": "f8ed865c5f35",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 301,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 5.86e-05,
+      "reasoning_tokens": 85,
+      "latency_ms": 4468,
+      "error": null
+    }
+  },
+  {
+    "index": 2,
+    "fingerprint": "0103eee8a81d",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 302,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 5.77e-05,
+      "reasoning_tokens": 83,
+      "latency_ms": 3213,
+      "error": null
+    }
+  },
+  {
+    "index": 3,
+    "fingerprint": "c75c19de416d",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 302,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 9.02e-05,
+      "reasoning_tokens": 148,
+      "latency_ms": 4510,
+      "error": null
+    }
+  },
+  {
+    "index": 4,
+    "fingerprint": "21ca37d08a95",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 303,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 6.93e-05,
+      "reasoning_tokens": 106,
+      "latency_ms": 2544,
+      "error": null
+    }
+  },
+  {
+    "index": 5,
+    "fingerprint": "923d87cde597",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 302,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 0.0001057,
+      "reasoning_tokens": 179,
+      "latency_ms": 2622,
+      "error": null
+    }
+  },
+  {
+    "index": 6,
+    "fingerprint": "564945e71ad0",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 303,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 9.13e-05,
+      "reasoning_tokens": 150,
+      "latency_ms": 3200,
+      "error": null
+    }
+  },
+  {
+    "index": 7,
+    "fingerprint": "cba493b5a50f",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 303,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 5.73e-05,
+      "reasoning_tokens": 82,
+      "latency_ms": 4067,
+      "error": null
+    }
+  },
+  {
+    "index": 8,
+    "fingerprint": "a317db225ad9",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 302,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "deepseek/deepseek-v4.1-flash",
+      "selected_provider": "Together",
+      "cost": 0.0021348,
+      "reasoning_tokens": 1739,
+      "latency_ms": 5972,
+      "error": null
+    }
+  },
+  {
+    "index": 9,
+    "fingerprint": "e0b073abc54f",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 303,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "deepseek/deepseek-v4.1-flash",
+      "selected_provider": "Together",
+      "cost": 0.0016587,
+      "reasoning_tokens": 1342,
+      "latency_ms": 5203,
+      "error": null
+    }
+  },
+  {
+    "index": 10,
+    "fingerprint": "659d17941add",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 303,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 7.18e-05,
+      "reasoning_tokens": 111,
+      "latency_ms": 3983,
+      "error": null
+    }
+  },
+  {
+    "index": 11,
+    "fingerprint": "cba493b5a50f",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 303,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 5.68e-05,
+      "reasoning_tokens": 81,
+      "latency_ms": 4082,
+      "error": null
+    }
+  },
+  {
+    "index": 12,
+    "fingerprint": "fad5450a66db",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 302,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "deepseek/deepseek-v4.1-flash",
+      "selected_provider": "Together",
+      "cost": 0.00306,
+      "reasoning_tokens": 2510,
+      "latency_ms": 8635,
+      "error": null
+    }
+  },
+  {
+    "index": 13,
+    "fingerprint": "2eb180e2d980",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 303,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 9.73e-05,
+      "reasoning_tokens": 162,
+      "latency_ms": 4552,
+      "error": null
+    }
+  },
+  {
+    "index": 14,
+    "fingerprint": "b4071cb8f311",
+    "trigger": "material_state_transition",
+    "backend": "Respan",
+    "outbound_projection": {
+      "features_sent": [
+        "agentic_complexity",
+        "reasoning_demand",
+        "route_sufficiency",
+        "task_complexity",
+        "tool_dependency"
+      ],
+      "features_unavailable": [],
+      "local_suitability_sent": false,
+      "chars": 302,
+      "prose_content_sent": false
+    },
+    "jev": {
+      "ok": true,
+      "http": 200,
+      "selected_model": "openai/gpt-6-luna",
+      "selected_provider": "OpenAI",
+      "cost": 5.12e-05,
+      "reasoning_tokens": 70,
+      "latency_ms": 3311,
+      "error": null
+    }
+  }
+]

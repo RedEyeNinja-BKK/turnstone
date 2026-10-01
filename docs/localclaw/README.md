@@ -163,6 +163,23 @@ Both resolve `judge.output_guard_model` / `DECISION_CAPABILITY` to
 `switchyard-smart-aux-turnstone`. The sensor can never influence the guard, model
 selection, tools, permissions or routing.
 
+## AUX lane metadata
+
+The three AUX model-definition rows carry documentation fields describing the
+lane's provider legs. These were stale until 2026-10-01, when they were
+converged on the operator ruling:
+
+| alias | `decision_primary_model` | `decision_fallback_model` | `decision_role` |
+|---|---|---|---|
+| `switchyard-smart-aux-turnstone` | `respan/span-01-lite` | `laya-rl-agent` | `composite_aux_resilient` |
+| `switchyard-smartfree-aux-turnstone` | `respan/span-01-lite` | *(none)* | `direct_span_only` |
+| `switchyard-smartlocal-aux-turnstone` | `laya-rl-agent` | *(none)* | *(unset)* |
+
+These four `decision_*` fields have **zero readers** in the Turnstone source.
+`routes.toml` is the topology authority; `supports_typed_decision` is the only
+load-bearing capability key on these rows. The metadata is a record for humans,
+not a control input.
+
 ## Known non-upstream behavior
 
 - `server_compat.extra_headers` per-lane request headers (upstream issue open).

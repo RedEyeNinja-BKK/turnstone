@@ -77,6 +77,7 @@ Production runs an immutable runtime slot, not the repository checkout:
 |---|---|
 | slot name | `1.8.5-8d6bd4a4-sensor-lane` |
 | slot commit | `8d6bd4a4609b243cc221dc0d2d5435fa2489d7b2` |
+| production anchor tag | `localclaw-prod-20261001-sensor-lane` |
 | version | 1.8.5 |
 | layout | `/opt/turnstone/runtimes/<slot>/venv` (a real, non-editable install) |
 | per-node activation | `/home/vincent/.local/share/turnstone-slots/node<N>.slot`, applied by `/opt/turnstone/bin/tt-node-slot-run` |
@@ -87,6 +88,18 @@ Unit text and the repository checkout are not deployment truth.
 The slot commit was, until 2026-10-01, **reachable from no branch** — it existed
 only as an object in the local object database. It is now the base of the
 integration branch and is pushed to the fork.
+
+### Two anchors, two different questions
+
+| anchor | answers |
+|---|---|
+| branch `integration/localclaw-v1.8.5-sensor-20261001` | where development continues |
+| tag `localclaw-prod-20261001-sensor-lane` | exactly what production was built from |
+
+They are deliberately different commits. The branch tip carries the sensor
+qualification suite and these documents, none of which are in the deployed tree;
+the tag carries only the deployed source. Roll back to the tag, develop on the
+branch.
 
 ## Reproducibility
 

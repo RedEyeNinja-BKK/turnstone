@@ -1,0 +1,494 @@
+[
+  {
+    "index": 1,
+    "fingerprint": "f8ed865c5f35",
+    "stored_backend": "Respan",
+    "backends": {
+      "laya": {
+        "http": 200,
+        "latency_ms": 2040,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 2.002,
+            "confidence": 0.3048,
+            "answer_confidence": 0.6176,
+            "probabilities": {
+              "0": 0.0354,
+              "1": 0.1568,
+              "2": 0.6176,
+              "3": 0.1509,
+              "4": 0.0393
+            }
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 1.9323,
+            "confidence": 0.2906,
+            "answer_confidence": 0.5974,
+            "probabilities": {
+              "0": 0.0432,
+              "1": 0.1859,
+              "2": 0.5974,
+              "3": 0.1424,
+              "4": 0.0311
+            }
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 2.0384,
+            "confidence": 0.3408,
+            "answer_confidence": 0.6535,
+            "probabilities": {
+              "0": 0.0329,
+              "1": 0.1243,
+              "2": 0.6535,
+              "3": 0.1503,
+              "4": 0.039
+            }
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 2.0527,
+            "confidence": 0.3073,
+            "answer_confidence": 0.6128,
+            "probabilities": {
+              "0": 0.0213,
+              "1": 0.1603,
+              "2": 0.6128,
+              "3": 0.1556,
+              "4": 0.05
+            }
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 1.9927,
+            "confidence": 0.2959,
+            "answer_confidence": 0.6053,
+            "probabilities": {
+              "0": 0.0333,
+              "1": 0.1712,
+              "2": 0.6053,
+              "3": 0.1499,
+              "4": 0.0403
+            }
+          }
+        },
+        "error": null
+      },
+      "span": {
+        "http": 200,
+        "latency_ms": 503,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 0.22050555,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 0.15090594,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 0.0663973,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 0.13323763,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 0.02153962,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          }
+        },
+        "error": null,
+        "served_model": "respan/span-01-lite-20260925",
+        "scale": "continuous 0..1 (noul)"
+      }
+    }
+  },
+  {
+    "index": 2,
+    "fingerprint": "0103eee8a81d",
+    "stored_backend": "Respan",
+    "backends": {
+      "laya": {
+        "http": 200,
+        "latency_ms": 2077,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 1.8741,
+            "confidence": 0.2979,
+            "answer_confidence": 0.5998,
+            "probabilities": {
+              "0": 0.0489,
+              "1": 0.2027,
+              "2": 0.5998,
+              "3": 0.1224,
+              "4": 0.0261
+            }
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 1.8099,
+            "confidence": 0.2941,
+            "answer_confidence": 0.5832,
+            "probabilities": {
+              "0": 0.0556,
+              "1": 0.2303,
+              "2": 0.5832,
+              "3": 0.1105,
+              "4": 0.0204
+            }
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 1.9435,
+            "confidence": 0.3396,
+            "answer_confidence": 0.6514,
+            "probabilities": {
+              "0": 0.0448,
+              "1": 0.149,
+              "2": 0.6514,
+              "3": 0.1276,
+              "4": 0.0273
+            }
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 1.9272,
+            "confidence": 0.2889,
+            "answer_confidence": 0.5889,
+            "probabilities": {
+              "0": 0.035,
+              "1": 0.2081,
+              "2": 0.5889,
+              "3": 0.1308,
+              "4": 0.0373
+            }
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 1.8587,
+            "confidence": 0.3046,
+            "answer_confidence": 0.5989,
+            "probabilities": {
+              "0": 0.0458,
+              "1": 0.2148,
+              "2": 0.5989,
+              "3": 0.1161,
+              "4": 0.0245
+            }
+          }
+        },
+        "error": null
+      },
+      "span": {
+        "http": 200,
+        "latency_ms": 479,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 0.22714144,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 0.16025943,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 0.07021286,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 0.1354656,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 0.022803254,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          }
+        },
+        "error": null,
+        "served_model": "respan/span-01-lite-20260925",
+        "scale": "continuous 0..1 (noul)"
+      }
+    }
+  },
+  {
+    "index": 3,
+    "fingerprint": "c75c19de416d",
+    "stored_backend": "Respan",
+    "backends": {
+      "laya": {
+        "http": 200,
+        "latency_ms": 2039,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 1.9498,
+            "confidence": 0.2723,
+            "answer_confidence": 0.5836,
+            "probabilities": {
+              "0": 0.044,
+              "1": 0.186,
+              "2": 0.5836,
+              "3": 0.149,
+              "4": 0.0374
+            }
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 1.8723,
+            "confidence": 0.2707,
+            "answer_confidence": 0.5721,
+            "probabilities": {
+              "0": 0.0539,
+              "1": 0.2103,
+              "2": 0.5721,
+              "3": 0.1371,
+              "4": 0.0266
+            }
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 2.0196,
+            "confidence": 0.298,
+            "answer_confidence": 0.6197,
+            "probabilities": {
+              "0": 0.0434,
+              "1": 0.1364,
+              "2": 0.6197,
+              "3": 0.1582,
+              "4": 0.0423
+            }
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 1.9903,
+            "confidence": 0.2784,
+            "answer_confidence": 0.585,
+            "probabilities": {
+              "0": 0.0309,
+              "1": 0.1891,
+              "2": 0.585,
+              "3": 0.1489,
+              "4": 0.0461
+            }
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 1.9381,
+            "confidence": 0.2679,
+            "answer_confidence": 0.5738,
+            "probabilities": {
+              "0": 0.0418,
+              "1": 0.2,
+              "2": 0.5738,
+              "3": 0.1469,
+              "4": 0.0375
+            }
+          }
+        },
+        "error": null
+      },
+      "span": {
+        "http": 200,
+        "latency_ms": 490,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 0.18895762,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 0.16764022,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 0.07198769,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 0.13712107,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 0.021923648,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          }
+        },
+        "error": null,
+        "served_model": "respan/span-01-lite-20260925",
+        "scale": "continuous 0..1 (noul)"
+      }
+    }
+  },
+  {
+    "index": 4,
+    "fingerprint": "21ca37d08a95",
+    "stored_backend": "Respan",
+    "backends": {
+      "laya": {
+        "http": 200,
+        "latency_ms": 2072,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 1.7969,
+            "confidence": 0.2493,
+            "answer_confidence": 0.5548,
+            "probabilities": {
+              "0": 0.0779,
+              "1": 0.2198,
+              "2": 0.5548,
+              "3": 0.1225,
+              "4": 0.025
+            }
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 1.7229,
+            "confidence": 0.2449,
+            "answer_confidence": 0.528,
+            "probabilities": {
+              "0": 0.0842,
+              "1": 0.2582,
+              "2": 0.528,
+              "3": 0.1099,
+              "4": 0.0197
+            }
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 1.9162,
+            "confidence": 0.2822,
+            "answer_confidence": 0.606,
+            "probabilities": {
+              "0": 0.0621,
+              "1": 0.1621,
+              "2": 0.606,
+              "3": 0.1372,
+              "4": 0.0326
+            }
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 1.8895,
+            "confidence": 0.2629,
+            "answer_confidence": 0.5667,
+            "probabilities": {
+              "0": 0.0487,
+              "1": 0.2165,
+              "2": 0.5667,
+              "3": 0.133,
+              "4": 0.0351
+            }
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 1.8071,
+            "confidence": 0.2523,
+            "answer_confidence": 0.5523,
+            "probabilities": {
+              "0": 0.069,
+              "1": 0.2301,
+              "2": 0.5523,
+              "3": 0.1222,
+              "4": 0.0265
+            }
+          }
+        },
+        "error": null
+      },
+      "span": {
+        "http": 200,
+        "latency_ms": 517,
+        "answers": {
+          "task_complexity": {
+            "available": true,
+            "value": 0.21366572,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "reasoning_demand": {
+            "available": true,
+            "value": 0.1608232,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "tool_dependency": {
+            "available": true,
+            "value": 0.080151185,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "agentic_complexity": {
+            "available": true,
+            "value": 0.14398043,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          },
+          "route_sufficiency": {
+            "available": true,
+            "value": 0.021403141,
+            "confidence": null,
+            "probabilities": null,
+            "scale": "continuous 0..1"
+          }
+        },
+        "error": null,
+        "served_model": "respan/span-01-lite-20260925",
+        "scale": "continuous 0..1 (noul)"
+      }
+    }
+  }
+]

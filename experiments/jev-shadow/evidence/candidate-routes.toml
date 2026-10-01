@@ -1,0 +1,1804 @@
+# LOCALCLAW SWITCHYARD — PRODUCTION ROUTING CONFIG (:4000)
+# Generated 2026-08-22 as part of Switchyard S2-H production-lineage reconciliation;
+# CUT OVER TO PRODUCTION 2026-08-22 (checkpoint-switchyard-s2h-cutover-deployed).
+# Translates the 9 `resource_router` (smart*) routes onto `fleet_router`, retires
+# `[resource_pools.*]` + `[comfyninja]` (see worksheet S2H_RECONCILIATION_WORKSHEET.md),
+# and preserves all passthrough + stage_router caller surfaces.
+#
+# Header corrected 2026-08-26 (Gate D3): the file IS the live production config.
+# Comment-only change; routing entries untouched.
+# Resource-gated readiness (OpenAI weekly / DeepSeek balance) is NOT expressed in
+# this config: it is produced at runtime by the FleetReadinessMonitor +
+# ResourceStateFactsClient (fleet_readiness.rs) writing into the same
+# SharedFleetState the FleetRouter server consumes (see PR #10 runtime-owner seam).
+# Per the accepted S2-E doctrine, cloud candidates are `unmanaged` for preflight
+# context admission (the old chars/4 estimator and 266K routing cap are NOT
+# resurrected for parity).
+
+schema_version = 1
+
+# ─── ESCALATION THRESHOLD RAISE v9 (2026-09-12, operator GO) ───────────────
+# `switchyard-smart-agentic-<agent>` escalation_max_input_tokens: 81920 -> 163840
+# (~16% -> ~31% of the routes' then-524288 window; that window is 266000 since
+# 2026-09-18, so the threshold is ~62% of it). The agentic tiers now carry
+# substantially more context on their cheap NT lane before handing off to the
+# thinking parent. The 4 `switchyard-smartlocal-*` routes are at 61440 since
+# 2026-09-18 (operator ruling): a deliberate reduction, not the lane's ceiling. — their
+# The 4 `switchyard-smartlocal-bounded-*` routes share that trigger and overflow to the
+# ComfyNinja q3-MTP lane `sw-comfyninja-qwen3_8-27b-q3-mtp-vl`. That lane is NEUTRAL:
+# each escalating route declares `escalation_reasoning_policy`, so the bounded tier
+# overflows non-thinking (`none`) and the plain tier overflows at `medium`.
+# Rollback: routes.toml.bak-20260912-pre-esc-v9.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ThaiLLM migrated to the Responses wire 2026-09-15 (operator GO): live-verified upstream
+#   (200 Responses object, SSE with event:+data: frames, store:false tolerated, and tool CALLS
+#   work on that surface). tool_calling stays FALSE on these routes: turning it on is a separate
+#   capability decision, not part of the wire migration.
+
+# ─── ALIGNMENT REFACTOR v8 (2026-09-12, operator GO) ───────────────────────
+# Enforces one traceable name chain across the three namespaces:
+#     route  `sw-<X>`   ->   target  `<X>`   ->   llm_client  `<X>`
+# (1) orphan targets `unsloth-qwen3_8-27b` / `-nt` and their clients removed;
+# (2) one llm_client per target, keyed identically (kills the duplicate
+#     upstream-id-within-one-client collapse warning for comfyninja q3/q4);
+# (3) targets renamed to mirror their route key:
+#       sy-gw-gpt-5_6-{luna,sol,terra}[-nt] -> openai-gpt-5_6-{luna,sol,terra}[-nt]
+#       thaillm-openthaigpt-8b-instruct      -> thaillm-openthaigpt
+#       thaillm-pathumma-qwen3-8b-think      -> thaillm-pathumma
+#       thaillm-typhoon-s-8b                 -> thaillm-typhoon
+#       thaillm-thalle-0_2-8b-fa             -> thaillm-thalle
+#       + new target htpc-qwen3_5-9b (splits the two htpc routes off one target);
+# (4) capability clients mirror their capability key the same way.
+# PUBLIC ROUTE IDS ARE UNCHANGED -- route keys/ids, candidates, escalations,
+# fleet_readiness and every credential reference are untouched.
+# Rollback: routes.toml.bak-20260912-pre-align-v8 (or .align-v8-20260912-deployed).
+# ─────────────────────────────────────────────────────────────────────────
+
+# ─── DeepSeek (existing) ──────────────────────────────────────────────
+[llm_clients.deepseek-deepseek-flash]
+format = "openai_responses"
+base_url = "https://api.deepseek.com"
+api_key_env = "LOCALCLAW_DEEPSEEK_API_KEY"
+# 2026-09-17 GATE 3 (operator GO): route-authoritative reasoning declarations.
+# Behaviourally inert for routes that declare no reasoning_policy.
+reasoning_dialect = "openai_effort"
+reasoning_efforts = ["none", "low", "high", "max"]
+# 2026-09-15 STAGE-1 RESPONSES CUTOVER (operator GO): openai_chat -> openai_responses.
+# DeepSeek /responses live-verified 2026-09-15: effort=none works (0 reasoning tokens),
+# reasoning-item replay accepted, tool loop round-trips, stream ends response.completed
+# (no [DONE] — the Responses codec is event-driven, no dependency), store=false tolerated.
+# Wire-level evidence pack: project memory switchyard_responses_migration_evidence_2026_09_15.
+# Rollback: restore routes.toml.bak-20260915-pre-responses-stage1 (sha 01b4669f…) + restart.
+
+
+# 2026-09-10: canonical upstream id is now `deepseek-flash` (= DeepSeek-V4.1-Flash).
+# The pre-V4.1 legacy DeepSeek ids remain callable server-side aliases, but this
+# config pins the canonical id and references no legacy id anywhere.
+
+[llm_clients.openrouter-typesafe-jev-router]
+format = "openai_chat"
+target = "openrouter-typesafe-jev-router"
+timeout_seconds = 120
+
+[targets.deepseek-deepseek-flash]
+id = "deepseek-flash"
+llm_client = "deepseek-deepseek-flash"
+
+# (targets `deepseek-pro`, `deepseek-pro-think` REMOVED 2026-09-11 with their routes —
+#  upstream retires the pro model on 2026-09-14 and no route referenced them.)
+
+# CLIENT SPLIT 2026-09-12 (operator GO, audit items 3-4): one llm_client
+# per target, so client key == target key. This family shared
+# `llm_clients.htpc`; the copies are identical connection config
+# (same base_url/credential/format) — only the target's extra_body
+# differs.
+
+[targets.openrouter-typesafe-jev-router]
+provider = "openrouter"
+model = "typesafe/jev-router"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[llm_clients.htpc-qwen3_5-9b]
+format = "openai_responses"
+base_url = "http://htpc-wsl.tailc8ef7b.ts.net:8889/v1"
+api_key_env = "LOCALCLAW_HTPC_API_KEY"
+[llm_clients.htpc-qwen3_5-9b-mtp]
+format = "openai_responses"
+base_url = "http://htpc-wsl.tailc8ef7b.ts.net:8889/v1"
+api_key_env = "LOCALCLAW_HTPC_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+# ORNITH 2026-09-19 (operator GO): Ornith-1.5-9B-MTP IQ4_XS supplements Qwen on
+# HTPC. One client per target, same family convention. Front :8889 resolves the
+# alias and switches the resident per request (~7-12 s switch cost).
+# 2026-09-19 operator ruling (option (a): mirror the ComfyNinja client shape) — the clients
+# now carry the `llama_cpp_enable_thinking` dialect, the same dialect the sibling
+# `htpc-qwen3_5-9b-mtp` client uses on this backend. The dialect makes the reasoning-policy
+# mechanism AVAILABLE and translatable; it is INERT while no route declares a
+# `reasoning_policy` — these routes stay neutral (no policy) and the no-think default comes
+# from the HTPC front profile's enable_thinking pin.
+[llm_clients.htpc-ornith-1_5-9b-mtp]
+format = "openai_responses"
+base_url = "http://htpc-wsl.tailc8ef7b.ts.net:8889/v1"
+api_key_env = "LOCALCLAW_HTPC_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+[llm_clients.htpc-ornith-1_5-9b-mtp-vl]
+format = "openai_responses"
+base_url = "http://htpc-wsl.tailc8ef7b.ts.net:8889/v1"
+api_key_env = "LOCALCLAW_HTPC_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.htpc-qwen3_5-9b-mtp]
+id = "Qwen3.5-9B-MTP"
+llm_client = "htpc-qwen3_5-9b-mtp"
+
+# ORNITH targets: wire id = Studio's advertised id (basename sans .gguf, verified
+# live 2026-09-19 via /api/inference/models). VL twin shares the resident weights;
+# the front switches mmproj attachment per request.
+[targets.htpc-ornith-1_5-9b-mtp]
+id = "Ornith-1.5-9B-MTP-IQ4_XS"
+llm_client = "htpc-ornith-1_5-9b-mtp"
+[targets.htpc-ornith-1_5-9b-mtp-vl]
+# Distinct wire id on purpose: the front resolves the INCOMING model field to a
+# profile, so both variants must present distinct ids or VL requests would be
+# silently misrouted. Studio serves the resident regardless (verified 2026-09-19).
+id = "Ornith-1.5-9B-MTP-VL"
+llm_client = "htpc-ornith-1_5-9b-mtp-vl"
+
+# TARGET SPLIT 2026-09-12 (operator GO, audit item 5): route `sw-htpc-qwen3_5-9b`
+# previously pointed at `htpc-qwen3_5-9b-mtp`, so one target could not mirror
+# either route key. Each route now owns the target named after it.
+[targets.htpc-qwen3_5-9b]
+id = "Qwen3.5-9B-Q4_0"
+llm_client = "htpc-qwen3_5-9b"
+
+# (route `switchyard/htpc/qwen3.5-9b-mtp` lives in the consolidated HTPC family
+#  section further down — moved 2026-09-11 so all four HTPC routes sit together.)
+
+# ─── ThaiLLM ──────────────────────────────────────────────────────────
+# CLIENT SPLIT 2026-09-12 (operator GO, audit items 3-4): one llm_client
+# per target, so client key == target key. This family shared
+# `llm_clients.thaillm`; the copies are identical connection config
+# (same base_url/credential/format) — only the target's extra_body
+# differs.
+[llm_clients.thaillm-openthaigpt]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+api_key_env = "LOCALCLAW_THAILLM_API_KEY"
+extra_headers = { User-Agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" }
+[llm_clients.thaillm-typhoon]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+api_key_env = "LOCALCLAW_THAILLM_API_KEY"
+extra_headers = { User-Agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" }
+[llm_clients.thaillm-thalle]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+api_key_env = "LOCALCLAW_THAILLM_API_KEY"
+extra_headers = { User-Agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" }
+[llm_clients.thaillm-qwen3_5-9b]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+api_key_env = "LOCALCLAW_THAILLM_API_KEY"
+extra_headers = { User-Agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" }
+[llm_clients.thaillm-qwen3_6-35b-a3b]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+api_key_env = "LOCALCLAW_THAILLM_API_KEY"
+extra_headers = { User-Agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" }
+
+[targets.thaillm-openthaigpt]
+id = "openthaigpt-thaillm-8b-instruct-v7.2"
+llm_client = "thaillm-openthaigpt"
+
+[targets.thaillm-typhoon]
+id = "typhoon-s-thaillm-8b-instruct"
+llm_client = "thaillm-typhoon"
+
+[targets.thaillm-thalle]
+id = "thalle-0.2-thaillm-8b-fa"
+llm_client = "thaillm-thalle"
+
+[targets.thaillm-qwen3_5-9b]
+id = "qwen3.5-9b"
+llm_client = "thaillm-qwen3_5-9b"
+
+[targets.thaillm-qwen3_6-35b-a3b]
+id = "qwen3.6-35b-a3b"
+llm_client = "thaillm-qwen3_6-35b-a3b"
+
+# (target `sy-gw-gpt-5-4-mini` REMOVED 2026-09-11 — model retired, see below.)
+
+[targets.openai-gpt-6-luna]
+id = "gpt-6-luna"
+llm_client = "openai-gpt-6-luna"
+# strict Codex backend: fill store=false on passthrough bodies lacking it
+extra_body = { store = false, stream = true }
+
+[targets.openai-gpt-6-sol]
+id = "gpt-6-sol"
+llm_client = "openai-gpt-6-sol"
+# strict Codex backend: fill store=false on passthrough bodies lacking it
+extra_body = { store = false, stream = true }
+[llm_clients.openai-gpt-6-luna]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+reasoning_dialect = "openai_effort"
+reasoning_efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+[llm_clients.openai-gpt-6-sol]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+reasoning_dialect = "openai_effort"
+reasoning_efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+[routes.sw-deepseek-deepseek-flash]
+id = "sw-deepseek-deepseek-flash"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+# RETIRED 2026-09-12 (operator GO): `switchyard/deepseek/deepseek-flash-thinking` - *-thinking class retired.
+#  Recover from routes.toml.bak-20260912-pre-unify-thinking-retire  [was routes.sw-ds-flash-v41-think]
+
+[routes.switchyard-jev-router-shadow-turnstone]
+id = "switchyard-jev-router-shadow-turnstone"
+type = "passthrough"
+target = "openrouter-typesafe-jev-router"
+context_window = 1000000
+tool_calling = true
+reasoning = true
+supports_vision = true
+shadow_only = true
+not_in_fallback_chain = true
+
+[routes.sw-openrouter-glm-5_3-flash]
+id = "sw-openrouter-glm-5_3-flash"
+type = "passthrough"
+target = "openrouter-glm-5_3-flash"
+context_window = 1310720
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+# RETIRED 2026-09-12 (operator GO): `switchyard/openrouter/glm-5.3-flash-thinking` - *-thinking class retired.
+#  Recover from routes.toml.bak-20260912-pre-unify-thinking-retire  [was routes.sw-or-glm-think]
+[routes.sw-openrouter-qwen3_8-flash]
+id = "sw-openrouter-qwen3_8-flash"
+type = "passthrough"
+target = "openrouter-qwen3_8-flash"
+context_window = 1000000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[llm_clients.openrouter-glm-5_3-flash]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[targets.openrouter-glm-5_3-flash]
+# 2026-09-12: OpenRouter-hosted reasoning models tolerate but do not
+# require replayed chain-of-thought, and bill for it every turn. Strip it
+# here so one caller-side replay flag cannot leak cost onto paid lanes.
+strip_reasoning_content = true
+id = "z-ai/glm-5.3-flash"
+llm_client = "openrouter-glm-5_3-flash"
+
+# ─── OPENROUTER BLOCK A (2026-08-27, operator GO) ──────────────────────
+# qwen/qwen3.8-flash added + thinking/NT qualification of both flash models:
+#  - GLM-5.3-flash: reasoning MANDATORY upstream (NT attempt -> 400 "Reasoning is
+#    mandatory"). effort modulates reasoning tokens. => thinking lane only;
+#    deliberately NO -non-thinking route (dead config that would 400).
+#  - Qwen3.8-flash: default (no reasoning object) = thinking-ON with runaway burn
+#    (700-900 r_tokens, finish=length, EMPTY content). NT toggle proven (0.6s,
+#    finish=stop). Thinking effort=low proven. => BOTH lanes; each target PINS its
+#    reasoning body — never rely on caller defaults.
+# Economics (OpenRouter live 2026-08-27, re-verified 2026-08-28): GLM $0.075/$0.25 per M (50% ZAI promo
+# expires 2026-09-09 -> $0.15/$0.50), cache read $0.015, ctx 1310720.
+# Qwen-flash $0.15/$0.47 per M, cache read $0.016 / write $0.20, ctx 1000000.
+# Soft-privacy posture (see header above) applies to the qwen lanes equally.
+# 2026-09-15 STAGE-2 RESPONSES CUTOVER (operator GO): OpenRouter client moved
+# openai_chat -> openai_responses. Parity live-probed 2026-09-15: tools + tool loop,
+# temperature, max_output_tokens, streaming (data-only SSE frames, JSON `type`
+# dispatch), and the `reasoning = { enabled = false }` NT pin (rt=0). GLM keeps NO
+# NT pin: OpenRouter answers 400 "Reasoning is mandatory for this endpoint" when
+# reasoning is disabled for z-ai/glm-5.3-flash. `strip_reasoning_content` is
+# re-armed on this wire by strip_input_reasoning_items (binary 5890c7b7…, commit
+# b10e1750): replayed CoT travels as input[] `reasoning` items and is now removed
+# there too. Rollback: routes.toml.bak-20260915-pre-openrouter-responses-apply.
+[llm_clients.openrouter-qwen3_8-flash]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+# Lane targets carry per-lane reasoning pins via extra_body. Targets sharing an
+# upstream model id MUST live on separate llm_clients (targets key by client+id;
+# same-id targets on one client collapse and drop their extra_body).
+# 2026-09-15 STAGE-2 RESPONSES CUTOVER (operator GO): OpenRouter client moved
+# openai_chat -> openai_responses. Parity live-probed 2026-09-15: tools + tool loop,
+# temperature, max_output_tokens, streaming (data-only SSE frames, JSON `type`
+# dispatch), and the `reasoning = { enabled = false }` NT pin (rt=0). GLM keeps NO
+# NT pin: OpenRouter answers 400 "Reasoning is mandatory for this endpoint" when
+# reasoning is disabled for z-ai/glm-5.3-flash. `strip_reasoning_content` is
+# re-armed on this wire by strip_input_reasoning_items (binary 5890c7b7…, commit
+# b10e1750): replayed CoT travels as input[] `reasoning` items and is now removed
+# there too. Rollback: routes.toml.bak-20260915-pre-openrouter-responses-apply.
+reasoning_dialect = "openrouter_enabled"
+[targets.openrouter-qwen3_8-flash]
+# 2026-09-12: OpenRouter-hosted reasoning models tolerate but do not
+# require replayed chain-of-thought, and bill for it every turn. Strip it
+# here so one caller-side replay flag cannot leak cost onto paid lanes.
+strip_reasoning_content = true
+id = "qwen/qwen3.8-flash"
+llm_client = "openrouter-qwen3_8-flash"
+
+# ─── OpenRouter Qwen3.7-Flash (2026-09-12, operator-directed) ──────────────
+# Upstream `qwen/qwen3.7-flash` verified live from the provider catalog 2026-09-12:
+#   context_length 1,000,000 · input modalities text + image + VIDEO (native
+#   multimodal) · max_completion 65,536 · $0.03/M in, $0.13/M out, $0.006/M
+#   cache-read - i.e. CHEAPER than qwen3.8-flash ($0.15/$0.47) and GLM-5.3-flash.
+# Two lanes only, matching the operator convention: NEUTRAL (unpinned, caller
+# overrides) and -nt (reasoning explicitly disabled). Each lane needs its OWN
+# llm_client because targets key by (client, model id) - same-id targets on one
+# client collapse and drop their extra_body (see the qwen3.8 block above).
+# Soft-privacy posture applies to these lanes equally.
+# 2026-09-15 STAGE-2 RESPONSES CUTOVER (operator GO): OpenRouter client moved
+# openai_chat -> openai_responses. Parity live-probed 2026-09-15: tools + tool loop,
+# temperature, max_output_tokens, streaming (data-only SSE frames, JSON `type`
+# dispatch), and the `reasoning = { enabled = false }` NT pin (rt=0). GLM keeps NO
+# NT pin: OpenRouter answers 400 "Reasoning is mandatory for this endpoint" when
+# reasoning is disabled for z-ai/glm-5.3-flash. `strip_reasoning_content` is
+# re-armed on this wire by strip_input_reasoning_items (binary 5890c7b7…, commit
+# b10e1750): replayed CoT travels as input[] `reasoning` items and is now removed
+# there too. Rollback: routes.toml.bak-20260915-pre-openrouter-responses-apply.
+[llm_clients.openrouter-qwen3_7-flash]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+# 2026-09-17 OPENROUTER QWEN 3.7 GATE 3 (operator GO): route-authoritative
+# reasoning declarations. Boolean dialect: honors exactly none/enabled and
+# rejects every exact effort. Declaring no reasoning_efforts is deliberate -
+# this backend cannot express effort gradation. Inert unless a route declares
+# a reasoning_policy.
+reasoning_dialect = "openrouter_enabled"
+
+# 2026-09-15 STAGE-2 RESPONSES CUTOVER (operator GO): OpenRouter client moved
+# openai_chat -> openai_responses. Parity live-probed 2026-09-15: tools + tool loop,
+# temperature, max_output_tokens, streaming (data-only SSE frames, JSON `type`
+# dispatch), and the `reasoning = { enabled = false }` NT pin (rt=0). GLM keeps NO
+# NT pin: OpenRouter answers 400 "Reasoning is mandatory for this endpoint" when
+# reasoning is disabled for z-ai/glm-5.3-flash. `strip_reasoning_content` is
+# re-armed on this wire by strip_input_reasoning_items (binary 5890c7b7…, commit
+# b10e1750): replayed CoT travels as input[] `reasoning` items and is now removed
+# there too. Rollback: routes.toml.bak-20260915-pre-openrouter-responses-apply.
+[targets.openrouter-qwen3_7-flash]
+# 2026-09-12: OpenRouter-hosted reasoning models tolerate but do not
+# require replayed chain-of-thought, and bill for it every turn. Strip it
+# here so one caller-side replay flag cannot leak cost onto paid lanes.
+strip_reasoning_content = true
+id = "qwen/qwen3.7-flash"
+llm_client = "openrouter-qwen3_7-flash"
+
+[routes.sw-openrouter-qwen3_7-flash]
+id = "sw-openrouter-qwen3_7-flash"
+type = "passthrough"
+target = "openrouter-qwen3_7-flash"
+context_window = 1000000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[routes.switchyard-smart-bounded-turnstone]
+id = "switchyard-smart-bounded-turnstone"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+
+# 2026-09-18 OPERATOR RULING — candidate order is an OPERATIONAL POSTURE, not a
+# reaction to current headroom. Luna is rank 1; OpenRouter Qwen 3.7 is rank 2;
+# DeepSeek Flash is rank 3.
+# Temporary OpenAI weekly-allowance exhaustion is handled by READINESS, which is what
+# the readiness plane is FOR: while the allowance gate says Luna cannot serve,
+# FleetRouter selects rank 2; when the allowance returns, Luna resumes rank 1 with NO
+# config edit. Encoding temporary exhaustion into long-term preference order would be
+# wrong, and rank 3 is not a preference change either.
+# RANK 3 IS AN INDEPENDENT-PROVIDER ESCAPE HATCH (added 2026-09-18 after the bounded
+# fleet was observed to collapse onto rank 2 alone and rate-limit: six clustered 429s
+# in one minute). Its purpose is provider/rate-limit DIVERSITY, which is why it is
+# DeepSeek and not another OpenRouter model, and it serves ONLY when BOTH higher-ranked
+# candidates are ineligible — it does not make DeepSeek a preferred bounded model.
+[[routes.switchyard-smart-bounded-turnstone.candidates]]
+target = "openai-gpt-6-luna"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 266000
+
+[[routes.switchyard-smart-bounded-turnstone.candidates]]
+target = "openrouter-qwen3_7-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1000000
+
+[routes.sw-htpc-qwen3_5-9b-mtp]
+id = "sw-htpc-qwen3_5-9b-mtp"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+context_window = 81920
+tool_calling = true
+reasoning = true
+supports_vision = false
+
+reasoning_policy = "enabled"
+[routes.sw-htpc-qwen3_5-9b]
+id = "sw-htpc-qwen3_5-9b"
+type = "passthrough"
+target = "htpc-qwen3_5-9b"
+context_window = 81920
+tool_calling = true
+reasoning = true
+supports_vision = false
+
+# ORNITH PASSTHROUGH 2026-09-19 (operator GO): plain passthrough, no reasoning_policy
+# (routes authoritative in reasoning, targets neutral — operator ruling 2026-09-19).
+# ctx = calibrated maxima @95% VRAM budget, GPU-only (--gpu-layers 99 --fit off),
+# measured 2026-09-19. Non-VL: enable_thinking pinned false by the front profile.
+[routes.sw-htpc-ornith-1_5-9b-mtp]
+id = "sw-htpc-ornith-1_5-9b-mtp"
+type = "passthrough"
+target = "htpc-ornith-1_5-9b-mtp"
+context_window = 98304
+tool_calling = true
+reasoning = false
+supports_vision = false
+
+[routes.sw-htpc-ornith-1_5-9b-mtp-vl]
+id = "sw-htpc-ornith-1_5-9b-mtp-vl"
+type = "passthrough"
+target = "htpc-ornith-1_5-9b-mtp-vl"
+context_window = 53248
+tool_calling = true
+reasoning = false
+supports_vision = true
+
+# RETIRED 2026-09-12 (operator GO): `switchyard/htpc/qwen3.5-9b-mtp-thinking` - *-thinking class retired.
+#  Recover from routes.toml.bak-20260912-pre-unify-thinking-retire  [was routes.canonical-htpc-thinking]
+[routes.sw-thaillm-openthaigpt]
+id = "sw-thaillm-openthaigpt"
+type = "passthrough"
+target = "thaillm-openthaigpt"
+context_window = 16384
+tool_calling = false
+reasoning = true
+
+[routes.sw-thaillm-typhoon]
+id = "sw-thaillm-typhoon"
+type = "passthrough"
+target = "thaillm-typhoon"
+context_window = 16384
+tool_calling = false
+reasoning = false
+
+[routes.sw-thaillm-thalle]
+id = "sw-thaillm-thalle"
+type = "passthrough"
+target = "thaillm-thalle"
+context_window = 16384
+tool_calling = false
+reasoning = true
+
+# localclaw/thai-translate -> T1 semantic translation alias (Typhoon primary).
+# Translation behavioral contract lives in the calling procedure; NOT wired to
+# the Schedule-7 Thai ANALYSIS stage (semantically incompatible — analysis, not
+# translation).
+[routes.sw-thaillm-qwen3_5-9b]
+id = "sw-thaillm-qwen3_5-9b"
+type = "passthrough"
+target = "thaillm-qwen3_5-9b"
+context_window = 32768
+tool_calling = false
+reasoning = true
+
+[routes.sw-thaillm-qwen3_6-35b-a3b]
+id = "sw-thaillm-qwen3_6-35b-a3b"
+type = "passthrough"
+target = "thaillm-qwen3_6-35b-a3b"
+context_window = 32768
+tool_calling = false
+reasoning = true
+
+# switchyard-smart-turnstone: universal, DeepSeek flash THINKING rank 1 (2026-09-09:
+# OpenRouter GLM/Qwen candidates removed - OR credits drained; refill = re-add + readiness)
+[routes.switchyard-smart-turnstone]
+id = "switchyard-smart-turnstone"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[[routes.switchyard-smart-turnstone.candidates]]
+target = "deepseek-deepseek-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 1048576
+
+[[routes.switchyard-smart-turnstone.candidates]]
+target = "openrouter-glm-5_3-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1310720
+
+[[routes.switchyard-smart-turnstone.candidates]]
+target = "openrouter-qwen3_8-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 3
+usable_context_tokens = 1000000
+
+# 2026-09-19 OPERATOR DIRECTIVE: FREE rank-4 fallback. Rank 1 is DeepSeek, ranks 2-3
+# are PAID OpenRouter lanes; this one costs nothing, so it still serves when the
+# OpenRouter balance is drained. That is only true because the paired code change scopes
+# a 402 to BILLING-unavailable candidates (models that charge), not the whole provider.
+[routes.switchyard-smart-hermes]
+id = "switchyard-smart-hermes"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = true
+supports_vision = true
+# 2026-09-18 ROUTE-AUTHORITY CONVERGENCE (operator GO, supersedes the 2026-09-14 note
+# that used to sit here). The first candidate is the NEUTRAL `deepseek-deepseek-flash`
+# target again, so this route is now structurally identical to `switchyard-smart-turnstone`
+# (operator directive: "switchyard-smart-hermes mirrors switchyard-smart-turnstone").
+#
+# WHY THE `-nt` TARGET IS GONE: target identity must not decide thinking vs non-thinking.
+# The dedicated `deepseek-deepseek-flash-nt` target and its client were deleted outright,
+# together with every other `-nt` route/target/client in this config. Non-thinking
+# execution mode is now owned by a route-level `reasoning_policy`, never by a model twin.
+# This route deliberately carries NO `reasoning_policy`: it is a caller-governed
+# reasoning lane (see `switchyard-smart-turnstone`, its mirror, which has served
+# thousands of substantial reasoning calls this way), and its two candidates speak
+# different reasoning dialects (openai_effort on DeepSeek, openrouter_enabled on
+# OpenRouter) so no single forced policy could be honoured by both.
+#
+# WHAT REPLACED THE 2026-09-14 FIX: that note retargeted candidate[0] to the `-nt` variant
+# because DeepSeek thinking rejects a trailing `assistant tool-call + tool-result`
+# continuation with HTTP 400 "The `reasoning_content` in the thinking mode must be passed
+# back to the API". That rejection is a REASONING-REPLAY contract problem, not a reason to
+# pin a model identity non-thinking, and it is handled on that seam instead
+# (`supports_reasoning_replay` / `replay_reasoning_to_model`). The trailing-tool-call
+# continuation shape is re-proven against this route on a spare port before activation.
+#
+# ROLLBACK: routes.toml.bak-20260918-pre-route-authority-convergence (sha 7c356033…),
+# restore + sanctioned restart. The `-nt` objects return with it.
+
+[[routes.switchyard-smart-hermes.candidates]]
+target = "deepseek-deepseek-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 1048576
+
+[[routes.switchyard-smart-hermes.candidates]]
+target = "openrouter-glm-5_3-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1310720
+
+[[routes.switchyard-smart-hermes.candidates]]
+target = "openrouter-qwen3_8-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 3
+usable_context_tokens = 1000000
+
+# 2026-09-19 OPERATOR DIRECTIVE: FREE rank-4 fallback. Rank 1 is DeepSeek, ranks 2-3
+# are PAID OpenRouter lanes; this one costs nothing, so it still serves when the
+# OpenRouter balance is drained. That is only true because the paired code change scopes
+# a 402 to BILLING-unavailable candidates (models that charge), not the whole provider.
+[routes.switchyard-smart-bounded-hermes]
+id = "switchyard-smart-bounded-hermes"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+
+# 2026-09-18 OPERATOR RULING — candidate order is an OPERATIONAL POSTURE, not a
+# reaction to current headroom. Luna is rank 1; OpenRouter Qwen 3.7 is rank 2;
+# DeepSeek Flash is rank 3.
+# Temporary OpenAI weekly-allowance exhaustion is handled by READINESS, which is what
+# the readiness plane is FOR: while the allowance gate says Luna cannot serve,
+# FleetRouter selects rank 2; when the allowance returns, Luna resumes rank 1 with NO
+# config edit. Encoding temporary exhaustion into long-term preference order would be
+# wrong, and rank 3 is not a preference change either.
+# RANK 3 IS AN INDEPENDENT-PROVIDER ESCAPE HATCH (added 2026-09-18 after the bounded
+# fleet was observed to collapse onto rank 2 alone and rate-limit: six clustered 429s
+# in one minute). Its purpose is provider/rate-limit DIVERSITY, which is why it is
+# DeepSeek and not another OpenRouter model, and it serves ONLY when BOTH higher-ranked
+# candidates are ineligible — it does not make DeepSeek a preferred bounded model.
+[[routes.switchyard-smart-bounded-hermes.candidates]]
+target = "openai-gpt-6-luna"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 266000
+
+[[routes.switchyard-smart-bounded-hermes.candidates]]
+target = "openrouter-qwen3_7-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1000000
+
+
+[fleet_readiness]
+observe_interval_seconds = 5
+# Static cloud-base readiness (Block A 2026-08-27): OpenRouter-hosted targets have
+# no local health fact to probe; they are immediately attemptable and upstream
+# failures surface as request errors, not readiness state. Fail-closed snapshot
+# semantics require an explicit entry or the candidate is never eligible.
+# NOTE: entries are keyed by UPSTREAM model id (resolve_target_model_id maps the
+# candidate's target name to the target's id, and state_for looks THAT up) —
+# same convention as comfy.model/htpc.model/openai_gated (upstream ids, e.g.
+# "unsloth/Qwen3.8-27B-GGUF", "gpt-5.6-luna"), NOT switchyard target names.
+ready = [ "qwen/qwen3.7-flash", "stealth/space-bunny-alpha", "inclusionai/ling-3.0-flash-fin:free", "z-ai/glm-5.3-flash", "qwen/qwen3.8-flash", "openthaigpt-thaillm-8b-instruct-v7.2", "qwen3.5-9b", "qwen3.6-35b-a3b", "thalle-0.2-thaillm-8b-fa", "typhoon-s-thaillm-8b-instruct", "qwen/qwen3.8-27b:free" ]   # 2026-09-12: qwen3.7-flash re-opened. 2026-09-18 F1: +3 zero-price fleet-free candidates. 2026-09-18 C1: +2 paid OpenRouter fleet-cloud candidates (no live probe exists for OpenRouter-hosted models). 2026-09-18 F2: +5 free ThaiLLM models (remote provider, no local probe).
+# NOTE: removed 2026-09-09 when OR credits drained; re-verified funded 2026-09-12 (live probe OK).
+# Keyed by UPSTREAM model id, not switchyard target name (see note above).
+
+# ComfyNinja GPU/resource fact (fail-closed unless a known serving signature).
+[fleet_readiness.comfy]
+url = "https://reninja.tailc8ef7b.ts.net:8447/v1/resource"
+auth_token_env = "COMFYNINJA_READ_TOKEN"
+model = "comfyninja/qwen3.8-27b-q3-mtp-vl"
+# 2026-09-18 L1 (operator GO): the previous gate key matched NO target in this
+# config, so the ComfyNinja fact gated nothing. It now gates the canonical local
+# escalation target, and `expected_resident` makes it mean "is the EXACT backing
+# this candidate requires resident right now?" - the classifier accepts only an
+# exact match (no wildcard, no substring, no q3/q4 equivalence), so the gate cannot
+# report `ready` while a different quantization is the resident.
+expected_resident = "qwen3.8-27b-q3-mtp-vl"
+
+[[fleet_readiness.comfy.governed]]
+model = "comfyninja/qwen3.8-27b-q3"
+expected_resident = "qwen3.8-27b-q3"
+
+[[fleet_readiness.comfy.governed]]
+model = "comfyninja/qwen3.8-27b-q3-mtp"
+expected_resident = "qwen3.8-27b-q3-mtp"
+
+[[fleet_readiness.comfy.governed]]
+model = "comfyninja/qwen3.8-27b-q4"
+expected_resident = "qwen3.8-27b-q4"
+
+[[fleet_readiness.comfy.governed]]
+model = "comfyninja/qwen3.8-27b-q4-mtp-vl"
+expected_resident = "qwen3.8-27b-q4-mtp-vl"
+
+[[fleet_readiness.comfy.governed]]
+model = "comfyninja/qwen3.8-27b-q4-mtp"
+expected_resident = "qwen3.8-27b-q4-mtp"
+
+# HTPC readiness fact (exact health + model identity).
+[fleet_readiness.htpc]
+base_url = "http://htpc-wsl.tailc8ef7b.ts.net:8081"
+# 2026-09-06 studio migration: probe hits llama-style readiness shim (:8081, tailnet)
+# which live-proxies studio /v1/models with the key; inference clients use :8888/v1 + bearer.
+# identity matches the Unsloth Studio /v1/models id (basename sans .gguf).
+expected_model = "Qwen3.5-9B-Q4_0"
+model = "Qwen3.5-9B-MTP"
+
+# Live resource facts gating the smart-route cloud candidates. OpenAI gate uses
+# the DEPLOYED confirmed-exhaustion-only policy: a candidate is eligible (Luna
+# stays) unless `limit_reached==true OR weekly used%>=100`; spend-control,
+# unavailable, fetch-failure, unknown telemetry all FAIL TOWARD LUNA (no spill).
+[fleet_readiness.resource]
+openai_url = "http://127.0.0.1:8645/resource/openai-codex"
+openai_auth_token_env = "OPENAI_CATALOG_TOKEN"
+# 2026-08-28: openclaw_openai_* + openclaw_openai_gated REMOVED (8647 retirement, Vincent GO).
+deepseek_url = "https://api.deepseek.com/user/balance"
+deepseek_api_key_env = "LOCALCLAW_DEEPSEEK_API_KEY"
+deepseek_currency = "CNY"
+# Rev-3 (Option B): all OpenAI family members observed under the single
+# OpenAI weekly-allowance fact (family-level observation; one fetch per cycle).
+openai_gated = ["gpt-6-luna", "gpt-6-sol"]  # 2026-09-11: gpt-5.4-mini retired (unsupported on this ChatGPT/Codex account)
+# Rev-3 (Option B): DeepSeek family members observed under the single
+# DeepSeek balance fact (family-level observation; one fetch per cycle).
+deepseek_gated = ["deepseek-flash"]  # 2026-09-11: pro removed from the family (upstream retirement + no consumer); vision now rides flash itself
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FLEET LANE COMPLETION - STAGED CANDIDATE (2026-08-23, operator GO: stage only)
+# ═══════════════════════════════════════════════════════════════════════════
+# ADDITIVE ONLY. Everything above (SHA d7a4ff8e) is the closed FLEET IDENTITY
+# baseline and is UNCHANGED. This section layers explicit canonical
+# thinking/non-thinking lanes for every cloud model and both local Qwen models.
+#
+# Canonical public IDs follow the operator-approved deterministic matrix:
+#   sw-deepseek-deepseek-flash[-nt]
+#   sw-openai-gpt-5_6-{luna,sol,terra}[-nt]
+#   (pre-V4.1 DeepSeek lanes retired 2026-09-11; see the DEEPSEEK FAMILY note above)
+#   (gpt-5.4-mini lanes retired 2026-09-11: the model returns
+#    "not supported when using Codex with a ChatGPT account" — dead on this
+#    account for text AND vision, so the whole family was removed.)
+#   qwen3.8-27b-{thinking,non-thinking}
+#   qwen3.5-9b-{thinking,non-thinking}
+#
+# Design rules:
+#  * Every new route is fleet_router with ONE candidate (the FLEET IDENTITY
+#    pattern) so existing readiness/gating semantics attach unchanged.
+#  * Thinking lanes reuse the proven thinking targets (deepseek-deepseek-flash,
+#    sy-gw-*-thinking via :8645) and add explicit enable_thinking
+#    targets for local Qwen (native mechanism, no prompt simulation).
+#  * Non-thinking lanes reuse existing NT targets where present
+#    (deepseek-deepseek-flash-nt, sy-gw-gpt-5_6-luna-nt) and add NT targets
+#    for the missing GPT/DeepSeek-pro/Qwen cases (extra_body effort=none or
+#    enable_thinking=false).
+#  * No provider precedence, routing policy, fallback, or residency behavior
+#    is altered. No existing route ID is modified or removed.
+#  * GPT family lanes use the 266K operator-declared envelope (mini keeps its
+#    provider-verified 200K passthrough envelope).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── NEW TARGETS (non-thinking for lanes that lacked one) ────────────────
+
+# (target `deepseek-pro-nothink` REMOVED 2026-09-11 with its route.)
+
+# GPT-5.6 Sol non-thinking (mirror sy-gw-luna-bounded-nothink pattern)
+[capability_clients.comfyninja-qwen3-embedding-0_6b]
+format = "openai_embeddings"
+base_url = "https://reninja.tailc8ef7b.ts.net:8448"
+model = "Qwen3-Embedding-0.6B"
+
+[capability_clients.comfyninja-qwen3-reranker-0_6b]
+format = "cohere_jina_rerank"
+base_url = "https://reninja.tailc8ef7b.ts.net:8449"
+model = "qwen3-reranker-0.6b-q8_0"
+# 2026-09-12 (operator GO): 60s, was the 30s default. The CPU-only reranker is
+# sequential per document (~0.4-1.5 s/doc) so a full 32-document batch sits at the
+# edge of 30s; Turnstone's own cap is also 30s, so both ceilings now sit at 60 and
+# a slow batch is no longer counted as a breaker failure. Raise further only with
+# measurement — every extra second here is a second added to a user turn.
+timeout_seconds = 120
+
+# ─── OpenAI gpt-5.4-mini family RETIRED (2026-09-11, operator-directed) ──────
+# The three `switchyard/openai/gpt-5.4-mini*` routes lived here. Removed after a
+# live probe showed the model is not served on this ChatGPT/Codex account at all:
+#   HTTP 400 "The 'gpt-5.4-mini' model is not supported when using Codex with a
+#   ChatGPT account."
+# Text turns 400 identically, so this was a dead route family, not a vision-only
+# problem. Both targets (`sy-gw-gpt-5-4-mini`, `sy-gw-mini-bounded-nothink`) also
+# removed, and gpt-5.4-mini dropped from `openai_gated`. No smart-route candidate
+# ever referenced the mini targets (verified 2026-09-11).
+# Rollback: the three blocks were:
+#   [routes.sw-oai-mini]       -> target sy-gw-gpt-5-4-mini
+#   [routes.sw-oai-mini-think] -> target sy-gw-gpt-5-4-mini
+#   [routes.sw-oai-mini-nt]    -> target sy-gw-mini-bounded-nothink
+# (restoring requires the two targets above as well — see
+#  routes.toml.bak-20260911-pre-htpc-passthrough-ds-cleanup for the last full copy).
+
+# ─── OpenAI Codex family — supports_vision DECLARED (2026-09-11) ───────
+# The nine gpt-5.6-{luna,sol,terra}{,-thinking,-nt} routes now declare
+# supports_vision = true. This became true only AFTER the Responses-codec fix
+# deployed the same day (commit 0c3ec261, binary 64c2d602…): previously every
+# image-bearing request to these target died with
+#   "Invalid type for 'input[0].content[1].image_url': expected an image URL,
+#    but got an object instead."
+# — the codec was passing the IR object where a URL string is required.
+# Post-fix validation: all 9 lanes answered a live image probe with "Red"
+# (16x16 PNG, detail=low). The declaration is therefore evidence-backed; before
+# the fix it would have routed vision into a 100%-failing path.
+[routes.sw-openai-gpt-6-luna]
+id = "sw-openai-gpt-6-luna"
+target = "openai-gpt-6-luna"
+type = "passthrough"
+context_window = 1050000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[routes.sw-openai-gpt-6-sol]
+id = "sw-openai-gpt-6-sol"
+target = "openai-gpt-6-sol"
+type = "passthrough"
+context_window = 1050000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+# RETIRED 2026-09-12 (operator GO): `switchyard/openai/gpt-5.6-sol-thinking` - *-thinking class retired.
+#  Recover from routes.toml.bak-20260912-pre-unify-thinking-retire  [was routes.sw-oai-sol-think]
+[routes.sw-comfyninja-qwen3_8-27b-q3]
+id = "sw-comfyninja-qwen3_8-27b-q3"
+type = "fleet_router"
+context_window = 262144
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+# 2026-09-23 READ-ONLY READINESS GATE (operator GO): converted from `passthrough` to a
+# one-candidate FleetRouter so the ComfyNinja readiness fact is CONSULTED before selection.
+# A passthrough route has no candidate list, so FleetRouter eligibility never ran and the fact
+# was never asked - the route kept advertising this target while the GPU was owned by DIFFUSION.
+# EXACTLY ONE candidate and NO fallback: when the backing is not proven resident this route
+# refuses honestly instead of routing onward to collect a residency 503 from the front.
+# The candidate mirrors the route's truthful envelope (config.rs validate_fleet_capabilities);
+# a defaulted-false supports_vision would make it ineligible for every image-bearing request.
+# The neutral reasoning declaration above is deliberately preserved (no reasoning_policy).
+[[routes.sw-comfyninja-qwen3_8-27b-q3.candidates]]
+target = "comfyninja-qwen3_8-27b-q3"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+
+# NEUTRAL BACKING ROUTE (2026-09-19 operator directive): this route declares NO reasoning
+# policy. `switchyard/vendor/model` is the neutral spelling — callers pin what they want
+# (`-thinking` / `-nt` variants pin it for them). The callers that reach this lane do so through
+# `escalation_reasoning_policy`, and direct callers that want thinking send it themselves
+# (Turnstone's `switchyard-comfyninja-*` rows already carry `reasoning_effort = "medium"`).
+[routes.sw-comfyninja-qwen3_8-27b-q3-mtp-vl]
+id = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+# 2026-09-23 READ-ONLY READINESS GATE (operator GO): converted from `passthrough` to a
+# one-candidate FleetRouter so the ComfyNinja readiness fact is CONSULTED before selection.
+# A passthrough route has no candidate list, so FleetRouter eligibility never ran and the fact
+# was never asked - the route kept advertising this target while the GPU was owned by DIFFUSION.
+# EXACTLY ONE candidate and NO fallback: when the backing is not proven resident this route
+# refuses honestly instead of routing onward to collect a residency 503 from the front.
+# The candidate mirrors the route's truthful envelope (config.rs validate_fleet_capabilities);
+# a defaulted-false supports_vision would make it ineligible for every image-bearing request.
+# The neutral reasoning declaration above is deliberately preserved (no reasoning_policy).
+[[routes.sw-comfyninja-qwen3_8-27b-q3-mtp-vl.candidates]]
+target = "comfyninja-qwen3_8-27b-q3-mtp-vl"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+
+# 2026-09-19 VL/non-VL split: NO-VISION twin of `sw-comfyninja-qwen3_8-27b-q3-mtp-vl`.
+# Same UD-Q3_K_XL + MTP backing loaded with Studio's `disable_vision=true`, so the ~885 MiB vision
+# projector is not resident and the GPU-only context maximum rises from the VL twin's 225280 to a
+# MEASURED 249856 (23715 MiB = 96.50% of 24576 MiB; load log: offloaded 66/66 layers to GPU, KV and
+# compute buffers on CUDA0 only, no `--mmproj` in the argv).
+# For MANUAL, deliberate selection on non-vision work. NOT an escalation destination: the
+# smartlocal overflow destinations stay on the `-vl` route, which is what keeps image routing
+# working. An image request here fails closed with "Image provided but current GGUF model does not
+# support vision." (proven live through this front).
+# Declares NO reasoning policy (`switchyard/vendor/model` is the neutral spelling): callers pin
+# their own, and the escalating routes pin theirs via `escalation_reasoning_policy`.
+[routes.sw-comfyninja-qwen3_8-27b-q3-mtp]
+id = "sw-comfyninja-qwen3_8-27b-q3-mtp"
+type = "fleet_router"
+context_window = 249856
+tool_calling = true
+reasoning = true
+supports_vision = false
+
+# 2026-09-23 READ-ONLY READINESS GATE (operator GO): converted from `passthrough` to a
+# one-candidate FleetRouter so the ComfyNinja readiness fact is CONSULTED before selection.
+# A passthrough route has no candidate list, so FleetRouter eligibility never ran and the fact
+# was never asked - the route kept advertising this target while the GPU was owned by DIFFUSION.
+# EXACTLY ONE candidate and NO fallback: when the backing is not proven resident this route
+# refuses honestly instead of routing onward to collect a residency 503 from the front.
+# The candidate mirrors the route's truthful envelope (config.rs validate_fleet_capabilities);
+# a defaulted-false supports_vision would make it ineligible for every image-bearing request.
+# The neutral reasoning declaration above is deliberately preserved (no reasoning_policy).
+[[routes.sw-comfyninja-qwen3_8-27b-q3-mtp.candidates]]
+target = "comfyninja-qwen3_8-27b-q3-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+
+# RETIRED 2026-09-12 (operator GO): `switchyard/comfyninja/qwen3.8-27b-q3-mtp-thinking` - *-thinking class retired.
+#  Recover from routes.toml.bak-20260912-pre-unify-thinking-retire  [was routes.sw-comfy-q3-mtp-think]
+# NEUTRAL BACKING ROUTE (2026-09-19 operator directive): this route declares NO reasoning
+# policy. `switchyard/vendor/model` is the neutral spelling — callers pin what they want
+# (`-thinking` / `-nt` variants pin it for them). The callers that reach this lane do so through
+# `escalation_reasoning_policy`, and direct callers that want thinking send it themselves
+# (Turnstone's `switchyard-comfyninja-*` rows already carry `reasoning_effort = "medium"`).
+[routes.sw-comfyninja-qwen3_8-27b-q4]
+id = "sw-comfyninja-qwen3_8-27b-q4"
+type = "fleet_router"
+context_window = 200704
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+# 2026-09-23 READ-ONLY READINESS GATE (operator GO): converted from `passthrough` to a
+# one-candidate FleetRouter so the ComfyNinja readiness fact is CONSULTED before selection.
+# A passthrough route has no candidate list, so FleetRouter eligibility never ran and the fact
+# was never asked - the route kept advertising this target while the GPU was owned by DIFFUSION.
+# EXACTLY ONE candidate and NO fallback: when the backing is not proven resident this route
+# refuses honestly instead of routing onward to collect a residency 503 from the front.
+# The candidate mirrors the route's truthful envelope (config.rs validate_fleet_capabilities);
+# a defaulted-false supports_vision would make it ineligible for every image-bearing request.
+# The neutral reasoning declaration above is deliberately preserved (no reasoning_policy).
+[[routes.sw-comfyninja-qwen3_8-27b-q4.candidates]]
+target = "comfyninja-qwen3_8-27b-q4"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+
+# NEUTRAL BACKING ROUTE (2026-09-19 operator directive): this route declares NO reasoning
+# policy. `switchyard/vendor/model` is the neutral spelling — callers pin what they want
+# (`-thinking` / `-nt` variants pin it for them). The callers that reach this lane do so through
+# `escalation_reasoning_policy`, and direct callers that want thinking send it themselves
+# (Turnstone's `switchyard-comfyninja-*` rows already carry `reasoning_effort = "medium"`).
+[routes.sw-comfyninja-qwen3_8-27b-q4-mtp-vl]
+id = "sw-comfyninja-qwen3_8-27b-q4-mtp-vl"
+type = "fleet_router"
+context_window = 163840
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+# 2026-09-23 READ-ONLY READINESS GATE (operator GO): converted from `passthrough` to a
+# one-candidate FleetRouter so the ComfyNinja readiness fact is CONSULTED before selection.
+# A passthrough route has no candidate list, so FleetRouter eligibility never ran and the fact
+# was never asked - the route kept advertising this target while the GPU was owned by DIFFUSION.
+# EXACTLY ONE candidate and NO fallback: when the backing is not proven resident this route
+# refuses honestly instead of routing onward to collect a residency 503 from the front.
+# The candidate mirrors the route's truthful envelope (config.rs validate_fleet_capabilities);
+# a defaulted-false supports_vision would make it ineligible for every image-bearing request.
+# The neutral reasoning declaration above is deliberately preserved (no reasoning_policy).
+[[routes.sw-comfyninja-qwen3_8-27b-q4-mtp-vl.candidates]]
+target = "comfyninja-qwen3_8-27b-q4-mtp-vl"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+
+# 2026-09-19 VL/non-VL split: NO-VISION twin of `sw-comfyninja-qwen3_8-27b-q4-mtp-vl`.
+# Same Q4_0 + MTP backing loaded with Studio's `disable_vision=true`, so the ~885 MiB vision
+# projector is not resident and the GPU-only context maximum rises from the VL twin's 163840 to a
+# MEASURED 188416 (23689 MiB = 96.39% of 24576 MiB; load log: offloaded 66/66 layers to GPU, KV and
+# compute buffers on CUDA0 only, no `--mmproj` in the argv).
+# For MANUAL, deliberate selection on non-vision work. NOT an escalation destination (see the q3
+# route above for why the `-vl` route must keep that role).
+# Declares NO reasoning policy (`switchyard/vendor/model` is the neutral spelling).
+[routes.sw-comfyninja-qwen3_8-27b-q4-mtp]
+id = "sw-comfyninja-qwen3_8-27b-q4-mtp"
+type = "fleet_router"
+context_window = 188416
+tool_calling = true
+reasoning = true
+supports_vision = false
+
+# 2026-09-23 READ-ONLY READINESS GATE (operator GO): converted from `passthrough` to a
+# one-candidate FleetRouter so the ComfyNinja readiness fact is CONSULTED before selection.
+# A passthrough route has no candidate list, so FleetRouter eligibility never ran and the fact
+# was never asked - the route kept advertising this target while the GPU was owned by DIFFUSION.
+# EXACTLY ONE candidate and NO fallback: when the backing is not proven resident this route
+# refuses honestly instead of routing onward to collect a residency 503 from the front.
+# The candidate mirrors the route's truthful envelope (config.rs validate_fleet_capabilities);
+# a defaulted-false supports_vision would make it ineligible for every image-bearing request.
+# The neutral reasoning declaration above is deliberately preserved (no reasoning_policy).
+[[routes.sw-comfyninja-qwen3_8-27b-q4-mtp.candidates]]
+target = "comfyninja-qwen3_8-27b-q4-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+
+# RETIRED 2026-09-12 (operator GO): `switchyard/comfyninja/qwen3.8-27b-q4-mtp-thinking` - *-thinking class retired.
+#  Recover from routes.toml.bak-20260912-pre-unify-thinking-retire  [was routes.sw-comfy-q4-mtp-think]
+# NEUTRAL BACKING ROUTE (2026-09-19 operator directive): this route declares NO reasoning
+# policy. `switchyard/vendor/model` is the neutral spelling — callers pin what they want
+# (`-thinking` / `-nt` variants pin it for them). The callers that reach this lane do so through
+# `escalation_reasoning_policy`, and direct callers that want thinking send it themselves
+# (Turnstone's `switchyard-comfyninja-*` rows already carry `reasoning_effort = "medium"`).
+[capabilities.switchyard-smartlocal-embedding]
+id = "switchyard-smartlocal-embedding"
+target = "comfyninja-qwen3-embedding-0_6b"
+contract = "localclaw-embedding-space:v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+[capabilities.switchyard-smartlocal-reranker]
+id = "switchyard-smartlocal-reranker"
+target = "comfyninja-qwen3-reranker-0_6b"
+# 2026-09-13 (operator GO, Decision 2): bounds ALIGNED TO THE EXECUTOR'S MEASURED LIMIT.
+# The executor is llama.cpp on CPU with a 512-token physical batch; measured acceptance was
+# 2500 chars of prose (2600 -> 502 "input (514 tokens) is too large ... current batch size:
+# 512") and 1200 chars of dense code-like text. The previous declaration (32768) accepted
+# documents the executor then rejected with an opaque 502 - the bulk of this lane's
+# executor_error count. 1024/512 is the value verified to pass for BOTH text classes AT the
+# cap, so an over-long document now fails fast here with an explicit bound instead of a 502.
+# CAPACITY follow-ups (not done here): raise the executor's physical batch size on ComfyNinja;
+# and have Turnstone truncate documents/query to these caps before sending.
+max_candidates = 64
+top_n = 5
+max_doc_chars = 1024
+max_query_chars = 512
+
+# ─── ComfyNinja q3/q4 targets (per-profile activation via comfyninja-rt seam) ───
+
+[targets.comfyninja-qwen3_8-27b-q3]
+id = "comfyninja/qwen3.8-27b-q3"
+llm_client = "comfyninja-qwen3_8-27b-q3"
+
+[targets.comfyninja-qwen3_8-27b-q3-mtp-vl]
+id = "comfyninja/qwen3.8-27b-q3-mtp-vl"
+llm_client = "comfyninja-qwen3_8-27b-q3-mtp-vl"
+
+[targets.comfyninja-qwen3_8-27b-q3-mtp]
+id = "comfyninja/qwen3.8-27b-q3-mtp"
+llm_client = "comfyninja-qwen3_8-27b-q3-mtp"
+
+# RETIRED 2026-09-12: orphaned target [was targets.comfyninja-q3-mtp-thinking]
+[targets.comfyninja-qwen3_8-27b-q4]
+id = "comfyninja/qwen3.8-27b-q4"
+llm_client = "comfyninja-qwen3_8-27b-q4"
+
+[targets.comfyninja-qwen3_8-27b-q4-mtp-vl]
+id = "comfyninja/qwen3.8-27b-q4-mtp-vl"
+llm_client = "comfyninja-qwen3_8-27b-q4-mtp-vl"
+
+[targets.comfyninja-qwen3_8-27b-q4-mtp]
+id = "comfyninja/qwen3.8-27b-q4-mtp"
+llm_client = "comfyninja-qwen3_8-27b-q4-mtp"
+
+# RETIRED 2026-09-12: orphaned target [was targets.comfyninja-q4-mtp-thinking]
+[llm_clients.comfyninja-qwen3_8-27b-q3]
+format = "openai_responses"
+base_url = "https://reninja.tailc8ef7b.ts.net:8446/v1"
+api_key_env = "LOCALCLAW_UNSLOTH_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+[llm_clients.comfyninja-qwen3_8-27b-q3-mtp-vl]
+format = "openai_responses"
+base_url = "https://reninja.tailc8ef7b.ts.net:8446/v1"
+api_key_env = "LOCALCLAW_UNSLOTH_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[llm_clients.comfyninja-qwen3_8-27b-q3-mtp]
+format = "openai_responses"
+base_url = "https://reninja.tailc8ef7b.ts.net:8446/v1"
+api_key_env = "LOCALCLAW_UNSLOTH_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+[llm_clients.comfyninja-qwen3_8-27b-q4]
+format = "openai_responses"
+base_url = "https://reninja.tailc8ef7b.ts.net:8446/v1"
+api_key_env = "LOCALCLAW_UNSLOTH_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+[llm_clients.comfyninja-qwen3_8-27b-q4-mtp-vl]
+format = "openai_responses"
+base_url = "https://reninja.tailc8ef7b.ts.net:8446/v1"
+api_key_env = "LOCALCLAW_UNSLOTH_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[llm_clients.comfyninja-qwen3_8-27b-q4-mtp]
+format = "openai_responses"
+base_url = "https://reninja.tailc8ef7b.ts.net:8446/v1"
+api_key_env = "LOCALCLAW_UNSLOTH_API_KEY"
+reasoning_dialect = "llama_cpp_enable_thinking"
+[routes.switchyard-smart-dsh]
+id = "switchyard-smart-dsh"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[[routes.switchyard-smart-dsh.candidates]]
+target = "deepseek-deepseek-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 1048576
+
+[[routes.switchyard-smart-dsh.candidates]]
+target = "openrouter-glm-5_3-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1310720
+
+[[routes.switchyard-smart-dsh.candidates]]
+target = "openrouter-qwen3_8-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 3
+usable_context_tokens = 1000000
+
+# 2026-09-19 OPERATOR DIRECTIVE: FREE rank-4 fallback. Rank 1 is DeepSeek, ranks 2-3
+# are PAID OpenRouter lanes; this one costs nothing, so it still serves when the
+# OpenRouter balance is drained. That is only true because the paired code change scopes
+# a 402 to BILLING-unavailable candidates (models that charge), not the whole provider.
+[routes.switchyard-smart-bounded-dsh]
+id = "switchyard-smart-bounded-dsh"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+
+# 2026-09-18 OPERATOR RULING — candidate order is an OPERATIONAL POSTURE, not a
+# reaction to current headroom. Luna is rank 1; OpenRouter Qwen 3.7 is rank 2;
+# DeepSeek Flash is rank 3.
+# Temporary OpenAI weekly-allowance exhaustion is handled by READINESS, which is what
+# the readiness plane is FOR: while the allowance gate says Luna cannot serve,
+# FleetRouter selects rank 2; when the allowance returns, Luna resumes rank 1 with NO
+# config edit. Encoding temporary exhaustion into long-term preference order would be
+# wrong, and rank 3 is not a preference change either.
+# RANK 3 IS AN INDEPENDENT-PROVIDER ESCAPE HATCH (added 2026-09-18 after the bounded
+# fleet was observed to collapse onto rank 2 alone and rate-limit: six clustered 429s
+# in one minute). Its purpose is provider/rate-limit DIVERSITY, which is why it is
+# DeepSeek and not another OpenRouter model, and it serves ONLY when BOTH higher-ranked
+# candidates are ineligible — it does not make DeepSeek a preferred bounded model.
+[[routes.switchyard-smart-bounded-dsh.candidates]]
+target = "openai-gpt-6-luna"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 266000
+
+[[routes.switchyard-smart-bounded-dsh.candidates]]
+target = "openrouter-qwen3_7-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1000000
+
+[routes.switchyard-smart-openclaw-local]
+id = "switchyard-smart-openclaw-local"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[[routes.switchyard-smart-openclaw-local.candidates]]
+target = "deepseek-deepseek-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 1048576
+
+[[routes.switchyard-smart-openclaw-local.candidates]]
+target = "openrouter-glm-5_3-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1310720
+
+[[routes.switchyard-smart-openclaw-local.candidates]]
+target = "openrouter-qwen3_8-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 3
+usable_context_tokens = 1000000
+
+# 2026-09-19 OPERATOR DIRECTIVE: FREE rank-4 fallback. Rank 1 is DeepSeek, ranks 2-3
+# are PAID OpenRouter lanes; this one costs nothing, so it still serves when the
+# OpenRouter balance is drained. That is only true because the paired code change scopes
+# a 402 to BILLING-unavailable candidates (models that charge), not the whole provider.
+[routes.switchyard-smart-bounded-openclaw-local]
+id = "switchyard-smart-bounded-openclaw-local"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+
+# 2026-09-18 OPERATOR RULING — candidate order is an OPERATIONAL POSTURE, not a
+# reaction to current headroom. Luna is rank 1; OpenRouter Qwen 3.7 is rank 2;
+# DeepSeek Flash is rank 3.
+# Temporary OpenAI weekly-allowance exhaustion is handled by READINESS, which is what
+# the readiness plane is FOR: while the allowance gate says Luna cannot serve,
+# FleetRouter selects rank 2; when the allowance returns, Luna resumes rank 1 with NO
+# config edit. Encoding temporary exhaustion into long-term preference order would be
+# wrong, and rank 3 is not a preference change either.
+# RANK 3 IS AN INDEPENDENT-PROVIDER ESCAPE HATCH (added 2026-09-18 after the bounded
+# fleet was observed to collapse onto rank 2 alone and rate-limit: six clustered 429s
+# in one minute). Its purpose is provider/rate-limit DIVERSITY, which is why it is
+# DeepSeek and not another OpenRouter model, and it serves ONLY when BOTH higher-ranked
+# candidates are ineligible — it does not make DeepSeek a preferred bounded model.
+[[routes.switchyard-smart-bounded-openclaw-local.candidates]]
+target = "openai-gpt-6-luna"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 266000
+
+[[routes.switchyard-smart-bounded-openclaw-local.candidates]]
+target = "openrouter-qwen3_7-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1000000
+
+[routes.switchyard-smart-openclaw-remote]
+id = "switchyard-smart-openclaw-remote"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[[routes.switchyard-smart-openclaw-remote.candidates]]
+target = "deepseek-deepseek-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 1048576
+
+[[routes.switchyard-smart-openclaw-remote.candidates]]
+target = "openrouter-glm-5_3-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1310720
+
+[[routes.switchyard-smart-openclaw-remote.candidates]]
+target = "openrouter-qwen3_8-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 3
+usable_context_tokens = 1000000
+
+# 2026-09-19 OPERATOR DIRECTIVE: FREE rank-4 fallback. Rank 1 is DeepSeek, ranks 2-3
+# are PAID OpenRouter lanes; this one costs nothing, so it still serves when the
+# OpenRouter balance is drained. That is only true because the paired code change scopes
+# a 402 to BILLING-unavailable candidates (models that charge), not the whole provider.
+[routes.switchyard-smart-bounded-openclaw-remote]
+id = "switchyard-smart-bounded-openclaw-remote"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+
+# 2026-09-18 OPERATOR RULING — candidate order is an OPERATIONAL POSTURE, not a
+# reaction to current headroom. Luna is rank 1; OpenRouter Qwen 3.7 is rank 2;
+# DeepSeek Flash is rank 3.
+# Temporary OpenAI weekly-allowance exhaustion is handled by READINESS, which is what
+# the readiness plane is FOR: while the allowance gate says Luna cannot serve,
+# FleetRouter selects rank 2; when the allowance returns, Luna resumes rank 1 with NO
+# config edit. Encoding temporary exhaustion into long-term preference order would be
+# wrong, and rank 3 is not a preference change either.
+# RANK 3 IS AN INDEPENDENT-PROVIDER ESCAPE HATCH (added 2026-09-18 after the bounded
+# fleet was observed to collapse onto rank 2 alone and rate-limit: six clustered 429s
+# in one minute). Its purpose is provider/rate-limit DIVERSITY, which is why it is
+# DeepSeek and not another OpenRouter model, and it serves ONLY when BOTH higher-ranked
+# candidates are ineligible — it does not make DeepSeek a preferred bounded model.
+[[routes.switchyard-smart-bounded-openclaw-remote.candidates]]
+target = "openai-gpt-6-luna"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 266000
+
+[[routes.switchyard-smart-bounded-openclaw-remote.candidates]]
+target = "openrouter-qwen3_7-flash"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 1000000
+
+
+[routes.switchyard-smartlocal-openclaw-remote]
+id = "switchyard-smartlocal-openclaw-remote"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = true
+supports_vision = true
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "enabled"
+
+reasoning_policy = "enabled"
+[[routes.switchyard-smartlocal-openclaw-remote.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+[routes.switchyard-smartlocal-bounded-openclaw-remote]
+id = "switchyard-smartlocal-bounded-openclaw-remote"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+# 2026-09-19 OPERATOR DIRECTIVE (item 3, superseded wording corrected 2026-09-19): the overflow
+# escalates to the REAL ComfyNinja q3-MTP lane - NOT to an invented internal stage, and NOT to an
+# `-nt` twin of it. `sw-comfyninja-qwen3_8-27b-q3-mtp-vl` is a NEUTRAL backing route (it declares no
+# reasoning policy of its own); what the escalated leg runs under is declared HERE, by the route
+# that is serving the request, via `escalation_reasoning_policy` below.
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "none"
+
+[[routes.switchyard-smartlocal-bounded-openclaw-remote.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+
+# ─── SMARTLOCAL AGENT FAMILY (2026-09-13, operator GO) ──────────────────────
+# Six routes mirroring the switchyard-smartlocal-openclaw-remote family's config
+# and parameters, named for the dsh and openclaw-local agents:
+#   switchyard-smartlocal-{,-bounded-,-agentic-}{dsh,openclaw-local}
+# Parameters are copied verbatim from the corresponding *-openclaw-remote template
+# (fleet_router, context_window 196608, HTPC candidate, comfyninja escalation,
+# escalation_max_input_tokens 81920); only the route name differs.
+# Rollback: routes.toml.bak-<ts>-pre-smartlocal-agents.
+# ───────────────────────────────────────────────────────────────────────────
+[routes.switchyard-smartlocal-dsh]
+id = "switchyard-smartlocal-dsh"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = true
+supports_vision = true
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "enabled"
+
+reasoning_policy = "enabled"
+[[routes.switchyard-smartlocal-dsh.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+[routes.switchyard-smartlocal-bounded-dsh]
+id = "switchyard-smartlocal-bounded-dsh"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+# 2026-09-19 OPERATOR DIRECTIVE (item 3, superseded wording corrected 2026-09-19): the overflow
+# escalates to the REAL ComfyNinja q3-MTP lane - NOT to an invented internal stage, and NOT to an
+# `-nt` twin of it. `sw-comfyninja-qwen3_8-27b-q3-mtp-vl` is a NEUTRAL backing route (it declares no
+# reasoning policy of its own); what the escalated leg runs under is declared HERE, by the route
+# that is serving the request, via `escalation_reasoning_policy` below.
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "none"
+
+[[routes.switchyard-smartlocal-bounded-dsh.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+
+[routes.switchyard-smartlocal-turnstone]
+id = "switchyard-smartlocal-turnstone"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = true
+supports_vision = true
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "enabled"
+
+reasoning_policy = "enabled"
+[[routes.switchyard-smartlocal-turnstone.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+[routes.switchyard-smartlocal-bounded-turnstone]
+id = "switchyard-smartlocal-bounded-turnstone"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+# 2026-09-19 OPERATOR DIRECTIVE (item 3, superseded wording corrected 2026-09-19): the overflow
+# escalates to the REAL ComfyNinja q3-MTP lane - NOT to an invented internal stage, and NOT to an
+# `-nt` twin of it. `sw-comfyninja-qwen3_8-27b-q3-mtp-vl` is a NEUTRAL backing route (it declares no
+# reasoning policy of its own); what the escalated leg runs under is declared HERE, by the route
+# that is serving the request, via `escalation_reasoning_policy` below.
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "none"
+
+[[routes.switchyard-smartlocal-bounded-turnstone.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+
+[routes.switchyard-smartlocal-openclaw-local]
+id = "switchyard-smartlocal-openclaw-local"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = true
+supports_vision = true
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "enabled"
+
+reasoning_policy = "enabled"
+[[routes.switchyard-smartlocal-openclaw-local.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+[routes.switchyard-smartlocal-bounded-openclaw-local]
+id = "switchyard-smartlocal-bounded-openclaw-local"
+type = "fleet_router"
+context_window = 225280
+tool_calling = true
+reasoning = false
+supports_vision = true
+reasoning_policy = "none"
+# 2026-09-19 OPERATOR DIRECTIVE (item 3, superseded wording corrected 2026-09-19): the overflow
+# escalates to the REAL ComfyNinja q3-MTP lane - NOT to an invented internal stage, and NOT to an
+# `-nt` twin of it. `sw-comfyninja-qwen3_8-27b-q3-mtp-vl` is a NEUTRAL backing route (it declares no
+# reasoning policy of its own); what the escalated leg runs under is declared HERE, by the route
+# that is serving the request, via `escalation_reasoning_policy` below.
+escalation = "sw-comfyninja-qwen3_8-27b-q3-mtp-vl"
+escalation_max_input_tokens = 61440
+escalation_reasoning_policy = "none"
+
+[[routes.switchyard-smartlocal-bounded-openclaw-local.candidates]]
+target = "htpc-qwen3_5-9b-mtp"
+tool_calling = true
+reasoning = true
+supports_vision = false
+preference_rank = 1
+usable_context_tokens = 81920
+
+
+[capability_clients.openrouter-lfm-embedding-350m-free]
+format = "openai_embeddings"
+# The server appends "/v1/embeddings" to this, so the effective endpoint is
+# https://openrouter.ai/api/v1/embeddings — the trailing "/api" (not "/api/v1")
+# is deliberate and avoids a duplicated /v1/v1 path.
+base_url = "https://openrouter.ai/api"
+model = "liquid/lfm-2.5-embedding-350m:free"
+api_key_env = "OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capabilities.switchyard-smartfree-embedding]
+id = "switchyard-smartfree-embedding"
+target = "openrouter-lfm-embedding-350m-free"
+contract = "localclaw-embedding-space:lfm2.5-350m-v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+# ── FREE CANDIDATE POOL (declarations retained) ───────────────────────────────
+# The zero-price OpenRouter targets/clients below were introduced for the free
+# service domain and are RETAINED as the free-pool declarations. The domain ROUTE
+# that consumed them was removed by the 2026-09-18 operator correction: the fleet
+# domains are a CLASSIFICATION of the PASSTHROUGH routes, not routes of their own.
+[llm_clients.openrouter-space-bunny-alpha-free]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+reasoning_dialect = "openai_effort"
+reasoning_efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+
+
+[llm_clients.openrouter-ling-3_0-flash-fin-free]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[targets.openrouter-space-bunny-alpha-free]
+# Replayed chain-of-thought is stripped on the wire. On a free lane there is no cost
+# argument, but a free provider may retain and train on what it receives, so
+# stripping reduces what a third party is able to retain — the same posture the
+# other OpenRouter-hosted targets in this file take.
+strip_reasoning_content = true
+id = "stealth/space-bunny-alpha"
+llm_client = "openrouter-space-bunny-alpha-free"
+
+
+[targets.openrouter-ling-3_0-flash-fin-free]
+strip_reasoning_content = true
+id = "inclusionai/ling-3.0-flash-fin:free"
+llm_client = "openrouter-ling-3_0-flash-fin-free"
+
+# ─── SMARTFREE FAMILY (2026-09-18) ──────────────────────────────────────────
+# ADDITIVE. A curated free-pool smart product for Turnstone. It does NOT replace
+# `switchyard-smart-turnstone`, `switchyard-smart-bounded-turnstone` or
+# `switchyard-smart-agentic-turnstone`.
+# 2026-09-18 OPERATOR CORRECTION: the three domain ROUTES were removed. The fleet
+# domains are a CLASSIFICATION of the PASSTHROUGH routes, not routes of their own;
+# the free candidate declarations above are retained as the free pool.
+#
+# Candidates are the two qualified OPENROUTER free models, not ThaiLLM: ThaiLLM stays in
+# `fleet-free` but its measured limits (no reliable tools, no vision, heterogeneous
+# reasoning) make it unsuitable for the first two smart ranks.
+#
+# Reasoning authority is ROUTE-level, per family convention. No target carries a reasoning
+# pin. Two clients are needed for the SAME model because a target has exactly one client and
+# a client has exactly one dialect: `openai_effort` can express exact efforts but NEVER
+# `enabled`, and `openrouter_enabled` can express `enabled` but NEVER an exact effort.
+#
+# SF0 evidence: all three free models accept exact `max` and honor `none` (rt=0), but do NOT
+# demonstrably grade reasoning depth by effort. `max` here means "on, at the strongest level
+# the provider accepts", not "measurably deeper than high".
+# ───────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+# SF1 — free-tier smart route for high-quality reasoning. Strongest common exact effort.
+[routes.switchyard-smartfree-turnstone]
+id = "switchyard-smartfree-turnstone"
+reasoning_policy = "max"
+type = "fleet_router"
+context_window = 262144
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[[routes.switchyard-smartfree-turnstone.candidates]]
+target = "openrouter-space-bunny-alpha-free"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 262144
+
+[[routes.switchyard-smartfree-turnstone.candidates]]
+target = "openrouter-qwen3_8-27b-free"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 262144
+
+[routes.switchyard-smartfree-bounded-turnstone]
+id = "switchyard-smartfree-bounded-turnstone"
+reasoning_policy = "low"
+type = "fleet_router"
+context_window = 262144
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[[routes.switchyard-smartfree-bounded-turnstone.candidates]]
+target = "openrouter-space-bunny-alpha-free"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 1
+usable_context_tokens = 262144
+
+
+[[routes.switchyard-smartfree-bounded-turnstone.candidates]]
+target = "openrouter-qwen3_8-27b-free"
+tool_calling = true
+reasoning = true
+supports_vision = true
+preference_rank = 2
+usable_context_tokens = 262144
+
+[routes.sw-openrouter-space-bunny-alpha-free]
+id = "sw-openrouter-space-bunny-alpha-free"
+type = "passthrough"
+target = "openrouter-space-bunny-alpha-free"
+context_window = 262144
+tool_calling = true
+reasoning = true
+supports_vision = true
+
+[routes.sw-openrouter-ling-3_0-flash-fin-free]
+id = "sw-openrouter-ling-3_0-flash-fin-free"
+type = "passthrough"
+target = "openrouter-ling-3_0-flash-fin-free"
+context_window = 262144
+tool_calling = true
+reasoning = true
+supports_vision = false
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SMARTLOCAL BOUNDED NT OVERFLOW (2026-09-18 operator convergence, item 10)
+#
+# A single SHARED semantic overflow lane for every `switchyard-smartlocal-bounded-*`
+# product: a passthrough over the SAME neutral q3-MTP target the thinking escalation
+# uses, but declaring `reasoning_policy = "none"` so the overflow stays non-thinking
+# end-to-end.
+#
+# WHY A SEPARATE ROUTE AND NOT THE DIRECT q3 LANE: escalation re-enters through the
+# DESTINATION route's own reasoning pipeline. `sw-comfyninja-qwen3_8-27b-q3-mtp-vl`
+# declares `medium`, so pointing a bounded NT route at it would silently serve a
+# THINKING leg on a non-thinking tier. The direct lane's semantics are NOT changed to
+# suit bounded traffic; this one shared route carries the NT contract instead, and no
+# per-agent overflow duplication exists.
+# ══════════════════════════════════════════════════════════════════════════════
+
+[llm_clients.openrouter-qwen3_8-27b-free]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+reasoning_dialect = "openai_effort"
+reasoning_efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+
+[targets.openrouter-qwen3_8-27b-free]
+id = "qwen/qwen3.8-27b:free"
+llm_client = "openrouter-qwen3_8-27b-free"
+strip_reasoning_content = true
+
+[routes.sw-openrouter-qwen3_8-27b-free]
+id = "sw-openrouter-qwen3_8-27b-free"
+type = "passthrough"
+target = "openrouter-qwen3_8-27b-free"
+context_window = 262144
+tool_calling = true
+reasoning = true
+supports_vision = false
+
+[llm_clients.openrouter-liquid-lfm-2_5-2_6b-free]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[targets.openrouter-liquid-lfm-2_5-2_6b-free]
+id = "liquid/lfm-2.5-2.6b:free"
+llm_client = "openrouter-liquid-lfm-2_5-2_6b-free"
+
+[routes.sw-openrouter-liquid-lfm-2_5-2_6b-free]
+id = "sw-openrouter-liquid-lfm-2_5-2_6b-free"
+type = "passthrough"
+target = "openrouter-liquid-lfm-2_5-2_6b-free"
+context_window = 65536
+tool_calling = true
+reasoning = true
+supports_vision = false
+
+[capability_clients.openrouter-respan-span-01-lite]
+format = "openrouter_alpha_decisions"
+base_url = "https://openrouter.ai"
+model = "respan/span-01-lite"
+api_key_env = "OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+# LFM remains a separately qualified FREE PASSTHROUGH route on the LLM side:
+#   routes.sw-openrouter-liquid-lfm-2_5-2_6b-free -> targets.openrouter-liquid-lfm-2_5-2_6b-free
+#   -> llm_clients.openrouter-liquid-lfm-2_5-2_6b-free
+# It is NOT a decision-capability backend and NOT part of any Span failover
+# chain. The former decision adapter that carried it has been removed: it had
+# zero wiring and zero lifetime traffic, and its "fallback" name implied a
+# relationship to Span that never existed in the config.
+#
+# ---------------------------------------------------------------------------
+# Decision-capability provider topology (converged 2026-09-30)
+#
+# Span (respan/span-01-lite) and HTPC Laya are QUALIFIED PEER PROVIDERS with
+# different coverage, not a primary/secondary hierarchy. Coverage:
+#
+#   shared 5 signals   task_complexity, reasoning_demand, tool_dependency,
+#                      agentic_complexity, route_sufficiency
+#   local_suitability  Span only. Laya does not provide it, and it is never
+#                      fabricated, inferred or carried forward.
+#
+# `fallback_target` below expresses R1/R2 EXECUTION ORDER for a resilient lane.
+# It is not a quality ranking.
+#
+# "smartfree" is a stable compatibility/logical alias. It is NOT a guarantee that
+# an upstream provider stays zero-cost; the OpenRouter routes behind these names
+# are priced at the provider's current discretion.
+# ---------------------------------------------------------------------------
+
+# Fallback executor: HTPC Laya, a typed-decision backend on its own path.
+[capability_clients.htpc-laya-decision]
+format = "openrouter_alpha_decisions"
+base_url = "http://100.105.20.36:8011"
+model = "laya-rl-agent"
+endpoint_path = "/v1/systemone"
+api_key_env = "LOCALCLAW_LAYA_API_KEY"
+timeout_seconds = 30
+
+# A. PRIMARY resilient lane — Span R1 with a one-hop Laya R2.
+#    This is the lane every consumer calls: the Turnstone shadow sensor
+#    (DECISION_CAPABILITY) and the Output Guard
+#    (judge.output_guard_model = switchyard-smart-aux-turnstone).
+#    R1 is attempted first; R2 runs only if R1 fails. The attempt order is
+#    EXECUTION TOPOLOGY, not a quality ranking: Span and HTPC Laya are
+#    qualified PEER providers with different coverage, not a hierarchy.
+[capabilities.switchyard-smart-aux-turnstone]
+id = "switchyard-smart-aux-turnstone"
+target = "openrouter-respan-span-01-lite"
+decision_contract = "switchyard-decision:v1"
+max_questions = 16
+max_state_chars = 65536
+fallback_target = "switchyard-smartlocal-aux-turnstone"
+
+# B. Laya-only direct lane. No Span leg, ever.
+#    For direct local operation, provider comparison and diagnostics.
+#    Provides the shared 5 signals; local_suitability is unavailable by design.
+[capabilities.switchyard-smartlocal-aux-turnstone]
+id = "switchyard-smartlocal-aux-turnstone"
+target = "htpc-laya-decision"
+decision_contract = "switchyard-decision:v1"
+max_questions = 16
+max_state_chars = 65536
+
+# C. Span-only lane. NO fallback leg by design: this is the direct Span lane,
+#    kept for provider comparison and diagnostics against the resilient
+#    `switchyard-smart-aux-turnstone` lane, which shares the same R1 client.
+#    If Span is unavailable this lane is DEAD (HTTP 502) -- that is its purpose.
+[capabilities.switchyard-smartfree-aux-turnstone]
+id = "switchyard-smartfree-aux-turnstone"
+target = "openrouter-respan-span-01-lite"
+decision_contract = "switchyard-decision:v1"
+max_questions = 16
+max_state_chars = 65536

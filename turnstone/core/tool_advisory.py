@@ -81,8 +81,8 @@ def render_output_guard_text(meta: dict[str, Any]) -> str:
     lines = [f"Output guard: {summary} ({risk_level.upper()})"]
     if meta.get("tier") == "llm" and not flags and risk_level != "none":
         lines.append(
-            "  This is an advisory assessment of the tool-result text, "
-            "not evidence that the command failed or that an attack occurred."
+            "  Turnstone framework advisory about tool-result text; "
+            "not command stdout, evidence of command failure, or proof of an attack."
         )
     for ann in meta.get("annotations") or []:
         lines.append(f"  {ann}")

@@ -705,9 +705,6 @@ def test_cancelled_typed_branch_does_not_spend_a_decision_call():
     assert not (verdict.error == "" and verdict.risk_level == "none")
 
 
-if __name__ == "__main__":
-    sys.exit(_run_all())
-
 
 def test_live_switchyard_response_metadata_and_score_are_distinct():
     """Actual /v1/decisions contract (Oct 2026): backend/child_lane/requested."""
@@ -741,3 +738,6 @@ def test_noul_does_not_override_actual_separate_confidence_score():
     assert result.risk_level == "high"
     assert result.risk_score == 0.9
     assert result.confidence == 0.7
+
+if __name__ == "__main__":
+    sys.exit(_run_all())

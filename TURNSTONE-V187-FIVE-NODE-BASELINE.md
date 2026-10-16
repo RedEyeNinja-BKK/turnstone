@@ -89,7 +89,7 @@ Do not manually restore the full PostgreSQL backup to undo a new worker; that wo
 - After all four workers: 3.8 GiB total RAM, 1.5 GiB used, 2.2 GiB available, 0 swap used; 4 vCPUs. These are idle measurements, not sustained-concurrency guarantees.
 - A real workstream on **node 2** successfully ran `id -un` => `turnstone`, `pwd` => `/var/lib/turnstone`, and `printf` => `NODE2_EXECUTION_OK`. A separate `printf` of forged SYSTEM OVERRIDE text was not followed. The guard displayed heuristic `prompt_injection, instruction_override (HIGH)` with semantic `tier1-decision`.
 - Node-2 production journal (PID 95278) recorded `output_guard_judge.typed_decision_alias` plus a clean `risk_level=none`, `risk_score=0.033206392` and an attack `risk_level=high`, `risk_score=0.9598802`. Both logged `backend=direct-openrouter-span-01-lite`, `child_lane=smartfree-decision`, `served_model=respan/span-01-lite-20260925`, `requested_model=tier1-decision`.
-- Previously verified head decision lane has real-workstream results for clean diagnostic and injection payloads; **nodes 3–5 have not yet been demonstrated with actual workstream execution**. Do not declare full per-node execution parity until those tests pass.
+- Previously verified head decision lane has real-workstream results for clean diagnostic and injection payloads; **nodes 3–5 have now independently generated live typed-decision Output Guard events**, but their actual `bash` stdout and exit-status receipts have not been supplied. Do not declare full per-node execution parity until those results are confirmed.
 
 ### Remaining gates before final baseline closure
 
@@ -97,3 +97,19 @@ Do not manually restore the full PostgreSQL backup to undo a new worker; that wo
 2. Inspect the correct per-instance journal and confirm `typed_decision_result` from each worker following its benign tool call, even with risk NONE. Do not assume an ACTIVE service implies functional model routing.
 3. Verify console lists five healthy nodes and no failed tool permissions or restarts after these tests. Check runtime RSS/CPU/swap under realistic workstream load before assuming concurrent five-node capacity.
 4. Preserve all user-granted access, current overlays, database backup, console and head configuration. Do not disable/retire healthy workers as a cleanup operation without explicit operator approval.
+
+## Five-node Output Guard parity receipt — 2026-10-16 18:32 ICT
+
+Operator supplied three independent `turnstone-node@N.service` systemd journal excerpts, each with `event=output_guard_judge.typed_decision_result`. These are **production service logs**, not direct standalone adapter calls:
+
+| Node | PID | Time ICT | Risk | `risk_score` |
+|---|---:|---|---|---:|
+| node-3 | 96614 | 18:32:30 | none | 0.033009186 |
+| node-4 | 96714 | 18:32:46 | none | 0.033009186 |
+| node-5 | 96821 | 18:32:58 | none | 0.033009186 |
+
+All three log `requested_model=tier1-decision`, `contract=switchyard-decision:v1`, `backend=direct-openrouter-span-01-lite`, `child_lane=smartfree-decision`, `served_model=respan/span-01-lite-20260925`, `confidence=null` and `leg=primary`. This completes **semantic judge dispatch parity on all five nodes** (head and node-2 verified previously).
+
+Status: **5/5 server health and PostgreSQL registrations PASS; 5/5 typed-decision dispatch PASS; 2/5 nodes have supplied explicit successful `bash` execution output (head and node-2), while stdout/exit receipts for nodes 3–5 remain unsubmitted.** The presence of a result event alone does not prove the user-requested command succeeded or that workstream placement matched the intended target. Request operator confirmation or transcript excerpts for nodes 3–5 before declaring full workstream-execution parity. Concurrency capacity/load gate remains deferred, not conflated with installation correctness.
+
+No production mutation was performed to record this receipt. Preserve all current services, permission grants, overlays and backups.

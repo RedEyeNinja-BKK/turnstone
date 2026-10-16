@@ -26,10 +26,14 @@ ORIGINS = {
     "worker_5": "http://127.0.0.1:8085",
 }
 SENSITIVE = re.compile(
-    r"(^|[_-])(password|passwd|secret|token|credential|api[_-]?key|private[_-]?key|authorization|cookie|env|headers)([_-]|$)",
+    r"(^|[_-])(password|passwd|secret|token|credential|api[_-]?key|private[_-]?key|authorization|cookie|env|headers|jwt|bearer)([_-]|$)",
     re.IGNORECASE,
 )
-TOKEN_PATTERN = re.compile(r"\bts_[0-9a-fA-F]{64}\b")
+TOKEN_PATTERNS = (
+    re.compile(r"\bts_[0-9a-fA-F]{64}\b"),
+    re.compile(r"\bglsa_[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"(?i)\bBearer[ \t]+\S{8,}"),
+)
 MAX_BODY = 262144
 MAX_RETURN = 18000
 
@@ -63,11 +67,18 @@ def validate_path(path: str, method: str) -> str:
         if nxt == decoded:
             break
         decoded = nxt
-    if ("\\" in decoded or "//" in decoded or "@" in decoded or "\x00" in decoded
+    if (any(ord(c) < 32 or ord(c) > 126 for c in path)
+            or "\\" in decoded or "//" in decoded or "@" in decoded or "\x00" in decoded
             or any(segment in (".", "..") for segment in decoded.split("/"))):
         raise BridgeRefusal("ambiguous or traversal path refused")
     for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in {"reveal", "include_secrets", "show_secrets"}:
+        decoded_key = key
+        for _ in range(4):
+            further = urllib.parse.unquote(decoded_key)
+            if further == decoded_key:
+                break
+            decoded_key = further
+        if decoded_key.lower() in {"reveal", "include_secrets", "show_secrets"}:
             raise BridgeRefusal("secret reveal arguments refused")
         if any("\r" in x or "\n" in x for x in (key, value)):
             raise BridgeRefusal("unsafe query value")
@@ -77,12 +88,19 @@ def validate_path(path: str, method: str) -> str:
 
 def redact(data: Any) -> Any:
     if isinstance(data, dict):
-        return {k: ("[REDACTED]" if SENSITIVE.search(str(k)) else redact(v))
-                for k, v in data.items()}
+        result = {}
+        for key, value in data.items():
+            # Convert camelCase keys such as accessToken and clientSecret.
+            normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key))
+            result[key] = "[REDACTED]" if SENSITIVE.search(normalized) else redact(value)
+        return result
     if isinstance(data, list):
-        return [redact(v) for v in data]
+        return [redact(value) for value in data]
     if isinstance(data, str):
-        return TOKEN_PATTERN.sub("[REDACTED]", data)
+        safe = data
+        for pattern in TOKEN_PATTERNS:
+            safe = pattern.sub("[REDACTED]", safe)
+        return safe
     return data
 
 def pack(status: int, body: Any) -> str:

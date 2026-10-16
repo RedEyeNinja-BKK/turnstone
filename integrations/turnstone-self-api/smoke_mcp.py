@@ -10,6 +10,7 @@ root-only Turnstone API credential. This does not modify sudoers, MCP
 definitions, roles or any running Turnstone service. No token is printed.
 """
 from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -30,8 +31,10 @@ async def smoke() -> None:
     params = StdioServerParameters(
         command=sys.executable, args=[str(server)],
     )
-    async with stdio_client(params) as (incoming, outgoing):
-        async with ClientSession(incoming, outgoing) as session:
+    async with (
+        stdio_client(params) as (incoming, outgoing),
+        ClientSession(incoming, outgoing) as session,
+    ):
             await session.initialize()
             print("MCP handshake: PASS")
             tools = await session.list_tools()
@@ -40,6 +43,21 @@ async def smoke() -> None:
             if names != expected:
                 raise RuntimeError(f"Unexpected tool names: {names}")
             print("MCP tool discovery: PASS (read and change tools)")
+            # LC-RD-003 patch: the shipped smoke checked tool NAMES only.
+            # Verify each tool's declared input schema actually covers the
+            # arguments the bridge accepts, so a renamed or emptied schema
+            # cannot pass as a working tool.
+            schemas = {tool.name: (tool.inputSchema or {}) for tool in tools.tools}
+            want_props = {
+                "turnstone_api_read": {"path", "target"},
+                "turnstone_api_change": {"method", "path", "body_json", "target"},
+            }
+            for tool_name, required in want_props.items():
+                props = set((schemas.get(tool_name, {}).get("properties") or {}).keys())
+                missing = required - props
+                if missing:
+                    raise RuntimeError(f"{tool_name}: schema missing {sorted(missing)}")
+            print("MCP tool schemas: PASS (required arguments present)")
             # Only read endpoints; do not invoke turnstone_api_change.
             for target in TARGETS:
                 result = await session.call_tool(

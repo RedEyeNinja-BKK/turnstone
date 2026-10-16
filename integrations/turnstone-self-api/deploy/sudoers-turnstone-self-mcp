@@ -1,0 +1,14 @@
+# /etc/sudoers.d/turnstone-self-mcp  --  TEMPLATE, NOT INSTALLED
+#
+# Exact-argv convenience entry for the trusted administrative principal.
+# This is NOT a security barrier (see LC-RD-003G / LC-RD-003F): any process
+# running as the service UID can invoke the same command. It exists so the
+# bridge can read its root-only credential without a generic root shell.
+#
+# Validate with:  visudo -c -f /etc/sudoers.d/turnstone-self-mcp
+# Install with:   install -o root -g root -m 0440 <this-file> /etc/sudoers.d/turnstone-self-mcp
+#
+# No arguments are accepted: the command is matched exactly, so a caller cannot
+# substitute a different script or inject arguments.
+
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/self-admin/launch-self-mcp.sh

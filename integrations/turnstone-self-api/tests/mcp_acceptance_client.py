@@ -168,6 +168,39 @@ def _tool_text(resp: dict) -> str:
     return "\n".join(c.get("text", "") for c in content)
 
 
+_SECRET_ARG_KEYS = ("api_key", "token", "secret", "password", "client_secret")
+
+
+def _redact_args(tool_name: str, tool_args: dict) -> str:
+    """Render tool arguments for the log with secret-bearing values masked.
+
+    Without this the harness echoed the full request body -- including a model
+    definition's ``api_key`` -- into stdout, which is exactly the disclosure the
+    bridge's own redaction exists to prevent. Mask before logging, never after.
+    """
+    safe: dict = {}
+    for key, value in tool_args.items():
+        if any(s in key.lower() for s in _SECRET_ARG_KEYS):
+            safe[key] = "[REDACTED]" if not isinstance(value, str) else f"[REDACTED len={len(value)}]"
+            continue
+        if key == "body_json" and isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                safe[key] = f"[body_json {len(value)} bytes, unparseable]"
+            else:
+                if isinstance(parsed, dict):
+                    parsed = {
+                        k: (f"[REDACTED len={len(v)}]" if any(s in k.lower() for s in _SECRET_ARG_KEYS) and isinstance(v, str)
+                            else v)
+                        for k, v in parsed.items()
+                    }
+                safe[key] = json.dumps(parsed, ensure_ascii=True)
+            continue
+        safe[key] = value
+    return f"{tool_name} {json.dumps(safe, ensure_ascii=True)}"
+
+
 def _print_envelope(label: str, text: str) -> None:
     """Pretty-print the bridge's {status, receipt, body} envelope."""
     print(f"--- {label} ---")
@@ -236,7 +269,7 @@ def main() -> int:
             print()
 
         for tool_name, tool_args in calls:
-            label = f"{tool_name} {json.dumps(tool_args, ensure_ascii=True)}"
+            label = _redact_args(tool_name, tool_args)
             try:
                 resp = client.call_tool(tool_name, tool_args)
             except (TimeoutError, EOFError) as exc:

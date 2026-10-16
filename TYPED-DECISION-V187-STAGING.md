@@ -46,7 +46,99 @@ actual backend and requested-route metadata.
 - Standalone regression suite: **31 passed / 0 failed**.
 - Mutation battery: **10/10 KILLED**, 0 survived, 0 untested, 0 errors.
 - Expected warnings in negative tests: simulated unresolved alias and HTTP 503.
-- Live `OutputGuardJudge` dispatch with Switchyard: **pending**.
+- Live `OutputGuardJudge` dispatch with Switchyard: **PASS** (clean none, diagnostic high, real route provenance).
+
+## Activation package and rollback gates (2026-10-16)
+
+The operator's isolated runs passed: **31/31 regression**, **10/10 killed
+mutations**, and **2/2 live synthetic OutputGuardJudge calls**. Scores were
+`0.024343979` (clean → none) and `0.952353300` (diagnostic → high);
+`backend`, `child_lane`, served model, and requested alias all appeared in
+provenance. There were no errors and the adapter did not invoke generative
+`model_turn`.
+
+The candidate remains NOT DEPLOYED until the operator runs the following
+separate phase commands. These commands act on **turnstone-server only**;
+the original `/opt/turnstone-venv` stays untouched. They do not update the
+database or reduce any user/agent permissions.
+
+```bash
+git -C "$HOME/typed-decision-v187-source" pull --ff-only
+sudo bash "$HOME/typed-decision-v187-source/scripts/deploy_typed_decision_v187.sh" \
+  stage "$HOME/typed-decision-v187-candidate"
+sudo bash "$HOME/typed-decision-v187-source/scripts/deploy_typed_decision_v187.sh" status
+```
+
+The `stage` phase validates both test receipts, copies the **tested candidate**
+to a root-owned `/opt/turnstone-overlays/typed-decision-v187` slot, confirms
+imports as service user `turnstone`, snapshots the config and full PostgreSQL
+database under `/var/backups/turnstone/typed-decision-v187-20261016` (root-only),
+and **does not restart or change services**.
+
+Only after `stage` passes, activate with an explicit operator confirmation:
+
+```bash
+sudo bash "$HOME/typed-decision-v187-source/scripts/deploy_typed_decision_v187.sh" activate
+# Type: ACTIVATE
+```
+
+The activation writes one removable systemd override to add
+`PYTHONPATH=/opt/turnstone-overlays/typed-decision-v187` for **turnstone-server**,
+restarts only that service, verifies the active process environment and
+`127.0.0.1:8080/health`, and automatically reverts the override if
+activation verification fails. **Existing workstreams may be interrupted by
+the restart**; plan accordingly. Console, PostgreSQL, privileges, and the
+original venv remain unchanged.
+
+Then, using **Admin → Models → Definitions**, edit the **existing**
+`tier1-decision` row: set its base URL to
+`https://switchyard-vm.tailc8ef7b.ts.net` (without `/v1`), merge the
+typed-capability keys below into the existing Advanced Capabilities JSON,
+and save. Do **not** change conversation or IntentJudge routes.
+
+```json
+{"supports_typed_decision":true,"decision_contract":"switchyard-decision:v1","decision_types":["noul"],"decision_endpoint":"/v1/decisions"}
+```
+
+In **Models → Roles**, the operator's pre-existing Output guard judge role
+assignment already writes `judge.output_guard_model=tier1-decision`.
+Confirm **Judge → Settings** has `judge.output_guard=true` and
+`judge.output_guard_llm=true`. The latter is a separate toggle and is
+OFF by default; do not assume the role assignment enables it.
+Click **Models → Definitions → Sync to Nodes** to reload the model row.
+
+Verify the DB model definition without displaying the API key:
+
+```bash
+sudo -u postgres psql -d turnstone -X -P pager=off -c "
+SELECT alias, model, base_url,
+       capabilities::jsonb->>'supports_typed_decision' AS typed_enabled,
+       capabilities::jsonb->>'decision_contract' AS contract
+FROM model_definitions WHERE alias='tier1-decision';"
+```
+
+Start a **new** interactive workstream and request a harmless command with
+synthetic diagnostic output, e.g. `printf 'ERROR: simulated diagnostic failure\n'`.
+Check `journalctl -u turnstone-server --since '10 minutes ago' --no-pager`
+for `output_guard_judge.typed_decision_alias` and
+`output_guard_judge.typed_decision_result` with
+`alias=tier1-decision`, risk and real backend provenance. Do not declare
+production acceptance from service health alone: this guard evidence must
+appear from an **actual workstream tool result**.
+
+**Revert**: first disable `judge.output_guard_llm` in the console (leave the
+normal heuristic `judge.output_guard` on), then run:
+
+```bash
+sudo bash "$HOME/typed-decision-v187-source/scripts/deploy_typed_decision_v187.sh" rollback
+# Type: ROLLBACK
+```
+
+The script removes only its own server override and restarts upstream 1.8.7.
+Restore `tier1-decision`'s original base URL/capabilities from the
+root-only preflight snapshot or via the console if reverting fully.
+**Do not restore the full DB snapshot just to undo these model settings**:
+doing so would destroy newer workstreams and changes.
 
 ## Activation prerequisites (DO NOT change yet)
 

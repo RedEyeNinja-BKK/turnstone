@@ -14,6 +14,7 @@ permission-checked routes an operator uses.
 | `deploy/launch-self-mcp.sh` | Privileged launcher wrapper (re-exports the server id; survives `env_reset`). |
 | `deploy/sudoers-turnstone-self-mcp` | Exact-argv sudoers template. NOT installed by this repo. |
 | `deploy/run_smoke_root.sh` | Operator-run root smoke gate: hash-verifies, stages root-owned, runs, validates receipt. |
+| `deploy/deploy-self-mcp.sh` | Operator-run installer/registrar: gates on a valid receipt, installs root-owned, registers the MCP row, activates the self-unload guard, reloads, verifies discovery. `--dry-run` previews. |
 
 ## Operating model — read this before deploying
 

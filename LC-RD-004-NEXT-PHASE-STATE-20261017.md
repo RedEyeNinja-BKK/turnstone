@@ -11,9 +11,16 @@ from the running system, not planned. Hostnames only; no addresses or secrets.
 
 ## Phase 1 — Native skills and Grafana capability
 
+> **Corrected and superseded.** This section originally reported "skills: none
+> installed — `skill_versions` has 0 rows". That used the wrong table:
+> `skill_versions` holds only version *history*, while installed skills live in
+> **`prompt_templates`**. Both skills have since been installed and are enabled
+> — see `LC-RD-004-MODEL-ONBOARDING-20261017.md`. The section's other
+> measurements (Grafana health, the 401, the external-only discover path) stand.
+
 | Item | Measured state |
 |---|---|
-| Skills installed in Turnstone | **none** — `skill_versions` has 0 rows |
+| Skills installed in Turnstone | **2, enabled** — `turnstone-self-management`, `grafana-operations` (stored in `prompt_templates`) |
 | Skills ready in the repo | 2 — `skills/turnstone-self-management/SKILL.md`, `skills/grafana-operations/SKILL.md` |
 | Skill install path | `POST /v1/api/admin/skills` (needs `admin.skills`), body carries `name`, `content`, `description`, `category`, `kind`, `version`, `author`, `license` |
 | `discover` endpoint | searches an **external** registry (skills.sh) — not the local repo; it will not find these two |
@@ -98,6 +105,10 @@ it yet, and a reliable executor is the stated precondition.
 ---
 
 ## Actionable immediately (no new authorization needed)
+
+> Items 1–3 and 5 below are **done** — see
+> `LC-RD-004-MODEL-ONBOARDING-20261017.md`. Item 2's session-level half
+> (fresh-workstream MCP injection) remains unverifiable from this session.
 
 1. **Install the two repo skills** via `POST /v1/api/admin/skills` — content is
    in-repo, no external dependency, no privilege change. Verify with

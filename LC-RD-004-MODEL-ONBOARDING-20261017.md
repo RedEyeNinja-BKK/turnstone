@@ -196,3 +196,40 @@ Existing credentials (unchanged, none added), machine privileges, the memory
 policy, the running MCP installation, Switchyard (`base_url`, routes, smart
 routes all untouched), and all healthy services. No permission reduction and no
 credential rotation was performed.
+
+## 8. Priority 3 - skills installed
+
+Both staged skills were installed through the audited Admin API
+(`POST /v1/api/admin/skills`, permission `admin.skills`) and are enabled:
+
+| Skill | version | category | content |
+|---|---|---|---|
+| `turnstone-self-management` | 1.0.0 | operations | 8,747 chars |
+| `grafana-operations` | 1.0.0 | operations | 9,534 chars |
+
+Content was taken from the repo `SKILL.md` bodies (frontmatter parsed for
+`description`/`version`/`author`/`license`; YAML frontmatter itself is not part
+of the stored content).
+
+**Correction to the earlier state report:** installed skills live in
+**`prompt_templates`**, not `skill_versions` (which holds version history).
+LC-RD-004-NEXT-PHASE-STATE originally read "skills: none installed" from the
+wrong table; that section now carries the correction.
+
+Session-level verification in a *fresh* workstream (MCP tool injection and skill
+visibility) is still not possible from this session, which predates MCP
+registration - recorded as a blocker, not claimed as done.
+
+## 9. Grafana credential - presence only, not used
+
+`/srv/turnstone/credentials/grafana/api_token` exists as described. Its parent
+directory `/srv/turnstone/credentials/api` is `0700 root:root`, so the service
+account **cannot traverse to it** - consistent with the skill's own statement
+that the token is deliberately root-only and must not be read by an
+unprivileged Turnstone tool. Presence confirmed by path inspection only; the
+value was never read, printed or used, and no credential was rotated or
+replaced.
+
+Grafana itself is healthy (`/api/health` → 200, v13.2.4, database ok). The HTTP
+API needs a token (`/api/version` → 401); using it requires a root-run read-only
+probe or a reviewed adapter - both are priority-4 work and were not started.

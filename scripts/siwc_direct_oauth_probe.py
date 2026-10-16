@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sign in with ChatGPT — direct OAuth (open-source token sharing) probe.
 
-A NARROW proof of concept: prove that a `chatgpt.tokens.use.direct`-scoped token
+A NARROW proof of concept: prove that a token granted `chatgpt.tokens.use.direct`
 can drive a real streamed `POST /v1/responses` call for a specific model. It is
 NOT a Turnstone production provider and deliberately does not touch Turnstone.
 
@@ -14,33 +14,38 @@ Official flow implemented (developers.openai.com/siwc/token-sharing-open-source)
   * redirect_uri is an http loopback on 127.0.0.1 and must be byte-identical in
     the authorization request and the code exchange
 
-WHY THERE IS A COPY-PASTE PATH
-    A 127.0.0.1 callback reaches the machine running the BROWSER, not this VM
-    (per OpenAI's self-hosted-VM guidance). So either the browser runs here
-    (--listen, optionally via `ssh -L 1455:127.0.0.1:1455 <vm>`), or the
-    operator approves on their own machine and pastes the resulting redirect URL
-    back (--complete). Both are supported; --listen is not required.
+HANDLING THE CALLBACK (no code ever travels through argv)
+    A 127.0.0.1 callback reaches the machine running the BROWSER, not this VM.
+    Two supported shapes, neither of which puts the authorization code on a
+    command line:
+      1. `--listen`  (preferred): forward the port and let this process capture
+         the callback directly.
+             ssh -L 1455:127.0.0.1:1455 <vm>          # from the Windows box
+      2. piped/interactive stdin, read WITHOUT echo and never logged.
+    There is intentionally no `--callback-url` flag: argv is world-readable via
+    /proc/<pid>/cmdline and lands in shell history and transcripts.
 
 SECRETS POLICY
     Tokens are never printed, logged, or passed on argv. The credential store is
     separate from Codex CLI's, mode 0700/0600. Only metadata is ever displayed.
+    An authorization URL that would carry `id_token_hint` (a signed JWT) is
+    written to a 0600 file instead of being printed, so it cannot reach a
+    transcript; `--with-id-token-hint` is opt-in and off by default.
 
 USAGE
-    # 1. generate the authorization URL (prints URL only, stores pending state)
+    # 1. generate the authorization URL
     python3 scripts/siwc_direct_oauth_probe.py authorize --agent-name Turnstone
 
-    # 2a. after approving in the browser, paste the FULL redirect URL back
-    python3 scripts/siwc_direct_oauth_probe.py complete --callback-url '<paste>'
-
-    # 2b. OR, with an SSH tunnel from the browser machine, let this VM capture it
+    # 2a. preferred: forward the port, then this captures the callback itself
     python3 scripts/siwc_direct_oauth_probe.py authorize --listen
 
-    # 3. verify authorization
+    # 2b. otherwise pipe the pasted redirect URL on stdin (input is hidden)
+    printf '%s\\n' "$PASTED" | python3 scripts/siwc_direct_oauth_probe.py complete
+
+    # 3. verify authorization and prove inference
     python3 scripts/siwc_direct_oauth_probe.py status
     python3 scripts/siwc_direct_oauth_probe.py models
     python3 scripts/siwc_direct_oauth_probe.py infer --model gpt-6.1-sol
-
-    python3 scripts/siwc_direct_oauth_probe.py refresh     # minimal refresh
 """
 from __future__ import annotations
 
@@ -51,11 +56,13 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import secrets
 import socketserver
 import stat
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -70,7 +77,7 @@ INITIAL_CLIENT_ID = "dynamic_agent_client"
 RESOURCE = "https://api.openai.com/v1"
 IDENTITY_SCOPES = ("openid", "profile", "email")
 PLAN_SCOPES = ("offline_access", "resource.invoke", "chatgpt.tokens.use.direct")
-SCOPES = " ".join(IDENTITY_SCOPES + PLAN_SCOPES)
+SCOPES_REQUESTED = " ".join(IDENTITY_SCOPES + PLAN_SCOPES)
 REQUIRED_PLAN_SCOPE = "chatgpt.tokens.use.direct"
 
 DEFAULT_REDIRECT = "http://127.0.0.1:1455/auth/callback"
@@ -81,6 +88,11 @@ FORBIDDEN_STORE_PREFIXES = ("/var/lib/turnstone/.codex",)
 CODEX_HOME_MARKER = "codex-home"
 
 API_BASE = "https://api.openai.com/v1"
+
+# RFC 4122 v4, as a URN — the documented supported ext_agent_host_id shape.
+HOST_ID_RE = re.compile(
+    r"^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 
 
 # =============================================================================
@@ -97,8 +109,13 @@ def make_pkce() -> tuple[str, str]:
     return verifier, challenge
 
 
+def new_host_id() -> str:
+    """A fresh ext_agent_host_id in the documented `urn:uuid:<UUIDv4>` shape."""
+    return f"urn:uuid:{uuid.uuid4()}"
+
+
 def _write_private(path: pathlib.Path, data: str) -> None:
-    """Write 0600, atomically enough for a single-writer probe."""
+    """Write 0600 under a 0700 parent."""
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -111,6 +128,19 @@ def _read_json(path: pathlib.Path) -> dict:
     if not path.is_file():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_callback_silently() -> str:
+    """Read the callback URL from stdin WITHOUT echo, and without logging it.
+
+    Uses getpass when attached to a tty (no echo, prompt on stderr); falls back
+    to a plain line read when piped. Either way the value is never printed.
+    """
+    if sys.stdin.isatty():
+        import getpass
+
+        return getpass.getpass("Paste the full callback URL (input hidden): ").strip()
+    return sys.stdin.readline().strip()
 
 
 # =============================================================================
@@ -139,12 +169,17 @@ class Store:
         return self.root / "host_id"
 
     def host_id(self) -> str:
-        """Stable per-host ext_agent_host_id (created once, then persisted)."""
+        """Stable per-host ext_agent_host_id, created once then preserved.
+
+        A persisted value is validated against the documented URN shape; a
+        malformed or legacy value is replaced (the identity is only ever used
+        for a registration this store has not yet completed at that point).
+        """
         if self._host_id_path.is_file():
             existing = self._host_id_path.read_text(encoding="utf-8").strip()
-            if existing:
+            if HOST_ID_RE.match(existing):
                 return existing
-        value = f"siwc-{uuid.uuid4().hex}"
+        value = new_host_id()
         _write_private(self._host_id_path, value)
         return value
 
@@ -167,6 +202,15 @@ class Store:
     def _creds_path(self) -> pathlib.Path:
         return self.root / "credentials.json"
 
+    @property
+    def _url_path(self) -> pathlib.Path:
+        return self.root / "authorize_url.txt"
+
+    def save_authorize_url(self, url: str) -> pathlib.Path:
+        """Write a possibly-sensitive authorization URL to a private file."""
+        _write_private(self._url_path, url)
+        return self._url_path
+
     def save_creds(self, payload: dict) -> None:
         _write_private(self._creds_path, json.dumps(payload, indent=2))
 
@@ -174,7 +218,7 @@ class Store:
         return _read_json(self._creds_path)
 
     def mask(self) -> str:
-        """Mode+owner of the credential file, for evidence (never its contents)."""
+        """Mode+size of the credential file, for evidence (never its contents)."""
         if not self._creds_path.is_file():
             return "no credentials stored"
         st = self._creds_path.stat()
@@ -198,11 +242,16 @@ def _post_form(url: str, form: dict, timeout: int = 45) -> tuple[int, dict]:
         try:
             return e.code, json.loads(raw or b"{}")
         except Exception:
-            return e.code, {"error": "unparseable", "error_description": raw[:300].decode("utf-8", "replace")}
+            return e.code, {
+                "error": "unparseable",
+                "error_description": raw[:300].decode("utf-8", "replace"),
+            }
 
 
 def _get_json(url: str, bearer: str, timeout: int = 45) -> tuple[int, dict]:
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {bearer}", "Accept": "application/json"})
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {bearer}", "Accept": "application/json"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"{}")
@@ -218,10 +267,58 @@ def discovery() -> dict:
 
 
 # =============================================================================
+# granted-scope evidence — the TOKEN RESPONSE is authoritative, nothing else
+# =============================================================================
+class ScopeEvidenceError(ValueError):
+    """The token response did not carry usable granted-scope evidence."""
+
+
+def parse_granted_scopes(token_response: dict) -> list[str]:
+    """Extract granted scopes from the token response, or raise.
+
+    RFC 6749 §5.1 defines a space-delimited ``scope`` parameter. Some servers
+    return an array instead, so both shapes are accepted. The callback's `scope`
+    query parameter and the scopes we *requested* are deliberately NOT consulted:
+    only the token endpoint may assert what was granted. Absent, empty, or
+    malformed evidence fails closed.
+    """
+    if not isinstance(token_response, dict):
+        raise ScopeEvidenceError("token response is not an object")
+
+    raw = token_response.get("scope")
+    if raw is None:
+        raw = token_response.get("scopes")
+
+    if raw is None:
+        raise ScopeEvidenceError(
+            "token response carries no 'scope'/'scopes' field — cannot establish granted scopes"
+        )
+    if isinstance(raw, str):
+        tokens = raw.replace(",", " ").split()
+    elif isinstance(raw, list) and all(isinstance(x, str) for x in raw):
+        tokens = [t for part in raw for t in part.replace(",", " ").split()]
+    else:
+        raise ScopeEvidenceError(f"malformed granted-scope evidence: {type(raw).__name__}")
+
+    tokens = [t.strip() for t in tokens if t and t.strip()]
+    if not tokens:
+        raise ScopeEvidenceError("token response reported an EMPTY granted-scope set")
+    return tokens
+
+
+def has_plan_scope(token_response: dict) -> tuple[bool, list[str]]:
+    """(authorized, granted) — raises ScopeEvidenceError when evidence is unusable."""
+    granted = parse_granted_scopes(token_response)
+    return (REQUIRED_PLAN_SCOPE in granted), granted
+
+
+# =============================================================================
 # authorize
 # =============================================================================
-def build_authorize_url(*, store: Store, redirect_uri: str, agent_name: str | None) -> tuple[str, dict]:
-    """Create a pending attempt and return (url, pending). Pure except for storage."""
+def build_authorize_url(
+    *, store: Store, redirect_uri: str, agent_name: str | None, with_id_token_hint: bool = False
+) -> tuple[str, dict]:
+    """Create a pending attempt and return (url, pending)."""
     verifier, challenge = make_pkce()
     state = b64url(secrets.token_bytes(32))
     nonce = b64url(secrets.token_bytes(32))
@@ -240,7 +337,7 @@ def build_authorize_url(*, store: Store, redirect_uri: str, agent_name: str | No
         "ext_agent_host_id": store.host_id(),
         "response_type": "code",
         "redirect_uri": redirect_uri,
-        "scope": SCOPES,
+        "scope": SCOPES_REQUESTED,
         "resource": RESOURCE,
         "state": state,
         "nonce": nonce,
@@ -249,9 +346,14 @@ def build_authorize_url(*, store: Store, redirect_uri: str, agent_name: str | No
     }
     if hint:
         params["agent_name_hint"] = hint
-    # Reauthorization hints are optional; only send an id_token_hint when present.
-    if issued_client_id and creds.get("id_token"):
+
+    # Reauthorization hints are optional. id_token_hint is a signed JWT, so it is
+    # sent only when explicitly opted into, and the resulting URL is never
+    # printed (see cmd_authorize) — it goes to a 0600 file instead.
+    sent_id_token_hint = False
+    if issued_client_id and with_id_token_hint and creds.get("id_token"):
         params["id_token_hint"] = creds["id_token"]
+        sent_id_token_hint = True
         if creds.get("email"):
             params["login_hint"] = creds["email"]
 
@@ -265,6 +367,7 @@ def build_authorize_url(*, store: Store, redirect_uri: str, agent_name: str | No
         "client_id_used": client_id,
         "is_initial_registration": not bool(issued_client_id),
         "agent_name_hint": hint,
+        "sent_id_token_hint": sent_id_token_hint,
     }
     return url, pending
 
@@ -276,20 +379,26 @@ class CallbackError(ValueError):
     pass
 
 
-def parse_callback(callback_url: str, pending: dict) -> dict:
+def parse_callback(
+    callback_url: str, pending: dict, *, expected_client_id: str | None = None
+) -> dict:
     """Validate the callback URL and extract grant material.
 
-    Enforces: state match (CSRF), error propagation, and — on a NEW
-    registration — presence of the issued client_id.
+    Enforces: state match (CSRF), error propagation, presence of the issued
+    client_id on a NEW registration, and — on reauthorization — that any
+    client_id the callback supplies matches the registration already selected.
+    Error messages never embed the URL or the code.
     """
     if not callback_url or "?" not in callback_url:
-        raise CallbackError("callback URL has no query string; paste the FULL redirect URL")
+        raise CallbackError("callback input has no query string; expected the full redirect URL")
     query = urllib.parse.urlparse(callback_url.strip()).query
     q = urllib.parse.parse_qs(query)
 
     if "error" in q:
         desc = (q.get("error_description") or [""])[0]
-        raise CallbackError(f"authorization denied: {q['error'][0]}{' — ' + desc if desc else ''}")
+        raise CallbackError(
+            f"authorization denied: {q['error'][0]}{' — ' + desc if desc else ''}"
+        )
 
     code = (q.get("code") or [""])[0]
     if not code:
@@ -303,20 +412,28 @@ def parse_callback(callback_url: str, pending: dict) -> dict:
         raise CallbackError("state mismatch — refusing (possible CSRF or a stale attempt)")
 
     issued = (q.get("client_id") or [""])[0].strip()
-    if pending.get("is_initial_registration") and not issued:
-        # Doc: "If a new-registration callback does not include an issued ID,
-        # treat registration as incomplete."
-        raise CallbackError(
-            "initial registration callback returned no issued client_id — "
-            "registration is incomplete; re-run the authorization"
-        )
+    if pending.get("is_initial_registration"):
+        if not issued:
+            # Doc: "If a new-registration callback does not include an issued ID,
+            # treat registration as incomplete."
+            raise CallbackError(
+                "initial registration callback returned no issued client_id — "
+                "registration is incomplete; re-run the authorization"
+            )
+        resolved = issued
+    else:
+        # Reauthorization: never let a callback swap the registration identity.
+        bound = (expected_client_id or str(pending.get("client_id_used") or "")).strip()
+        if issued and bound and issued != bound:
+            raise CallbackError(
+                "callback client_id does not match the selected registration — refusing "
+                "to replace the saved registration"
+            )
+        resolved = bound or issued
+        if not resolved:
+            raise CallbackError("no client_id bound to this attempt — re-run `authorize`")
 
-    scope = (q.get("scope") or [""])[0]
-    return {
-        "code": code,
-        "client_id": issued or str(pending.get("client_id_used") or ""),
-        "scope": scope,
-    }
+    return {"code": code, "client_id": resolved}
 
 
 def exchange_code(*, pending: dict, grant: dict) -> tuple[int, dict]:
@@ -342,15 +459,16 @@ def refresh_tokens(*, creds: dict) -> tuple[int, dict]:
 
 
 # =============================================================================
-# ID token validation
+# ID token validation — mandatory, never optional
 # =============================================================================
-def validate_id_token(id_token: str, *, nonce: str, client_id: str, jwks_uri: str | None = None) -> dict:
-    """Verify signature (JWKS/RS256), issuer, audience, expiry and nonce.
-
-    Audience is checked against the ISSUED client id on a new registration, and
-    falls back to the recorded client id thereafter.
-    """
+def validate_id_token(
+    id_token: str, *, nonce: str, client_id: str, jwks_uri: str | None = None
+) -> dict:
+    """Verify signature (JWKS/RS256), issuer, audience, expiry, subject, nonce."""
     import jwt  # PyJWT, imported lazily so --help works without the venv
+
+    if not id_token or not isinstance(id_token, str):
+        raise CallbackError("no id_token present — an authenticated connection requires one")
 
     if not jwks_uri:
         jwks_uri = discovery().get("jwks_uri")
@@ -366,31 +484,72 @@ def validate_id_token(id_token: str, *, nonce: str, client_id: str, jwks_uri: st
         audience=client_id,
         options={"require": ["iss", "aud", "exp", "sub"]},
     )
-    if nonce and claims.get("nonce") != nonce:
+    if not claims.get("sub"):
+        raise CallbackError("ID token has no subject claim")
+    if not nonce or claims.get("nonce") != nonce:
         raise CallbackError("ID token nonce does not match this attempt")
     return claims
 
 
-def check_plan_scope(*sources: str) -> tuple[bool, str]:
-    """True when chatgpt.tokens.use.direct appears in any granted-scope string."""
-    merged: list[str] = []
-    for s in sources:
-        if not s:
+# =============================================================================
+# model discovery — documented `models[]` with slug/display_name/visibility
+# =============================================================================
+class ModelCatalogError(ValueError):
+    """The model-list response did not match the documented shape."""
+
+
+def parse_model_catalog(payload: object) -> list[dict]:
+    """Parse the Sign-in-with-ChatGPT model list.
+
+    Documented shape: a top-level ``models`` array whose entries carry ``slug``,
+    ``display_name`` and ``visibility``; entries with ``visibility == "list"``
+    are the display-relevant set, and ``slug`` is what is passed back as
+    ``model``. Anything else fails closed with the observed keys named, so a
+    schema change is diagnosable instead of silently yielding "no models".
+    """
+    if not isinstance(payload, dict):
+        raise ModelCatalogError(f"model list is {type(payload).__name__}, not an object")
+    rows = payload.get("models")
+    if not isinstance(rows, list):
+        observed = ", ".join(sorted(payload)) or "(empty object)"
+        raise ModelCatalogError(
+            f"model list has no 'models' array (observed top-level keys: {observed})"
+        )
+
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        merged.extend(urllib.parse.unquote_plus(str(s)).replace(",", " ").split())
-    granted = set(merged)
-    if REQUIRED_PLAN_SCOPE in granted:
-        return True, " ".join(sorted(granted))
-    return False, " ".join(sorted(granted)) or "(none reported)"
+        slug = row.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        out.append({
+            "slug": slug.strip(),
+            "display_name": str(row.get("display_name") or ""),
+            "visibility": str(row.get("visibility") or ""),
+        })
+    if not out:
+        raise ModelCatalogError("'models' array contained no entry with a usable 'slug'")
+    return out
+
+
+def listable_models(payload: object) -> list[dict]:
+    """The display-relevant subset (visibility == 'list'), per the docs."""
+    return [m for m in parse_model_catalog(payload) if m["visibility"] == "list"]
+
+
+def find_model(payload: object, slug: str) -> dict | None:
+    for m in parse_model_catalog(payload):
+        if m["slug"] == slug:
+            return m
+    return None
 
 
 # =============================================================================
 # inference
 # =============================================================================
-def list_models(access_token: str) -> tuple[int, list[dict]]:
-    status, payload = _get_json(f"{API_BASE}/models", access_token)
-    rows = payload.get("data") if isinstance(payload, dict) else None
-    return status, (rows if isinstance(rows, list) else [])
+def models_request(access_token: str) -> tuple[int, dict]:
+    return _get_json(f"{API_BASE}/models", access_token)
 
 
 def responses_infer(access_token: str, model: str, prompt: str, timeout: int = 120) -> dict:
@@ -413,7 +572,8 @@ def responses_infer(access_token: str, model: str, prompt: str, timeout: int = 1
             "Accept": "text/event-stream",
         },
     )
-    out = {"http": 0, "text": "", "completed": False, "failed": None, "incomplete": None, "events": 0}
+    out = {"http": 0, "text": "", "completed": False, "failed": None,
+           "incomplete": None, "events": 0}
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             out["http"] = r.status
@@ -453,16 +613,21 @@ def responses_infer(access_token: str, model: str, prompt: str, timeout: int = 1
 # =============================================================================
 # --listen: capture the loopback callback (for `ssh -L` from the browser host)
 # =============================================================================
-def run_listener(*, store: Store, redirect_uri: str, timeout: int) -> dict | None:
+def run_listener(*, redirect_uri: str, timeout: int) -> str | None:
     parsed = urllib.parse.urlparse(redirect_uri)
-    host, port, path = parsed.hostname or "127.0.0.1", parsed.port or 1455, parsed.path
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 1455
+    path = parsed.path
     captured: dict = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             if urllib.parse.urlparse(self.path).path != path:
-                self.send_response(404); self.end_headers(); return
-            captured["url"] = f"{redirect_uri}{'?' + self.path.split('?', 1)[1] if '?' in self.path else ''}"
+                self.send_response(404)
+                self.end_headers()
+                return
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            captured["url"] = f"{redirect_uri}?{qs}" if qs else ""
             body = b"Authorization captured. You may close this window."
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -470,67 +635,26 @@ def run_listener(*, store: Store, redirect_uri: str, timeout: int) -> dict | Non
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *a):  # silence default logging (it prints URLs)
+        def log_message(self, *a):  # never log the request line (it carries a code)
             return
 
     with socketserver.TCPServer((host, port), Handler) as httpd:
         httpd.timeout = timeout
         deadline = time.time() + timeout
-        while time.time() < deadline and "url" not in captured:
+        while time.time() < deadline and not captured.get("url"):
             httpd.handle_request()
-    return captured.get("url") and captured or None
+    return captured.get("url") or None
 
 
 # =============================================================================
-# CLI
+# completion (shared by --listen and stdin)
 # =============================================================================
-def _granted_scopes_from_token_response(tok: dict, callback_scope: str) -> str:
-    for key in ("scope", "scopes"):
-        val = tok.get(key)
-        if isinstance(val, str) and val.strip():
-            return val
-        if isinstance(val, list) and val:
-            return " ".join(str(v) for v in val)
-    return callback_scope
-
-
-def cmd_authorize(args, store: Store) -> int:
-    url, pending = build_authorize_url(
-        store=store, redirect_uri=args.redirect_uri, agent_name=args.agent_name
-    )
-    store.save_pending(pending)
-    kind = "INITIAL REGISTRATION (dynamic_agent_client)" if pending["is_initial_registration"] \
-        else "REAUTHORIZATION (issued client_id)"
-    print(f"mode          {kind}")
-    print(f"host_id       {store.host_id()}")
-    print(f"redirect_uri  {args.redirect_uri}")
-    print(f"pending       stored (state/nonce/verifier at {store.root}/pending.json, mode 0600)")
-    print()
-    print("=" * 78)
-    print("  OPERATOR ACTION — open this URL in the browser on your own machine:")
-    print()
-    print(url)
-    print()
-    print("  After approving you will land on the loopback callback. Nothing is")
-    print("  listening there on your machine, so copy the FULL address from the")
-    print("  browser's address bar and paste it into --complete.")
-    print("=" * 78)
-
-    if args.listen:
-        print()
-        print(f"listening on {args.redirect_uri} for up to {args.timeout}s (SSH-forward this port)")
-        got = run_listener(store=store, redirect_uri=args.redirect_uri, timeout=args.timeout)
-        if not got:
-            print("no callback received before the timeout", file=sys.stderr)
-            return 1
-        return _complete_from_url(got["url"], store)
-    return 0
-
-
-def _complete_from_url(callback_url: str, store: Store) -> int:
+def complete_from_stdin_or_url(callback_url: str, store: Store) -> int:
     pending = store.pending()
     try:
-        grant = parse_callback(callback_url, pending)
+        grant = parse_callback(
+            callback_url, pending, expected_client_id=str(store.creds().get("client_id") or "")
+        )
     except CallbackError as exc:
         print(f"REFUSING: {exc}", file=sys.stderr)
         return 2
@@ -541,49 +665,57 @@ def _complete_from_url(callback_url: str, store: Store) -> int:
         print(f"TOKEN EXCHANGE FAILED (HTTP {status}): {err}", file=sys.stderr)
         return 3
 
-    scopes = _granted_scopes_from_token_response(tok, grant.get("scope", ""))
-    authorized, granted_list = check_plan_scope(scopes, grant.get("scope", ""))
-    print(f"token exchange  OK (HTTP {status})")
-    print(f"issued client_id {grant['client_id']}")
-
-    if not authorized:
+    # --- authoritative granted-scope check ---------------------------------
+    try:
+        authorized, granted = has_plan_scope(tok)
+    except ScopeEvidenceError as exc:
         print(
-            f"\nNOT AUTHORIZED for ChatGPT plan usage: {REQUIRED_PLAN_SCOPE} is ABSENT.\n"
-            f"granted scopes: {granted_list}",
+            f"AUTHORIZATION INDETERMINATE — failing closed: {exc}\n"
+            "No credential was stored.",
             file=sys.stderr,
         )
         return 4
-    print(f"granted scopes   {granted_list}")
+
+    print(f"token exchange   OK (HTTP {status})")
+    print(f"issued client_id {grant['client_id']}")
+    print(f"granted scopes   {' '.join(granted)}")
+    if not authorized:
+        print(
+            f"\nNOT AUTHORIZED for ChatGPT plan usage: {REQUIRED_PLAN_SCOPE} was not granted.\n"
+            "No credential was stored.",
+            file=sys.stderr,
+        )
+        return 4
     print(f"AUTHORIZED       {REQUIRED_PLAN_SCOPE} present")
 
-    identity = {}
+    # --- ID token is mandatory --------------------------------------------
     id_token = tok.get("id_token")
-    if id_token:
-        try:
-            jwks = discovery().get("jwks_uri")
-            claims = validate_id_token(
-                id_token, nonce=str(pending.get("nonce") or ""),
-                client_id=grant["client_id"], jwks_uri=jwks,
-            )
-            identity = {"sub": claims.get("sub"), "email": claims.get("email")}
-            print(f"id_token         verified (sub={identity['sub']}, email={identity.get('email')})")
-        except Exception as exc:  # noqa: BLE001
-            print(f"REFUSING: ID token validation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-            return 5
-    else:
-        print("WARNING: no id_token returned; identity not verified", file=sys.stderr)
+    try:
+        claims = validate_id_token(
+            id_token,
+            nonce=str(pending.get("nonce") or ""),
+            client_id=grant["client_id"],
+            jwks_uri=discovery().get("jwks_uri"),
+        )
+    except CallbackError as exc:
+        print(f"REFUSING: ID token validation failed: {exc}", file=sys.stderr)
+        return 5
+    except Exception as exc:  # noqa: BLE001
+        print(f"REFUSING: ID token validation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 5
 
-    expires_at = int(time.time()) + int(tok.get("expires_in") or 0)
+    print(f"id_token         verified (sub={claims.get('sub')}, email={claims.get('email')})")
+
     store.save_creds({
         "client_id": grant["client_id"],
         "access_token": tok["access_token"],
         "refresh_token": tok.get("refresh_token", ""),
-        "id_token": id_token or "",
+        "id_token": id_token,
         "token_type": tok.get("token_type", "Bearer"),
-        "expires_at": expires_at,
-        "granted_scopes": granted_list,
-        "sub": identity.get("sub", ""),
-        "email": identity.get("email", ""),
+        "expires_at": int(time.time()) + int(tok.get("expires_in") or 0),
+        "granted_scopes": " ".join(granted),
+        "sub": claims.get("sub", ""),
+        "email": claims.get("email", ""),
         "host_id": store.host_id(),
         "resource": RESOURCE,
     })
@@ -593,8 +725,57 @@ def _complete_from_url(callback_url: str, store: Store) -> int:
     return 0
 
 
+# =============================================================================
+# CLI
+# =============================================================================
+def cmd_authorize(args, store: Store) -> int:
+    url, pending = build_authorize_url(
+        store=store,
+        redirect_uri=args.redirect_uri,
+        agent_name=args.agent_name,
+        with_id_token_hint=args.with_id_token_hint,
+    )
+    store.save_pending(pending)
+    kind = ("INITIAL REGISTRATION (dynamic_agent_client)"
+            if pending["is_initial_registration"] else "REAUTHORIZATION (issued client_id)")
+    print(f"mode          {kind}")
+    print(f"host_id       {store.host_id()}")
+    print(f"redirect_uri  {args.redirect_uri}")
+    print(f"pending       stored (state/nonce/verifier, mode 0600)")
+
+    if pending["sent_id_token_hint"]:
+        # The URL now carries a signed JWT — never print it.
+        path = store.save_authorize_url(url)
+        print()
+        print("This authorization URL carries an id_token_hint, so it is NOT printed.")
+        print(f"Open it from: {path}  (mode 0600)")
+        print("Do not paste it into any transcript, ticket or chat.")
+    else:
+        print()
+        print("=" * 78)
+        print("  OPERATOR ACTION — open this URL in the browser on your own machine:")
+        print()
+        print(url)
+        print("=" * 78)
+
+    if args.listen:
+        print()
+        print(f"listening on {args.redirect_uri} for up to {args.timeout}s")
+        print("from your Windows box:  ssh -L 1455:127.0.0.1:1455 <this-vm>")
+        got = run_listener(redirect_uri=args.redirect_uri, timeout=args.timeout)
+        if not got:
+            print("no callback received before the timeout", file=sys.stderr)
+            return 1
+        return complete_from_stdin_or_url(got, store)
+    return 0
+
+
 def cmd_complete(args, store: Store) -> int:
-    return _complete_from_url(args.callback_url, store)
+    url = read_callback_silently()
+    if not url:
+        print("REFUSING: no callback URL provided on stdin", file=sys.stderr)
+        return 2
+    return complete_from_stdin_or_url(url, store)
 
 
 def cmd_status(args, store: Store) -> int:
@@ -602,15 +783,18 @@ def cmd_status(args, store: Store) -> int:
     print(f"store            {store.root} ({store.mask()})")
     print(f"host_id          {store.host_id()}")
     if not creds:
-        print("credentials      NONE — run `authorize` then `complete`")
+        print("credentials      NONE — run `authorize` then complete the consent")
         return 1
-    remaining = int(creds.get("expires_at", 0)) - int(time.time())
     print(f"client_id        {creds.get('client_id')}")
     print(f"sub / email      {creds.get('sub')} / {creds.get('email')}")
     print(f"granted_scopes   {creds.get('granted_scopes')}")
-    print(f"access_token     present={bool(creds.get('access_token'))} expires_in={remaining}s")
+    print(f"access_token     present={bool(creds.get('access_token'))} "
+          f"expires_in={int(creds.get('expires_at', 0)) - int(time.time())}s")
     print(f"refresh_token    present={bool(creds.get('refresh_token'))}")
-    authorized, _ = check_plan_scope(str(creds.get("granted_scopes", "")))
+    try:
+        authorized, _ = has_plan_scope({"scope": str(creds.get("granted_scopes", ""))})
+    except ScopeEvidenceError:
+        authorized = False
     print(f"plan usage       {'AUTHORIZED' if authorized else 'NOT AUTHORIZED'}")
     return 0 if authorized else 1
 
@@ -642,26 +826,37 @@ def cmd_refresh(args, store: Store) -> int:
 
 
 def cmd_models(args, store: Store) -> int:
-    token = _valid_access_token(store) or ""
+    token = _valid_access_token(store)
     if not token:
         print("no usable access token; run authorize/complete first", file=sys.stderr)
         return 1
-    status, rows = list_models(token)
-    listed = [r for r in rows if r.get("visibility", "list") == "list"]
-    print(f"GET /v1/models -> HTTP {status}, {len(listed)} listed models")
+    status, payload = models_request(token)
+    print(f"GET /v1/models -> HTTP {status}")
     if status != 200:
-        print(json.dumps(rows)[:400], file=sys.stderr)
+        print(json.dumps(payload)[:400], file=sys.stderr)
         return 1
-    ids = sorted(str(r.get("id") or r.get("slug")) for r in listed)
-    for i in ids:
-        print(f"  {i}")
-    target = "gpt-6.1-sol"
-    print(f"\n{target} available: {target in ids}")
+    try:
+        everything = parse_model_catalog(payload)
+        listed = [m for m in everything if m["visibility"] == "list"]
+    except ModelCatalogError as exc:
+        print(f"REFUSING: {exc}", file=sys.stderr)
+        return 1
+    print(f"{len(listed)} listed of {len(everything)} reported")
+    for m in sorted(listed, key=lambda r: r["slug"]):
+        print(f"  {m['slug']:34s} {m['display_name']}")
+    target = args.model
+    match = find_model(payload, target)
+    print()
+    if match is None:
+        print(f"{target} available: NO (not present in the catalog)")
+        return 1
+    print(f"{target} available: YES  visibility={match['visibility']!r} "
+          f"display_name={match['display_name']!r}")
     return 0
 
 
 def cmd_infer(args, store: Store) -> int:
-    token = _valid_access_token(store) or ""
+    token = _valid_access_token(store)
     if not token:
         print("no usable access token; run authorize/complete first", file=sys.stderr)
         return 1
@@ -681,7 +876,30 @@ def cmd_infer(args, store: Store) -> int:
     return 1
 
 
+def reject_credentialish_argv(argv: list[str]) -> None:
+    """Refuse a callback URL / authorization code on the command line.
+
+    This runs BEFORE argparse: argparse echoes unrecognized values into its error
+    text, so a stray `--callback-url 'http://…?code=…'` would copy the one-time
+    authorization code into stderr and from there into logs and transcripts. The
+    guard refuses without repeating the offending value.
+
+    `--redirect-uri` (a static loopback URI with no code) remains allowed.
+    """
+    for arg in argv:
+        lowered = arg.lower()
+        if "callback-url" in lowered or "code=" in lowered:
+            raise SystemExit(
+                "REFUSING: a callback URL or authorization code must not be passed on the "
+                "command line.\nargv is world-readable (/proc/<pid>/cmdline) and is echoed "
+                "verbatim by argparse on error.\n"
+                "Pipe it on stdin instead:  printf '%s\\n' \"$URL\" | "
+                "<prog> complete"
+            )
+
+
 def main() -> int:
+    reject_credentialish_argv(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--store", default=DEFAULT_STORE)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -689,15 +907,17 @@ def main() -> int:
     a = sub.add_parser("authorize")
     a.add_argument("--redirect-uri", default=DEFAULT_REDIRECT)
     a.add_argument("--agent-name", default="Turnstone")
-    a.add_argument("--listen", action="store_true")
+    a.add_argument("--listen", action="store_true",
+                   help="capture the loopback callback here (use with ssh -L)")
     a.add_argument("--timeout", type=int, default=300)
+    a.add_argument("--with-id-token-hint", action="store_true",
+                   help="reauthorization only: send id_token_hint (URL then goes to a file)")
 
-    c = sub.add_parser("complete")
-    c.add_argument("--callback-url", required=True)
-
+    sub.add_parser("complete", help="read the callback URL from stdin (input is not echoed)")
     sub.add_parser("status")
     sub.add_parser("refresh")
-    sub.add_parser("models")
+    m = sub.add_parser("models")
+    m.add_argument("--model", default="gpt-6.1-sol")
 
     i = sub.add_parser("infer")
     i.add_argument("--model", default="gpt-6.1-sol")

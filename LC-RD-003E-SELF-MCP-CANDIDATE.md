@@ -53,3 +53,22 @@ Do not install sudoers or register the MCP until the output is evaluated. Valida
 6. Real workstream discovery/read, operator-approved skill install, read-back and recovery; no Switchyard or Grafana mutation implied.
 
 STATUS: API AUTHENTICATED + NAMED PERMISSIONS VERIFIED; SELF MCP CANDIDATE STAGED IN GIT; NOT DEPLOYED.
+
+## Candidate hardening + first real MCP transport test
+
+- Hardened candidate path/query parser for ASCII controls and double-encoded query reveal keys; recursive response redaction now recognizes jwt, accessToken, refreshToken, clientSecret, apiKey, ts_ and glsa_ token strings. These are defenses in depth, NOT exhaustive secret-output guarantees for arbitrary APIs.
+- Extended offline test suite by three tests; operator must rerun them. Earlier 8/8 PASS applies to prior candidate revision, not yet to this revision.
+- Added integrations/turnstone-self-api/smoke_mcp.py: uses the existing /opt/turnstone-venv MCP SDK to launch candidate via stdio, validate initialize/tools/list and call the read tool on Console + five nodes with the staged root-only ts_ token. It invokes NO API mutation and makes NO changes to the registered MCP catalogue or active workstreams.
+- Run diagnostic as root for deliberate local credential access; this does NOT mean a permanently root-executed model-facing MCP bridge is already approved. Production must separately review token custody, root process boundaries, output sanitization and exact-argv privilege behavior.
+
+### Next operator commands — read-only
+
+    git -C ~/turnstone-five-node-source pull --ff-only
+    python3 -m py_compile ~/turnstone-five-node-source/integrations/turnstone-self-api/server.py
+    python3 -m py_compile ~/turnstone-five-node-source/integrations/turnstone-self-api/smoke_mcp.py
+    python3 -m unittest discover -s ~/turnstone-five-node-source/integrations/turnstone-self-api/tests -v
+    sudo /opt/turnstone-venv/bin/python ~/turnstone-five-node-source/integrations/turnstone-self-api/smoke_mcp.py
+
+- Run as described on turnstone-vm and capture nonsecret PASS/FAIL only; do not paste tokens.
+- Independently add model.skills.write to the identity owning the Turnstone ts_ management token if operator approves. Keep all original grants and role memberships; verify NO permissions disappeared.
+- Do NOT install sudoers, copy code into /opt, add a DB MCP row, restart or reload MCP yet. These are separate deployment gates.

@@ -150,6 +150,13 @@ Hashes after the fixes:
 | `deploy/sudoers-turnstone-self-mcp` | `7a344ab8059d13de27ebad6f70ee2d2ae8440b059edb2e4e4c7c0c85f8dfd355` |
 | `tests/test_deploy_verifier.sh` | `a9375bf731d69c8f9c186a26886463b9d203268373390e44c8cd11e057359386` |
 
+> **Superseded by LC-RD-003H.** `deploy/deploy-self-mcp.sh` (now
+> `455ce932bf2647f5800e3dae8791b7247b8ff335d8f00efb6896c8a9550992df`) and
+> `tests/test_deploy_verifier.sh` (now
+> `18acb917da49f8710c6b2d0b0ef8ca1b54dcd3aa8b1f59f62dcf9a78e8e76344`) gained a
+> bounded convergence window after step 6 was observed to false-fail on nodes
+> whose MCP handshake was still in flight. See LC-RD-003H §2–§3.
+
 Nothing in this round changes `server.py`, the MCP row body, or any accepted
 limitation in §5 — it makes the gates that protect the deployment actually
 enforce what they claim.

@@ -154,11 +154,27 @@ echo "=== 6. ASSERT per-node registration: connected + $EXPECTED_TOOLS tools ===
 if [ "$DRY_RUN" = 1 ]; then
   echo "  [dry-run] would assert nodes: ${EXPECTED_NODES[*]}"
 else
+  # The reload returns when reconcile finishes, NOT when a connect completes,
+  # and its added/removed/updated lists only mean "no config delta" — neither
+  # establishes connection success. A node whose MCP handshake is still in
+  # flight reports connected=false / tools=0 with has_error=false. A single
+  # sample here therefore failed on whichever nodes were slowest to handshake
+  # (observed 2026-10-17: head-1/node-2/node-3 at exit 8 while their bridges
+  # were alive and reported connected seconds later). Poll a bounded window.
+  #
   # The verifier program arrives on stdin (heredoc) so the API response cannot
   # share that channel: a heredoc redirect overrides the pipe, which made
   # json.load(sys.stdin) fail even on a healthy payload. Deliver the response
   # on fd 3 instead, keeping the program and the payload separate.
-  "$PY" - "$SERVER_NAME" "$EXPECTED_TOOLS" "${EXPECTED_NODES[@]}" 3< <(api GET "$SERVERS_URL") <<'PYEOF' || exit 8
+  NODE_CONVERGE_TIMEOUT_S=${NODE_CONVERGE_TIMEOUT_S:-120}
+  NODE_POLL_S=${NODE_POLL_S:-5}
+  [ "$NODE_POLL_S" -ge 1 ] || NODE_POLL_S=1
+  MAX_ATTEMPTS=$(( NODE_CONVERGE_TIMEOUT_S / NODE_POLL_S + 1 ))
+  attempt=0
+  while :; do
+    attempt=$(( attempt + 1 ))
+    rc=0
+    out=$("$PY" - "$SERVER_NAME" "$EXPECTED_TOOLS" "${EXPECTED_NODES[@]}" 3< <(api GET "$SERVERS_URL") <<'PYEOF' 2>&1
 import json, sys
 
 name, want_tools = sys.argv[1], int(sys.argv[2])
@@ -166,11 +182,11 @@ expected_nodes = sys.argv[3:]
 try:
     payload = json.load(open(3))
 except OSError as exc:
-    print(f"FAIL: could not open the API-response channel (fd 3): {exc}")
-    raise SystemExit(1)
+    print(f"FAIL: could not read the API response on fd 3: {exc}")
+    raise SystemExit(2)
 except json.JSONDecodeError as exc:
     print(f"FAIL: API response was not valid JSON: {exc}")
-    raise SystemExit(1)
+    raise SystemExit(2)
 rows = [s for s in payload.get("servers", []) if s.get("name") == name]
 if not rows:
     print(f"FAIL: no server row named {name!r}")
@@ -211,6 +227,26 @@ if problems:
     raise SystemExit(1)
 print(f"PASS: {len(expected_nodes)} nodes connected with {want_tools} tools each")
 PYEOF
+    ) || rc=$?
+
+    case "$rc" in
+      0) printf '%s\n' "$out"; break ;;
+      2)
+        # Transport / auth / parse failure: retrying cannot help.
+        printf '%s\n' "$out"
+        echo "FAIL: could not read per-node MCP status from the API" >&2
+        exit 8
+        ;;
+    esac
+
+    if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+      printf '%s\n' "$out"
+      echo "FAIL: nodes did not all connect within ${NODE_CONVERGE_TIMEOUT_S}s" >&2
+      exit 8
+    fi
+    echo "  attempt ${attempt}/${MAX_ATTEMPTS}: not all nodes connected yet — re-checking in ${NODE_POLL_S}s"
+    sleep "$NODE_POLL_S"
+  done
 fi
 
 echo

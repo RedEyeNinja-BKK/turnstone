@@ -20,6 +20,10 @@ TOKEN_FILE = Path("/srv/turnstone/credentials/api/turnstone_admin_token")
 ORIGINS = {
     "console": "http://127.0.0.1:8090",
     "head": "http://127.0.0.1:8080",
+    "worker_2": "http://127.0.0.1:8082",
+    "worker_3": "http://127.0.0.1:8083",
+    "worker_4": "http://127.0.0.1:8084",
+    "worker_5": "http://127.0.0.1:8085",
 }
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):

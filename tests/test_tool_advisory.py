@@ -117,7 +117,7 @@ class TestRenderOutputGuardText:
             }
         )
         assert text == (
-            "Output guard: semantic risk signal (no specific indicator supplied) (HIGH)\\n"
+            "Output guard: semantic risk signal (no specific indicator supplied) (HIGH)\n"
             "  This is an advisory assessment of the tool-result text, "
             "not evidence that the command failed or that an attack occurred."
         )
@@ -133,7 +133,7 @@ class TestRenderOutputGuardText:
             }
         )
         assert text == (
-            "Output guard: prompt_injection (HIGH)\\n"
+            "Output guard: prompt_injection (HIGH)\n"
             "  Untrusted role delimiter found."
         )
 

@@ -154,12 +154,23 @@ echo "=== 6. ASSERT per-node registration: connected + $EXPECTED_TOOLS tools ===
 if [ "$DRY_RUN" = 1 ]; then
   echo "  [dry-run] would assert nodes: ${EXPECTED_NODES[*]}"
 else
-  api GET "$SERVERS_URL" | "$PY" - "$SERVER_NAME" "$EXPECTED_TOOLS" "${EXPECTED_NODES[@]}" <<'PYEOF' || exit 8
+  # The verifier program arrives on stdin (heredoc) so the API response cannot
+  # share that channel: a heredoc redirect overrides the pipe, which made
+  # json.load(sys.stdin) fail even on a healthy payload. Deliver the response
+  # on fd 3 instead, keeping the program and the payload separate.
+  "$PY" - "$SERVER_NAME" "$EXPECTED_TOOLS" "${EXPECTED_NODES[@]}" 3< <(api GET "$SERVERS_URL") <<'PYEOF' || exit 8
 import json, sys
 
 name, want_tools = sys.argv[1], int(sys.argv[2])
 expected_nodes = sys.argv[3:]
-payload = json.load(sys.stdin)
+try:
+    payload = json.load(open(3))
+except OSError as exc:
+    print(f"FAIL: could not open the API-response channel (fd 3): {exc}")
+    raise SystemExit(1)
+except json.JSONDecodeError as exc:
+    print(f"FAIL: API response was not valid JSON: {exc}")
+    raise SystemExit(1)
 rows = [s for s in payload.get("servers", []) if s.get("name") == name]
 if not rows:
     print(f"FAIL: no server row named {name!r}")

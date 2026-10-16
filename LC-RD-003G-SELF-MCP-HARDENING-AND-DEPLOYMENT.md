@@ -113,10 +113,18 @@ found **in the fix itself** during verification and is recorded as #7.
 | 6 | **`api()` never checked HTTP status** — a non-2xx body was piped straight into the JSON parser, producing silent garbage or an opaque traceback | Every call asserts 2xx and returns non-zero on failure; each call site has an explicit `exit N` |
 | — | *(hardening)* `visudo -c` validated the file **after** installing it into `/etc/sudoers.d/` | Validation now runs against the staged temp file **before** installation |
 | 7 | **(self-found) the fix for (2)/(3) reintroduced the masking bug** — `check_rc=$?` inside an `if ! cmd; then` branch captures the status of the *negation* (always 0). The script would print `SMOKE RECEIPT INVALID (receipt_check exit 0)` and then **exit 0** | Captured on the command's own line: `"$PY" … receipt_check.py "$OUT" \|\| check_rc=$?` |
+| 8 | **(operator-reported) the per-node verifier could never read its input** — `api GET "$SERVERS_URL" \| "$PY" - … <<'PYEOF'` gives the Python program stdin via the heredoc, and a heredoc redirect **overrides the pipe**. `json.load(sys.stdin)` therefore read EOF and raised `JSONDecodeError`, so `\|\| exit 8` aborted the deployment **even on a completely healthy payload**. The bug is invisible to review and to isolated testing of the Python block | Program and payload separated: the program stays on stdin (heredoc) and the API response is delivered on **fd 3** via `3< <(api GET "$SERVERS_URL")`; Python does `json.load(open(3))` with explicit `OSError`/`JSONDecodeError` handling → `SystemExit(1)` → `exit 8`. argv indices unchanged |
 
 Defect 7 is the reason the verification below is empirical rather than a
 syntax check: a script that prints "REFUSING TO PASS / RECEIPT INVALID" and then
 exits 0 looks correct in review and in `bash -n`.
+
+Defect 8 is the same lesson one level up: it survived review, `bash -n`, **and**
+an isolated test of the Python block. The isolated test passed precisely because
+it fed JSON over a pipe to a *standalone file*, never exercising the heredoc
+invocation the script actually uses. The regression test for it therefore runs
+the **real block, extracted verbatim from the script by marker**, so it cannot
+drift from what executes.
 
 ### Verification evidence
 
@@ -126,17 +134,21 @@ exits 0 looks correct in review and in `bash -n`.
 | Per-node assertion block, 6 synthetic payloads | all-good → `0`; disconnected node, absent node, wrong tool count, `auto_approve=true`, no matching row → `1` |
 | `run_smoke_root.sh` exit status | `rc=0`+good → `0`; **`rc=0`+leak → `1`**; `rc=5`+good → `5`; `rc=5`+leak → `5` |
 | Pre-fix tail on a leak receipt | printed `RECEIPT INVALID` … then **exited 0** (masking proven) |
+| **`tests/test_deploy_verifier.sh`** (drives the real extracted block) | **11/11 PASS** — 1 positive (healthy → `0`), 5 unhealthy (→ `8`), 3 fail-closed (empty / non-JSON / unreadable channel → `8`) |
+| Same test aimed at the pre-fix script | **fails** — structural guard fires, and behaviorally a healthy payload returned `8` instead of `0` |
 | `deploy-self-mcp.sh --dry-run` (non-root) | exit `0`, performs no install, no sudoers write, no API call |
+| Python suites | `45/45 PASS`, `55 subtests` — unchanged (no Python file touched this round) |
 | Syntax | `bash -n` / `sh -n` clean per declared shebang; no `\|\| true` remains |
 
 Hashes after the fixes:
 
 | File | sha256 |
 |---|---|
-| `deploy/deploy-self-mcp.sh` | `71a14865684ed4e1ca38b684273224dff7b05875a192b1af571d937cf62b8fe6` |
+| `deploy/deploy-self-mcp.sh` | `8340557772381f3c877493a971c106a78c491c2289572104a534428e31874bf9` |
 | `deploy/run_smoke_root.sh` | `36ababb2baf06c7bae82ab9980ce121fac4f765678c88fca7e2bbb9d517b3379` |
 | `deploy/launch-self-mcp.sh` | `8ba6c83e96c5f6267bec677df780e1505d1b850eb9c7d2db63fa2b3eb7ba9c5a` |
 | `deploy/sudoers-turnstone-self-mcp` | `7a344ab8059d13de27ebad6f70ee2d2ae8440b059edb2e4e4c7c0c85f8dfd355` |
+| `tests/test_deploy_verifier.sh` | `a9375bf731d69c8f9c186a26886463b9d203268373390e44c8cd11e057359386` |
 
 Nothing in this round changes `server.py`, the MCP row body, or any accepted
 limitation in §5 — it makes the gates that protect the deployment actually

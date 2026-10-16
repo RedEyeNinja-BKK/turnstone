@@ -63,7 +63,7 @@ def validate_path(path: str, method: str) -> str:
         if nxt == decoded:
             break
         decoded = nxt
-    if ("\" in decoded or "//" in decoded or "@" in decoded or "\x00" in decoded
+    if ("\\" in decoded or "//" in decoded or "@" in decoded or "\x00" in decoded
             or any(segment in (".", "..") for segment in decoded.split("/"))):
         raise BridgeRefusal("ambiguous or traversal path refused")
     for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):

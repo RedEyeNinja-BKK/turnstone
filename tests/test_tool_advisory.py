@@ -118,8 +118,8 @@ class TestRenderOutputGuardText:
         )
         assert text == (
             "Output guard: semantic risk signal (no specific indicator supplied) (HIGH)\n"
-            "  This is an advisory assessment of the tool-result text, "
-            "not evidence that the command failed or that an attack occurred."
+            "  Turnstone framework advisory about tool-result text; "
+            "not command stdout, evidence of command failure, or proof of an attack."
         )
         assert "ignore safeguards" not in text
 

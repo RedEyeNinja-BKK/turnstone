@@ -418,20 +418,13 @@ class OutputGuardJudge:
 
         if not resolved:
             if typed_spec is not None:
-                # Unreachable for dispatch: ``evaluate`` takes the typed branch
-                # before any provider construction, and the generative
-                # resolution above is gated on ``typed_spec is None``.  The
-                # session binding is still materialised below as the object's
-                # immutable lane, so state the situation accurately instead of
-                # claiming a fallback that will never happen.  A misleading
-                # "not a registered alias - falling back to session model"
-                # line here read, in production, as the guard having used the
-                # session model when the typed decision had in fact served.
-                log.warning(
-                    "output_guard_judge.typed_alias_unresolved alias=%r — the "
-                    "typed-decision path is still taken; a typed alias never "
-                    "uses the generative session model.",
-                    requested_alias,
+                # Expected: typed aliases intentionally bypass generative model
+                # binding. The typed adapter uses the registry URL directly.
+                # Do not report this normal path as an unresolved alias.
+                log.debug(
+                    "output_guard_judge.typed_decision_binding_bypassed",
+                    alias=requested_alias,
+                    contract=typed_spec.contract,
                 )
             elif construction_error is not None:
                 # The alias IS registered; its binding could not be built.
@@ -757,6 +750,11 @@ class OutputGuardJudge:
             leg=result.leg or "primary",
             risk_level=result.risk_level,
             confidence=result.confidence,
+            risk_score=result.risk_score,
+            backend=result.backend,
+            child_lane=result.child_lane,
+            served_model=result.served_model,
+            requested_model=result.requested_model,
         )
         return OutputJudgeVerdict(
             verdict_id=verdict_id,

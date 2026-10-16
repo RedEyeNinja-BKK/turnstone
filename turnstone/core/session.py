@@ -4988,7 +4988,7 @@ class ChatSession:
         # invites the bypass.
         aliases: list[str] = []
         if self._registry is not None:
-            aliases = sorted(a for a in self._registry.list_aliases() if a != "default")
+            aliases = sorted(a for a in self._registry.list_generative_aliases() if a != "default")
         aliases_str = ", ".join(f"`{a}`" for a in aliases)
         persona_line = self._persona_catalog_line()
         persona_base: dict[str, str] = {}
@@ -9501,7 +9501,7 @@ class ChatSession:
         ):
             available = ""
             if self._registry is not None and self._registry.count:
-                available = f" Available: {', '.join(self._registry.list_aliases())}"
+                available = f" Available: {', '.join(self._registry.list_generative_aliases())}"
             if self._kind == WorkstreamKind.COORDINATOR:
                 remedy = "Recreate the alias or adjust the workstream model."
             else:
@@ -20501,7 +20501,7 @@ class ChatSession:
             if self._registry is None:
                 available_str = "(no registry configured)"
             else:
-                available = sorted(a for a in self._registry.list_aliases() if a != "default")
+                available = sorted(a for a in self._registry.list_generative_aliases() if a != "default")
                 available_str = (
                     ", ".join(available)
                     if available
@@ -28769,7 +28769,7 @@ class ChatSession:
                 if self._model_alias:
                     info += f" ({self._model_alias})"
                 if self._registry and self._registry.count > 1:
-                    avail = ", ".join(self._registry.list_aliases())
+                    avail = ", ".join(self._registry.list_generative_aliases())
                     info += f"\nAvailable: {avail}"
                     if self._registry.fallback:
                         info += f"\nFallback: {', '.join(self._registry.fallback)}"
@@ -28831,7 +28831,7 @@ class ChatSession:
                 else:
                     available = ""
                     if self._registry:
-                        available = f" Available: {', '.join(self._registry.list_aliases())}"
+                        available = f" Available: {', '.join(self._registry.list_generative_aliases())}"
                     self.ui.on_info(f"Unknown model alias: {arg}.{available}")
 
         elif cmd == "/raw":

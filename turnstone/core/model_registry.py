@@ -754,6 +754,28 @@ class ModelRegistry:
         """Return all registered model aliases."""
         return list(self._models.keys())
 
+    def list_generative_aliases(self) -> list[str]:
+        """Return the aliases that can actually generate assistant text.
+
+        A row declaring ``capabilities["supports_typed_decision"]`` is a
+        *decision* backend: it answers with a typed decision object (see
+        :mod:`turnstone.core.typed_decision`) and generates no assistant text,
+        so a chat/Responses request against it fails outright.  Offering such an
+        alias as a session or task-agent model *choice* is therefore a
+        guaranteed failure, and these surfaces use this accessor instead of
+        :meth:`list_aliases`.
+
+        The row is NOT removed from the registry: :meth:`list_aliases` still
+        enumerates it (the Models tab and the reload endpoint manage it) and the
+        Output Guard still resolves and executes it through the typed-decision
+        seam.
+        """
+        return [
+            alias
+            for alias, cfg in self._models.items()
+            if not (cfg.capabilities or {}).get("supports_typed_decision")
+        ]
+
     def resolve(self, alias: str | None = None) -> tuple[Any, str, ModelConfig, int]:
         """Resolve *alias* to ``(client, model_name, config, generation)``.
 

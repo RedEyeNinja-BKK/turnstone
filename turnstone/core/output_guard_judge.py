@@ -1050,11 +1050,19 @@ class OutputGuardJudge:
     def _error_verdict(
         self, verdict_id: str, call_id: str, start: float, reason: str
     ) -> OutputJudgeVerdict:
+        # On the TYPED path the judge never resolves an alias: provider
+        # construction is skipped by design, so ``self._judge_model_alias`` stays
+        # "" and ``self._model`` is the SESSION lane's raw model.  Recording that
+        # as the judge named the wrong model in the audit trail.  Prefer the
+        # typed alias when this judge is a typed-decision judge.  Fail-closed
+        # classification is untouched: still ``risk_level="none"`` under
+        # ``tier="llm_error"``.
+        typed_alias = getattr(self, "_typed_alias", "")
         return OutputJudgeVerdict(
             verdict_id=verdict_id,
             call_id=call_id,
             risk_level="none",
-            judge_model=self._judge_model_alias or self._model,
+            judge_model=self._judge_model_alias or typed_alias or self._model,
             latency_ms=int((time.monotonic() - start) * 1000),
             error=reason,
         )

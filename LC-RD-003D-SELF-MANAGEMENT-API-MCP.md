@@ -76,3 +76,11 @@ PREPARED IN GITHUB, NOT DEPLOYED: Self API token absent/unverified, self-MCP bri
 - Probe correction commit a6332eac530680e2892b859aea6085ae6d6df081 accepts comma-separated RBAC string and distinguishes NOT_REPORTED and UNEXPECTED_SHAPE from reported zero.
 - Operator next: git -C ~/turnstone-five-node-source pull --ff-only; sudo python3 ~/turnstone-five-node-source/scripts/turnstone_self_api_probe.py
 - Confirm named opt-in permissions before deploying an actual self-administration MCP server. Preserve all existing grants, credentials and five-node runtime.
+
+## MCP options reconciled with released examples
+
+- Upstream release v1.8.7 includes examples/mcp-cluster-ops/README.md, but explicitly labels the MCP sidecar **superseded by the built-in coordinator in 1.5+**. Its old tools only list nodes and run shell commands on nodes; it does not implement the full Console Admin API as typed MCP tools, so do not deploy it as an alleged self-admin solution.
+- Built-in coordinator remains useful for child workstream routing and delegation but does not substitute for all Admin API endpoints.
+- Full administrative self-MCP still requires a new, authorized and audited bridge. Do not register an unauthenticated loopback-wide MCP server exposing root token.
+- The updated self API probe now checks Console + all five server endpoints (head and workers 2–5) using the same staged token, with no credentials printed.
+- The operator must run the updated probe and return named permissions before a bridge deployment is considered; specifically inspect explicit opt-in grants (e.g. model.skills.write). No existing grants will be narrowed.

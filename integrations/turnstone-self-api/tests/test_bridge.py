@@ -60,6 +60,37 @@ class SecurityTests(unittest.TestCase):
         self.assertNotIn("private", output)
         self.assertIn("ordinary", output)
 
+    def test_redacts_jwt_and_camelcase_fields(self):
+        sensitive = {
+            "jwt": "eyJ.fake.signature",
+            "accessToken": "secret-value",
+            "refreshToken": "another-secret",
+            "clientSecret": "hidden-client",
+            "apiKey": "sk-secret",
+            "token": "glsa_" + "A" * 24,
+            "notes": "Bearer " + "x" * 25,
+            "state": "healthy",
+        }
+        out = bridge.redact(sensitive)
+        for name in ("jwt", "accessToken", "refreshToken", "clientSecret", "apiKey", "token"):
+            self.assertEqual(out[name], "[REDACTED]")
+        self.assertNotIn("Bearer", out["notes"])
+        self.assertEqual(out["state"], "healthy")
+
+    def test_refuses_double_encoded_reveal(self):
+        for path in (
+            "/v1/api/admin/mcp-servers?%72eveal=true",
+            "/v1/api/admin/mcp-servers?%2572eveal=true",
+            "/v1/api/admin/mcp-servers?show%5fsecrets=yes",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(bridge.BridgeRefusal):
+                    bridge.validate_path(path, "GET")
+
+    def test_rejects_raw_control_character(self):
+        with self.assertRaises(bridge.BridgeRefusal):
+            bridge.validate_path("/v1/api/admin/skills\nX: injected", "GET")
+
     def test_rejects_non_root_token_access(self):
         with patch.object(bridge.os, "geteuid", return_value=102):
             with self.assertRaises(bridge.BridgeRefusal):

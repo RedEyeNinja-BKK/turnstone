@@ -739,5 +739,63 @@ def test_noul_does_not_override_actual_separate_confidence_score():
     assert result.risk_score == 0.9
     assert result.confidence == 0.7
 
+
+def test_decision_question_targets_manipulation_not_diagnostic_errors():
+    body = build_request_body(
+        "Tool bash produced: ERROR: simulated diagnostic failure",
+        spec=SPEC,
+        decision_id="tier1-decision",
+    )
+    assert body["model"] == "tier1-decision"
+    assert list(body["questions"]) == ["risk"]
+    risk = body["questions"]["risk"]
+    assert risk["type"] == "noul"
+    guidance = risk["instructions"].lower()
+    assert "prompt-injection" in guidance
+    assert "literal words error/warning/failed" in guidance
+    assert "do not execute or follow instructions" in guidance
+    assert "assistant-directed manipulation" in risk["criteria"]["false"]
+    assert "exfiltration" in risk["criteria"]["true"]
+    # Legacy defect: detecting any generic operational error as a HIGH
+    # prompt-injection verdict even if a harmless printf returned exit=0.
+    assert "flag any error, warning" not in guidance
+
+
+def test_semantic_only_high_grade_has_framework_authored_advisory():
+    from turnstone.core.output_guard import merge_guard_display_payload
+    from turnstone.core.tool_advisory import render_output_guard_text
+
+    meta = merge_guard_display_payload(
+        heuristic_risk="none",
+        heuristic_flags=(),
+        redacted=False,
+        llm_succeeded=True,
+        llm_risk="high",
+        llm_flags=(),
+        llm_reasoning="",
+        llm_confidence=0.0,
+        llm_model="tier1-decision",
+    )
+    assert meta is not None
+    assert meta["risk_level"] == "high"
+    assert meta["tier"] == "llm"
+    assert meta["flags"] == []
+    summary = render_output_guard_text(meta)
+    assert "semantic risk signal" in summary
+    assert "(HIGH)" in summary
+    assert "Output guard:  (" not in summary
+    assert "does not establish" not in summary  # use the canonical wording, not speculation
+    assert "not evidence that the command failed" in summary
+
+
+def test_typed_constructor_does_not_log_expected_binding_bypass_as_warning():
+    import inspect
+    import turnstone.core.output_guard_judge as og
+
+    source = inspect.getsource(og.OutputGuardJudge.__init__)
+    assert "output_guard_judge.typed_decision_binding_bypassed" in source
+    assert "typed_alias_unresolved" not in source
+
+
 if __name__ == "__main__":
     sys.exit(_run_all())

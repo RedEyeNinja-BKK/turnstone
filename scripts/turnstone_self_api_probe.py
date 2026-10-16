@@ -61,6 +61,18 @@ def call(base: str, path: str, token: str) -> tuple[int | str, dict | None]:
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return "CONNECTION_ERROR", None
 
+def parse_permissions(raw: object) -> tuple[set[str], str]:
+    """Normalize Turnstone's comma-separated RBAC string; distinguish absent/invalid."""
+    if raw is None:
+        return set(), "NOT_REPORTED"
+    if isinstance(raw, str):
+        return {p.strip() for p in raw.split(",") if p.strip()}, "REPORTED"
+    if isinstance(raw, (list, tuple, set)):
+        if not all(isinstance(p, str) for p in raw):
+            return set(), "UNEXPECTED_SHAPE"
+        return {p.strip() for p in raw if p.strip()}, "REPORTED"
+    return set(), "UNEXPECTED_SHAPE"
+
 def main():
     token = get_token()
     needed = (
@@ -77,18 +89,20 @@ def main():
             print(f"{label}.identity: unexpected response shape")
             continue
         scopes = data.get("scopes", [])
-        permissions = data.get("permissions", [])
+        perms, perm_status = parse_permissions(data.get("permissions"))
         if isinstance(scopes, str):
             scopes = [x.strip() for x in scopes.split(",") if x.strip()]
-        if isinstance(permissions, dict):
-            permissions = list(permissions.keys())
-        if not isinstance(permissions, (list, tuple, set)):
-            permissions = []
-        perms = {str(x) for x in permissions}
-        print(f"{label}.scopes: {sorted(scopes)}")
-        print(f"{label}.permissions_count: {len(perms)}")
+        if not isinstance(scopes, (list, tuple, set)):
+            scopes = []
+        print(f"{label}.scopes: {sorted(str(x) for x in scopes)}")
+        print(f"{label}.permissions_format: {perm_status}")
+        print(f"{label}.permissions_count: {len(perms) if perm_status == 'REPORTED' else 'UNKNOWN'}")
         for p in needed:
-            print(f"{label}.perm.{p}: {'YES' if p in perms else 'NO_OR_NOT_REPORTED'}")
+            verdict = (
+                ("YES" if p in perms else "NO")
+                if perm_status == "REPORTED" else "UNKNOWN"
+            )
+            print(f"{label}.perm.{p}: {verdict}")
     base = ORIGINS["console"]
     endpoints = [
         ("cluster_overview", "/v1/api/cluster/overview"),

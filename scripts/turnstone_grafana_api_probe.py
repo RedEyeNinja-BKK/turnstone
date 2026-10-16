@@ -55,7 +55,9 @@ def main():
         NoRedirects(), urllib.request.HTTPSHandler(context=ssl.create_default_context())
     )
     targets = [
+        ("instance_health", "/api/health"),
         ("organization", "/api/org/"),
+        ("token_permissions", "/api/access-control/user/permissions"),
         ("dashboard_search", "/api/search?type=dash-db&limit=1"),
         ("datasources", "/api/datasources"),
         ("organization_users", "/api/org/users"),
@@ -65,8 +67,18 @@ def main():
         try:
             status, obj = get_json(opener, token, path)
             statuses[label] = status
-            if status == 200 and label == "organization" and isinstance(obj, dict):
+            if status == 200 and label == "instance_health" and isinstance(obj, dict):
+                print(f"{label}: HTTP 200 grafana_version={str(obj.get('version','unknown'))[:64]}")
+            elif status == 200 and label == "organization" and isinstance(obj, dict):
                 print(f"{label}: HTTP 200 org_id={obj.get('id')} name={str(obj.get('name',''))[:64]!r}")
+            elif status == 200 and label == "token_permissions" and isinstance(obj, dict):
+                groups = (
+                    "dashboards", "folders", "datasources", "alert", "orgs",
+                    "users", "serviceaccounts", "permissions", "accesscontrol",
+                )
+                summary = {group: sum(1 for k in obj if k.startswith(group))
+                           for group in groups}
+                print(f"{label}: HTTP 200 actions={len(obj)} grouped_counts={summary}")
             elif status == 200 and isinstance(obj, list):
                 print(f"{label}: HTTP 200 readable (returned={len(obj)})")
             else:

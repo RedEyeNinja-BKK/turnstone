@@ -58,3 +58,26 @@ If an external clone exists at a different path, pass --external-path /absolute/
 5. Resume separate self-MCP deployment and later Grafana skill import. Full current 34 privileges remain unchanged; no service restarts or unapproved narrowing.
 
 STATUS: RESEARCH + READ-ONLY DIAGNOSTIC STAGED IN GIT. NO REMOTE MEMORY INSTALLATION OR NATIVE DB MUTATION.
+
+## Operator diagnostic receipt — installed external collection and healthy native memory
+
+- On turnstone-vm (2026-10-16), read-only memory status probe reported native_console_whoami=200, admin.memories=YES, native_admin_memories=200, native_db_memory_count=1.
+- Index health: HTTP 200; over_budget=False; max_entry_count=1; invalid_description_count=0; envelope_count=3.
+- External repository confirmed at /opt/turnstone-memory, expected layout, 250 top-level shared Markdown memory files, generated index present and readable by turnstone service user; sample file readable by turnstone.
+- Thus not a missing external installation and not a broken native Memories API. The gap left to prove is actual agent/prompt discovery and real read_file tool execution in interactive/coordinator workstreams.
+- GitHub public main had 265 top-level items during the review while local files count was 250. Do not conclude drift, loss or an update requirement until comparing actual local commit and origin. A pinned checkout may deliberately differ from current main.
+- Turnstone 1.8.7 personas stamp prompts/tool/MCP/native-memory switches at workstream creation: editing a persona later does not retroactively modify existing workstreams; coordinator and task-agent inheritance differs. Do not blindly change default stock persona or override its prompt without reviewing current provenance.
+- Added scripts/turnstone_memory_wiring_probe.py (read-only) to check public repo local Git origin/commit, generated-index heading/size, inline memory pointer in built-in engineer/orchestrator personas, tool visibility, and whether the one native memory's metadata suggests an existing reference pointer; it does NOT print memory bodies or persona prompts.
+- Run it after pulling the operations branch and compile check, then test a real new interactive workstream with read_file on the generated index and one relevant referenced note. The native database entry is not the same as the external Markdown corpus. No import, sync or write has been approved.
+
+### Next command
+
+    git -C ~/turnstone-five-node-source pull --ff-only
+    python3 -m py_compile ~/turnstone-five-node-source/scripts/turnstone_memory_wiring_probe.py
+    sudo python3 ~/turnstone-five-node-source/scripts/turnstone_memory_wiring_probe.py
+
+### Interactive acceptance
+
+Run a new Turnstone 'engineer' interactive workstream, with tool use enabled, and ask it to call read_file on /opt/turnstone-memory/collections/turnstone/MEMORY.md, then open only the relevant engineering memory file. Verify actual tool execution receipts, not just a plausible prose response. Separately test if it discovers the collection without an absolute-path prompt; if not, stage a dedicated, targeted skill or persona pointer and test it before activating for new engineering sessions.
+
+STATUS: native memory healthy; external collection on disk and service-readable; live persona/tool discovery unproven. Self-management MCP remains separate and not yet production registered.

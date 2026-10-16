@@ -65,3 +65,14 @@ After API and MCP checks, install turnstone-self-management and grafana-operatio
 ## Status
 
 PREPARED IN GITHUB, NOT DEPLOYED: Self API token absent/unverified, self-MCP bridge not installed, native skills not installed. No services, permission grants, model DB rows, or Grafana dashboard changed by this staging.
+
+## Operator self-API auth receipt, 2026-10-16
+
+- The Turnstone administrative API token was staged using the no-echo script, root:root 0600.
+- Console and head whoami each returned HTTP 200 with approve/read/write scopes.
+- Console GET cluster_overview, cluster_nodes, admin_skills, admin_mcp, admin_models, admin_settings, admin_roles, admin_users all returned HTTP 200.
+- No writes, MCP tool executions, installations, privilege modifications or service restarts performed.
+- Original script reported permissions_count=0 incorrectly: v1.8.7 auth.py emits comma-separated whoami permissions string; script only handled list/tuple/set/dict.
+- Probe correction commit a6332eac530680e2892b859aea6085ae6d6df081 accepts comma-separated RBAC string and distinguishes NOT_REPORTED and UNEXPECTED_SHAPE from reported zero.
+- Operator next: git -C ~/turnstone-five-node-source pull --ff-only; sudo python3 ~/turnstone-five-node-source/scripts/turnstone_self_api_probe.py
+- Confirm named opt-in permissions before deploying an actual self-administration MCP server. Preserve all existing grants, credentials and five-node runtime.

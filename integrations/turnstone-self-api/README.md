@@ -14,7 +14,9 @@ permission-checked routes an operator uses.
 | `deploy/launch-self-mcp.sh` | Privileged launcher wrapper (re-exports the server id; survives `env_reset`). |
 | `deploy/sudoers-turnstone-self-mcp` | Exact-argv sudoers template. NOT installed by this repo. |
 | `deploy/run_smoke_root.sh` | Operator-run root smoke gate: hash-verifies, stages root-owned, runs, validates receipt. |
-| `deploy/deploy-self-mcp.sh` | Operator-run installer/registrar: gates on a valid receipt, installs root-owned, registers the MCP row, activates the self-unload guard, reloads, verifies discovery. `--dry-run` previews. |
+| `deploy/deploy-self-mcp.sh` | Operator-run installer/registrar: gates on a valid receipt, installs root-owned, registers the MCP row, activates the self-unload guard, reloads, waits (bounded) for per-node convergence. `--dry-run` previews. |
+| `tests/test_deploy_verifier.sh` | Drives the deploy script's per-node verifier, extracted verbatim from the script, against healthy/unhealthy/convergence payloads. |
+| `tests/mcp_acceptance_client.py` | Acceptance helper: speaks MCP stdio to the **deployed** bridge via the exact-argv sudoers rule. NO writes unless given `turnstone_api_change` explicitly. |
 
 ## Operating model — read this before deploying
 
@@ -78,6 +80,16 @@ must not be relied on through the launcher. The bridge resolves its own id from
 self-lookup matching this module's path in a row's `command`/`args`. When none
 resolves, every receipt says `self_guard: inactive_unresolved` — the guard is
 never silently inactive.
+
+Deployed through the launcher, receipts read `active:<id> (env)`: the launcher
+re-exports the id from the `self_server_id` file, and env is probed before the
+file. Either source is sufficient; `(env)` is simply the one that wins.
+
+**Deployment status and acceptance evidence: see
+[`LC-RD-003H`](../../LC-RD-003H-SELF-MCP-DEPLOYMENT-CONVERGENCE.md)** — install
+state, per-node connectivity, the bounded convergence fix, and the MCP-driven
+acceptance receipts including the admin write, its read-back and the bound
+`audit_events` rows.
 
 ## Tools
 

@@ -21,7 +21,11 @@
 #       /opt/turnstone-integrations/self-admin/server.py
 #
 # SUDOERS (exact argv only; no generic root shell, no arguments accepted):
-#   turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/self-admin/launch-self-mcp.sh
+#   turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/self-admin/launch-self-mcp.sh ""
+#
+# The trailing "" is REQUIRED. A sudoers command spec with no argument list
+# matches ANY arguments, so omitting it would also permit
+# `launch-self-mcp.sh <anything>`. See deploy/sudoers-turnstone-self-mcp.
 #
 # After registering the MCP row, write its server id so the self-disable guard
 # is active (root-owned, 0644, no trailing newline):

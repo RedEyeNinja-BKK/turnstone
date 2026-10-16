@@ -784,8 +784,9 @@ def test_semantic_only_high_grade_has_framework_authored_advisory():
     assert "semantic risk signal" in summary
     assert "(HIGH)" in summary
     assert "Output guard:  (" not in summary
-    assert "does not establish" not in summary  # use the canonical wording, not speculation
-    assert "not evidence that the command failed" in summary
+    assert "Turnstone framework advisory" in summary
+    assert "not command stdout" in summary
+    assert "proof of an attack" in summary
 
 
 def test_typed_constructor_does_not_log_expected_binding_bypass_as_warning():

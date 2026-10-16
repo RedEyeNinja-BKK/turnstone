@@ -67,7 +67,23 @@ def render_output_guard_text(meta: dict[str, Any]) -> str:
     """
     flags = meta.get("flags") or []
     risk_level = str(meta.get("risk_level") or "none")
-    lines = [f"Output guard: {', '.join(flags)} ({risk_level.upper()})"]
+    # A typed semantic verdict has a risk grade but deliberately no invented
+    # reasoning or specific indicator flags. The old join rendered this as
+    # "Output guard:  (HIGH)", an alarming but content-free system advisory.
+    # All wording here is framework-authored; never echo a model's untrusted
+    # free-form reasoning into the high-priority advisory channel.
+    if flags:
+        summary = ", ".join(flags)
+    elif meta.get("tier") == "llm" and risk_level != "none":
+        summary = "semantic risk signal (no specific indicator supplied)"
+    else:
+        summary = "no specific indicators supplied"
+    lines = [f"Output guard: {summary} ({risk_level.upper()})"]
+    if meta.get("tier") == "llm" and not flags and risk_level != "none":
+        lines.append(
+            "  This is an advisory assessment of the tool-result text, "
+            "not evidence that the command failed or that an attack occurred."
+        )
     for ann in meta.get("annotations") or []:
         lines.append(f"  {ann}")
     if meta.get("redacted"):

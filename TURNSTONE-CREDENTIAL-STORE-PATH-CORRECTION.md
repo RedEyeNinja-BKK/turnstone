@@ -43,3 +43,16 @@ The fresh-install template `scripts/turnstone_credential_store_stage.sh` uses th
 - No Turnstone service restart, API-key rotation, or remote SSH authorization occurred.
 
 **Pending**: encrypted off-VM backup, remote SSH host-key pinning, explicit additive grants to agent-vm and switchyard-vm, and credential-store integration into Turnstone API/model configuration. No remote authorization should be inferred from a staged key alone.
+
+## Live post-migration cleanliness audit — 2026-10-16
+
+Operator reported the following verified results on `turnstone-vm`:
+
+- `/srv/turnstone` and `/srv/turnstone/credentials`: **root:turnstone, 0750**.
+- Old incorrectly named store and parent: **absent**.
+- `grep -RIlF` over `/etc/systemd/system` and `/etc/turnstone`: **no references to the old path**.
+- `realpath /srv/turnstone/credentials`: resolves to itself; no compatibility symlink.
+- The staged key fingerprints remain the two previously documented values; migration/status passed.
+- **One obsolete script remains:** `/home/vincent/LC-RD-003B-stage-credential-store.sh`. Operator was given a guarded, interactive deletion command (`rm -i`). **Its deletion has not yet been confirmed**.
+
+**Result:** Turnstone credential-store path and active-configuration cleanup **PASS**. Housekeeping of the obsolete user-home script remains pending operator confirmation. Legacy SSH authorization still present on `agent-vm` is a separate management-access concern; do not retire it without explicit operator approval. No server/service/model configuration change was made by this audit.

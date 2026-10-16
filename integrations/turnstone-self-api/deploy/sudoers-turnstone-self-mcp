@@ -8,7 +8,7 @@
 # Validate with:  visudo -c -f /etc/sudoers.d/turnstone-self-mcp
 # Install with:   install -o root -g root -m 0440 <this-file> /etc/sudoers.d/turnstone-self-mcp
 #
-# No arguments are accepted: the command is matched exactly, so a caller cannot
-# substitute a different script or inject arguments.
+# No arguments are accepted: the trailing "" matches "no arguments" in
+# sudoers, so a caller cannot append arguments or substitute another script.
 
-turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/self-admin/launch-self-mcp.sh
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/self-admin/launch-self-mcp.sh ""

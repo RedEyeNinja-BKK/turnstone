@@ -97,7 +97,52 @@ unforgeability and no removal of legitimate capability.
 5. One bounded, reversible administrative write with read-back, binding the
    receipt's `request_sha256` to the API audit row.
 
-## 7. Provenance
+## 7. Deploy-script defects (operator-reported round)
+
+A review of the operator-run deployment tooling found six defect classes in the
+shell scripts. All were reproduced, fixed, and re-tested. One further defect was
+found **in the fix itself** during verification and is recorded as #7.
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | **Wrong validator path** — both scripts invoked `$SRC_DIR/../receipt_check.py`; the file lives at `$SRC_DIR/receipt_check.py` | Corrected in both; a readability guard fails closed with a named message |
+| 2 | **`\|\| true` masked failures** — `run_smoke_root.sh` discarded the validator's exit status, and the deploy script read the admin token with `2>/dev/null \|\| true` | Removed; both now refuse explicitly (empty/unreadable token is fatal) |
+| 3 | **Gate integrity** — because of (1)+(2) the root smoke could report success on an *invalid* receipt, so the deployment gate consumed a meaningless exit status | The smoke script now exits non-zero on an invalid receipt; the deploy aborts (`exit 3`) **before** any install, sudoers write, or API call |
+| 4 | **Assertions printed, never asserted** — per-node verification only pretty-printed, so any node could be disconnected and the script still exited 0 | Replaced with an assertion block: `transport`/`enabled`/`auto_approve` on the row, plus per-node `connected`/`tools`/`has_error` for all six expected node ids; any problem → `SystemExit(1)` → `\|\| exit 8` |
+| 5 | **Sudoers matched *any* arguments** — a command spec with no argument list matches any arguments in sudoers, so `sudo …/launch-self-mcp.sh anything` was permitted | Trailing `""` constrains the entry to exactly zero arguments |
+| 6 | **`api()` never checked HTTP status** — a non-2xx body was piped straight into the JSON parser, producing silent garbage or an opaque traceback | Every call asserts 2xx and returns non-zero on failure; each call site has an explicit `exit N` |
+| — | *(hardening)* `visudo -c` validated the file **after** installing it into `/etc/sudoers.d/` | Validation now runs against the staged temp file **before** installation |
+| 7 | **(self-found) the fix for (2)/(3) reintroduced the masking bug** — `check_rc=$?` inside an `if ! cmd; then` branch captures the status of the *negation* (always 0). The script would print `SMOKE RECEIPT INVALID (receipt_check exit 0)` and then **exit 0** | Captured on the command's own line: `"$PY" … receipt_check.py "$OUT" \|\| check_rc=$?` |
+
+Defect 7 is the reason the verification below is empirical rather than a
+syntax check: a script that prints "REFUSING TO PASS / RECEIPT INVALID" and then
+exits 0 looks correct in review and in `bash -n`.
+
+### Verification evidence
+
+| Check | Result |
+|---|---|
+| `receipt_check.py` discrimination | good receipt → `0`; credential-leak receipt → `1`; missing file → `2` |
+| Per-node assertion block, 6 synthetic payloads | all-good → `0`; disconnected node, absent node, wrong tool count, `auto_approve=true`, no matching row → `1` |
+| `run_smoke_root.sh` exit status | `rc=0`+good → `0`; **`rc=0`+leak → `1`**; `rc=5`+good → `5`; `rc=5`+leak → `5` |
+| Pre-fix tail on a leak receipt | printed `RECEIPT INVALID` … then **exited 0** (masking proven) |
+| `deploy-self-mcp.sh --dry-run` (non-root) | exit `0`, performs no install, no sudoers write, no API call |
+| Syntax | `bash -n` / `sh -n` clean per declared shebang; no `\|\| true` remains |
+
+Hashes after the fixes:
+
+| File | sha256 |
+|---|---|
+| `deploy/deploy-self-mcp.sh` | `71a14865684ed4e1ca38b684273224dff7b05875a192b1af571d937cf62b8fe6` |
+| `deploy/run_smoke_root.sh` | `36ababb2baf06c7bae82ab9980ce121fac4f765678c88fca7e2bbb9d517b3379` |
+| `deploy/launch-self-mcp.sh` | `8ba6c83e96c5f6267bec677df780e1505d1b850eb9c7d2db63fa2b3eb7ba9c5a` |
+| `deploy/sudoers-turnstone-self-mcp` | `7a344ab8059d13de27ebad6f70ee2d2ae8440b059edb2e4e4c7c0c85f8dfd355` |
+
+Nothing in this round changes `server.py`, the MCP row body, or any accepted
+limitation in §5 — it makes the gates that protect the deployment actually
+enforce what they claim.
+
+## 8. Provenance
 
 The candidate was recovered from the public fork
 `RedEyeNinja-BKK/turnstone` at `9f2096e0…` after an earlier review concluded the

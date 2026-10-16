@@ -63,5 +63,19 @@ echo "receipt: $OUT  (contains NO token by construction)"
 
 echo
 echo "=== 6. validate the receipt (non-secret assertions + disclosure scan) ==="
-"$PY" "$SRC_DIR/../receipt_check.py" "$OUT" || true
-exit "$rc"
+# An INVALID receipt must make this script exit non-zero (never masked): the
+# deployment gate consumes this script's exit status.
+# NOTE: capture the status on the command's own line. Inside an
+# `if ! cmd; then` branch, $? is the status of the *negation* (always 0),
+# which would silently mask an invalid receipt and exit 0.
+check_rc=0
+"$PY" "$SRC_DIR/receipt_check.py" "$OUT" || check_rc=$?
+if [ "$check_rc" -ne 0 ]; then
+  echo "SMOKE RECEIPT INVALID (receipt_check exit $check_rc)" >&2
+fi
+
+if [ "$rc" -ne 0 ]; then
+  echo "SMOKE FAILED (smoke exit $rc)" >&2
+  exit "$rc"
+fi
+exit "$check_rc"

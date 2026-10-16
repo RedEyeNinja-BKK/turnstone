@@ -74,12 +74,17 @@ case "$1" in
     cp -a -- "$CANDIDATE/turnstone" "$TMP/turnstone"
     chown -R root:root "$TMP"
     chmod 0755 "$TMP"
+    # The isolated candidate was created with umask 077. cp -a retains those
+    # private mode bits on nested package directories and Python source files,
+    # so the service user cannot traverse/import the otherwise valid overlay.
+    # Open read/traversal on CODE only; keep /var/backups/turnstone root-private.
+    chmod -R a+rX -- "$TMP/turnstone"
     for path in typed_decision.py output_guard_judge.py tool_advisory.py; do
       cmp -- "$CANDIDATE/turnstone/core/$path" "$TMP/turnstone/core/$path" ||
         die "Copy mismatch: $path"
     done
     runuser -u turnstone -- env HOME=/var/lib/turnstone PYTHONPATH="$TMP" "$PY" -c \
-      'import pathlib,turnstone.core.typed_decision as d,turnstone.core.output_guard_judge as g,turnstone.core.tool_advisory as a; x=pathlib.Path(d.__file__).resolve().parents[2]; assert all(pathlib.Path(m.__file__).resolve().parents[2]==x for m in (g,a)); print("Service-user imports OK")'
+      'import os,pathlib,turnstone.core.typed_decision as d,turnstone.core.output_guard_judge as g,turnstone.core.tool_advisory as a; x=pathlib.Path(os.environ["PYTHONPATH"]).resolve()/"turnstone"; assert all(pathlib.Path(m.__file__).resolve().is_relative_to(x) for m in (d,g,a)), "candidate modules did not load from staging slot"; print("Service-user imports OK, all modules from:",x)'
     install -d -o root -g root -m 0700 "$BACKUP"
     install -m 0600 /etc/turnstone/config.toml "$BACKUP/config.toml"
     systemctl cat turnstone-server.service > "$BACKUP/server-unit.before.txt"

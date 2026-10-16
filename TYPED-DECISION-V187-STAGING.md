@@ -20,6 +20,34 @@ bash "$HOME/typed-decision-v187-source/scripts/stage_typed_decision_v187.sh"
 
 The runner checks the installed `1.8.7` package version, copies its package tree into `$HOME/typed-decision-v187-candidate`, overlays the two patched modules, then executes the standalone regression suite and mutation battery **against the copy**. If the candidate directory exists, it refuses to overwrite it. Logs: `regression.log` and `mutation.log` in candidate root.
 
+## Live candidate-only backend verification (AFTER isolated unit/mutation green)
+
+Run from `vincent`'s original source clone. This uses the candidate package
+copy, not the running server, and makes **two synthetic decision calls** to
+Switchyard through the real `OutputGuardJudge._evaluate_active` dispatcher.
+A `model_turn` trap ensures no chat/Responses fallback is invoked.
+
+```bash
+git -C "$HOME/typed-decision-v187-source" pull --ff-only
+PYTHONPATH="$HOME/typed-decision-v187-candidate" \
+  /opt/turnstone-venv/bin/python \
+  "$HOME/typed-decision-v187-source/scripts/live_verify_typed_decision_v187.py"
+```
+
+Expected final line: `LIVE CANDIDATE OUTPUT GUARD: PASS; services/config/DB unchanged`.
+Risk level from the second synthetic error-containing output is **not asserted**,
+since model classification is nondeterministic; both must succeed and retain the
+actual backend and requested-route metadata.
+
+## Results supplied by operator (2026-10-16)
+
+- Installed upstream Turnstone: `1.8.7`, isolated candidate under
+  `/home/vincent/typed-decision-v187-candidate`.
+- Standalone regression suite: **31 passed / 0 failed**.
+- Mutation battery: **10/10 KILLED**, 0 survived, 0 untested, 0 errors.
+- Expected warnings in negative tests: simulated unresolved alias and HTTP 503.
+- Live `OutputGuardJudge` dispatch with Switchyard: **pending**.
+
 ## Activation prerequisites (DO NOT change yet)
 
 - Actual model alias and wire model id: `tier1-decision`.

@@ -72,3 +72,14 @@ STATUS: API AUTHENTICATED + NAMED PERMISSIONS VERIFIED; SELF MCP CANDIDATE STAGE
 - Run as described on turnstone-vm and capture nonsecret PASS/FAIL only; do not paste tokens.
 - Independently add model.skills.write to the identity owning the Turnstone ts_ management token if operator approves. Keep all original grants and role memberships; verify NO permissions disappeared.
 - Do NOT install sudoers, copy code into /opt, add a DB MCP row, restart or reload MCP yet. These are separate deployment gates.
+
+## Root-only smoke staging correction
+
+Do **not** directly execute the development checkout's Python scripts as root: source checkout is owned by vincent and is operator-writable. Stage exact reviewed bytes into root-owned 0700 /run directory before launching a privileged smoke process. This still does not register MCP, grant sudo, or restart any service.
+
+    sudo install -d -o root -g root -m 0700 /run/turnstone-self-mcp-smoke
+    sudo install -o root -g root -m 0600 ~/turnstone-five-node-source/integrations/turnstone-self-api/server.py /run/turnstone-self-mcp-smoke/server.py
+    sudo install -o root -g root -m 0600 ~/turnstone-five-node-source/integrations/turnstone-self-api/smoke_mcp.py /run/turnstone-self-mcp-smoke/smoke_mcp.py
+    sudo /opt/turnstone-venv/bin/python /run/turnstone-self-mcp-smoke/smoke_mcp.py
+
+Root-only staging is disposable; keep it isolated from the user-owned checkout. Review what is copied and rerun the offline unit suite before any root smoke. The previous direct-checkout root smoke instruction is superseded by this correction.

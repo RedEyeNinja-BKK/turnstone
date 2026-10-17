@@ -20,7 +20,7 @@ Reference for the Switchyard running on `switchyard-vm`. Measured 2026-10-17.
 | Build id | `7f4d76212f363150ad13382fedb27cafec9c06da` |
 | Reported version | `switchyard-server 0.3.0` |
 | Config | `/etc/switchyard/routes.toml` sha256 `7b8445b20346670fa712f1e2b82b81730126df738054e6aef5340ea5dbcc326f` (V7.2; was `9a6448ef…` before the rerank `top_n` change) |
-| Source tree | `localclaw-vm:/home/vincent/.local/lib/localclaw-switchyard/src` (original build host, clean) |
+| Source of record | `RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005` |
 | Source commit | `6de85da15b68294cfda1775a1afa6e30ebd3cf16` (2026-10-05), branch `fix/decision-named-lane-composition-20261004` |
 | Fork on GitHub | `RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005` |
 | Built with | rustc `1.99.0 (b940084d7 2026-09-28)`, Ubuntu 24.04, GCC 13.3 — reproduces this hash bitwise |
@@ -93,52 +93,51 @@ The tarball contains no sources and records no commit: the only provenance
 file inside it, `PRE-STATE`, lists hashes, the unit fragment and the argv the
 process was started with.
 
-### The authentic source: `localclaw-vm` and the fork on GitHub
+### The source of record
 
-The project was developed and built on **`localclaw-vm`** (tailnet
-`100.106.125.92`), not on `switchyard-vm`. `switchyard-vm` is the October 15
-migration destination. Reaching the original host needs root there; from
-`agent-vm` or `switchyard-vm`, `sudo ssh 100.106.125.92` works, and the tree is
-read as `sudo -u vincent` so git does not trip on ownership.
+The source for any change to this deployment is the fork at
+`RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005`, at
+`6de85da15b68294cfda1775a1afa6e30ebd3cf16`. That branch is the artifact this
+work is based on and the only one that should be treated as authoritative.
 
 | Fact | Value |
 |---|---|
-| Original tree | `localclaw-vm:/home/vincent/.local/lib/localclaw-switchyard/src` |
-| Branch | `fix/decision-named-lane-composition-20261004` |
+| Branch | `v6-decision-planes-20261005` |
 | HEAD | `6de85da15b68294cfda1775a1afa6e30ebd3cf16` |
-| Working tree | clean (`git status --porcelain` empty) |
 | Cargo.lock | `5262f62deb3ca69e7900ea3b89dd68af5e857bd3a3c3efe6cc66d03cb7e61f16` |
-| Toolchain pin | `rust-toolchain.toml` → 1.99 |
-| Preserved on GitHub | `RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005`, same HEAD |
+| Toolchain pin | `rust-toolchain.toml` → `1.99` |
 
 The six commits between `2c6e6df5` and `6de85da1` are the missing work, and
 they touch exactly five files: `config.rs`, `decision_executor.rs`,
 `runner.rs`, `tests/decision_lane_naming.rs`, and `decision_surface.rs`.
 `default_decision_lane` and `decision_lane_composition` appear in `config.rs`.
 
-The build is recorded in shared-workspace evidence on `localclaw-vm`:
-`shared-workspace/operations/evidence/v6-decision-named-lanes-20261004/`
-holds `candidate-switchyard-server` (sha256 `74963b1d…`, 26,984,312 bytes),
-its `SHA256SUMS`, the five source files and the patch, written at 07:08 on
-2026-10-05 — two minutes after the final commit at 07:06.
+Provenance for the earlier history of the tree is not established here. The
+deployment arrived as a prebuilt tarball carrying no sources and no commit
+(see below), so the correspondence between `6de85da1` and the running binary
+rests on the reproduction in the next section, not on a recorded build.
 
 ### Reproduction is bitwise
 
 `git archive` of `6de85da1`, built with rustc **1.99.0**
 (`b940084d7 2026-09-28`) on Ubuntu 24.04 with GCC 13.3, reproduces the
-deployed binary **exactly**:
+baseline deployed binary **exactly**:
 
 ```
 74963b1d57c664172175f820f2b94c8ad790629feb2965538c9a09983387d147
 ```
 
-Recipe: `cargo build --release --locked -p switchyard-server` with
-`CARGO_HOME=$HOME/.cargo`, from a checkout at `6de85da1`. Bitwise identity
-depends on all four: the commit, that rustc release, that GCC, and the
-crate-registry path. Building on `agent-vm` (rustc 1.99.1, Debian GCC 14.2)
-compiles and passes every test but yields `becc1143…` — 59,600 bytes larger,
-with `.text` differing by 0.15% and every crate disambiguator different. That
-is a toolchain difference, not a source difference.
+Recipe: `cargo build --release --locked -p switchyard-server` from a checkout
+at `6de85da1`. Bitwise identity depends on all four: the commit, that rustc
+release, that GCC, and the crate-registry path. Building the same source on
+`agent-vm` (rustc 1.99.1, Debian GCC 14.2) compiles and passes every test but
+yields a different hash — 59,600 bytes larger, with `.text` differing by 0.15%
+and every crate disambiguator different. That is a toolchain difference, not a
+source difference.
+
+`rust-toolchain.toml` names the channel `1.99`, which now resolves to 1.99.1.
+A build today therefore does **not** reproduce the deployed hash even from the
+same commit. Build with `cargo +1.99.0` until that pin is made exact.
 
 `switchyard-vm` itself never compiled the project: no `cargo`, `rustc`,
 `~/.cargo`, `~/.rustup` or `target/` exists there. `~/.bash_history` shows an
@@ -154,7 +153,7 @@ commit; its only provenance file, `PRE-STATE`, lists hashes and the unit argv.
 A rebuild from the bundle — or from the `production-src` clone on
 `switchyard-vm`, which is the same tree — cannot be deployed: it rejects the
 live manifest at startup (`unknown field decision_lane_composition`). Use
-`6de85da1` from the fork, or the original host, for any source change.
+`6de85da1` from the fork for any source change.
 
 ---
 

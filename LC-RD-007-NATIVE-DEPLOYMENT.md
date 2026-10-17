@@ -68,6 +68,27 @@ Negative controls (the gate must refuse, and does):
 | `core/oauth_token_store.py` | `REFUSED: missing the credential store module` |
 | console posture guard | `REFUSED: admin write path still demands OIDC/OBO posture for this mode` |
 
+## 2b. Reconciliation of the root staging receipts (2026-10-17)
+
+Independently re-measured against the staged bytes, not inferred from the
+receipt text:
+
+| Claim | Measurement |
+|---|---|
+| `openai-oauth-v187` is a superset of the R2 slot | 263 `.py` vs 262; **no file present in R2 is absent**; exactly 4 files differ (`model_registry`, `model_backend_auth`, `settings_registry`, `console/server`) + 1 added (`oauth_token_store.py`) |
+| R2 content preserved | the 4 differing files contain only OAuth additions; all other R2 files are byte-identical |
+| all four cooperating changes | 14/14 structural markers present; the dispatch branch precedes the delegated-user check |
+| syntax | 263/263 files compile |
+| import provenance | `turnstone`, `core.model_registry`, `core.model_backend_auth`, `console.server` all resolve under the slot; `MODEL_AUTH_MODES` includes `openai_oauth` |
+| superset of the *running* tree | no file in `typed-decision-v187-finish` is missing from the slot |
+
+Known inert delta: `core/settings_registry.py` is copied whole from the repository,
+so it also registers `model.auto_continue_truncated`, `tools.rerank_candidate_pool`
+and `tools.rerank_timeout_cap_s`. Their implementation is *not* in this slot, so
+they change no behaviour; they are visible in the Settings tab and do nothing.
+They were not stripped because the slot is verified and immutable and is not
+being restaged. `model.openai_oauth_store` is the only intended new setting.
+
 ## 3. Canary evidence already obtained
 
 In-process, through the **new dispatch seam** (`registry → resolve_model_backend_auth_token
@@ -82,43 +103,62 @@ served_model='gpt-6.1-sol'
 Still required before cutover: a **fresh-workstream** canary through Turnstone,
 which needs this package active.
 
-## 4. Activation sequence (operator-gated — NOT run)
+## 4. Activation sequence (operator-gated)
+
+The switch is implemented in the staging script so the same bytes that were
+staged are the bytes that get activated:
 
 ```bash
-# 0. Prerequisites
-#    - SIWC runtime store live at /srv/turnstone/credentials/runtime/openai-siwc
-#    - R2 staged and verified
-#    - audience allow-list includes https://api.openai.com/v1
-#      (setting: model.auth_audience_allowlist)
+# 0. Read-only inspection (no privilege, no writes)
+bash scripts/stage_openai_oauth_v187.sh plan
 
-sudo bash scripts/stage_typed_decision_v187_r2.sh stage
+# 1. Re-confirm the candidate (re-runs the acceptance suites)
 sudo bash scripts/stage_typed_decision_v187_r2.sh verify
-sudo bash scripts/stage_openai_oauth_v187.sh stage
 sudo bash scripts/stage_openai_oauth_v187.sh verify
+
+# 2. Optional: exercise the full preflight without writing
+bash scripts/stage_openai_oauth_v187.sh activate --confirm --dry-run
 
 # --- approval boundary ---
 
-sudo install -d -o root -g root -m 0755 /etc/systemd/system/turnstone-node@.service.d
-for f in /etc/systemd/system/turnstone-server.service.d/93-openai-oauth-v187.conf \
-         "/etc/systemd/system/turnstone-node@.service.d/93-openai-oauth-v187.conf" \
-         /etc/systemd/system/turnstone-console.service.d/93-openai-oauth-v187.conf; do
-  printf '[Service]\nEnvironment="PYTHONPATH=/opt/turnstone-overlays/openai-oauth-v187"\n' \
-    | sudo tee "$f" >/dev/null
-  sudo chmod 0644 "$f"
-done
-sudo systemctl daemon-reload
-sudo systemctl restart turnstone-server.service turnstone-node@2 turnstone-node@3 \
-     turnstone-node@4 turnstone-node@5 turnstone-console.service
+# 3. One restart window
+sudo bash scripts/stage_openai_oauth_v187.sh activate --confirm
+
+# Rollback, if needed
+sudo bash scripts/stage_openai_oauth_v187.sh rollback --confirm
 ```
 
-Post-activation checks: each unit's `MainPID` environ shows the OAuth slot;
-`/health` returns 200; the alias probe still excludes `tier1-decision`; a fresh
-workstream selects the canary alias and performs real inference with
-`served_model=gpt-6.1-sol`.
+The script refuses to activate without the literal `--confirm` and without root.
+It writes the three `93-` drop-ins atomically (root:root, 0644), records a receipt
+under `/var/log/turnstone-v187/` **before** the switch, `daemon-reload`s, then
+restarts `turnstone-server`, `turnstone-node@2..5` and `turnstone-console` in a
+single `systemctl restart`. It declares success only after, for **every** unit:
 
-**Rollback** — remove the three `93-` drop-ins, `daemon-reload`, restart the same
-units. The `90-`/`91-` (and R2 `92-`) anchors restore the previous overlay. Model
-rows are untouched by activation and rollback.
+* `is-active` is `active`,
+* the live process's `PYTHONPATH` equals the slot (proven from `/proc/PID/environ`,
+  not inferred from the drop-in),
+* `GET /health` returns 2xx on 8080, 8082–8085 and 8090,
+* the journal since the restart contains no `ModuleNotFoundError`, `ImportError:`
+  or traceback.
+
+Any failure triggers automatic rollback (remove the three drop-ins,
+`daemon-reload`, restart the same units) and a non-zero exit.
+
+The gate itself is pinned by `tests/test_combined_activation.py` (13 executed,
+0 skipped on this host): the refusals and the dry run are executed, and the
+restart/provenance/rollback wiring is asserted structurally.
+
+**Scope of this switch.** It changes code only. No model row, credential, setting
+or database row is touched, and no alias is repointed. `auth_mode=openai_oauth`
+remains unreachable until a canary row is deliberately created (section 5). The
+SIWC runtime store and the audience allow-list are prerequisites for that
+**canary**, not for this activation.
+
+**Rollback** removes only the three `93-` drop-ins. The `90-`/`91-` anchors restore
+`typed-decision-v187-finish`, which is what is running today. There is **no `92-`
+anchor on this host** because the R2 slot was never activated on its own; if it
+ever is, `92-` sorts before `93-` and removing `93-` would land on R2 instead.
+Model rows are untouched by activation and rollback.
 
 ## 5. Alias cutover (a separate, later gate)
 

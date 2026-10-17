@@ -1,6 +1,9 @@
 # Typed-decision 1.8.7 — revision 2 (r2) corrections and deployment plan
 
-Status: **code + tests complete and green in the repository. NOT staged, NOT activated.**
+Status: **R2 staged and verified at `/opt/turnstone-overlays/typed-decision-v187-r2`; NOT activated.**
+Activation of R2 alone is **superseded** by the combined R2 + native-OAuth package
+(`LC-RD-007-NATIVE-DEPLOYMENT.md`, `93-` drop-ins): the `92-` path below is retained as the
+record of the standalone plan and must not be applied now.
 The live overlay `/opt/turnstone-overlays/typed-decision-v187-finish` is untouched.
 
 ## 1. Why r2 exists
@@ -114,7 +117,12 @@ BACKUP  /var/backups/turnstone/typed-decision-v187-r2-<date>   (root-only)
 > pristine 1.8.7 and does not carry this fix. Switching the server and nodes alone leaves that
 > asymmetry; decide explicitly whether the Console should also take the r2 overlay.
 
-**Activate (operator-gated)** — verify first-pass `-finish` still active and `/health` OK, require a
+**Activate (operator-gated)** — SUPERSEDED: do not write the `92-` drop-ins. The accepted
+candidate is activated as part of the combined package, which writes `93-` drop-ins for all
+three unit families and verifies provenance, health and journal before declaring success.
+The procedure below is retained only as the standalone R2 design record.
+
+Verify first-pass `-finish` still active and `/health` OK, require a
 typed confirmation, write both drop-ins, `daemon-reload`, restart only the affected units, then
 verify the running processes' `PYTHONPATH` really is r2 and `/health` is OK. On any failure:
 remove the two drop-ins, `daemon-reload`, restart, confirm `-finish` restored.

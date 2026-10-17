@@ -25,11 +25,18 @@
 # The R2 script, whose base-commit check DOES read Git objects, runs those reads
 # as the repository owner for the same reason.
 #
-# Usage (root):
+# Usage:
+#   bash stage_openai_oauth_v187.sh plan                     # read-only
 #   sudo bash stage_openai_oauth_v187.sh stage
 #   sudo bash stage_openai_oauth_v187.sh verify
-#   sudo bash stage_openai_oauth_v187.sh status
-#   sudo bash stage_openai_oauth_v187.sh activate     # refuses: operator gate
+#   bash stage_openai_oauth_v187.sh status                   # read-only
+#   sudo bash stage_openai_oauth_v187.sh activate --confirm
+#   sudo bash stage_openai_oauth_v187.sh rollback --confirm
+#
+# `plan`, `status` and `--dry-run` write nothing and need no privilege.
+# Activation and rollback refuse without the literal `--confirm` argument and
+# without root. That is the operator gate, not a convenience flag: activation
+# restarts every unit in one window and interrupts live workstreams.
 #
 # Sandbox (no root, /var/tmp only):
 #   R2_SANDBOX=1 R2_ROOT=/var/tmp/r2-sbx/r2 OAUTH_ROOT=/var/tmp/r2-sbx/oauth \
@@ -48,14 +55,31 @@ SERVER_DROPIN=/etc/systemd/system/turnstone-server.service.d/93-openai-oauth-v18
 NODE_DROPIN="/etc/systemd/system/turnstone-node@.service.d/93-openai-oauth-v187.conf"
 CONSOLE_DROPIN=/etc/systemd/system/turnstone-console.service.d/93-openai-oauth-v187.conf
 
+# One restart window, one rollback. The head server and the four execution
+# nodes all import the model/provider stack; the console is where the new mode
+# is administered. Leaving any of them on the old overlay would let the
+# registry and the dispatch layer disagree about the same model row.
+UNITS=(turnstone-server.service turnstone-node@2.service turnstone-node@3.service \
+       turnstone-node@4.service turnstone-node@5.service turnstone-console.service)
+HEALTH_PORTS=(8080 8082 8083 8084 8085 8090)
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-90}
+RECEIPTS_DIR=${ACTIVATION_RECEIPTS_DIR:-/var/log/turnstone-v187}
+
 die() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
 say() { printf '%s\n' "$*"; }
 
 if [[ "$SANDBOX" == "1" ]]; then
   [[ "$NEW" == /var/tmp/* ]] || die "sandbox requires OAUTH_ROOT under /var/tmp"
   STAGE_OWNER=$(id -un); STAGE_GROUP=$(id -gn)
+elif [[ "$EUID" -ne 0 ]]; then
+  # Read-only verbs and their dry-run forms need no privilege; stage, verify and
+  # a real activate/rollback do. The verbs themselves re-check before writing.
+  case "${1:-}" in
+    plan|status|activate|rollback) STAGE_OWNER=$(id -un); STAGE_GROUP=$(id -gn) ;;
+    stage|verify) die "must run as root (or use plan/status/--dry-run, or set R2_SANDBOX=1)" ;;
+    *) : ;;  # unknown verb: fall through to the usage error
+  esac
 else
-  [[ "$EUID" -eq 0 ]] || die "must run as root (or set R2_SANDBOX=1 with OAUTH_ROOT under /var/tmp)"
   STAGE_OWNER=root; STAGE_GROUP=root
 fi
 
@@ -217,25 +241,294 @@ cmd_status() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# Activation / rollback (operator-gated; see LC-RD-007-NATIVE-DEPLOYMENT.md)
+#
+# SAFETY ARGUMENT: this step changes CODE, not model routing. No model row uses
+# auth_mode=openai_oauth at activation time, so the new branch is unreachable
+# until an operator creates a canary row (a separate, later gate). The visible
+# effects are the accepted R2 typed-decision corrections and the appearance of
+# openai_oauth in the admin mode list. The credential store and audience
+# allow-list are prerequisites for the CANARY, not for this switch.
+# ---------------------------------------------------------------------------
+
+dropin_body() { printf '[Service]\nEnvironment="PYTHONPATH=%s"\n' "$NEW"; }
+
+dropin_paths() { printf '%s\n' "$SERVER_DROPIN" "$NODE_DROPIN" "$CONSOLE_DROPIN"; }
+
+# The last-sorting drop-in that sets PYTHONPATH wins in systemd's merge order.
+# Refuse to activate if something would silently override the 93- file.
+higher_pythonpath_override() {
+  local unit=$1 ours=$2 d base ours_base
+  ours_base=$(basename "$ours")
+  for d in "/etc/systemd/system/${unit}.d"/*.conf; do
+    [[ -e "$d" ]] || continue
+    [[ "$d" == "$ours" ]] && continue
+    base=$(basename "$d")
+    [[ "$base" > "$ours_base" ]] || continue
+    grep -qE '^[[:space:]]*Environment=.*PYTHONPATH=' "$d" && { printf '%s\n' "$d"; return 0; }
+  done
+  return 0
+}
+
+preflight_no_override() {
+  local item unit path hit
+  for item in "turnstone-server.service|$SERVER_DROPIN" \
+              "turnstone-node@.service|$NODE_DROPIN" \
+              "turnstone-console.service|$CONSOLE_DROPIN"; do
+    unit=${item%%|*}; path=${item#*|}
+    hit=$(higher_pythonpath_override "$unit" "$path")
+    [[ -z "$hit" ]] || die "drop-in would be overridden by $hit"
+  done
+}
+
+configured_pythonpath() {  # effective value from unit config (no restart needed)
+  systemctl show -p Environment --value "$1" 2>/dev/null \
+    | tr ' ' '\n' | sed -n 's/^PYTHONPATH=//p' | tail -1
+}
+
+proc_pythonpath() {
+  [[ -r "/proc/$1/environ" ]] || return 1
+  tr '\0' '\n' < "/proc/$1/environ" | sed -n 's/^PYTHONPATH=//p' | tail -1
+}
+
+check_http() { curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$1/health"; }
+
+preflight_slot() {
+  [[ -d "$NEW" ]] || die "slot absent: $NEW"
+  [[ -f "$NEW/turnstone/__init__.py" ]] || die "slot is not a turnstone tree: $NEW"
+  if [[ "$SANDBOX" != "1" ]]; then
+    [[ "$(stat -c %U "$NEW")" == root ]] || die "slot must be root-owned: $NEW"
+    local mode; mode=$(stat -c %a "$NEW")
+    (( (8#$mode & 8#022) == 0 )) || die "slot is group/world writable (mode $mode): $NEW"
+  fi
+  grep -q 'if auth_mode in DIRECT_OAUTH_MODEL_AUTH_MODES:' "$NEW/turnstone/console/server.py" \
+    || die "staged console lacks the direct-OAuth posture guard"
+  grep -q '_resolve_direct_oauth_token' "$NEW/turnstone/core/model_backend_auth.py" \
+    || die "staged dispatch lacks the direct-OAuth branch"
+  grep -q 'class OAuthTokenStore' "$NEW/turnstone/core/oauth_token_store.py" \
+    || die "staged tree lacks the credential store"
+  grep -q 'def list_generative_aliases' "$NEW/turnstone/core/model_registry.py" \
+    || die "staged tree lacks the accepted R2 accessor"
+}
+
+preflight_units() {
+  local u
+  for u in "${UNITS[@]}"; do
+    systemctl cat "$u" >/dev/null 2>&1 || die "unit not installed: $u"
+    [[ "$(systemctl is-active "$u")" == active ]] || die "unit not active: $u"
+    [[ "$(systemctl is-failed "$u")" != failed ]] || die "unit is failed: $u"
+  done
+}
+
+print_plan() {
+  local u pid cur
+  say "Slot:      $NEW"
+  say "Previous:  (90-/91- anchors and the unit file)"
+  say "Units:     ${UNITS[*]}"
+  say "Health:    ports ${HEALTH_PORTS[*]} (GET /health, 2xx within ${HEALTH_TIMEOUT}s)"
+  say "Receipts:  $RECEIPTS_DIR"
+  say ""
+  say "Current process environment:"
+  for u in "${UNITS[@]}"; do
+    pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || true)
+    cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
+    say "  $(printf '%-28s' "$u") pid=$(printf '%-7s' "${pid:-none}") PYTHONPATH=${cur:-(none)}"
+  done
+  say ""
+  say "Would write:"
+  while read -r p; do say "  $p"; done < <(dropin_paths)
+  say "Contents: $(dropin_body | tr '\n' ' ')"
+  say "Then: systemctl daemon-reload; systemctl restart ${UNITS[*]}"
+  say "Then: verify PID PYTHONPATH, unit state and /health; otherwise roll back."
+  say ""
+  say "No model row is changed. auth_mode=openai_oauth stays unreachable until a"
+  say "canary row is created deliberately (separate gate)."
+}
+
+write_dropin() {
+  local path=$1 dir tmp
+  dir=$(dirname "$path")
+  install -d -o root -g root -m 0755 "$dir"
+  tmp=$(mktemp "$dir/.93-oauth.XXXXXXXX") || die "cannot create a temporary drop-in in $dir"
+  dropin_body > "$tmp"
+  chmod 0644 "$tmp"; chown root:root "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+capture_receipt() {
+  local stamp out p u pid cur manifest
+  install -d -o root -g root -m 0755 "$RECEIPTS_DIR"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  manifest=$(cd "$NEW" && find . -name '*.py' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+  out="$RECEIPTS_DIR/combined-v187-$stamp.txt"
+  {
+    echo "operation=activate-combined-v187"
+    echo "utc=$stamp"
+    echo "slot=$NEW"
+    echo "slot_python_manifest_sha256=$manifest"
+    echo "repo_revision=$(cd "$REPO" && git rev-parse HEAD 2>/dev/null || echo unavailable)"
+    for u in "${UNITS[@]}"; do
+      pid=$(systemctl show -p MainPID --value "$u")
+      cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
+      echo "before unit=$u pid=$pid pythonpath=${cur:-(none)}"
+    done
+    while read -r p; do
+      if [[ -e "$p" ]]; then echo "before dropin=$p sha256=$(sha256sum "$p" | cut -d' ' -f1)";
+      else echo "before dropin=$p absent"; fi
+    done < <(dropin_paths)
+  } > "$out"
+  chmod 0640 "$out"; chown root:root "$out"
+  say "receipt: $out"
+}
+
+wait_healthy() {
+  local want=$1 deadline=$((SECONDS + HEALTH_TIMEOUT)) u p pid cur ok
+  while (( SECONDS < deadline )); do
+    ok=1
+    for u in "${UNITS[@]}"; do
+      [[ "$(systemctl is-active "$u")" == active ]] || ok=0
+      pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo 0)
+      cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
+      [[ "$cur" == "$want" ]] || ok=0
+    done
+    for p in "${HEALTH_PORTS[@]}"; do check_http "$p" || ok=0; done
+    (( ok )) && return 0
+    sleep 2
+  done
+  return 1
+}
+
+journal_scan() {  # since-epoch; nonzero if a fatal import error was logged
+  local since=$1 u out
+  for u in "${UNITS[@]}"; do
+    out=$(journalctl -u "$u" --since "@$since" --no-pager -q 2>/dev/null \
+      | grep -E 'ModuleNotFoundError|ImportError:|Traceback \(most recent call last\)' || true)
+    [[ -z "$out" ]] || { printf '%s\n' "$out" >&2; return 1; }
+  done
+}
+
+remove_dropins() {
+  local p removed=0
+  while read -r p; do
+    [[ -e "$p" ]] || continue
+    rm -f "$p"; removed=$((removed + 1)); say "removed: $p"
+    rmdir "$(dirname "$p")" 2>/dev/null || true
+  done < <(dropin_paths)
+  say "drop-ins removed: $removed"
+}
+
+do_restart() {
+  ACTIVATION_START_EPOCH=$(date +%s)
+  systemctl daemon-reload
+  systemctl restart "${UNITS[@]}"
+  say "restarted: ${UNITS[*]}"
+}
+
+rollback_core() {
+  local u pid cur want p ok deadline
+  remove_dropins
+  systemctl daemon-reload
+  systemctl restart "${UNITS[@]}" 2>/dev/null || true
+  say "rollback restarted: ${UNITS[*]}"
+  ok=1; deadline=$((SECONDS + HEALTH_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    ok=1
+    for u in "${UNITS[@]}"; do
+      want=$(configured_pythonpath "$u")
+      pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo 0)
+      cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
+      [[ "$cur" == "$want" ]] || ok=0
+      [[ "$(systemctl is-active "$u")" == active ]] || ok=0
+    done
+    for p in "${HEALTH_PORTS[@]}"; do check_http "$p" || ok=0; done
+    (( ok )) && break
+    sleep 2
+  done
+  if (( ok )); then say "ROLLBACK OK: previous overlay is live and healthy"; return 0; fi
+  say "ROLLBACK INCOMPLETE: units restarted but health checks did not pass"; return 1
+}
+
+cmd_plan() { preflight_slot; preflight_units; print_plan; }
+
 cmd_activate() {
-  cat >&2 <<'MSG'
-REFUSED: activation is an operator-gated production boundary.
+  local confirm=0 dry=0 arg p all_present=1 identical=1
+  for arg in "$@"; do
+    case "$arg" in
+      --confirm) confirm=1 ;;
+      --dry-run) dry=1 ;;
+      *) die "usage: $0 activate --confirm [--dry-run]" ;;
+    esac
+  done
+  (( confirm == 1 )) || die "refusing to activate without --confirm (operator gate)"
+  [[ "$EUID" -eq 0 || "$dry" -eq 1 ]] || die "must run as root to activate"
 
-This package introduces a NEW model auth mode and a credential source. It must
-not be activated before:
-  * the SIWC runtime store is live at the canonical path,
-  * a fresh-workstream canary has run against it, and
-  * the operator approves a restart window for server, nodes and console.
+  preflight_slot
+  preflight_units
+  preflight_no_override
 
-The exact command set is in LC-RD-007-NATIVE-DEPLOYMENT.md.
-MSG
-  exit 3
+  while read -r p; do
+    [[ -e "$p" ]] || { all_present=0; continue; }
+    cmp -s <(dropin_body) "$p" || identical=0
+  done < <(dropin_paths)
+
+  if (( all_present == 1 && identical == 1 )); then
+    say "ALREADY ACTIVE: all three 93- drop-ins already point at $NEW"
+    say "No restart performed."
+    return 0
+  fi
+  (( all_present == 0 )) || die "a 93- drop-in exists with different content; inspect before overriding"
+
+  print_plan
+  if (( dry == 1 )); then say "DRY RUN: nothing written, nothing restarted"; return 0; fi
+
+  capture_receipt
+  while read -r p; do write_dropin "$p"; say "wrote: $p"; done < <(dropin_paths)
+  do_restart
+
+  if ! wait_healthy "$NEW"; then
+    say "ACTIVATION FAILED: health/provenance checks did not pass; rolling back" >&2
+    rollback_core || true
+    die "activation rolled back"
+  fi
+  if ! journal_scan "${ACTIVATION_START_EPOCH}"; then
+    say "ACTIVATION FAILED: fatal import error in the journal; rolling back" >&2
+    rollback_core || true
+    die "activation rolled back"
+  fi
+  say "ACTIVATED: ${UNITS[*]} now import from $NEW"
+  say "Rollback: sudo bash $0 rollback --confirm"
+}
+
+cmd_rollback() {
+  local confirm=0 dry=0 arg p present=0
+  for arg in "$@"; do
+    case "$arg" in
+      --confirm) confirm=1 ;;
+      --dry-run) dry=1 ;;
+      *) die "usage: $0 rollback --confirm [--dry-run]" ;;
+    esac
+  done
+  (( confirm == 1 )) || die "refusing to roll back without --confirm (operator gate)"
+  [[ "$EUID" -eq 0 || "$dry" -eq 1 ]] || die "must run as root to roll back"
+
+  while read -r p; do [[ -e "$p" ]] && present=$((present + 1)); done < <(dropin_paths)
+  (( present > 0 )) || { say "NOT ACTIVE: no 93- drop-ins present; nothing to roll back"; return 0; }
+
+  if (( dry == 1 )); then
+    print_plan
+    say "DRY RUN: would remove the three 93- drop-ins and restart ${UNITS[*]}"
+    return 0
+  fi
+  rollback_core
 }
 
 case "${1:-}" in
   stage)    [[ $# -eq 1 ]] || die "usage: $0 stage";    cmd_stage ;;
   verify)   [[ $# -eq 1 ]] || die "usage: $0 verify";   cmd_verify ;;
   status)   [[ $# -eq 1 ]] || die "usage: $0 status";   cmd_status ;;
-  activate) cmd_activate ;;
-  *) die "usage: $0 {stage|verify|status|activate}" ;;
+  plan)     [[ $# -eq 1 ]] || die "usage: $0 plan";     cmd_plan ;;
+  activate) shift; cmd_activate "$@" ;;
+  rollback) shift; cmd_rollback "$@" ;;
+  *) die "usage: $0 {stage|verify|status|plan|activate --confirm|rollback --confirm}" ;;
 esac

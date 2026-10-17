@@ -80,7 +80,16 @@ def test_session_wiring_changes_no_control_flow():
 
     for hunk in hunks:
         body = "\n".join(hunk)
-        is_seam_hunk = ("sensor" in body) or ("_ws_id" in body)
+        # A hunk made only of a seam call's argument list mentions neither the
+        # module name nor _ws_id; `registry=registry` (2026-10-17, S6) is one
+        # such argument. It is a seam marker in its own right.
+        is_seam_hunk = (
+            ("sensor" in body)
+            or ("_ws_id" in body)
+            or ("registry=registry" in body)
+            or ("registry=getattr(self, \"_registry\", None)" in body)
+            or ("workstream=workstream" in body)
+        )
         # Locality: a change outside a sensor region would not mention it.
         assert is_seam_hunk, (
             f"diff hunk is not a sensor call site: {body[:200]!r}"
@@ -355,16 +364,58 @@ def test_a_failing_sensor_cannot_break_the_send_path():
 
 
 def test_hook_signature_accepts_no_control_inputs():
-    """The call site cannot pass, and cannot receive, a control value."""
+    """The call site cannot pass, and cannot receive, a control VALUE.
+
+    `workstream` is an identifier used for per-workstream cadence counting and
+    dedupe; it is deliberately NOT part of the sensed state.
+
+    `registry` (2026-10-17, S6) is not a control value but a capability handle:
+    it exists so the sensor can resolve its own `tier1-decision` row. Handing
+    the sensor a routing surface raises the obvious question, so the guarantee
+    is enforced dynamically instead of by signature shape - see
+    `test_sensor_reads_only_the_decision_row`. The forbidden names below stay
+    forbidden, which is the part that protects routing.
+    """
     signature = inspect.signature(lifecycle.observe_event)
     parameters = set(signature.parameters)
-    # `workstream` is the only addition over the original three, and it is an
-    # identifier used for per-workstream cadence counting. It is deliberately
-    # NOT part of the sensed state, so it cannot change a semantic fingerprint.
-    assert parameters == {"event", "state", "force", "workstream"}
-    for forbidden in ("model", "provider", "route", "lane", "effort", "tools", "guard"):
+    assert parameters == {"event", "state", "force", "workstream", "registry"}
+    for forbidden in ("model", "provider", "route", "lane", "effort", "tools", "guard",
+                      "model_alias", "client", "model_binding"):
         assert forbidden not in parameters
     assert signature.return_annotation in (None, "None")
+
+
+def test_sensor_reads_only_the_decision_row(monkeypatch):
+    """Given a registry, the sensor consults exactly ONE alias.
+
+    This is the real containment for the registry injection: whatever else the
+    registry exposes, resolution may read only the decision capability row's
+    capabilities and base_url. A future change that reaches for the session's
+    model, a fallback ladder or any other alias fails here.
+    """
+    from turnstone.core.shadow_driver import DECISION_CAPABILITY, resolve_decision_endpoint
+
+    seen: list[str] = []
+
+    class _SpyRow:
+        capabilities = {"supports_typed_decision": True}
+        base_url = "https://switchyard.example.internal"
+
+    class _SpyRegistry:
+        def get_config(self, alias):
+            seen.append(alias)
+            if alias != DECISION_CAPABILITY:
+                raise AssertionError(f"sensor read unrelated alias {alias!r}")
+            return _SpyRow()
+
+        def __getattr__(self, name):  # any other registry surface is off-limits
+            raise AssertionError(f"sensor touched registry.{name}")
+
+    assert resolve_decision_endpoint(_SpyRegistry()) == (
+        DECISION_CAPABILITY,
+        "https://switchyard.example.internal",
+    )
+    assert seen == [DECISION_CAPABILITY]
 
 
 def test_projection_never_contains_a_control_field():

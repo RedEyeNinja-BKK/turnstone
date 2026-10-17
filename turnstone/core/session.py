@@ -91,12 +91,22 @@ except Exception:  # noqa: BLE001 - an absent sensor must never block the sessio
     _sensor_lifecycle = None
 
 
-def _sensor_observe(event: str, state: dict, *, workstream: str = "") -> None:
-    """Advisory shadow-sensing seam. Cannot raise; discards the result."""
+def _sensor_observe(
+    event: str, state: dict, *, workstream: str = "", registry: object = None
+) -> None:
+    """Advisory shadow-sensing seam. Cannot raise; discards the result.
+
+    ``registry`` is the calling session's own model registry. It is passed on
+    every event so the sensor can resolve the ``tier1-decision`` row; nothing
+    about it is stored in the sensor module. Omitting it yields an explicitly
+    unresolved (silent) sensor, never a guessed endpoint.
+    """
     if _sensor_lifecycle is None:
         return
     try:
-        _sensor_lifecycle.observe_event(event, state, workstream=workstream)
+        _sensor_lifecycle.observe_event(
+            event, state, workstream=workstream, registry=registry
+        )
     except Exception:  # noqa: BLE001 - a sensor must never fail a task
         pass
 
@@ -107,6 +117,7 @@ def _sensor_observe_delegation(
     result: object,
     *,
     workstream: str = "",
+    registry: object = None,
 ) -> None:
     """The delegation seams, wholly inside the fail-open boundary.
 
@@ -131,12 +142,16 @@ def _sensor_observe_delegation(
                 "phase": "delegation",
                 "blocker": str(result),
             }
-        _sensor_lifecycle.observe_event(event, state, workstream=workstream)
+        _sensor_lifecycle.observe_event(
+            event, state, workstream=workstream, registry=registry
+        )
     except Exception:  # noqa: BLE001 - a sensor must never fail a task
         pass
 
 
-def _sensor_observe_substantive(user_input: object, *, workstream: str = "") -> None:
+def _sensor_observe_substantive(
+    user_input: object, *, workstream: str = "", registry: object = None
+) -> None:
     """The operator_instruction seam, wholly inside the fail-open boundary.
 
     The substance check AND the state construction AND the observe call all
@@ -157,6 +172,7 @@ def _sensor_observe_substantive(user_input: object, *, workstream: str = "") -> 
                 "phase": "operator_instruction",
             },
             workstream=workstream,
+            registry=registry,
         )
     except Exception:  # noqa: BLE001 - a sensor must never fail a task
         pass
@@ -12745,6 +12761,7 @@ class ChatSession:
                 _sensor_observe_substantive(
                     user_input,
                     workstream=getattr(self, "_ws_id", ""),
+                    registry=getattr(self, "_registry", None),
                 )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
             # can mutate history.  The old code's first in-try act was the loop-top
@@ -15036,6 +15053,7 @@ class ChatSession:
                             "blocker": cause,
                         },
                         workstream=getattr(self, "_ws_id", ""),
+                        registry=getattr(self, "_registry", None),
                     )
                     log.warning(
                         "stream.retry",
@@ -26610,6 +26628,7 @@ class ChatSession:
                     item,
                     result,
                     workstream=getattr(self, "_ws_id", ""),
+                    registry=getattr(self, "_registry", None),
                 )
 
             if not self._publish_for_generation(
@@ -26698,6 +26717,7 @@ class ChatSession:
                     item,
                     msg,
                     workstream=getattr(self, "_ws_id", ""),
+                    registry=getattr(self, "_registry", None),
                 )
 
             self._publish_for_generation(

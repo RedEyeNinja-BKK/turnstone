@@ -16,6 +16,7 @@ import urllib.request  # noqa: F401 - imported by the driver under test
 import pytest
 
 from turnstone.core import sensor_lifecycle as lifecycle
+from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.shadow_driver import (
     REQUEST_TIMEOUT_SECONDS,
     ShadowSensor,
@@ -966,3 +967,241 @@ def test_sanitized_redacts_assignment_with_diacritic_keyword():
     # The non-secret parts of the sentence survive sanitized mode.
     assert "rotate" in cleaned
     assert "now" in cleaned
+
+
+# ---------------------------------------------------------------------------
+# S6: decision-registry wiring through the real session initialization path.
+#
+# The defect these pin: sensor_lifecycle.hook() called
+# resolve_decision_endpoint() with NO registry, so every activated observation
+# was recorded as `decision_endpoint_unresolved` and no graded signal was ever
+# produced. Passing a registry into the resolver by hand does not prove the
+# production path, so these tests build a real ChatSession and drive the real
+# seams.
+# ---------------------------------------------------------------------------
+
+
+class _NullUI(SessionUIBase):
+    """Minimal UI satisfying the SessionUIBase contract."""
+
+
+def _registry_with(**rows):
+    """Build a real ModelRegistry from (alias -> capabilities/base_url) rows."""
+    from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+    models = {}
+    for alias, spec in rows.items():
+        models[alias] = ModelConfig(
+            alias=alias,
+            base_url=spec["base_url"],
+            api_key="synthetic-not-a-credential",
+            model=spec.get("model", "synthetic-model"),
+            provider=spec.get("provider", "openrouter"),
+            capabilities=dict(spec.get("capabilities", {})),
+        )
+    return ModelRegistry(models=models, default=next(iter(models), ""))
+
+
+def _real_session(registry):
+    from unittest.mock import MagicMock
+
+    from turnstone.core.session import ChatSession
+
+    return ChatSession(
+        client=MagicMock(),
+        model="test-model",
+        ui=_NullUI(),
+        instructions=None,
+        temperature=0.5,
+        max_tokens=4096,
+        tool_timeout=30,
+        registry=registry,
+    )
+
+
+def _typed_row(base_url="https://switchyard.example.internal"):
+    return {
+        "base_url": base_url,
+        "capabilities": {"supports_typed_decision": True},
+    }
+
+
+def test_real_session_registry_reaches_the_sensor(tmp_path, monkeypatch):
+    """RED before the repair: a real ChatSession left the sensor unresolved."""
+    from turnstone.core.session import _sensor_observe
+
+    monkeypatch.setattr(lifecycle, "ENABLED", True)
+    monkeypatch.setenv("TURNSTONE_SENSOR_STORE_DIR", str(tmp_path))
+    lifecycle.reset_hooks()
+
+    registry = _registry_with(**{DECISION_CAPABILITY: _typed_row()})
+    session = _real_session(registry)
+    assert session._registry is registry
+
+    # Bound through the actual registry the session built itself.
+    hook = lifecycle.hook(session._registry)
+    assert hook._sensor._resolved is True, "the session registry must resolve the lane"
+    assert hook._sensor.switchyard == "https://switchyard.example.internal"
+
+    # And the process-level (no-registry) hook stays honestly unresolved.
+    assert lifecycle.hook()._sensor._resolved is False
+    assert resolve_decision_endpoint(None) == ("", "")
+
+    # The seam forwards the registry rather than dropping it.
+    seen = {}
+    real_observe = lifecycle.observe_event
+
+    def _record(event, state=None, *, force=False, workstream="", registry=None):
+        seen["registry"] = registry
+        return real_observe(
+            event, state, force=force, workstream=workstream, registry=registry
+        )
+
+    monkeypatch.setattr(lifecycle, "observe_event", _record)
+    _sensor_observe(
+        "retry_transition",
+        {"objective": "x"},
+        workstream="ws",
+        registry=session._registry,
+    )
+    assert seen["registry"] is registry
+    lifecycle.reset_hooks()
+
+
+def test_every_session_seam_passes_the_sessions_own_registry():
+    """The four call sites must inject `self._registry`, not a constant."""
+    tree = ast.parse(SESSION.read_text())
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name):
+            continue
+        if not func.id.startswith("_sensor_observe"):
+            continue
+        # Skip the module-level definitions themselves (no call context).
+        if not any(kw.arg == "registry" for kw in node.keywords):
+            continue
+        for kw in node.keywords:
+            if kw.arg != "registry":
+                continue
+            assert isinstance(kw.value, ast.Call), ast.dump(kw.value)
+            assert isinstance(kw.value.func, ast.Name)
+            assert kw.value.func.id == "getattr"
+            # getattr(self, "_registry", None) - never a module constant.
+            assert kw.value.args[0].id == "self"
+            assert kw.value.args[1].value == "_registry"
+            assert kw.value.args[2].value is None
+            sites.append(node.lineno)
+    assert len(sites) == 4, f"expected 4 seams, found {sites}"
+
+
+def test_separate_sessions_do_not_contaminate_each_other(tmp_path, monkeypatch):
+    """Two registries -> two endpoints, two dedupe timelines, no bleed."""
+    monkeypatch.setattr(lifecycle, "ENABLED", True)
+    monkeypatch.setenv("TURNSTONE_SENSOR_STORE_DIR", str(tmp_path))
+    lifecycle.reset_hooks()
+
+    reg_a = _registry_with(**{DECISION_CAPABILITY: _typed_row("https://a.example")})
+    reg_b = _registry_with(**{DECISION_CAPABILITY: _typed_row("https://b.example")})
+    sess_a = _real_session(reg_a)
+    sess_b = _real_session(reg_b)
+
+    hook_a = lifecycle.hook(sess_a._registry)
+    hook_b = lifecycle.hook(sess_b._registry)
+    assert hook_a is not hook_b
+    assert hook_a._sensor.switchyard == "https://a.example"
+    assert hook_b._sensor.switchyard == "https://b.example"
+
+    state = {"objective": "shared text, independent timelines"}
+    assert hook_a._sensor.should_sense(
+        state, event="operator_instruction", workstream="ws"
+    )[0]
+    # B has never seen this state in ITS timeline, so it admits.
+    assert hook_b._sensor.should_sense(
+        state, event="operator_instruction", workstream="ws"
+    )[0]
+    # A's repeat is suppressed by A's own fingerprint.
+    assert hook_a._sensor.should_sense(
+        state, event="operator_instruction", workstream="ws"
+    ) == (False, "unchanged_state")
+    lifecycle.reset_hooks()
+
+
+@pytest.mark.parametrize(
+    "registry_factory, label",
+    [
+        (lambda: None, "no registry"),
+        (lambda: _registry_with(other={"base_url": "https://x"}), "row absent"),
+        (
+            lambda: _registry_with(
+                **{DECISION_CAPABILITY: {"base_url": "https://x", "capabilities": {}}}
+            ),
+            "not a typed-decision row",
+        ),
+        (
+            lambda: _registry_with(
+                **{
+                    DECISION_CAPABILITY: {
+                        "base_url": "https://x",
+                        "capabilities": {"supports_typed_decision": True},
+                    }
+                }
+            ),
+            "blank base_url is not blank here",
+        ),
+    ],
+)
+def test_unresolvable_registry_sends_nothing(registry_factory, label, tmp_path, monkeypatch):
+    """Fail-open: an unusable registry yields unresolved and NO network call."""
+    monkeypatch.setattr(lifecycle, "ENABLED", True)
+    monkeypatch.setenv("TURNSTONE_SENSOR_STORE_DIR", str(tmp_path))
+    lifecycle.reset_hooks()
+
+    calls = []
+
+    def _trap(*a, **k):
+        calls.append(1)
+        raise AssertionError(f"network call attempted: {label}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _trap)
+
+    registry = registry_factory()
+    if label == "blank base_url is not blank here":
+        # Build a row whose base_url is whitespace: resolution must refuse it.
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        cfg = ModelConfig(
+            alias=DECISION_CAPABILITY,
+            base_url="   ",
+            api_key="synthetic-not-a-credential",
+            model="m",
+            provider="openrouter",
+            capabilities={"supports_typed_decision": True},
+        )
+        registry = ModelRegistry(models={DECISION_CAPABILITY: cfg}, default=DECISION_CAPABILITY)
+
+    hook = lifecycle.hook(registry)
+    assert hook._sensor._resolved is False, label
+    hook.observe_event("operator_instruction", {"objective": "x"}, workstream="ws")
+    assert calls == [], label
+    lifecycle.reset_hooks()
+
+
+def test_exploding_registry_cannot_raise_into_the_task(monkeypatch):
+    """A registry whose accessor raises must not escape the seam."""
+    from turnstone.core.session import _sensor_observe_substantive
+
+    class _Exploding:
+        def get_config(self, alias):
+            raise RuntimeError("registry exploded")
+
+    monkeypatch.setattr(lifecycle, "ENABLED", True)
+    lifecycle.reset_hooks()
+    # Resolution is contained: unresolved, no exception.
+    hook = lifecycle.hook(_Exploding())
+    assert hook._sensor._resolved is False
+    # And so is the seam itself.
+    _sensor_observe_substantive("do the work", workstream="ws", registry=_Exploding())
+    lifecycle.reset_hooks()

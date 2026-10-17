@@ -38,9 +38,10 @@ import os
 import pathlib
 import re
 import threading
-import unicodedata
 import time
+import unicodedata
 import uuid
+import weakref
 from collections.abc import Mapping
 from typing import Any
 
@@ -567,30 +568,91 @@ class SensorHook:
                 pass
 
 
-#: Process-wide hook. Created on first use so importing this module has no side
-#: effect on a process that never senses.
+#: Hook used when no registry is supplied — the UNRESOLVED case, plus the
+#: override point the suite uses to drive the module-level wrapper. Created on
+#: first use so importing this module has no side effect on a process that
+#: never senses.
 _HOOK: SensorHook | None = None
+
+#: Registry-scoped hooks, keyed by the registry object's ``id`` and validated by
+#: a weak reference before use. This is a *cache*, not a registry binding: no
+#: module global ever holds "the" registry, and a hook is only ever returned for
+#: the exact object it was built from. Two sessions backed by different
+#: registries therefore get independent endpoints and independent dedupe state;
+#: when a registry is rebound (hot reload) the new object simply misses the
+#: cache and a fresh hook is built. Dead entries are pruned while the lock is
+#: held, so a long-lived process cannot accumulate them.
+_HOOKS: dict[int, tuple[Any, SensorHook]] = {}
 _HOOK_LOCK = threading.Lock()
 
 
-def hook() -> SensorHook:
-    global _HOOK
-    if _HOOK is None:
-        with _HOOK_LOCK:
-            if _HOOK is None:
-                # 2026-10-17 hardening: resolve the decision endpoint from the
-                # live registry (tier1-decision row) at hook construction. A
-                # failed resolution yields ("", "") — an UNRESOLVED sensor
-                # whose observations are explicitly unavailable with no
-                # network request of any kind. There is deliberately no
-                # fallback URL here: silence would be the dishonest option.
-                from .shadow_driver import ShadowSensor, resolve_decision_endpoint
+def _build_hook(registry: Any) -> SensorHook:
+    """Build a hook whose sensor resolves the decision lane FROM ``registry``.
 
-                decision_id, base_url = resolve_decision_endpoint()
-                _HOOK = SensorHook(
-                    ShadowSensor(decision_id=decision_id, base_url=base_url)
-                )
-    return _HOOK
+    A failed resolution yields ``("", "")`` — an UNRESOLVED sensor whose
+    observations are explicitly unavailable with no network request of any
+    kind. There is deliberately no fallback URL and no fallback alias here:
+    silence would be the dishonest option, and inventing an endpoint would be
+    worse.
+    """
+    from .shadow_driver import ShadowSensor, resolve_decision_endpoint
+
+    decision_id, base_url = resolve_decision_endpoint(registry)
+    return SensorHook(ShadowSensor(decision_id=decision_id, base_url=base_url))
+
+
+def hook(registry: Any = None) -> SensorHook:
+    """Return the sensor hook for ``registry``.
+
+    ``registry`` is the session's own ``ModelRegistry`` (or any object exposing
+    ``get_config``). Passing it is what makes the decision lane resolvable: the
+    historical wiring called the resolver with no registry at all, so every
+    activated observation was recorded as ``decision_endpoint_unresolved`` and
+    no graded signal was ever produced.
+
+    With ``registry=None`` this returns the unresolved process hook, preserving
+    the historical fail-closed behaviour and the suite's override point.
+    """
+    global _HOOK
+    if registry is None:
+        if _HOOK is None:
+            with _HOOK_LOCK:
+                if _HOOK is None:
+                    _HOOK = _build_hook(None)
+        return _HOOK
+
+    key = id(registry)
+    with _HOOK_LOCK:
+        entry = _HOOKS.get(key)
+        if entry is not None:
+            ref, existing = entry
+            if ref() is registry:
+                return existing
+        # Prune entries whose registry has been collected, then (re)build. The
+        # weakref check above makes an id reused after GC safe: identity, not
+        # the integer, is what decides a cache hit.
+        for stale_key in [k for k, (ref, _) in _HOOKS.items() if ref() is None]:
+            del _HOOKS[stale_key]
+        try:
+            ref = weakref.ref(registry)
+        except TypeError:  # registry is not weak-referenceable
+            ref = _strong_ref(registry)
+        built = _build_hook(registry)
+        _HOOKS[key] = (ref, built)
+        return built
+
+
+def _strong_ref(value: Any) -> Any:
+    """Fallback reference for objects that cannot be weakly referenced."""
+    return lambda: value
+
+
+def reset_hooks() -> None:
+    """Drop every cached hook. Test/reset helper; not a production path."""
+    global _HOOK
+    with _HOOK_LOCK:
+        _HOOK = None
+        _HOOKS.clear()
 
 
 def observe_event(
@@ -599,6 +661,7 @@ def observe_event(
     *,
     force: bool = False,
     workstream: str = "",
+    registry: Any = None,
 ) -> None:
     """Module-level convenience wrapper around :func:`hook`.
 
@@ -607,10 +670,14 @@ def observe_event(
     gate runs — no cadence row, no fingerprint commit, no file I/O. The
     SensorHook method above stays ungated so the suite can exercise the hook
     logic directly.
+
+    ``registry`` is the calling session's registry, passed explicitly on every
+    event. It is not stored anywhere: it only selects (or builds) that
+    registry's hook.
     """
     if not ENABLED:
         return
-    hook().observe_event(event, state, force=force, workstream=workstream)
+    hook(registry).observe_event(event, state, force=force, workstream=workstream)
 
 
 def verify_correlation(

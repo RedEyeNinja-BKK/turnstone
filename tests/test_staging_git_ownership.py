@@ -194,13 +194,6 @@ def test_git_really_refuses_a_repo_owned_by_another_uid() -> None:
 def test_sandbox_repo_owned_by_the_invoker_is_readable() -> None:
     """Control: the same code path works when owner == invoker."""
     with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
-        # TemporaryDirectory creates a 0700 directory owned by THIS uid (root
-        # here). Chowning the repo to the service identity is not enough: that
-        # identity still cannot traverse a root-owned 0700 parent, so the
-        # owner-side read would fail on a permission error and the fixture
-        # would report a false negative about the very thing it tests.
-        os.chmod(tmp, 0o755)
-        assert _run(["test", "-x", str(_TMP)]).returncode == 0
         repo = pathlib.Path(tmp) / "r"
         assert _run(["git", "init", "-q", str(repo)]).returncode == 0
         assert _run(
@@ -217,6 +210,36 @@ def test_sandbox_repo_owned_by_the_invoker_is_readable() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_fixture_parent_chmod_is_scoped_to_the_root_only_tier() -> None:
+    """Regression: the traversal correction was once applied to the wrong test.
+
+    A `tmp` created by TemporaryDirectory is 0700 owned by the CREATOR. Only the
+    root/foreign-owner fixture needs its parent opened, because only there does
+    the reading identity differ from the creating one. Applying it to the
+    owner==invoker control is misleading noise; omitting it from Tier 3 leaves a
+    fixture that cannot be traversed and would report a false negative.
+    """
+    src = pathlib.Path(__file__).read_text(encoding="utf-8")
+
+    def body(name: str) -> str:
+        start = src.index(f"def {name}(")
+        nxt = src.find("\ndef ", start + 1)
+        return src[start : nxt if nxt != -1 else len(src)]
+
+    sandbox = body("test_sandbox_repo_owned_by_the_invoker_is_readable")
+    tier3 = body("test_root_can_read_a_repo_owned_by_the_service_user")
+
+    assert "os.chmod(tmp, 0o755)" not in sandbox, (
+        "the owner==invoker control does not need its parent opened"
+    )
+    assert "os.chmod(tmp, 0o755)" in tier3, (
+        "the root/foreign-owner fixture MUST open its disposable parent"
+    )
+    # Tier 3 must prove traversability before asserting anything authoritative.
+    assert 'test", "-x"' in tier3
+    assert tier3.index('"-x"') < tier3.index("dubious ownership")
+
+
 def test_root_can_read_a_repo_owned_by_the_service_user() -> None:
     """THE production scenario: root staging a turnstone-owned repository."""
     if os.geteuid() != 0:
@@ -229,6 +252,14 @@ def test_root_can_read_a_repo_owned_by_the_service_user() -> None:
         return
 
     with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        # TemporaryDirectory creates a 0700 directory owned by the CREATOR --
+        # root, in this test. Chowning the repo to the service identity is not
+        # enough on its own: that identity has no execute bit on this parent, so
+        # every owner-side read would fail with a permission error and the
+        # fixture would report a false negative about the guard it measures.
+        # Open traversal on this DISPOSABLE parent only; the repository's own
+        # permissions are never touched.
+        os.chmod(tmp, 0o755)
         repo = pathlib.Path(tmp) / "r"
         assert _run(["git", "init", "-q", str(repo)]).returncode == 0
         assert _run(
@@ -240,17 +271,19 @@ def test_root_can_read_a_repo_owned_by_the_service_user() -> None:
             os.chown(path, *_uid_gid(service_user))
         os.chown(repo, *_uid_gid(service_user))
 
+        # The fixture must be reachable by the identity BEFORE anything is
+        # asserted, or a permission failure here would be indistinguishable from
+        # a failure of the guard under test.
+        reachable = _run(["runuser", "-u", service_user, "--", "test", "-x", str(repo)])
+        assert reachable.returncode == 0, (
+            "fixture unreachable by the service identity: the disposable parent "
+            "or the repo directory is not traversable"
+        )
+
         # (a) a bare read as root MUST fail; this is the bug being fixed
         bare = _run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"])
         assert bare.returncode != 0, "expected Git to refuse the foreign-owned repo"
         assert "dubious ownership" in (bare.stdout + bare.stderr)
-
-        # Intermediate proof: the fixture itself must be reachable by the
-        # identity, or every later assertion would measure the fixture.
-        traversable = _run(["runuser", "-u", service_user, "--", "test", "-x", str(repo)])
-        assert traversable.returncode == 0, (
-            "fixture unreachable by the service identity; the parent chain is not traversable"
-        )
 
         # (b) the same read as the owner MUST succeed
         owned = _run(

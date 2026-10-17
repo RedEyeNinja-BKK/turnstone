@@ -330,7 +330,20 @@ service identity *before* the authoritative assertions.
 states plainly that skipped tiers were **not verified** in that run. A
 self-reporting skip is no longer also counted as a pass.
 
-Baseline on this host (unprivileged): `executed: 12 passed: 12 failed: 0 skipped: 1`.
+Baseline on this host (unprivileged): `executed: 13 passed: 13 failed: 0 skipped: 1`.
+
+### Fixture placement correction
+
+The traversal `chmod 0755` was initially inserted into
+`test_sandbox_repo_owned_by_the_invoker_is_readable` instead of the Tier 3
+fixture - the owner==invoker control does not need its parent opened, and Tier 3
+still could not be traversed by `turnstone`. It now lives in Tier 3 only, and the
+traversability proof runs **before** any authoritative assertion, so a permission
+failure can no longer be mistaken for a failure of the guard under test.
+
+`test_fixture_parent_chmod_is_scoped_to_the_root_only_tier` pins the placement;
+two mutation controls confirm it bites - restoring the misplacement, and removing
+the Tier 3 chmod alone, each fail it with a distinct message.
 
 ### Operator sequence (unchanged slots)
 

@@ -51,7 +51,7 @@ class _RecordingSensor:
         return True, Trigger.MATERIAL.value
 
     def observe(self, state, *, event=None, force=False, decided=False,
-                workstream="", event_id=""):
+                workstream="", event_id="", content_mode=""):
         # `decided` mirrors the real ShadowSensor signature. Without it the hook's
         # `decided=True` call raised TypeError, which the fail-open boundary
         # swallowed -- so this stub silently recorded ZERO calls and the suite

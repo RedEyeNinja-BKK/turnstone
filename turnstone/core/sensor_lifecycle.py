@@ -488,6 +488,7 @@ class SensorHook:
                 decided=True,
                 workstream=workstream,
                 event_id=event_id,
+                content_mode=CONTENT_MODE,
             )
         except Exception:  # noqa: BLE001 - a sensor must never fail a task
             try:

@@ -888,3 +888,29 @@ def test_deadline_defaults_are_sane():
     assert 1.0 <= driver.DEADLINE_SECONDS <= 10.0
     assert driver.DEADLINE_SECONDS >= driver.REQUEST_TIMEOUT_SECONDS
     assert driver.MAX_ABANDONED_CALLS >= 1
+
+
+def test_every_observation_records_mode_and_projection_schema(tmp_path, monkeypatch):
+    """A stored record must say which exposure posture produced it."""
+    from turnstone.core.shadow_observation import PROJECTION_SCHEMA
+
+    monkeypatch.setattr(lifecycle, "CONTENT_MODE", "metadata")
+    hook, _sensor = _hook_with_store(tmp_path)
+    hook.observe_event("operator_instruction", {"objective": "a"}, workstream="w")
+
+    row = _read_jsonl(tmp_path / "observations.jsonl")[0]
+    assert row["content_mode"] == "metadata"
+    assert row["projection_schema"] == PROJECTION_SCHEMA
+    assert row["sensor_version"]
+
+
+def test_unavailable_records_also_carry_mode(tmp_path, monkeypatch):
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    monkeypatch.setattr(lifecycle, "CONTENT_MODE", "sanitized")
+    sensor = ShadowSensor(store=tmp_path / "o.jsonl", timeout=0.2)  # unresolved
+    hook = lifecycle.SensorHook(sensor, cadence_store=tmp_path / "c.jsonl", persist=False)
+    hook.observe_event("operator_instruction", {"objective": "a"}, workstream="w")
+    row = _read_jsonl(tmp_path / "o.jsonl")[0]
+    assert row["content_mode"] == "sanitized"
+    assert row["reason"] == "decision_endpoint_unresolved"

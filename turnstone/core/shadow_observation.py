@@ -34,6 +34,17 @@ from typing import Any
 
 SENSOR_VERSION = "turnstone-sensor-shadow:v1"
 
+#: Version of the bounded projection schema. Recorded on every observation so a
+#: stored record can be interpreted against the projection policy that produced
+#: it. Bump when the *meaning* of a projected field changes.
+PROJECTION_SCHEMA = "turnstone-sensor-projection:v1"
+
+#: Allowed content-minimization modes. ``full`` reproduces the historical
+#: projection; ``sanitized`` strips secrets/paths/e-mails; ``metadata`` sends no
+#: free text at all. The active value is recorded on every observation so the
+#: exposure posture of a measurement is never ambiguous after the fact.
+CONTENT_MODES = ("full", "sanitized", "metadata")
+
 #: Process identity for telemetry. The five-node fleet runs six processes that
 #: append to the same store root; a record with no process attribution cannot
 #: be attributed to the node that observed it. ``TURNSTONE_NODE_ID`` is set by
@@ -177,6 +188,10 @@ class SensorSnapshot:
     workstream: str = ""
     #: Node:pid that produced this record.
     process_id: str = ""
+    #: Which content-minimization mode produced the projected state.
+    content_mode: str = ""
+    #: Version of the projection schema (see PROJECTION_SCHEMA).
+    projection_schema: str = PROJECTION_SCHEMA
     #: Dropped because a higher tier was present, or the low-tier reserve had to
     #: be protected. Policy working as designed; NOT capacity pressure.
     evicted_by_tier: bool = False
@@ -206,6 +221,8 @@ class SensorSnapshot:
             "event_id": self.event_id,
             "workstream": self.workstream,
             "process_id": self.process_id,
+            "content_mode": self.content_mode,
+            "projection_schema": self.projection_schema,
             "signals": [s.to_dict() for s in self.signals],
             "reason": self.reason,
             "extra": self.extra,
@@ -244,6 +261,7 @@ def unavailable(
     event_id: str = "",
     workstream: str = "",
     process_id: str = "",
+    content_mode: str = "",
 ) -> SensorSnapshot:
     """The fail-open snapshot. A task must never fail because sensing did.
 
@@ -289,6 +307,7 @@ def unavailable(
         event_id=event_id,
         workstream=workstream,
         process_id=process_id or PROCESS_ID,
+        content_mode=content_mode,
         signals=signals,
         reason=reason,
     )
@@ -314,6 +333,7 @@ def build_snapshot(
     event_id: str = "",
     workstream: str = "",
     process_id: str = "",
+    content_mode: str = "",
 ) -> SensorSnapshot:
     """Build a successful observation from a decision response.
 
@@ -388,6 +408,7 @@ def build_snapshot(
         event_id=event_id,
         workstream=workstream,
         process_id=process_id or PROCESS_ID,
+        content_mode=content_mode,
         signals=tuple(signals),
         extra=(dict(unqualified_raw) if unqualified_raw else {}),
     )

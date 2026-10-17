@@ -314,6 +314,7 @@ class ShadowSensor:
         decided: bool = False,
         workstream: str = "",
         event_id: str = "",
+        content_mode: str = "",
     ):
         """Take one advisory observation, or record why none was taken.
 
@@ -362,6 +363,7 @@ class ShadowSensor:
                 reason="decision_endpoint_unresolved",
                 event_id=event_id,
                 workstream=workstream,
+                content_mode=content_mode,
             ))
         if decided:
             # The caller owns cadence and already committed the fingerprint.
@@ -383,6 +385,7 @@ class ShadowSensor:
                 reason=why,
                 event_id=event_id,
                 workstream=workstream,
+                content_mode=content_mode,
             )
 
         serialised: SerializedState | None = None
@@ -405,6 +408,7 @@ class ShadowSensor:
                     latency_ms=int((time.monotonic() - started) * 1000),
                     event_id=event_id,
                     workstream=workstream,
+                    content_mode=content_mode,
                     state_truncated=serialised.state_truncated,
                     evicted_by_tier=serialised.evicted_by_tier,
                     overflowed_budget=serialised.overflowed_budget,
@@ -422,6 +426,7 @@ class ShadowSensor:
                 latency_ms=int((time.monotonic() - started) * 1000),
                 event_id=event_id,
                 workstream=workstream,
+                content_mode=content_mode,
             )
             return self._record(snapshot)
 
@@ -442,6 +447,7 @@ class ShadowSensor:
                 latency_ms=latency_ms,
                 event_id=event_id,
                 workstream=workstream,
+                content_mode=content_mode,
                 state_truncated=serialised.state_truncated,
                 evicted_by_tier=serialised.evicted_by_tier,
                 overflowed_budget=serialised.overflowed_budget,
@@ -461,6 +467,7 @@ class ShadowSensor:
                 latency_ms=latency_ms,
                 event_id=event_id,
                 workstream=workstream,
+                content_mode=content_mode,
                 state_truncated=serialised.state_truncated,
                 evicted_by_tier=serialised.evicted_by_tier,
                 overflowed_budget=serialised.overflowed_budget,
@@ -512,6 +519,7 @@ class ShadowSensor:
             }),
             event_id=event_id,
             workstream=workstream,
+            content_mode=content_mode,
         )
         return self._record(snapshot)
 

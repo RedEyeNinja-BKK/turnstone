@@ -621,10 +621,12 @@ def test_pinned_revision_is_the_deployed_laya_checkpoint():
     import json
     import urllib.request
 
-    for url in (
-        "http://100.105.20.36:8011/health",
-        "http://100.105.20.36:8011/openapi.json",
-    ):
+    # 2026-10-17: the live-service probe URL comes from the environment so the
+    # fixture carries no real internal address. Unset -> honest skip.
+    base = os.environ.get("TURNSTONE_SENSOR_LAYA_PROBE_URL", "").rstrip("/")
+    if not base:
+        pytest.skip("TURNSTONE_SENSOR_LAYA_PROBE_URL not set")
+    for url in (f"{base}/health", f"{base}/openapi.json"):
         try:
             with urllib.request.urlopen(url, timeout=8) as response:
                 body = json.loads(response.read())

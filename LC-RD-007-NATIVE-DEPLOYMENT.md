@@ -16,10 +16,16 @@ four and then asserts the complete set:
 | 1 | `core/model_registry.py` | `openai_oauth` in `MODEL_AUTH_MODES`; `DIRECT_OAUTH_MODEL_AUTH_MODES`; deliberately **not** in `MODEL_AUTH_MODE_PROFILES` |
 | 2 | `core/model_backend_auth.py` | `_resolve_direct_oauth_token` branch, **before** the delegated-user check |
 | 3 | `core/oauth_token_store.py` | the coordinated store (flock + re-read under lock + atomic replace) |
-| 4 | `console/server.py` | posture tier: this mode needs the local store, not OIDC/OBO |
+| 4 | `console/server.py` | posture tier: this mode needs the local store, not OIDC/OBO (copied whole; it also carries the R2 picker guard) |
 
 Plus `core/settings_registry.py` (`model.openai_oauth_store`) and the accepted R2
 typed-decision content, which the package inherits rather than duplicating.
+
+R2 and this package are deliberately disjoint at the file level: R2 *patches*
+`model_registry.py` and `console/server.py` with only the typed-decision changes
+and its verify refuses any `openai_oauth` reference; this package then *copies*
+the full repository versions on top. That is what makes "R2 alone" and "R2 +
+OAuth" both internally consistent, instead of R2 shipping half a feature.
 
 ### Why the mode is not given an OBO "mint leg"
 

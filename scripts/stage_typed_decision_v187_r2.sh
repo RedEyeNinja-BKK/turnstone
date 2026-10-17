@@ -101,7 +101,6 @@ version=$("$PY" -c 'import importlib.metadata as m; print(m.version("turnstone")
 FULL_FILES=(
   "core/output_guard_judge.py"
   "cli.py"
-  "console/server.py"
 )
 
 check_full_file_bases() {
@@ -114,6 +113,70 @@ check_full_file_bases() {
       die "base mismatch for $f: repository base $BASE_COMMIT differs from $BASE_TREE; \
 refusing to overlay a divergent module"
   done
+}
+
+patch_console_picker() {
+  # R2 needs exactly one Console change: skip typed-decision rows when building
+  # the workstream-creation picker (GET /v1/api/models reads the DB directly and
+  # never consults ModelRegistry). The repository copy of this file ALSO carries
+  # the LC-RD-007 direct-OAuth posture guard, which belongs to the separate
+  # package -- so this file is patched, not copied.
+  local target="$1"
+  "$PY" - "$target" <<'PYEOF'
+import pathlib, sys
+target = pathlib.Path(sys.argv[1])
+text = target.read_text(encoding="utf-8")
+
+if "openai_oauth" in text or "DIRECT_OAUTH_MODEL_AUTH_MODES" in text:
+    raise SystemExit(
+        "refusing: the 1.8.7 console already references the direct-OAuth feature; "
+        "this revision must not ship a partial implementation of it"
+    )
+if "is_typed_decision" in text:
+    raise SystemExit("refusing: the typed-decision picker guard is already present")
+
+anchor1 = (
+    '            "effort_ladder": [],\n'
+    '        }\n'
+    '        try:\n'
+)
+add1 = (
+    '            "effort_ladder": [],\n'
+    '        }\n'
+    '        # A row declaring ``supports_typed_decision`` is a decision backend:\n'
+    '        # it answers with a typed decision object and generates no assistant\n'
+    '        # text, so it cannot back a workstream. It is excluded from this\n'
+    '        # creation picker only -- it stays in the registry, in the Models\n'
+    '        # admin tab, and is still executed by the Output Guard.\n'
+    '        is_typed_decision = False\n'
+    '        try:\n'
+)
+assert text.count(anchor1) == 1, "anchor1"
+text = text.replace(anchor1, add1, 1)
+
+anchor2 = (
+    '                if isinstance(parsed, dict):\n'
+    '                    caps = parsed\n'
+)
+add2 = (
+    '                if isinstance(parsed, dict):\n'
+    '                    caps = parsed\n'
+    '                    is_typed_decision = bool(caps.get("supports_typed_decision"))\n'
+)
+assert text.count(anchor2) == 1, "anchor2"
+text = text.replace(anchor2, add2, 1)
+
+anchor3 = '        models.append(entry)\n'
+add3 = (
+    '        if is_typed_decision:\n'
+    '            continue\n'
+    '        models.append(entry)\n'
+)
+assert text.count(anchor3) == 1, "anchor3"
+text = text.replace(anchor3, add3, 1)
+target.write_text(text, encoding="utf-8")
+print("console/server.py patched: typed rows excluded from the creation picker")
+PYEOF
 }
 
 patch_model_registry() {
@@ -254,6 +317,7 @@ cmd_stage() {
     cmp -s "$REPO/turnstone/$f" "$NEW/turnstone/$f" || die "copy mismatch: $f"
   done
   patch_model_registry "$NEW/turnstone/core/model_registry.py"
+  patch_console_picker "$NEW/turnstone/console/server.py"
   patch_session "$NEW/turnstone/core/session.py"
   patch_openai_responses "$NEW/turnstone/core/providers/_openai_responses.py"
 
@@ -287,6 +351,8 @@ cmd_verify() {
     || die "staged _openai_responses.py is missing the tool_search guard"
   grep -q 'def list_generative_aliases' "$NEW/turnstone/core/model_registry.py" \
     || die "staged model_registry.py is missing list_generative_aliases"
+  grep -q 'is_typed_decision = bool' "$NEW/turnstone/console/server.py" \
+    || die "staged console/server.py is missing the typed-decision picker guard"
   # R2 must not carry a half-installed openai_oauth auth mode. That feature is
   # staged separately, with its own store, dispatch branch and settings entry.
   if grep -rq 'openai_oauth' "$NEW/turnstone/core" "$NEW/turnstone/console" "$NEW/turnstone/cli.py"; then

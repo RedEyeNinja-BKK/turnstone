@@ -326,7 +326,7 @@ cmd_status() {
 #
 # SAFETY ARGUMENT: this step changes CODE, not model routing. No model row uses
 # auth_mode=openai_oauth at activation time, so the new branch is unreachable
-# until an operator creates a canary row (a separate, later gate). The visible
+# until the three existing aliases are migrated (a separate, later gate). The visible
 # effects are the accepted R2 typed-decision corrections and the appearance of
 # openai_oauth in the admin mode list. The credential store and audience
 # allow-list are prerequisites for the CANARY, not for this switch.
@@ -475,7 +475,7 @@ print_plan() {
   say "Then: verify PID PYTHONPATH, unit state, /health and preserved env; otherwise roll back."
   say ""
   say "No model row is changed. auth_mode=openai_oauth stays unreachable until a"
-  say "canary row is created deliberately (separate gate)."
+  say "the three existing aliases are migrated deliberately (separate gate)."
 }
 
 # All-or-nothing drop-in write. Records what THIS run created so a mid-way
@@ -627,13 +627,100 @@ wait_healthy() {
   return 1
 }
 
-journal_scan() {  # since-epoch; nonzero if a fatal import error was logged
-  local since=$1 u out
+# Classify the journal since the restart. Prints offending text and returns 1
+# only for a genuine failure.
+#
+# WHY THIS IS NOT A GREP FOR "Traceback"
+#   A coordinated restart of six units necessarily breaks the console's SSE
+#   links to the five nodes it is watching: the peer closes mid-stream and
+#   httpx raises RemoteProtocolError inside turnstone.console.collector. Those
+#   are warning-level, expected, and self-healing -- they are the restart
+#   working, not the restart failing. Treating any traceback as a fatal import
+#   error therefore fails a perfectly good activation (observed 2026-10-17).
+#
+#   The rule is therefore split by MEANING:
+#     * an import/startup failure is fatal, always, wherever it appears;
+#     * a traceback is fatal unless its terminal exception is a
+#       connection-loss or cancellation class -- i.e. the process lost a peer
+#       or was stopped deliberately, rather than failing to start or crashing.
+#   Single-line JSON log records carry escaped newlines, so they are normalised
+#   first; journald may also split them across lines.
+JOURNAL_CLASSIFIER='
+import re, sys
+
+text = sys.stdin.read().replace("\\n", "\n")
+lines = text.splitlines()
+
+IMPORT_FAILURE = re.compile(
+    r"\b(ModuleNotFoundError|ImportError|SyntaxError|IndentationError)\b"
+)
+HEADER_TEXT = "Traceback (most recent call last):"
+TERMINAL = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)\b")
+# journalctl prefixes every stored line with "Oct 17 18:05:28 host unit[pid]: ".
+# A traceback that journald split across entries therefore carries that prefix
+# on BOTH its header and its continuation lines, so the prefix is stripped
+# before the indentation rule is applied.
+PREFIX = re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+\S+?:\s?")
+
+# Losing a peer, or being cancelled while units restart around this one. These
+# are expected during a coordinated restart.
+BENIGN = {
+    "RemoteProtocolError", "ProtocolError", "ConnectError", "ConnectTimeout",
+    "ReadTimeout", "WriteTimeout", "PoolTimeout", "TimeoutException",
+    "RemoteDisconnected", "ConnectionResetError", "ConnectionAbortedError",
+    "ConnectionRefusedError", "BrokenPipeError", "ClosedResourceError",
+    "EndOfStream", "IncompleteRead", "CancelledError", "TransportError",
+    "APIConnectionError", "APITimeoutError", "NetworkError",
+}
+
+fatal = []
+block = None
+for raw in lines:
+    line = raw.rstrip("\r")
+    core = PREFIX.sub("", line, count=1)
+    if HEADER_TEXT in core:
+        if block is not None:
+            fatal.append("\n".join(block))
+        block = [line]
+        continue
+    if block is not None:
+        if core.startswith((" ", "\t")) or not core.strip():
+            block.append(line)
+            continue
+        m = TERMINAL.match(core)
+        name = m.group(1).split(".")[-1] if m else None
+        if name is None or name not in BENIGN:
+            fatal.append("\n".join(block + [line]))
+        block = None
+
+if block is not None:
+    fatal.append("\n".join(block))
+
+# An import/startup failure is fatal even outside a traceback block.
+for raw in lines:
+    if IMPORT_FAILURE.search(raw) and not any(raw in f for f in fatal):
+        fatal.append(raw)
+
+if fatal:
+    print("\n".join(fatal))
+    sys.exit(1)
+'
+
+journal_scan() {  # since-epoch; nonzero only for a genuine failure
+  local since=$1 u out rc=0 verdict
   for u in "${UNITS[@]}"; do
-    out=$(journalctl -u "$u" --since "@$since" --no-pager -q 2>/dev/null \
-      | grep -E 'ModuleNotFoundError|ImportError:|Traceback \(most recent call last\)' || true)
-    [[ -z "$out" ]] || { printf '%s\n' "$out" >&2; return 1; }
+    out=$(journalctl -u "$u" --since "@$since" --no-pager -q 2>/dev/null || true)
+    [[ -n "$out" ]] || continue
+    verdict=$(printf '%s\n' "$out" | "$PY" -c "$JOURNAL_CLASSIFIER" 2>&1) && continue
+    rc=1
+    say "  fatal journal entry in $u:" >&2
+    printf '%s\n' "$verdict" | sed 's/^/    /' >&2
   done
+  if (( rc != 0 )); then
+    say "  (connection-loss and cancellation tracebacks are expected while the" >&2
+    say "   units restart together, and are not counted as failures)" >&2
+  fi
+  return $rc
 }
 
 remove_dropins() {

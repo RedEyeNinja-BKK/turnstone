@@ -619,6 +619,106 @@ def test_rollback_refuses_to_claim_success_when_a_dropin_survives() -> None:
     _with_harness(body)
 
 
+# ---------------------------------------------------------------------------
+# C. the journal gate distinguishes restart noise from a real failure
+#
+# Observed on 2026-10-17: a healthy activation was rolled back because a
+# coordinated restart necessarily breaks the console's SSE links to the five
+# nodes. The console logs each disconnect as a warning-level traceback whose
+# terminal exception is httpx.RemoteProtocolError. That is the restart working.
+# ---------------------------------------------------------------------------
+
+BENIGN_SSE = (
+    'Oct 17 18:05:28 host turnstone-console[1]: {"event": "SSE connection to node '
+    'turnstone-node-3 failed", "level": "warning", "exception": "Traceback (most '
+    'recent call last):\\n  File \\"/opt/turnstone-venv/lib/python3.13/site-packages/'
+    'httpx/_models.py\\", line 1055, in aiter_raw\\n    async for chunk in self.stream:'
+    '\\n  File \\"/opt/turnstone-venv/lib/python3.13/site-packages/httpx_sse/_api.py'
+    '\\", line 42, in aiter_sse\\n    async for line in lines:\\n'
+    'httpx.RemoteProtocolError: peer closed connection without sending complete '
+    'message body (incomplete chunked read)"}'
+)
+
+FATAL_IMPORT = (
+    "Oct 17 18:05:30 host turnstone-server[2]: Traceback (most recent call last):\\n"
+    '  File "/opt/turnstone-overlays/x/turnstone/cli.py", line 10, in <module>\\n'
+    "    import turnstone.core.oauth_token_store\\n"
+    "ModuleNotFoundError: No module named 'turnstone.core.oauth_token_store'"
+)
+
+FATAL_CRASH = (
+    "Oct 17 18:05:31 host turnstone-server[3]: Traceback (most recent call last):\\n"
+    '  File "/opt/turnstone-overlays/x/turnstone/console/server.py", line 99, in boot\\n'
+    "    cfg = load()\\n"
+    "KeyError: 'models'"
+)
+
+
+def test_benign_sse_disconnect_does_not_fail_activation() -> None:
+    """The exact 2026-10-17 false positive: a warning, not an import error."""
+
+    def body(h: Harness) -> None:
+        (h.state / "journal_error").write_text(BENIGN_SSE + "\n")
+        p = h.run("activate", "--confirm")
+        out = p.stdout + p.stderr
+        assert p.returncode == 0, f"a benign disconnect failed activation: {out[-600:]}"
+        assert "ACTIVATED" in p.stdout
+        assert h.all_proc() == {str(h.slot)}, h.all_proc()
+        for u in UNITS:
+            assert h.dropin(u).exists(), u
+
+    _with_harness(body)
+
+
+def test_fatal_import_error_still_fails_activation() -> None:
+    """Narrowing the gate must not blind it to a genuine startup failure."""
+
+    def body(h: Harness) -> None:
+        (h.state / "journal_error").write_text(FATAL_IMPORT + "\n")
+        p = h.run("activate", "--confirm")
+        out = p.stdout + p.stderr
+        assert p.returncode != 0, "a real import error must fail activation"
+        assert "fatal import error" in out
+        assert "ModuleNotFoundError" in out, out[-600:]
+        for u in UNITS:
+            assert not h.dropin(u).exists(), f"drop-in survived: {u}"
+        assert "ROLLBACK VERIFIED" in out
+
+    _with_harness(body)
+
+
+def test_fatal_non_import_traceback_still_fails_activation() -> None:
+    """The exemption is by exception CLASS, not 'any traceback is fine'."""
+
+    def body(h: Harness) -> None:
+        (h.state / "journal_error").write_text(FATAL_CRASH + "\n")
+        p = h.run("activate", "--confirm")
+        out = p.stdout + p.stderr
+        assert p.returncode != 0, "a KeyError traceback must still fail the gate"
+        assert "KeyError" in out, out[-600:]
+        for u in UNITS:
+            assert not h.dropin(u).exists()
+
+    _with_harness(body)
+
+
+def test_import_failure_is_fatal_even_inside_a_benign_block() -> None:
+    """An ImportError embedded in an otherwise ignorable traceback still blocks."""
+
+    def body(h: Harness) -> None:
+        mixed = BENIGN_SSE + "\n" + (
+            "Oct 17 18:05:32 host turnstone-node@2[4]: ImportError: cannot import "
+            "name 'list_generative_aliases'\n"
+        )
+        (h.state / "journal_error").write_text(mixed)
+        p = h.run("activate", "--confirm")
+        out = p.stdout + p.stderr
+        assert p.returncode != 0
+        assert "ImportError" in out, out[-600:]
+
+    _with_harness(body)
+
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items()) if n.startswith("test_") and callable(o)]
     passed = failed = 0

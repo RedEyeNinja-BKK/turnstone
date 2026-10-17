@@ -157,8 +157,9 @@ turn 2: response.completed, "Bangkok: 33°C and clear."
 served_model='gpt-6.1-sol'
 ```
 
-Still required before cutover: a **fresh-workstream** canary through Turnstone,
-which needs this package active.
+Those turns ran in-process through the new dispatch seam. What remains is the
+same ordinary check any new model gets, once the package is active: a live
+request through each of the three real aliases.
 
 ## 4. Activation sequence (operator-gated)
 
@@ -235,9 +236,9 @@ script.
 
 **Scope of this switch.** It changes code only. No model row, credential, setting
 or database row is touched, and no alias is repointed. `auth_mode=openai_oauth`
-remains unreachable until a canary row is deliberately created (section 5). The
+remains unreachable until the three aliases are migrated (section 5). The
 SIWC runtime store and the audience allow-list are prerequisites for that
-**canary**, not for this activation.
+**alias migration**, not for this activation.
 
 **Rollback target** removes only the three `94-` drop-ins. The `90-`/`91-` anchors
 restore `typed-decision-v187-finish`. There is **no `92-` anchor on this host**
@@ -246,25 +247,30 @@ before `94-` and removing `94-` would land on R2 instead. Both `92-` and the
 superseded `93-` family are refused at preflight for that reason. Model rows are
 untouched by activation and rollback.
 
-## 5. Alias cutover (a separate, later gate)
+## 5. The three registry aliases (no canary alias)
 
-The canary is a **new** alias; the existing `gpt-6.1-sol` row keeps pointing at
-Switchyard until the canary passes.
+There is no separate canary alias. The three existing rows are migrated in
+place; their alias names, context windows and enabled flag are preserved, and a
+byte-level snapshot of the prior configuration is taken first.
 
-1. Add a canary row, e.g. `gpt-6.1-sol-native`:
-   `provider=openai`, `model=gpt-6.1-sol`,
-   `base_url=https://api.openai.com/v1`,
-   `auth_mode=openai_oauth`, `obo_audience=https://api.openai.com/v1`,
-   `api_key=''` (keyless ⇒ fail-closed), `context_window` as measured.
-2. Prove a fresh workstream on the canary: streaming, a client-side function call,
-   multi-turn continuity, reasoning effort (never `none`), and
-   `served_model=gpt-6.1-sol`.
-3. Only then repoint the `gpt-6.1-sol` alias. Keep the Switchyard row's exact
-   configuration recorded for rollback.
-4. **No silent fallback to GPT-6 Sol.** If the native route fails, the alias must
-   fail visibly; the Switchyard row is restored deliberately, not automatically.
+| Alias | provider model | reasoning | served identity |
+|---|---|---|---|
+| `gpt-6-luna` | `gpt-6-luna` | thinking (`medium`) | `gpt-6-luna` |
+| `gpt-6-luna-nt` | `gpt-6-luna` | `none` - no reasoning emitted | `gpt-6-luna` |
+| `gpt-6.1-sol` | `gpt-6.1-sol` | default (`medium`) | `gpt-6.1-sol` |
 
-`gpt-6-luna` and `gpt-6-luna-nt` are not touched by this package or the cutover.
+All three: `provider=openai`, `base_url=https://api.openai.com/v1`,
+`auth_mode=openai_oauth`, `obo_audience=https://api.openai.com/v1`, sharing the
+single runtime store. `scripts/migrate_openai_routes.py` performs the change and
+`… verify` asserts it.
+
+The previous rows mapped `gpt-6.1-sol` to `direct-openai-gpt-6-sol` - a
+different, older model - and routed all three through Switchyard. The live
+Switchyard manifest confirms it: it offers `direct-openai-gpt-6-sol` and has no
+`gpt-6.1-sol` entry at all.
+
+**No silent fallback.** If a route fails, it fails visibly. It is never
+re-pointed at another model to make a check pass.
 
 ## 6. Credential cutover (single-writer handoff)
 
@@ -285,7 +291,7 @@ holds.
 
 Because the access token is expired, the **first** call through either store
 performs a refresh and rotates the refresh token. The handoff therefore cannot
-be deferred until after the canary starts: it must complete before the first
+be deferred until after the migration starts: it must complete before the first
 call on the new path.
 
 **Handoff - one step, in this order:**
@@ -304,7 +310,7 @@ call on the new path.
    (`SIWC_STORE_DIR` overrides it) - set it, or it becomes a second writer.
 4. Never revive a rotated token from the archive.
 
-Only then create the canary row.
+Only then migrate the three rows.
 
 ## 7. Audience allow-list (additive)
 
@@ -329,8 +335,8 @@ curl -sS -X PUT -H "Authorization: Bearer $TURNSTONE_ADMIN_TOKEN" \
 ```
 
 Re-read afterwards and confirm every previous entry is still present before
-creating the canary row. This write needs the `admin.settings` scope and is
-audited. It belongs to the canary gate, not to code activation.
+migrating the three rows. This write needs the `admin.settings` scope and is
+audited. It belongs to the migration gate, not to code activation.
 
 ## 8. Rollback target, measured on the live host
 

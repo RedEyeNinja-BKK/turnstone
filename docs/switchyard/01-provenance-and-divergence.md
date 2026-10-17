@@ -19,7 +19,7 @@ Reference for the Switchyard running on `switchyard-vm`. Measured 2026-10-17.
 | Binary sha256 | `74963b1d57c664172175f820f2b94c8ad790629feb2965538c9a09983387d147` |
 | Build id | `7f4d76212f363150ad13382fedb27cafec9c06da` |
 | Reported version | `switchyard-server 0.3.0` |
-| Config | `/etc/switchyard/routes.toml` sha256 `9a6448ef543bac6300401efd5f46b831f3f1001d85ed9e9aa55e617ccc1fa5a5` |
+| Config | `/etc/switchyard/routes.toml` sha256 `7b8445b20346670fa712f1e2b82b81730126df738054e6aef5340ea5dbcc326f` (V7.2; was `9a6448ef…` before the rerank `top_n` change) |
 | Source tree | `/home/vincent/switchyard-migration/production-src` (owner `vincent`, clean) |
 | Source commit | `2c6e6df53e9dbac9f6121d9780e4c09930d51b40` (2026-10-04) |
 | Decision | `fix(translation): let a Responses upstream require a list-shaped input` |
@@ -30,6 +30,28 @@ Reference for the Switchyard running on `switchyard-vm`. Measured 2026-10-17.
 the binary (`strings` finds no 40-hex revision), so provenance comes from the
 source tree, not from the artifact. **Record the source commit, not just
 `0.3.0`, in any deployment receipt.**
+
+### The local source bundle does not match this binary
+
+Measured 2026-10-17. The git bundle at
+`/var/lib/turnstone/switchyard-upstream/fork/src.bundle` (HEAD `2c6e6df5`, 543
+commits) is **not** the tree this binary was built from:
+
+| Check | Deployed binary | Bundle-built binary |
+|---|---|---|
+| Accepts `[decision_lane_composition]` from the live config | yes | **no** — `unknown field` |
+| `decision_lane_composition` present in the image | yes (4 occurrences) | **no** (0) |
+| `--dry-run` on the live config | passes | fails |
+| sha256 | `74963b1d57c664…` | `2c7061ad987738…` |
+
+So the bundle predates at least one fork commit that the deployed binary
+contains. Treat the bundle as a *reference for behaviour*, never as the
+build input for a replacement artifact.
+
+**Consequence:** a rebuild from the bundle cannot be deployed. It would reject
+the live manifest at startup. Any source change to this deployment needs the
+true tree from `production-src` first, or the bundle must be regenerated from
+it and re-verified against the running binary.
 
 ---
 

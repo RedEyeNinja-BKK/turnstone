@@ -601,7 +601,7 @@ def test_sudoers_verbs_match_the_launcher_exactly() -> None:
     # Derived from the module, never a hand-maintained list: a verb the module
     # serves but the launcher or the sudoers template omits is unreachable at
     # runtime (the deployed 'org' verb was exactly that defect).
-    expected = set(grafana.ENDPOINTS) | {"all", "query"}
+    expected = set(grafana.ENDPOINTS) | {"all", "query", "dashboard"}
     assert launcher_verbs == expected
     assert rule_verbs == expected
 
@@ -621,7 +621,7 @@ def test_sudoers_grants_no_wildcards_or_unrestricted_powers() -> None:
     assert "*" not in text
     assert "NOPASSWD: ALL" not in text
     assert "SETENV:" not in text
-    expected = set(grafana.ENDPOINTS) | {"all", "query"}
+    expected = set(grafana.ENDPOINTS) | {"all", "query", "dashboard"}
     assert text.count("NOPASSWD:") == len(expected)
     # The existing self-management bridge grant must not be touched here.
     assert "launch-self-mcp" not in text
@@ -632,6 +632,122 @@ def test_launcher_and_installer_parse() -> None:
 
     for script in (LAUNCHER, INSTALLER):
         subprocess.run(["bash", "-n", str(script)], check=True)
+
+
+def test_dashboard_request_accepts_a_valid_uid() -> None:
+    assert grafana.parse_dashboard_request(b'{"uid":"switchyard-dashboard-v6"}') == (
+        "switchyard-dashboard-v6"
+    )
+
+
+def test_dashboard_request_refuses_traversal_and_extra_fields() -> None:
+    for raw, needle in (
+        (b'{"uid":"../../admin"}', "uid"),
+        (b'{"uid":"a?x=1"}', "uid"),
+        (b'{"uid":"ok","url":"https://evil.invalid"}', "url"),
+        (b"{}", "uid"),
+        (b"[]", "object"),
+        (b"", "empty"),
+    ):
+        try:
+            grafana.parse_dashboard_request(raw)
+        except grafana.GrafanaError as exc:
+            assert needle in str(exc), (raw, str(exc))
+        else:
+            raise AssertionError(f"must be refused: {raw!r}")
+
+
+def test_dashboard_summary_walks_nested_row_panels() -> None:
+    body = {
+        "meta": {"folderTitle": "Ops"},
+        "dashboard": {
+            "title": "SWITCHYARD DASHBOARD V6.7",
+            "uid": "switchyard-dashboard-v6",
+            "version": 12,
+            "tags": ["switchyard"],
+            "refresh": "30s",
+            "time": {"from": "now-6h", "to": "now"},
+            "templating": {
+                "list": [{"name": "instance", "type": "query", "current": {"value": "10.0.0.5"}}]
+            },
+            "panels": [
+                {
+                    "title": "Requests",
+                    "type": "timeseries",
+                    "datasource": {"uid": "df7wrp11a9hq8c", "type": "prometheus"},
+                    "targets": [{"expr": "rate(switchyard_requests_total[5m])"}],
+                },
+                {
+                    "title": "Row",
+                    "type": "row",
+                    "collapsed": True,
+                    "panels": [
+                        {
+                            "title": "Latency p95",
+                            "type": "timeseries",
+                            "datasource": {"uid": "df7wrp11a9hq8c", "type": "prometheus"},
+                            "targets": [{"expr": "histogram_quantile(0.95, x)"}],
+                        }
+                    ],
+                },
+            ],
+        },
+    }
+    out = grafana.summarize_dashboard(body)
+    assert out is not None
+    assert out["title"] == "SWITCHYARD DASHBOARD V6.7"
+    assert out["folder"] == "Ops"
+    assert out["panel_count"] == 3
+    titles = [p["title"] for p in out["panels"]]
+    assert titles == ["Requests", "Row", "Latency p95"]
+    assert out["panels"][0]["queries"] == ["rate(switchyard_requests_total[5m])"]
+    assert out["panels"][2]["datasource"]["type"] == "prometheus"
+    assert out["variables"][0] == {"name": "instance", "type": "query", "current": "10.0.0.5"}
+
+
+def test_dashboard_summary_rejects_a_non_dashboard_body() -> None:
+    assert grafana.summarize_dashboard({"message": "not found"}) is None
+    assert grafana.summarize_dashboard(None) is None
+
+
+def test_query_summary_reports_label_values() -> None:
+    body = {
+        "results": {
+            "A": {
+                "status": 200,
+                "frames": [
+                    {
+                        "schema": {
+                            "name": "",
+                            "fields": [
+                                {},
+                                {
+                                    "labels": {
+                                        "__name__": "switchyard_requests_total",
+                                        "job": "switchyard",
+                                    }
+                                },
+                            ],
+                        },
+                        "data": {"values": [[1700000000000], [42]]},
+                    }
+                ],
+            }
+        }
+    }
+    out = grafana.summarize_query(body)
+    assert out is not None
+    labels = out["A"]["series"][0]["labels"]
+    assert labels["__name__"] == "switchyard_requests_total"
+    assert labels["job"] == "switchyard"
+
+
+def test_label_projection_is_bounded() -> None:
+    labels = {f"k{i}": "v" * 500 for i in range(50)}
+    out = grafana._bounded_labels(labels)
+    assert len(out) == grafana.MAX_LABEL_PAIRS
+    assert all(len(v) <= grafana.MAX_LABEL_VALUE_CHARS for v in out.values())
+    assert grafana._bounded_labels("not-a-dict") == {}
 
 
 def _run_all() -> int:

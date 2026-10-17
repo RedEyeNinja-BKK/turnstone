@@ -92,7 +92,10 @@ MAX_EXPR_CHARS = 512
 MAX_RANGE_MINUTES = 1440
 MAX_STEP_SECONDS = 3600
 MAX_QUERY_POINTS = 1200
-MAX_FRAMES_REPORTED = 5
+MAX_FRAMES_REPORTED = 60
+MAX_LABEL_PAIRS = 8
+MAX_LABEL_VALUE_CHARS = 80
+MAX_PANELS_REPORTED = 200
 MAX_VALUES_SCANNED = 20000
 
 QUERY_PATH = "/api/ds/query"
@@ -411,6 +414,23 @@ def build_query(request: dict[str, Any], datasource: dict[str, Any], *, now_ms: 
     }
 
 
+def _bounded_labels(labels: Any) -> dict[str, str]:
+    """Return up to MAX_LABEL_PAIRS label pairs, each value truncated.
+
+    Label values are the point: ``__name__`` carries the metric name and
+    ``job``/``instance`` say which target produced it. Without them a summary
+    can say a series exists but not which one.
+    """
+    if not isinstance(labels, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in labels.items():
+        if len(out) >= MAX_LABEL_PAIRS:
+            break
+        out[str(key)[:64]] = str(value)[:MAX_LABEL_VALUE_CHARS]
+    return out
+
+
 def summarize_query(body: Any) -> dict[str, Any] | None:
     """Project a query response to a bounded, non-sensitive summary."""
     if not isinstance(body, dict):
@@ -456,6 +476,7 @@ def summarize_query(body: Any) -> dict[str, Any] | None:
                 summary["series"].append(
                     {
                         "name": str(schema.get("name") or "")[:120],
+                        "labels": _bounded_labels(labels),
                         "label_count": len(labels) if isinstance(labels, dict) else 0,
                         "points": count,
                         "last": last if isinstance(last, (int, float, str)) else None,
@@ -465,6 +486,119 @@ def summarize_query(body: Any) -> dict[str, Any] | None:
                 break
         out[str(ref)] = summary
     return out
+
+
+def parse_dashboard_request(raw: bytes) -> str:
+    """Validate a dashboard request and return its uid.
+
+    Same contract as query: one bounded JSON object on stdin, no free-form
+    path. The uid grammar is the same one datasource uids already use, so a
+    traversal or query-string injection cannot survive validation.
+    """
+    if not raw:
+        raise GrafanaError("dashboard request is empty")
+    if len(raw) > MAX_QUERY_REQUEST_BYTES:
+        raise GrafanaError("dashboard request exceeds the size bound")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise GrafanaError("dashboard request is not valid JSON") from None
+    if not isinstance(data, dict):
+        raise GrafanaError("dashboard request must be a JSON object")
+    unknown = set(data) - {"uid"}
+    if unknown:
+        raise GrafanaError("unsupported dashboard field(s): " + ", ".join(sorted(unknown)))
+    uid = data.get("uid")
+    if not isinstance(uid, str) or not _UID_RE.match(uid):
+        raise GrafanaError("uid must be 1-40 characters of [A-Za-z0-9_-]")
+    return uid
+
+
+def _panel_targets(panel: dict[str, Any]) -> list[str]:
+    exprs: list[str] = []
+    for target in panel.get("targets") or []:
+        if not isinstance(target, dict):
+            continue
+        expr = target.get("expr") or target.get("query")
+        if isinstance(expr, str) and expr.strip():
+            exprs.append(expr.strip()[:200])
+    return exprs[:4]
+
+
+def _walk_panels(panels: Any, depth: int = 0) -> list[dict[str, Any]]:
+    """Flatten panels, including those nested inside collapsed rows."""
+    found: list[dict[str, Any]] = []
+    if depth > 3 or not isinstance(panels, list):
+        return found
+    for panel in panels:
+        if not isinstance(panel, dict) or len(found) >= MAX_PANELS_REPORTED:
+            continue
+        found.append(panel)
+        found.extend(_walk_panels(panel.get("panels"), depth + 1))
+    return found
+
+
+def summarize_dashboard(body: Any) -> dict[str, Any] | None:
+    """Project a dashboard to its operational essentials.
+
+    Titles, panel types, the queries they run and the variables that scope
+    them are what make a dashboard informative; anything else is layout.
+    """
+    if not isinstance(body, dict):
+        return None
+    dash = body.get("dashboard")
+    if not isinstance(dash, dict):
+        return None
+    meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+    panels = _walk_panels(dash.get("panels"))
+    projected: list[dict[str, Any]] = []
+    for panel in panels:
+        ds = panel.get("datasource")
+        if isinstance(ds, dict):
+            ds_ref = {"uid": ds.get("uid"), "type": ds.get("type")}
+        else:
+            ds_ref = {"uid": None, "type": ds if isinstance(ds, str) else None}
+        projected.append(
+            {
+                "title": str(panel.get("title") or "")[:120],
+                "type": panel.get("type"),
+                "datasource": ds_ref,
+                "queries": _panel_targets(panel),
+            }
+        )
+    variables: list[dict[str, Any]] = []
+    templating = dash.get("templating")
+    if isinstance(templating, dict):
+        for var in templating.get("list") or []:
+            if not isinstance(var, dict):
+                continue
+            current = var.get("current")
+            value: Any = None
+            if isinstance(current, dict):
+                value = current.get("value")
+            if isinstance(value, list):
+                value = [str(v)[:60] for v in value[:5]]
+            elif value is not None:
+                value = str(value)[:60]
+            variables.append({"name": var.get("name"), "type": var.get("type"), "current": value})
+    return {
+        "title": dash.get("title"),
+        "uid": dash.get("uid"),
+        "version": dash.get("version"),
+        "tags": [str(t)[:40] for t in (dash.get("tags") or [])][:10],
+        "refresh": dash.get("refresh"),
+        "time": dash.get("time") if isinstance(dash.get("time"), dict) else None,
+        "folder": meta.get("folderTitle"),
+        "panel_count": len(panels),
+        "panels": projected,
+        "variables": variables[:20],
+    }
+
+
+def run_dashboard(token: str, uid: str) -> dict[str, Any]:
+    """Fetch one dashboard by uid and project it."""
+    status, body = get_json(f"/api/dashboards/uid/{uid}", token)
+    return {"status": status, "dashboard": summarize_dashboard(body)}
 
 
 def run_query(token: str, request: dict[str, Any]) -> tuple[dict[str, Any], list[int]]:
@@ -649,11 +783,15 @@ def _audit(fd: int, record: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Bounded read-only Grafana checks")
-    parser.add_argument("command", choices=[*ENDPOINTS, "query", "all"])
+    parser.add_argument("command", choices=[*ENDPOINTS, "query", "dashboard", "all"])
     parser.add_argument("--limit", type=int, default=PAGE_LIMIT)
     args = parser.parse_args(argv)
 
-    raw = sys.stdin.buffer.read(MAX_QUERY_REQUEST_BYTES + 1) if args.command == "query" else b""
+    raw = (
+        sys.stdin.buffer.read(MAX_QUERY_REQUEST_BYTES + 1)
+        if args.command in ("query", "dashboard")
+        else b""
+    )
     started = time.monotonic()
 
     try:
@@ -687,6 +825,27 @@ def main(argv: list[str] | None = None) -> int:
         finish("refused", [], {"error": type(exc).__name__})
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
+
+    if args.command == "dashboard":
+        try:
+            dash_uid = parse_dashboard_request(raw)
+        except GrafanaError as exc:
+            finish("refused", [], {"error": type(exc).__name__})
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 3
+        try:
+            out = run_dashboard(token, dash_uid)
+        except GrafanaError as exc:
+            finish("error", [], {"dashboard_uid": dash_uid, "error": type(exc).__name__})
+            print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True))
+            return 4
+        finish(
+            "ok" if out["status"] == 200 else "upstream_error",
+            [out["status"]],
+            {"dashboard_uid": dash_uid},
+        )
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0 if out["status"] == 200 else 4
 
     if args.command == "query":
         try:

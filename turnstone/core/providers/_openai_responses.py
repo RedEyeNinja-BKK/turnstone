@@ -353,7 +353,11 @@ class OpenAIResponsesProvider:
             converted.append({"type": "web_search"})
 
         # Responses API requires a tool_search tool when defer_loading is used
-        if any(t.get("defer_loading") for t in converted):
+        # Defence in depth: ``apply_tool_search`` normally strips defer_loading
+        # on a row without the capability, but a tool dict may arrive here
+        # already carrying the flag.  A direct-OAuth lane accepts no hosted
+        # tool_search request, so the capability - not the flag alone - decides.
+        if caps.supports_tool_search and any(t.get("defer_loading") for t in converted):
             converted.append({"type": "tool_search"})
 
         return converted if converted else None

@@ -796,9 +796,17 @@ rollback_core() {
       cfg=$(configured_pythonpath "$u")
       pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo 0)
       cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
-      [[ "$(systemctl is-active "$u")" == active ]] || affected+=("$u (not active)")
-      [[ "$cur" == "$want" ]] || affected+=("$u (running PYTHONPATH=${cur:-(none)}, expected ${want:-(none)})")
-      [[ "$cfg" == "$want" ]] || affected+=("$u (configured PYTHONPATH=${cfg:-(none)}, expected ${want:-(none)})")
+      # One line per unit, naming every dimension that is wrong, so an operator
+      # reads a single actionable statement instead of repeated entries.
+      detail=""
+      [[ "$(systemctl is-active "$u")" == active ]] || detail="not active"
+      if [[ "$cur" != "$want" ]]; then
+        detail="${detail:+$detail; }running PYTHONPATH=${cur:-(none)}, expected ${want:-(none)}"
+      fi
+      if [[ "$cfg" != "$want" ]]; then
+        detail="${detail:+$detail; }configured PYTHONPATH=${cfg:-(none)}, expected ${want:-(none)}"
+      fi
+      [[ -z "$detail" ]] || affected+=("$u ($detail)")
     done
     for p in "${HEALTH_PORTS[@]}"; do
       check_http "$p" || affected+=("port $p (no 2xx from /health)")

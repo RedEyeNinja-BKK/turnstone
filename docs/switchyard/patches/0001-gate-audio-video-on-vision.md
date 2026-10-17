@@ -6,7 +6,10 @@ verified in production.** Binary `b183a87157eaf1917e61601343a84df2fb08be4b20f959
 - Base: `6de85da15b68294cfda1775a1afa6e30ebd3cf16` (Authentic production
   lineage; see `01-provenance-and-divergence.md`.)
 - Patch: `0001-gate-audio-video-on-vision.patch` (436 lines, 3 files)
-- Upstream fork branch: `v6-decision-planes-20261005`
+- Fork branch carrying the commit:
+  `fix/media-admission-gate-20261017` at `5721d34` (one commit on
+  `6de85da1`). The preservation branch `v6-decision-planes-20261005`
+  is left at `6de85da1` so the lineage it records stays intact.
 
 ## The defect
 

@@ -16,17 +16,17 @@ Reference for the Switchyard running on `switchyard-vm.example.invalid`. Measure
 | Host | `switchyard-vm.example.invalid` (`192.0.2.53`) |
 | Unit | `switchyard-neutral-green.service` (`User=switchyard`) |
 | Binary | `/opt/switchyard/bin/switchyard-server` |
-| Binary sha256 (deployed) | `b183a87157eaf1917e61601343a84df2fb08be4b20f959d562d8b75cf4b1196c` (media gate; baseline was `74963b1d57c664…`) |
+| Binary sha256 (deployed) | `25f9262051b656d439645e574ebbd4d70b07cd7ca03d6228178bdc180c5543ca` (explicit video capability; earlier `b183a871…` media gate, baseline `74963b1d57c664…`) |
 | Build id | `7f4d76212f363150ad13382fedb27cafec9c06da` |
 | Reported version | `switchyard-server 0.3.0` |
-| Config | `/etc/switchyard/routes.toml` sha256 `7b8445b20346670fa712f1e2b82b81730126df738054e6aef5340ea5dbcc326f` (V7.2; was `9a6448ef…` before the rerank `top_n` change) |
+| Config | `/etc/switchyard/routes.toml` sha256 `0b653d3e2ffe4edd19ba95ca8f1c9be34889c43b9cfd9008fa6c852975ea4776` (adds `video = true` to Nemotron and its routes; was `7b8445b2…`) |
 | Source of record | `RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005` |
 | Source commit | `6de85da15b68294cfda1775a1afa6e30ebd3cf16` (2026-10-05), branch `fix/decision-named-lane-composition-20261004` |
 | Fork on GitHub | `RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005` |
 | Built with | rustc `1.99.0 (b940084d7 2026-09-28)`, Ubuntu 24.04, GCC 13.3 — reproduces this hash bitwise |
 | Decision | `fix(decision): an unaddressed request is served by the DECLARED default lane` |
 | Bind | `127.0.0.1:4000`, published on the tailnet TLS listener (`:443`) |
-| Started | restarted 2026-10-18 00:39 +07 for the media gate |
+| Started | restarted 2026-10-18 01:53 +07 for the video capability |
 
 `--version` prints the crate version only; no commit hash is embedded. The two
 40-hex strings the image does carry are toolchain identifiers, not revisions:

@@ -1,15 +1,20 @@
-# Patch: refuse video and audio at admission
+# Patch: media admission — explicit video capability, audio refused
 
-Status: **applied to the authentic source, reviewed, built, deployed and
-verified in production.** Binary `b183a87157eaf1917e61601343a84df2fb08be4b20f959d562d8b75cf4b1196c`.
+Status: **deployed and verified in production (2026-10-18).**
 
-- Base: `6de85da15b68294cfda1775a1afa6e30ebd3cf16` (Authentic production
-  lineage; see `01-provenance-and-divergence.md`.)
-- Patch: `0001-gate-audio-video-on-vision.patch` (436 lines, 3 files)
-- Fork branch carrying the commit:
-  `fix/media-admission-gate-20261017` at `5721d34` (one commit on
-  `6de85da1`). The preservation branch `v6-decision-planes-20261005`
-  is left at `6de85da1` so the lineage it records stays intact.
+- Base: `6de85da15b68294cfda1775a1afa6e30ebd3cf16` (see
+  `01-provenance-and-divergence.md`).
+- Fork branch: `fix/media-admission-gate-20261017`, commits `5721d34`,
+  `03bcbcb`, `23b869d`. The preservation branch `v6-decision-planes-20261005`
+  is left at `6de85da1`.
+- Patch: `0001-gate-audio-video-on-vision.patch` covers the first commit.
+
+Two stages, both deployed:
+
+| Stage | Binary | Behaviour |
+|---|---|---|
+| 1. Media gate | `b183a871…` | Video and audio refused unconditionally |
+| 2. Video capability | `25f92620…` | Video admitted where an explicit `video = true` is declared; audio still refused |
 
 ## The defect
 
@@ -21,78 +26,93 @@ matched only image type strings. A media request therefore passed admission on
 a route that declares `vision = false` and was forwarded to a provider that
 cannot serve it.
 
-Measured against the live deployment, route
-`direct-openrouter-xing4_0-29b-a4b-free` (`vision = false`):
+Measured against route `direct-openrouter-xing4_0-29b-a4b-free` (`vision = false`):
 
 | input | before | after |
 |---|---|---|
 | image | 400 `unsupported_capability` (local) | 400 (local), unchanged |
-| video | **502 upstream** (rate limit surfaced after forward) | **400** `unsupported_capability` (local) |
-| audio | **404 upstream_error** `No endpoints found that support input audio` | **400** `unsupported_capability` (local) |
+| video | **502 upstream** (surfaced after forward) | **400** `unsupported_capability` (local) |
+| audio | **404 upstream** | **400** `unsupported_capability` (local) |
 
-Audio is reachable from Turnstone (`turnstone/core/audio.py` emits
-`input_audio`); video is not emitted today, so that half of the gap is latent.
+## Why video got its own declaration
 
-## Design decision
+The first stage refused video outright, which closed the defect but also denied
+video to a model that can serve it. `vision` is a declaration about images and
+is not evidence of video support: on this deployment one target accepts video
+and another does not, and both are reachable through routes that declare
+`vision = true`.
 
-The deployment declares multimodal support with one boolean, `vision`. It says
-nothing about video or audio, and there is no field that could. Inferring
-either from `vision` is precisely the defect, so both are refused
-unconditionally:
+`video` is therefore a target fact, a route promise and a composite promise,
+separate from `vision`:
 
-- `ContentBlock::Video` / `ContentBlock::Audio` in decoded content, including
-  inside tool results;
-- `input_video`, `video_url`, `video`, `input_audio`, `audio` as preserved JSON
-  type discriminators, and as bare keys on message and content-part objects.
+- Video is admitted only when the selected route declares `video = true`.
+- A target that declares nothing is video-incapable. This is the opposite of
+  the rule for `vision`, where absence means permitted, because no deployment
+  carried video before the field existed.
+- A route claiming video with no video-capable target fails at load.
+- A composite claiming video with no video-capable child fails at load.
+- A target claiming video on a non-`openai_responses` client fails at load:
+  video has one faithful representation, the Responses `input_video` part, and
+  the Chat codec would otherwise deliver its content as text.
 
-The refusal is checked **before** the image/tool scan, so a request carrying
-both an image and a video reports the medium nobody can serve.
+Audio has no declaration at all and remains refused unconditionally: no
+configured model or transport has been verified to accept it.
 
-Limitation, stated rather than hidden: there is no configuration surface for
-video or audio capability, so the refusal is total. Admitting either later
-requires a schema addition, not an inference from `vision`.
+## Media detection
 
-## False-positive guards
+Two walks, because the evidence differs in strength:
 
-The walk is deliberately narrow, and each restriction has a test:
+1. Explicit `type` discriminators, wherever they appear, with `output` followed
+   only from `*_call_output` objects.
+2. Bare keys (`video`, `video_url`, `input_video`, `audio`, `input_audio`),
+   matched only on message objects and content-part objects.
 
-- Tool **definitions** are never walked: a tool may declare a parameter named
-  `video`.
-- Bare media **keys** are matched only on message and content-part objects, so
-  a field named `video` inside tool output — ordinary data — is not read as
-  caller-supplied media.
-- `output` is followed only from a `*_call_output` part, matching the
-  pre-existing image check.
+Tool definitions are never walked, so a tool that declares a property named
+`video` is not mistaken for a request carrying video. Tool output that merely
+contains such a field, without a type discriminator, is ordinary data and is
+preserved.
 
-## Tests
+## Wire format: measured, not assumed
 
-| Level | Test | Proves |
+The two OpenRouter APIs disagree, and this is the single most important
+operational fact in this patch:
+
+| API | `video_url` shape | free endpoint |
 |---|---|---|
-| unit | `video_and_audio_are_refused_even_when_vision_is_enabled` | every representation, three wire formats, `vision = true` included |
-| unit | `media_preserved_as_a_bare_key_is_refused` | keyed media with no `type` |
-| unit | `text_is_admitted_after_the_media_rule` | text unaffected |
-| unit | `a_tool_schema_naming_video_is_not_treated_as_media` | no false refusal on tool schemas |
-| unit | `media_named_fields_inside_tool_output_are_not_request_media` | no false refusal on tool output |
-| unit | `media_named_data_in_unrelated_nesting_is_not_request_media` | no false refusal on unrelated nesting |
-| integration | `video_and_audio_never_reach_the_upstream` | 400 on all three endpoints and `MockUpstream` records **zero** calls |
+| Chat Completions | object: `{"url": …}` | accepted |
+| Responses | string | accepted |
+| either, `https://` URL | — | **404** `No endpoints found that support video URLs` |
+| either, `data:video/mp4;base64,…` | — | accepted |
 
-Full workspace: **1046 passed, 0 failed** (rustc 1.99.1). Focused suites also
-pass under the production toolchain (rustc 1.99.0).
+So a public video URL is refused by the free endpoint regardless of shape,
+while the same bytes inline as base64 are accepted. Switchyard targets
+`openrouter` with `format = "openai_responses"`, so the working shape there is
+`{"type":"input_video","video_url":"data:video/mp4;base64,…"}` — a string.
 
-## Review
-
-Four independent review rounds. Rounds 1–3 blocked on real defects, each fixed
-and regression-tested: untyped media keys were missed; `preserved_media`
-followed every `output`; bare-key matching was too deep. Round 4: **PASS**.
+Tested end to end through Switchyard against `smartfree`: with the video the
+model answered **"rabbit"** (the actual character in the test clip); without
+it, **"Dog"**. Through composite `tier1` the same request also answered
+"rabbit", with `composition_attempt_total{child_route="smartfree",
+outcome="selected"}` confirming the video-capable child was chosen.
 
 ## Deployment
 
-| Item | Value |
-|---|---|
-| Binary before | `74963b1d57c664172175f820f2b94c8ad790629feb2965538c9a09983387d147` |
-| Binary after | `b183a87157eaf1917e61601343a84df2fb08be4b20f959d562d8b75cf4b1196c` |
-| Size | 26,984,312 → 26,990,680 bytes |
-| Rollback anchor | `/var/lib/switchyard/rollback/media-gate-20261017T173857Z/` |
-| Config | unchanged, `7b8445b20346670fa712f1e2b82b81730126df738054e6aef5340ea5dbcc326f` |
-| Running executable | `/proc/138695/exe` = new hash |
-| `--dry-run` | exit 0 under the unit's real environment, 29 routes |
+- Binary `25f9262051b656d439645e574ebbd4d70b07cd7ca03d6228178bdc180c5543ca`
+  (27,086,512 bytes), built from the branch with rustc 1.99.0.
+- Config `0b653d3e2ffe4edd19ba95ca8f1c9be34889c43b9cfd9008fa6c852975ea4776`:
+  eight `video = true` insertions — the Nemotron target, its three routes, and
+  the four composites that contain a video-capable child. Xing is untouched
+  (`vision = false`, no video).
+- Rollback anchor
+  `/var/lib/switchyard/rollback/video-capability-20261017T185328Z/`.
+- `--dry-run` under the unit's real `EnvironmentFile`s: exit 0, 29 routes.
+- Verified by `/proc/<pid>/exe`, not a version string.
+
+## Regression
+
+All 29 routes intact; text on `smartfree`, `smartfree-bounded`, `smart`,
+`tier1`, `tier1-bounded`, `tier2` and the Xing direct route returns 200; image
+on a vision route 200; audio 400; video to a text-only route 400; decision
+lane 200; metrics families present.
+
+Workspace tests: 1061 passed, 0 failed.

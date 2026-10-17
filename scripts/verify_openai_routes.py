@@ -34,6 +34,7 @@ from turnstone.core.model_backend_auth import (  # noqa: E402
     resolve_model_backend_auth_token,
 )
 from turnstone.core.model_registry import ModelConfig  # noqa: E402
+from turnstone.core.model_turn import resolve_capabilities  # noqa: E402
 from turnstone.core.providers import create_client, create_provider  # noqa: E402
 from turnstone_self_api import call  # noqa: E402
 
@@ -45,6 +46,13 @@ EXPECT = {
 
 PROMPT_TOOL = "What is the weather in Bangkok? Use the get_weather tool."
 PROMPT_PLAIN = "Reply with exactly: OK"
+# A prompt that reliably elicits reasoning when reasoning is ON. Without this the
+# "no reasoning emitted" check would pass for the wrong reason -- a trivial
+# prompt produces no reasoning on ANY setting, so it proves nothing.
+PROMPT_THINK = (
+    "A bat and a ball cost $1.10 together. The bat costs $1.00 more than the "
+    "ball. How much does the ball cost? Think step by step, then answer."
+)
 
 
 def _tool() -> dict:
@@ -99,10 +107,27 @@ def _served_model(token: str, model: str) -> str:
 
     client = OpenAI(base_url=DIRECT_OAUTH_RESOURCE, api_key=token)
     try:
-        resp = client.responses.create(model=model, input=PROMPT_PLAIN, store=False)
+        # Two properties of this endpoint, both of which Turnstone's provider
+        # already honours: `input` must be a LIST of items, and the request must
+        # STREAM (a non-streamed call is a 400). Reading the identity from the
+        # stream's own response object is therefore the supported shape.
+        with client.responses.stream(
+            model=model,
+            store=False,
+            input=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": PROMPT_PLAIN}],
+                }
+            ],
+        ) as stream:
+            for event in stream:
+                if getattr(event, "type", "") == "response.created":
+                    resp = getattr(event, "response", None)
+                    return str(getattr(resp, "model", "") or "<not reported>")
     except Exception as exc:  # noqa: BLE001 - the failure text is the result
-        return f"<probe failed: {type(exc).__name__}>"
-    return str(getattr(resp, "model", "") or "<not reported>")
+        return f"<probe failed: {type(exc).__name__}: {str(exc)[:160]}>"
+    return "<stream ended without response.created>"
 
 
 def check_alias(cfg: ModelConfig, alias: str) -> tuple[bool, list[str]]:
@@ -138,53 +163,89 @@ def check_alias(cfg: ModelConfig, alias: str) -> tuple[bool, list[str]]:
 
     # 3. One real request through Turnstone's provider adapter.
     provider = create_provider(cfg.provider)
-    client = create_client(
-        cfg.provider, base_url=cfg.base_url, api_key="", follow_redirects=False
-    ).with_options(api_key=token)
-    caps = provider.get_capabilities(cfg.model)
-    chunks = list(
-        provider.create_streaming(
-            client=client,
-            model=cfg.model,
-            messages=[{"role": "user", "content": PROMPT_TOOL if spec["tool"] else PROMPT_PLAIN}],
-            tools=[_tool()] if spec["tool"] else None,
-            max_tokens=256,
-            temperature=None,
-            reasoning_effort=cfg.reasoning_effort or None,
-            capabilities=caps,
-        )
+    _ = provider  # caps resolved below through the production merge
+    # Mirror the registry's own construction for a dynamic-auth row: the cached
+    # client is built with a placeholder because the real credential is bound
+    # per call with with_options(). Passing "" here would make the SDK refuse to
+    # construct at all, which is not the production shape.
+    base = create_client(
+        cfg.provider,
+        base_url=cfg.base_url,
+        api_key="backend-auth-placeholder-unused",
+        follow_redirects=False,
     )
-    text = "".join(getattr(c, "content_delta", "") or "" for c in chunks)
-    reasoning = "".join(getattr(c, "reasoning_delta", "") or "" for c in chunks)
-    emitted_reasoning_blocks = any(
-        b.get("type") in ("reasoning", "thinking")
-        for c in chunks
-        for b in (getattr(c, "provider_blocks", None) or [])
-        if isinstance(b, dict)
-    )
-    tool_names = [d.name for c in chunks for d in (getattr(c, "tool_call_deltas", None) or [])]
+    client = base.with_options(api_key=token)
+    # MUST go through resolve_capabilities, not provider.get_capabilities: only
+    # the former applies the row's declared capability overrides, and the
+    # reasoning contract depends on them. Bypassing it silently omits the
+    # `reasoning` parameter and leaves the server default in charge -- which
+    # makes a non-thinking row look compliant for the wrong reason.
+    caps = resolve_capabilities(provider, cfg.model, alias, None, cfg=cfg)
+    wire_reasoning = provider._build_kwargs(
+        model=cfg.model,
+        messages=[{"role": "user", "content": "x"}],
+        tools=None,
+        max_tokens=16,
+        temperature=None,
+        reasoning_effort=cfg.reasoning_effort or None,
+        deferred_names=None,
+        capabilities=caps,
+    ).get("reasoning")
 
+    def request(prompt: str, with_tool: bool) -> tuple[str, str, bool, list[str]]:
+        """One streaming turn through Turnstone's adapter."""
+        chunks = list(
+            provider.create_streaming(
+                client=client,
+                model=cfg.model,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[_tool()] if with_tool else None,
+                max_tokens=512,
+                temperature=None,
+                reasoning_effort=cfg.reasoning_effort or None,
+                capabilities=caps,
+            )
+        )
+        text = "".join(getattr(c, "content_delta", "") or "" for c in chunks)
+        reasoning = "".join(getattr(c, "reasoning_delta", "") or "" for c in chunks)
+        has_blocks = any(
+            b.get("type") in ("reasoning", "thinking")
+            for c in chunks
+            for b in (getattr(c, "provider_blocks", None) or [])
+            if isinstance(b, dict)
+        )
+        tools = [d.name for c in chunks for d in (getattr(c, "tool_call_deltas", None) or [])]
+        return text, reasoning, has_blocks, tools
+
+    # 4a. Functional request: a tool call where the row is meant to make one,
+    #     otherwise a plain answer.
     if spec["tool"]:
+        text, _r, _b, tool_names = request(PROMPT_TOOL, with_tool=True)
         if "get_weather" not in tool_names:
             return False, [f"no get_weather tool call (got {tool_names!r}); text={text[:120]!r}"]
         notes.append("streaming tool call: get_weather")
-    elif not text.strip():
-        return False, ["empty response"]
+    else:
+        text, _r, _b, _t = request(PROMPT_PLAIN, with_tool=False)
+        if not text.strip():
+            return False, ["empty response"]
 
-    # 4. The reasoning contract -- the part that cannot be faked.
+    # 4b. The reasoning contract, measured with a prompt that actually demands
+    #     reasoning. A trivial prompt proves nothing either way.
+    _text, reasoning, has_blocks, _t = request(PROMPT_THINK, with_tool=False)
     if spec["thinking"] == "off":
-        if reasoning.strip() or emitted_reasoning_blocks:
+        if reasoning.strip() or has_blocks:
             return False, [
                 f"reasoning emitted on a non-thinking route "
-                f"({len(reasoning)} chars delta, reasoning_blocks={emitted_reasoning_blocks})"
+                f"({len(reasoning)} chars delta, reasoning_blocks={has_blocks})"
             ]
-        notes.append("reasoning: none emitted (contract holds)")
+        notes.append("reasoning: none emitted on a reasoning-eliciting prompt (contract holds)")
     else:
-        notes.append(
-            "reasoning: emitted"
-            if (reasoning.strip() or emitted_reasoning_blocks)
-            else "reasoning: not present in this sample (thinking still enabled)"
-        )
+        if not (reasoning.strip() or has_blocks):
+            return False, [
+                "thinking route emitted no reasoning on a reasoning-eliciting prompt "
+                "-- thinking is not actually active"
+            ]
+        notes.append("reasoning: emitted on a reasoning-eliciting prompt (thinking active)")
 
     # 5. Served-model identity.
     served = _served_model(token, cfg.model)
@@ -193,6 +254,7 @@ def check_alias(cfg: ModelConfig, alias: str) -> tuple[bool, list[str]]:
     if served != cfg.model:
         return False, [f"served model is {served!r}, expected {cfg.model!r}"]
     notes.append(f"served_model={served}")
+    notes.append(f"wire reasoning param: {wire_reasoning!r}")
     return True, notes
 
 

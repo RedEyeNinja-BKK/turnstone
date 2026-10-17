@@ -72,7 +72,10 @@ ALIASES: dict[str, dict[str, Any]] = {
     },
     "gpt-6.1-sol": {
         "model": "gpt-6.1-sol",
-        "reasoning_effort": "medium",
+        # Measured on this deployment: gpt-6.1-sol emits no reasoning at
+        # low/medium and does at high. "high" is therefore the lowest level at
+        # which "thinking" is an observation rather than a label.
+        "reasoning_effort": "high",
         "surface_persisted_reasoning": True,
         "replay_reasoning_to_model": False,
     },
@@ -174,8 +177,13 @@ def _target_payload(alias: str, row: dict[str, Any]) -> dict[str, Any]:
     # be forwarded: "none" requires a declared "none" level.
     if spec["reasoning_effort"] == "none":
         caps["reasoning_effort_values"] = ["none"]
+    elif spec["model"] == "gpt-6.1-sol":
+        # Provider-supported set, quoted verbatim by a 400 on 'minimal':
+        # "Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'".
+        caps["reasoning_effort_values"] = ["low", "medium", "high", "xhigh", "max"]
     else:
-        caps["reasoning_effort_values"] = ["minimal", "low", "medium", "high"]
+        # gpt-6-luna accepted every level tested, including 'minimal'.
+        caps["reasoning_effort_values"] = ["minimal", "low", "medium", "high", "xhigh", "max"]
     return {
         "provider": "openai",
         "model": spec["model"],
@@ -292,11 +300,13 @@ async def cmd_verify() -> int:
             problems.append(f"{alias}: " + "; ".join(bad))
         if _is_switchyard(row):
             problems.append(f"{alias}: still references Switchyard")
-        # The masked read returns "***" when a key is stored.
-        if row.get("api_key") not in ("", None, "***"):
-            problems.append(f"{alias}: unexpected api_key value shape")
-        if row.get("api_key") == "***":
-            print(f"{alias:14s} note: a static key is still stored (inert on this mode)")
+        # The bridge redacts any value under api_key, so its CONTENT is not
+        # readable here -- only whether one is present. That is enough: an
+        # openai_oauth row never reads api_key, and presence is expected
+        # (accepted residual).
+        stored_key = row.get("api_key") not in ("", None)
+        if stored_key:
+            print(f"{alias:14s} note: a static key is still stored, masked (inert on this mode)")
 
     if problems:
         print("VERIFY FAILED:")

@@ -81,7 +81,14 @@ SCOPES_REQUESTED = " ".join(IDENTITY_SCOPES + PLAN_SCOPES)
 REQUIRED_PLAN_SCOPE = "chatgpt.tokens.use.direct"
 
 DEFAULT_REDIRECT = "http://127.0.0.1:1455/auth/callback"
-DEFAULT_STORE = os.environ.get("SIWC_STORE_DIR", "/var/lib/turnstone/github/siwc-creds")
+# Canonical service-runtime store, matching
+# turnstone.core.model_backend_auth.DEFAULT_OPENAI_OAUTH_STORE. The previous
+# default (/var/lib/turnstone/github/siwc-creds) was archived during the
+# single-writer handoff; pointing this probe back at an archive would make it a
+# SECOND refresher for one rotating grant, which revokes the credential.
+DEFAULT_STORE = os.environ.get(
+    "SIWC_STORE_DIR", "/srv/turnstone/credentials/runtime/openai-siwc"
+)
 
 # Never allowed to collide with Codex CLI's own store.
 FORBIDDEN_STORE_PREFIXES = ("/var/lib/turnstone/.codex",)

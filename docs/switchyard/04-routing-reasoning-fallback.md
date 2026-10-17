@@ -80,29 +80,27 @@ From `crates/switchyard-runner/src/composition.rs`:
 Therefore a tier's own `route_reasoning_policy` — even if one were declared —
 would not reach its children. Each child applies its own.
 
-### The resulting gap
+### Resolution: bounded tiers name bounded children
+
+The gap is closed on the configuration side, not in the fork. A
+`smartfree-bounded` primitive targets the same physical model as `smartfree`
+and sets `route_reasoning_policy = "none"`; every bounded tier now references
+the bounded primitives:
 
 ```
-tier1-bounded       = [smartfree, smart-bounded]
+tier1-bounded       = [smartfree-bounded, smart-bounded]
+tier2-bounded       = [smartfree-bounded, smartlocal-bounded]
 tier1               = [smartfree, smart]
-tier2-bounded       = [smartfree, smartlocal-bounded]
 tier2               = [smartfree, smartlocal]
 ```
 
-`smartfree` declares `route_reasoning_policy = "inherit"`. So in every
-`-bounded` tier the free leg is **not** forced non-thinking; only the second
-child is. The bounded tiers are therefore not genuinely bounded across the
-whole execution path.
-
-Fixing this needs either:
-
-1. a `smartfree-bounded` primitive over the same physical models with
-   `route_reasoning_policy = "none"`, referenced from the bounded tiers
-   (narrow, no fork change), or
-2. composition propagating a parent policy (fork change, wider blast radius).
-
-Option 1 is the smaller change and is consistent with "do not recreate separate
-physical `-nt` pins" — the physical models stay shared; only the policy differs.
+The physical models stay shared; only the policy differs, which is consistent
+with "do not recreate separate physical `-nt` pins". Composition still drops a
+child's prepared state and propagates no parent policy, so this holds only as
+long as the tier's children are the bounded primitives: a new `-bounded` tier
+must list them explicitly. The dashboard's ROUTE LINEUP and TIERS panels show
+both the policy scope and the child pairing, so the invariant is visible without
+reading the manifest.
 
 ---
 
@@ -176,6 +174,9 @@ session_id, trial_id, task, origin
 ```
 
 `child_route`, `tier` and `cross_child_reason` are the composition telemetry.
-**They exist only in this file — they are not Prometheus labels.** Any
-candidate-level or tier-level panel must either read the log or accept that the
-metric surface cannot show it.
+Most of it is also exported as Prometheus counters:
+`switchyard_composition_attempt_total{parent_route,child_route,target,outcome,capability}`
+and `switchyard_composition_cross_total{parent_route,from_child,to_child,reason}`.
+`cross_child_reason` is the `reason` label; `tier` has no metric equivalent and
+is log-only, as are the per-request token counts. A tier-level panel must read
+the log or aggregate its children; a child-level panel can use the metrics.

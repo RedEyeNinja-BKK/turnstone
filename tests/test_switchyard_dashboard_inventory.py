@@ -23,7 +23,10 @@ import copy
 import importlib.util
 import pathlib
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 
@@ -326,7 +329,7 @@ def test_summary_count_mismatch_is_rejected() -> None:
     assert any("CATALOG SUMMARY says 5" in item for item in found), found
 
 
-def _edit_provider_row(text: str, provider: str, edit) -> str:
+def _edit_provider_row(text: str, provider: str, edit: Callable[[list[str]], None]) -> str:
     lines = []
     for line in text.splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -342,9 +345,7 @@ def test_provider_upstream_ids_must_be_in_their_own_row() -> None:
     inv = build()
     document = dashboard_for(inv)
     panel = _panel(document, 9005)
-    text = _edit_provider_row(
-        panel["content"], "openai", lambda cells: cells.__setitem__(5, "—")
-    )
+    text = _edit_provider_row(panel["content"], "openai", lambda cells: cells.__setitem__(5, "—"))
     text = _edit_provider_row(
         text, "openrouter", lambda cells: cells.__setitem__(5, cells[5] + ", `gpt-x`")
     )

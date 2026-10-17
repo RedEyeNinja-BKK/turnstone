@@ -145,8 +145,7 @@ def _table_block_problems(block: list[str], start: int) -> list[str]:
         rule = _cells(block[1])
         if len(rule) != len(header):
             problems.append(
-                f"line {start + 2}: separator has {len(rule)} column(s), "
-                f"header has {len(header)}"
+                f"line {start + 2}: separator has {len(rule)} column(s), header has {len(header)}"
             )
         position = 2
     for offset in range(position, len(block)):
@@ -155,8 +154,7 @@ def _table_block_problems(block: list[str], start: int) -> list[str]:
             problems.append(f"line {start + offset + 1} is a second separator inside the table")
         elif len(cells) != len(header):
             problems.append(
-                f"line {start + offset + 1} has {len(cells)} cell(s), "
-                f"header has {len(header)}"
+                f"line {start + offset + 1} has {len(cells)} cell(s), header has {len(header)}"
             )
     return problems
 
@@ -400,9 +398,7 @@ def check_lineup_footer(
             v.append(f"ROUTE LINEUP footer states the {label} count {len(matches)} times")
         stated[label] = int(matches[0][0])
         if stated[label] != actual:
-            v.append(
-                f"ROUTE LINEUP footer says {stated[label]} {label}, the table has {actual}"
-            )
+            v.append(f"ROUTE LINEUP footer says {stated[label]} {label}, the table has {actual}")
         published_range = (int(matches[0][1]), int(matches[0][2]))
         if published_range != (first_row, last_row):
             v.append(

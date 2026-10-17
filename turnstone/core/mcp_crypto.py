@@ -644,7 +644,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     dynamic_model_auth = bool(
         model_registry is not None
         and hasattr(model_registry, "has_dynamic_auth")
-        and model_registry.has_dynamic_auth()
+        and model_registry.has_token_store_dynamic_auth()
     )
 
     if (user_scoped_count > 0 or dynamic_model_auth) and cipher_cfg is None:

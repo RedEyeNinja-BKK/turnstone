@@ -151,7 +151,13 @@ LOCAL_PROVIDERS: frozenset[str] = frozenset({"openai-compatible", "anthropic-com
 LOCAL_PLACEHOLDER_API_KEY = "dummy"
 
 
-def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
+def create_client(
+    provider_name: str,
+    *,
+    base_url: str,
+    api_key: str,
+    follow_redirects: bool | None = None,
+) -> Any:
     """Create an SDK client for the given provider.
 
     An empty *api_key* is converted to ``None`` so that the underlying
@@ -163,6 +169,13 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
     A local provider with neither a key nor the env var gets
     :data:`LOCAL_PLACEHOLDER_API_KEY` so the client still constructs; a
     commercial provider in that state fails the way the SDK dictates.
+
+    *follow_redirects* ``False`` builds the OpenAI-family client on an
+    explicit transport that does not follow HTTP redirects (the SDK default
+    is to follow them). The direct-OAuth lane sets it: its bearer is issued
+    for one exact endpoint, and a 30x is one of the ways a credential could
+    otherwise be moved to a host the grant never authorized. ``None`` keeps
+    each SDK's own default, so every existing lane is unchanged.
     """
     resolved_key: str | None = api_key if api_key else None
     if resolved_key is None and provider_name in LOCAL_PROVIDERS:
@@ -189,9 +202,23 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
             base_url = GOOGLE_DEFAULT_BASE_URL
         elif not base_url and provider_name == "xai":
             base_url = XAI_DEFAULT_BASE_URL
+        redirect_kwargs: dict[str, Any] = {}
+        if follow_redirects is False:
+            import httpx2
+            import openai as _openai
+
+            # Mirror the SDK's own ``_DefaultHttpxClient`` so the only
+            # behavioural difference is the redirect policy. httpx2 is the
+            # OpenAI v3 default transport; passing an httpx(v1) client here
+            # would be a different transport class than the SDK expects.
+            redirect_kwargs["http_client"] = httpx2.Client(
+                timeout=_openai.DEFAULT_TIMEOUT,
+                limits=_openai.DEFAULT_CONNECTION_LIMITS,
+                follow_redirects=False,
+            )
         if base_url:
-            return OpenAI(base_url=base_url, api_key=resolved_key)
-        return OpenAI(api_key=resolved_key)
+            return OpenAI(base_url=base_url, api_key=resolved_key, **redirect_kwargs)
+        return OpenAI(api_key=resolved_key, **redirect_kwargs)
     if provider_name in ("anthropic", "anthropic-compatible"):
         from turnstone.core.providers._anthropic import _ensure_anthropic
 

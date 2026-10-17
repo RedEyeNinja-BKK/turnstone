@@ -27,12 +27,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import turnstone.core.model_registry as mr  # noqa: E402
 from turnstone.core.model_backend_auth import (  # noqa: E402
+    DIRECT_OAUTH_RESOURCE,
     BackendAuthUnavailableError,
+    DirectOAuthBindingError,
+    direct_oauth_endpoint_problem,
     resolve_model_backend_auth_token,
 )
 from turnstone.core.model_registry import ModelConfig  # noqa: E402
 
 _TMP = "/var/tmp"
+_ROOT = pathlib.Path(os.environ.get("R2_REPO") or pathlib.Path(__file__).resolve().parents[1])
 
 
 class _ConfigStore:
@@ -46,15 +50,25 @@ class _ConfigStore:
 def _cfg(mode: str = "openai_oauth", **over: Any) -> ModelConfig:
     base: dict[str, Any] = {
         "alias": "gpt-6.1-sol-native",
-        "base_url": "https://api.openai.com/v1",
+        "base_url": DIRECT_OAUTH_RESOURCE,
         "api_key": "",  # keyless: fail-closed applies
         "model": "gpt-6.1-sol",
-        "provider": "openai-responses",
+        "provider": "openai",  # the Responses surface; see _MODEL_PROVIDERS
         "auth_mode": mode,
-        "obo_audience": "https://api.openai.com/v1",
+        "obo_audience": DIRECT_OAUTH_RESOURCE,
     }
     base.update(over)
     return ModelConfig(**base)
+
+
+class _NoTokenMint:
+    """Mint client that always refuses, for the non-direct fallback contract."""
+
+    def mint_model_obo_token_sync(self, **_kwargs: Any) -> None:
+        return None
+
+    def mint_app_token_sync(self, **_kwargs: Any) -> None:
+        return None
 
 
 def _seed_store(root: pathlib.Path, *, expires_in: int = 3600) -> None:
@@ -195,6 +209,295 @@ def test_static_alias_is_untouched_by_the_new_mode() -> None:
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# fail-closed is unconditional for direct OAuth
+# ---------------------------------------------------------------------------
+
+
+def test_static_key_never_enables_a_fallback() -> None:
+    """A row carrying ``api_key`` must STILL refuse when the store fails.
+
+    The shared dynamic formula is ``configured_fail_closed or not api_key``.
+    Inheriting it here would let a subscriber row with a leftover static key
+    silently serve through that key whenever the OAuth store was unusable —
+    the credential would appear to work while requests left on a different
+    identity than the operator configured.
+    """
+    with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        missing = pathlib.Path(tmp) / "absent"
+        try:
+            resolve_model_backend_auth_token(
+                "gpt-6.1-sol-native",
+                _cfg(api_key="sk-not-a-real-key"),  # nonempty static key
+                principal_id="",
+                config_store=_ConfigStore(
+                    {
+                        "model.openai_oauth_store": str(missing),
+                        "model.auth_fail_closed": False,  # global fallback OFF
+                    }
+                ),
+                mint_client=None,
+            )
+        except BackendAuthUnavailableError:
+            pass
+        else:
+            raise AssertionError("a direct-oauth row must not fall back to its static key")
+
+
+def test_global_fail_closed_flag_is_irrelevant() -> None:
+    """Turning the global flag ON must not be what makes it fail closed."""
+    with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        root = pathlib.Path(tmp) / "store"
+        _seed_store(root, expires_in=-10)
+        data = json.loads((root / "credentials.json").read_text(encoding="utf-8"))
+        data["state"] = "needs_reauth"
+        (root / "credentials.json").write_text(json.dumps(data), encoding="utf-8")
+        for fail_closed in (False, True):
+            try:
+                resolve_model_backend_auth_token(
+                    "sol",
+                    _cfg(api_key="sk-not-a-real-key"),
+                    principal_id="",
+                    config_store=_ConfigStore(
+                        {
+                            "model.openai_oauth_store": str(root),
+                            "model.auth_fail_closed": fail_closed,
+                        }
+                    ),
+                    mint_client=None,
+                )
+            except BackendAuthUnavailableError:
+                continue
+            raise AssertionError(f"fallback was possible with auth_fail_closed={fail_closed}")
+
+
+def test_missing_resource_refuses_instead_of_returning_none() -> None:
+    """No resource means no call — not "use the static key".
+
+    The shared prelude returns ``None`` for a dynamic mode without an
+    audience. Returning ``None`` here would hand the SDK the row's static
+    credential, which is precisely the substitution this lane forbids.
+    """
+    with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        root = pathlib.Path(tmp) / "store"
+        _seed_store(root)
+        try:
+            resolve_model_backend_auth_token(
+                "sol",
+                _cfg(obo_audience=""),
+                principal_id="",
+                config_store=_ConfigStore({"model.openai_oauth_store": str(root)}),
+                mint_client=None,
+            )
+        except DirectOAuthBindingError as exc:
+            assert "no resource" in str(exc).lower()
+        else:
+            raise AssertionError("a resource-less direct-oauth row must refuse")
+
+
+# ---------------------------------------------------------------------------
+# endpoint and resource binding
+# ---------------------------------------------------------------------------
+
+
+def test_mismatched_resource_is_refused() -> None:
+    with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        root = pathlib.Path(tmp) / "store"
+        _seed_store(root)
+        try:
+            resolve_model_backend_auth_token(
+                "sol",
+                _cfg(obo_audience="https://api.openai.com/v2"),
+                principal_id="",
+                config_store=_ConfigStore({"model.openai_oauth_store": str(root)}),
+                mint_client=None,
+            )
+        except DirectOAuthBindingError:
+            pass
+        else:
+            raise AssertionError("a mismatched OAuth resource must be refused")
+
+
+def test_alternate_host_is_refused() -> None:
+    with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        root = pathlib.Path(tmp) / "store"
+        _seed_store(root)
+        try:
+            resolve_model_backend_auth_token(
+                "sol",
+                _cfg(base_url="https://api.openai.com.evil.example/v1"),
+                principal_id="",
+                config_store=_ConfigStore({"model.openai_oauth_store": str(root)}),
+                mint_client=None,
+            )
+        except DirectOAuthBindingError:
+            pass
+        else:
+            raise AssertionError("an alternate host must not receive the credential")
+
+
+def test_plain_http_is_refused() -> None:
+    assert direct_oauth_endpoint_problem("openai", "http://api.openai.com/v1") is not None
+
+
+def test_trailing_slash_variant_is_refused() -> None:
+    assert direct_oauth_endpoint_problem("openai", "https://api.openai.com/v1/") is not None
+
+
+def test_credential_bearing_url_is_refused() -> None:
+    url = "https://" + "user" + ":" + "pw" + "@api.openai.com/v1"
+    assert direct_oauth_endpoint_problem("openai", url) is not None
+    assert direct_oauth_endpoint_problem("openai", "https://api.openai.com/v1?x=1") is not None
+    assert direct_oauth_endpoint_problem("openai", "https://api.openai.com/v1#frag") is not None
+
+
+def test_non_default_port_is_refused() -> None:
+    assert direct_oauth_endpoint_problem("openai", "https://api.openai.com:8443/v1") is not None
+
+
+def test_compat_provider_is_refused() -> None:
+    """``openai-compatible`` accepts any base_url, so it cannot carry this grant."""
+    assert direct_oauth_endpoint_problem("openai-compatible", DIRECT_OAUTH_RESOURCE) is not None
+    assert direct_oauth_endpoint_problem("openai", DIRECT_OAUTH_RESOURCE) is None
+
+
+def test_binding_is_checked_before_the_store_is_read() -> None:
+    """A mis-bound row never touches the credential at all."""
+
+    class _ExplodingStore:
+        def __init__(self, *_a: Any, **_k: Any) -> None:
+            raise AssertionError("the store must not be opened for a mis-bound row")
+
+    import turnstone.core.oauth_token_store as ots
+
+    original = ots.OAuthTokenStore
+    ots.OAuthTokenStore = _ExplodingStore  # type: ignore[assignment]
+    try:
+        try:
+            resolve_model_backend_auth_token(
+                "sol",
+                _cfg(base_url="https://api.openai.com/v1/"),
+                principal_id="",
+                config_store=_ConfigStore(),
+                mint_client=None,
+            )
+        except DirectOAuthBindingError:
+            pass
+        else:
+            raise AssertionError("expected a binding refusal")
+    finally:
+        ots.OAuthTokenStore = original  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# the other modes keep their contracts
+# ---------------------------------------------------------------------------
+
+
+def test_entra_fallback_contract_is_unchanged() -> None:
+    """An Entra row with a static key still falls back when minting fails.
+
+    Only the direct-OAuth branch changed. If this starts raising, the
+    fail-closed correction has leaked into modes it was not meant to touch.
+    """
+    assert (
+        resolve_model_backend_auth_token(
+            "entra-model",
+            _cfg(mode="entra_obo", api_key="sk-static"),
+            principal_id="user-1",
+            config_store=_ConfigStore(),
+            mint_client=_NoTokenMint(),
+        )
+        is None
+    )
+
+
+def test_direct_oauth_client_disables_redirects() -> None:
+    """The bearer's transport must not follow a 30x to another host."""
+    registry = mr.ModelRegistry(models={"sol": _cfg()}, default="sol")
+    client = registry.get_client("sol")
+    http_client = getattr(client, "_client", None)
+    assert http_client is not None
+    assert getattr(http_client, "follow_redirects", None) is False
+
+
+def test_static_client_keeps_the_sdk_redirect_default() -> None:
+    registry = mr.ModelRegistry(
+        models={"plain": _cfg(mode="static", obo_audience="", api_key="sk-x")}, default="plain"
+    )
+    client = registry.get_client("plain")
+    http_client = getattr(client, "_client", None)
+    assert http_client is not None
+    assert getattr(http_client, "follow_redirects", None) is True
+
+
+# ---------------------------------------------------------------------------
+# the write path mirrors the runtime binding
+# ---------------------------------------------------------------------------
+
+
+def test_console_create_and_update_both_enforce_the_binding() -> None:
+    """Defence in depth: neither write path may accept a mis-bound row.
+
+    The runtime seam is authoritative, but a row that is refused only at
+    serve time is a silent misconfiguration; both admin paths call the same
+    predicate the runtime uses.
+    """
+    src = (
+        pathlib.Path(mr.__file__).resolve().parent.parent
+        / "console"
+        / "server.py"
+    ).read_text(encoding="utf-8")
+    assert "from turnstone.core.model_backend_auth import direct_oauth_endpoint_problem" in src
+    assert src.count("_direct_oauth_endpoint_error(") >= 3, (
+        "expected the definition plus both call sites (create and update)"
+    )
+    # The update call must read the POST-merge provider/base_url, not the
+    # request's own fields: re-pointing an armed row is the edit that matters.
+    window = src[src.index("# Endpoint binding is enforced on the POST-merge row") :]
+    assert 'updates.get("provider"' in window
+    assert 'updates.get("base_url"' in window
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# boot/store requirements: direct OAuth must not inherit the MCP key guard
+# ---------------------------------------------------------------------------
+
+
+class _BareState:
+    """app_state without an MCP token store, as on a keyless deployment."""
+
+
+def test_direct_oauth_only_does_not_require_the_mcp_token_store() -> None:
+    """The lane reads a file store, so it must not force the MCP cipher.
+
+    ``has_dynamic_auth`` and the shared key guard both used to treat every
+    dynamic mode as an MCP-cached mint. A direct-OAuth-only deployment would
+    then abort at boot demanding an encryption key it never touches.
+    """
+    models = {"sol": _cfg()}
+    registry = mr.ModelRegistry(models=models, default="sol")
+    assert registry.has_dynamic_auth() is True
+    assert registry.has_token_store_dynamic_auth() is False
+    assert mr.dynamic_auth_key_error(models, _BareState()) == ""
+
+
+def test_entra_still_requires_the_mcp_token_store() -> None:
+    models = {"entra": _cfg(mode="entra_obo")}
+    registry = mr.ModelRegistry(models=models, default="entra")
+    assert registry.has_token_store_dynamic_auth() is True
+    assert mr.dynamic_auth_key_error(models, _BareState()) != ""
+
+
+def test_a_mixed_registry_still_requires_the_store() -> None:
+    models = {"sol": _cfg(), "entra": _cfg(mode="entra_obo", alias="entra")}
+    registry = mr.ModelRegistry(models=models, default="sol")
+    assert registry.has_token_store_dynamic_auth() is True
 
 
 def _run_all() -> int:

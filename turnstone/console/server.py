@@ -6021,7 +6021,8 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 config_store.get("mcp.config_path") or None,
                 storage=storage,
                 required=bool(
-                    app.state.coord_registry and app.state.coord_registry.has_dynamic_auth()
+                    app.state.coord_registry
+                    and app.state.coord_registry.has_token_store_dynamic_auth()
                 ),
             )
             if app.state.mcp_client is not None:
@@ -11945,7 +11946,7 @@ def _ensure_console_mcp_client(app: Any) -> dict[str, Any]:
             mgr = create_mcp_client(
                 cfg_path or None,
                 storage=storage,
-                required=bool(registry and registry.has_dynamic_auth()),
+                required=bool(registry and registry.has_token_store_dynamic_auth()),
             )
             if mgr is None:
                 return {"skipped": "no MCP servers configured"}
@@ -12830,6 +12831,31 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     )
 
 
+def _direct_oauth_endpoint_error(auth_mode: str, provider: str, base_url: str) -> JSONResponse | None:
+    """Refuse a direct-OAuth row that would aim the credential off-endpoint.
+
+    The runtime dispatch seam (``model_backend_auth._require_direct_oauth_binding``)
+    is authoritative and re-checks every call, so a DB-direct insert or a
+    later edit cannot bypass it. This mirror exists so the write path refuses
+    the row up front, with an actionable 400, instead of accepting a
+    definition that can only fail at serve time.
+
+    One shared predicate, two call sites by design: normalisation drift here
+    must not be able to disagree with what the wire check accepts.
+    """
+    if auth_mode not in DIRECT_OAUTH_MODEL_AUTH_MODES:
+        return None
+    from turnstone.core.model_backend_auth import direct_oauth_endpoint_problem
+
+    problem = direct_oauth_endpoint_problem(provider, base_url)
+    if problem is None:
+        return None
+    return JSONResponse(
+        {"error": f"auth_mode {auth_mode!r} requires a bound endpoint: {problem}"},
+        status_code=400,
+    )
+
+
 def _validate_dynamic_model_auth(
     request: Request,
     *,
@@ -13605,6 +13631,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     )
     if dynamic_auth_error is not None:
         return dynamic_auth_error
+    endpoint_error = _direct_oauth_endpoint_error(auth_mode, provider, base_url)
+    if endpoint_error is not None:
+        return endpoint_error
 
     storage.create_model_definition(
         definition_id=definition_id,
@@ -13903,6 +13932,19 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         )
         if dynamic_auth_error is not None:
             return dynamic_auth_error
+
+    # Endpoint binding is enforced on the POST-merge row whenever it is (or
+    # becomes) direct-OAuth, independent of which field this request touched:
+    # re-pointing an armed row is exactly the edit that must not slip through.
+    # A row left in an unbound state by a DB-direct write is refused here until
+    # it is repaired, matching what the dispatch seam would do at serve time.
+    endpoint_error = _direct_oauth_endpoint_error(
+        gate.eff_auth_mode,
+        str(updates.get("provider", existing.get("provider", "openai")) or ""),
+        str(updates.get("base_url", existing.get("base_url", "")) or ""),
+    )
+    if endpoint_error is not None:
+        return endpoint_error
 
     if updates:
         storage.update_model_definition(definition_id, **updates)

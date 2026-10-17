@@ -1315,12 +1315,12 @@ def main() -> None:
     mcp_client = create_mcp_client(
         getattr(args, "mcp_config", None),
         storage=_get_storage(),
-        required=registry.has_dynamic_auth(),
+        required=registry.has_token_store_dynamic_auth(),
     )
     if mcp_client is not None:
         cli_auth_storage = _get_storage()
         mcp_client.set_storage(cli_auth_storage)
-        if registry.has_dynamic_auth():
+        if registry.has_token_store_dynamic_auth():
             # The CLI has no ASGI lifespan, but app-identity model auth needs
             # the same discovered OIDC config and encrypted token store as the
             # server hosts. The mint HTTP client itself belongs to mcp-loop.

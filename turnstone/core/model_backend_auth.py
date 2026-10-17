@@ -7,6 +7,7 @@ two inputs for every model-backed role without importing session lifecycle.
 
 from __future__ import annotations
 
+import urllib.parse
 from typing import TYPE_CHECKING, Any, cast
 
 from turnstone.core.log import get_logger
@@ -28,9 +29,89 @@ log = get_logger(__name__)
 #: can point at a non-production store without editing code.
 DEFAULT_OPENAI_OAUTH_STORE = "/srv/turnstone/credentials/runtime/openai-siwc"
 
+#: The ONE endpoint a direct-account ChatGPT OAuth credential may be sent to.
+#: This is both the OAuth resource indicator and the Responses API root: the
+#: grant is issued for this audience, so a request to any other host would put
+#: a subscriber credential where it was never authorized to go.
+DIRECT_OAUTH_RESOURCE = "https://api.openai.com/v1"
+
+#: Provider whose client actually targets that endpoint. ``openai`` is the
+#: Responses surface; ``openai-compatible`` is deliberately excluded because it
+#: accepts an arbitrary operator-supplied base_url and would let a DB edit
+#: re-point the credential after the fact.
+DIRECT_OAUTH_PROVIDER = "openai"
+
 
 class BackendAuthUnavailableError(RuntimeError):
     """A fail-closed dynamic model credential could not be resolved."""
+
+
+class DirectOAuthBindingError(BackendAuthUnavailableError):
+    """A direct-OAuth row does not bind its credential to the one allowed endpoint.
+
+    Subclasses :class:`BackendAuthUnavailableError` so every existing
+    fail-closed handler keeps its behaviour; the distinct type exists so a
+    misconfiguration is not mistaken for a transient credential outage.
+    """
+
+
+def direct_oauth_endpoint_problem(provider: str, base_url: str) -> str | None:
+    """Return why *provider*/*base_url* may not receive the OAuth credential.
+
+    ``None`` means the pair is exactly the authorized binding. The checks are
+    stated individually so a refusal names the offending dimension (host,
+    scheme, embedded credential, port, path) instead of only "not allowed",
+    while the final exact-equality test makes any unanticipated spelling fail
+    closed rather than pass by normalisation.
+    """
+    if provider != DIRECT_OAUTH_PROVIDER:
+        return (
+            f"provider must be {DIRECT_OAUTH_PROVIDER!r} for a direct-OAuth credential, "
+            f"not {provider!r}"
+        )
+    parsed = urllib.parse.urlsplit(base_url)
+    if base_url != DIRECT_OAUTH_RESOURCE:
+        if parsed.scheme != "https":
+            return "base_url must use https"
+        if parsed.username or parsed.password:
+            return "base_url must not embed credentials"
+        if parsed.query or parsed.fragment:
+            return "base_url must not carry a query or fragment"
+        if parsed.hostname != "api.openai.com":
+            return "base_url host must be api.openai.com"
+        if parsed.port not in (None, 443):
+            return "base_url must use the default TLS port"
+        return f"base_url must be exactly {DIRECT_OAUTH_RESOURCE}"
+    return None
+
+
+def _require_direct_oauth_binding(alias: str, config: ModelConfig) -> str:
+    """Return the OAuth resource after proving the endpoint binding.
+
+    Runs at the credential-dispatch boundary, not only in the Console write
+    path, so a DB-direct insert or a later edit cannot bypass it. A missing
+    resource is a refusal, never ``None`` (which callers read as "use the
+    static key") and never an empty-string request parameter.
+    """
+    resource = str(getattr(config, "obo_audience", "") or "")
+    if not resource:
+        raise DirectOAuthBindingError(
+            f"Direct-OAuth model alias {alias!r} has no resource; refusing to resolve a credential"
+        )
+    if resource != DIRECT_OAUTH_RESOURCE:
+        raise DirectOAuthBindingError(
+            f"Direct-OAuth model alias {alias!r} targets {resource!r}; "
+            f"the credential is only authorized for {DIRECT_OAUTH_RESOURCE}"
+        )
+    problem = direct_oauth_endpoint_problem(
+        str(getattr(config, "provider", "") or ""),
+        str(getattr(config, "base_url", "") or ""),
+    )
+    if problem is not None:
+        raise DirectOAuthBindingError(
+            f"Direct-OAuth model alias {alias!r} cannot carry the credential: {problem}"
+        )
+    return resource
 
 
 def _mint_refusal_cause(
@@ -76,21 +157,24 @@ def resolve_model_backend_auth_token(
     if not alias or config is None:
         return None
     mode = getattr(config, "auth_mode", "static")
+    if mode not in DYNAMIC_MODEL_AUTH_MODES:
+        return None
+    if mode in DIRECT_OAUTH_MODEL_AUTH_MODES:
+        # Always fail closed, and before the delegated-user check on purpose:
+        # the stored grant belongs to the deployment's own account (an app
+        # identity), so requiring an acting user would refuse every legitimate
+        # call. Nothing here consults ``api_key`` or ``model.auth_fail_closed``:
+        # a subscriber credential must never silently degrade to a static key,
+        # not even on a row that happens to carry one.
+        return _resolve_direct_oauth_token(alias, mode, config, config_store)
     obo_audience = getattr(config, "obo_audience", "")
-    if mode not in DYNAMIC_MODEL_AUTH_MODES or not obo_audience:
+    if not obo_audience:
         return None
     has_static_key = bool(getattr(config, "api_key", ""))
     configured_fail_closed = bool(
         config_store is not None and config_store.get("model.auth_fail_closed")
     )
     must_fail_closed = configured_fail_closed or not has_static_key
-    if mode in DIRECT_OAUTH_MODEL_AUTH_MODES:
-        # Before the delegated-user check on purpose: the stored grant belongs
-        # to the deployment's own account (an app identity), so requiring an
-        # acting user would refuse every legitimate call.
-        return _resolve_direct_oauth_token(
-            alias, mode, obo_audience, config_store, must_fail_closed
-        )
     user_id = ""
     if mode not in APP_IDENTITY_MODEL_AUTH_MODES:
         user_id = principal_id.strip()
@@ -174,11 +258,10 @@ def resolve_model_backend_auth_token(
 def _resolve_direct_oauth_token(
     alias: str,
     mode: str,
-    resource: str,
+    config: ModelConfig,
     config_store: Any | None,
-    must_fail_closed: bool,
-) -> str | None:
-    """Mint from the local coordinated OAuth token store (Option B).
+) -> str:
+    """Read the token from the local coordinated OAuth store (Option B).
 
     The store owns the ONLY refresh token for the account and serialises
     rotation across every process (flock + re-read under lock + atomic
@@ -186,17 +269,21 @@ def _resolve_direct_oauth_token(
     store keeps current, so two aliases on the same store cannot race the
     provider into revoking the grant.
 
-    ``resource`` is the model row's ``obo_audience`` column, reused as the
-    OAuth resource indicator (no schema change for a direct-account lane).
+    The model row's ``obo_audience`` is reused as the OAuth resource indicator
+    (no schema change for a direct-account lane) and is validated together with
+    the endpoint before the credential is touched.
 
-    Fail-closed: an unusable credential never silently degrades to a static
-    key on a keyless alias, and never becomes the SDK's placeholder literal.
+    Fail-closed, unconditionally: every failure raises. There is no return path
+    that hands the caller ``None``, because ``None`` means "use the row's static
+    key" and a subscriber credential must never be silently substituted or
+    substituted for.
     """
     from turnstone.core.oauth_token_store import (
         OAuthTokenError,
         OAuthTokenStore,
     )
 
+    resource = _require_direct_oauth_binding(alias, config)
     configured = ""
     if config_store is not None:
         configured = str(config_store.get("model.openai_oauth_store") or "").strip()
@@ -213,9 +300,11 @@ def _resolve_direct_oauth_token(
             error_type=type(exc).__name__,
             cause=str(exc),
         )
-        if must_fail_closed:
-            raise BackendAuthUnavailableError(
-                f"Direct-OAuth backend authentication unavailable for model alias {alias!r}"
-            ) from exc
-        return None
+        raise BackendAuthUnavailableError(
+            f"Direct-OAuth backend authentication unavailable for model alias {alias!r}"
+        ) from exc
+    if not token:
+        raise BackendAuthUnavailableError(
+            f"Direct-OAuth backend authentication unavailable for model alias {alias!r}"
+        )
     return str(token)

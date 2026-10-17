@@ -196,15 +196,23 @@ KEY_GUARD_DEFERRED_TO_LIFESPAN: Any = object()
 def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) -> str:
     """The dynamic-auth key requirement, shared by every install/swap site.
 
-    One derivation so no two sites can drift: a registry carrying
-    dynamic-auth aliases must not become live on a host whose token store is
-    absent, or every mint fails per-call while the operator sees nothing.
-    Used by the swap chokepoint in :meth:`ModelRegistry.reload` and by the
-    console's first-install bootstrap paths. Returns ``""`` when permitted,
-    else the refusal message. Token-store presence is process-constant, so a
-    refusal here is stable until restart.
+    One derivation so no two sites can drift: a registry carrying dynamic-auth
+    aliases that mint through the MCP token store must not become live on a host
+    whose token store is absent, or every mint fails per-call while the operator
+    sees nothing. Used by the swap chokepoint in :meth:`ModelRegistry.reload` and
+    by the console's first-install bootstrap paths. Returns ``""`` when
+    permitted, else the refusal message. Token-store presence is
+    process-constant, so a refusal here is stable until restart.
+
+    Direct-OAuth aliases are excluded: their credential is a local file store,
+    so they neither need nor use the MCP cipher. Including them would make a
+    direct-OAuth-only deployment refuse to install a row -- or abort at boot --
+    for a key it never touches.
     """
-    if not any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in models.values()):
+    if not any(
+        _is_dynamic_auth_mode(cfg.auth_mode) and cfg.auth_mode not in DIRECT_OAUTH_MODEL_AUTH_MODES
+        for cfg in models.values()
+    ):
         return ""
     if getattr(app_state, "mcp_token_store", None) is not None:
         return ""
@@ -617,7 +625,17 @@ class ModelRegistry:
                 client_key = "backend-auth-placeholder-unused"
             try:
                 self._clients[alias] = create_client(
-                    cfg.provider, base_url=cfg.base_url, api_key=client_key
+                    cfg.provider,
+                    base_url=cfg.base_url,
+                    api_key=client_key,
+                    # A direct-OAuth bearer is issued for one exact endpoint.
+                    # The SDK follows redirects by default, which would let
+                    # its response move that credential to a host the grant
+                    # never authorized; pin the transport instead. Every other
+                    # mode keeps the SDK default (``None``).
+                    follow_redirects=(
+                        False if cfg.auth_mode in DIRECT_OAUTH_MODEL_AUTH_MODES else None
+                    ),
                 )
             except ValueError as exc:
                 # create_client's own misconfig errors already carry
@@ -764,6 +782,25 @@ class ModelRegistry:
     def has_dynamic_auth(self) -> bool:
         """Return whether any alias needs a runtime-minted backend credential."""
         return any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in self._models.values())
+
+    def has_token_store_dynamic_auth(self) -> bool:
+        """Whether any alias mints through the MCP-encrypted token store.
+
+        The boot and swap guards exist because a mint PERSISTS encrypted cache
+        rows, so the host must have the MCP token-encryption key before such a
+        registry becomes live. A direct-OAuth row does not use that cipher at
+        all -- it reads a coordinated file store -- so a deployment whose only
+        dynamic rows are direct-OAuth must not be forced to configure an MCP
+        key (or abort at boot) for machinery it never touches.
+
+        Every key/store guard reads THIS accessor; :meth:`has_dynamic_auth`
+        remains the raw "mints at runtime" fact.
+        """
+        return any(
+            _is_dynamic_auth_mode(cfg.auth_mode)
+            and cfg.auth_mode not in DIRECT_OAUTH_MODEL_AUTH_MODES
+            for cfg in self._models.values()
+        )
 
     def list_aliases(self) -> list[str]:
         """Return all registered model aliases."""

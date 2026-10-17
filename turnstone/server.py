@@ -4845,7 +4845,7 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
     # A model may switch from static to dynamic auth while the node has no MCP
     # servers. Ensure the dedicated mint loop exists after the registry reload;
     # model auth must not depend on an unrelated MCP catalog being configured.
-    if registry.has_dynamic_auth() and getattr(request.app.state, "mcp_client", None) is None:
+    if registry.has_token_store_dynamic_auth() and getattr(request.app.state, "mcp_client", None) is None:
         from turnstone.core.mcp_client import MCPClientManager
 
         mcp_mgr = MCPClientManager({})
@@ -6190,7 +6190,7 @@ def main() -> None:
     mcp_client = create_mcp_client(
         mcp_config_cli or config_store.get("mcp.config_path") or None,
         storage=_get_storage(),
-        required=registry.has_dynamic_auth(),
+        required=registry.has_token_store_dynamic_auth(),
     )
     # Mutable ref so session_factory always sees the latest MCP client,
     # including ones created by internal_mcp_reload after startup.

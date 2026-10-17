@@ -165,7 +165,34 @@ ENDPOINTS: dict[str, Callable[[int], str]] = {
     "folders": lambda limit: _search_path("dash-folder", limit),
 }
 
-ALL_VERBS = ("identity", "health", "datasources", "folders", "dashboards", "alerts", "org")
+# Derived from the allow-list so a new endpoint verb cannot be served by the
+# module but left out of the aggregate verb. Order fixes the output layout.
+ALL_VERBS = tuple(ENDPOINTS)
+
+
+def select_uid(payload: Any, ds_type: str = "prometheus") -> str:
+    """Return the first datasource uid of *ds_type*, or "" when there is none.
+
+    Accepts both shapes this tool produces: the CLI wraps each verb under its
+    own key (``{"datasources": {"status": ..., "data": [...]}}``) while the
+    verb result itself is ``{"status": ..., "data": [...]}``. Reading only the
+    unwrapped shape is what made ``query-smoke`` report Prometheus as absent
+    while ``datasources`` plainly listed it.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    body = payload.get("datasources")
+    if not isinstance(body, dict):
+        body = payload
+    rows = body.get("data")
+    if not isinstance(rows, list):
+        return ""
+    for row in rows:
+        if isinstance(row, dict) and row.get("type") == ds_type:
+            uid = row.get("uid")
+            if isinstance(uid, str) and uid:
+                return uid
+    return ""
 
 
 def _opener() -> urllib.request.OpenerDirector:
@@ -502,6 +529,7 @@ def summarize(name: str, body: Any) -> Any:
                 "uid": d.get("uid"),
                 "name": d.get("name"),
                 "type": d.get("type"),
+                "url": d.get("url"),
                 "isDefault": d.get("isDefault"),
                 "readOnly": d.get("readOnly"),
                 "queryable": d.get("type") in QUERY_DATASOURCE_TYPES,
@@ -571,19 +599,35 @@ def run(name: str, token: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _apply_audit_ownership(fd: int, parent: str | None) -> None:
+    """Match the audit file's mode and group to its directory.
+
+    The launcher runs as root, so a newly created file would be ``root:root``
+    and the Turnstone identity could not read its own audit trail. The
+    installer owns the directory's group (``root:turnstone``), so the file
+    follows it rather than hard-coding a group here.
+    """
+    if os.geteuid() != 0:
+        return
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o640)
+    if not parent:
+        return
+    with contextlib.suppress(OSError):
+        os.fchown(fd, -1, os.stat(parent).st_gid)
+
+
 def _open_audit(path: str | None = None) -> int:
     """Open the audit log, creating its directory. Refusal is fail-closed."""
     target = path or os.environ.get("GRAFANA_AUDIT_PATH") or AUDIT_PATH
+    parent = os.path.dirname(target)
     try:
-        parent = os.path.dirname(target)
         if parent:
             os.makedirs(parent, mode=0o750, exist_ok=True)
         fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
     except OSError as exc:
         raise GrafanaError(f"audit log unavailable ({type(exc).__name__})") from None
-    if os.geteuid() == 0:
-        with contextlib.suppress(OSError):
-            os.fchmod(fd, 0o640)
+    _apply_audit_ownership(fd, parent)
     return fd
 
 

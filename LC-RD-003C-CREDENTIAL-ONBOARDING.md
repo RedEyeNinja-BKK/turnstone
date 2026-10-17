@@ -44,7 +44,7 @@ Do not duplicate existing model keys in root-only files and call the work comple
 The operator approved an additive, exact-argv sudo grant so the Turnstone
 service identity can use the existing Grafana credential from its own runtime,
 without an operator shell. The credential remains root-owned and unreadable by
-the service identity; the grant carries only these nine literal invocations.
+the service identity; the grant carries one literal rule per verb.
 
 - `scripts/turnstone_grafana_readonly.py` — bounded read-only surface:
   authenticated identity, organization, permissions, health, datasources,

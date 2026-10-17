@@ -153,24 +153,37 @@ cmd_query_smoke() {
   require_root
   [ -x "$LAUNCHER" ] || die "launcher not installed"
   local uid
-  uid=$(run_as_service datasources | "$PYTHON" -c '
+  # Parse with the deployed module's own selector: one implementation, so the
+  # installer cannot drift from the CLI's response shape again.
+  uid=$(run_as_service datasources | "$PYTHON" -I -B -c '
 import json, sys
+sys.path.insert(0, sys.argv[1])
+import grafana_runtime
 try:
-    rows = json.load(sys.stdin).get("data") or []
+    print(grafana_runtime.select_uid(json.load(sys.stdin)))
 except Exception:
     sys.exit(1)
-for row in rows:
-    if row.get("type") == "prometheus":
-        print(row["uid"])
-        break
-')
+' "$DEST")
   if [ -z "${uid:-}" ]; then
     note "no Prometheus datasource found; bounded query not attempted"
-    return 0
+    return 1
   fi
   heading "bounded query (datasource $uid, vector(1), instant, 5m)"
-  printf '%s' "{\"datasource_uid\":\"$uid\",\"expr\":\"vector(1)\",\"kind\":\"instant\",\"minutes\":5}" |
-    run_as_service query
+  local out
+  out=$(printf '%s' "{\"datasource_uid\":\"$uid\",\"expr\":\"vector(1)\",\"kind\":\"instant\",\"minutes\":5}" |
+    run_as_service query) || { printf '%s\n' "$out"; return 1; }
+  printf '%s\n' "$out"
+  printf '%s' "$out" | "$PYTHON" -I -c '
+import json, sys
+try:
+    body = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+results = (body.get("data") or {})
+points = sum(int((r or {}).get("points") or 0) for r in results.values())
+sys.exit(0 if body.get("status") == 200 and points > 0 else 1)
+' || { note "bounded query returned no data points"; return 1; }
+  note "bounded query returned data points"
 }
 
 cmd_install() {
@@ -180,9 +193,17 @@ cmd_install() {
   heading "Install"
   install_files
   install_sudoers
+  heading "Drift check"
+  cmd_check || return 1
   heading "Verify"
   if cmd_verify; then
-    note "INSTALLED AND VERIFIED"
+    heading "Bounded query smoke"
+    if cmd_query_smoke; then
+      note "INSTALLED AND VERIFIED"
+    else
+      note "INSTALLED, but the bounded query did not return data"
+      return 1
+    fi
   else
     note "INSTALLED, but verification reported an error (see above)"
     return 1

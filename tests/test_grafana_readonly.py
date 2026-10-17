@@ -359,6 +359,71 @@ def test_datasource_resolution_refuses_an_unknown_uid() -> None:
         grafana.get_json = original
 
 
+# The exact payload the CLI produced against Grafana 13.2.4: main() wraps each
+# verb result under its own key. query-smoke parsed the unwrapped shape and
+# therefore saw no datasources at all.
+_REAL_DATASOURCES_PAYLOAD = {
+    "datasources": {
+        "data": [
+            {
+                "isDefault": False,
+                "name": "loki",
+                "queryable": True,
+                "readOnly": False,
+                "type": "loki",
+                "uid": "bfajhiz1i96o0c",
+            },
+            {
+                "isDefault": True,
+                "name": "prometheus",
+                "queryable": True,
+                "readOnly": False,
+                "type": "prometheus",
+                "uid": "df7wrp11a9hq8c",
+            },
+        ],
+        "status": 200,
+    }
+}
+
+
+def test_select_uid_reads_the_wrapped_cli_shape() -> None:
+    assert grafana.select_uid(_REAL_DATASOURCES_PAYLOAD) == "df7wrp11a9hq8c"
+
+
+def test_select_uid_also_reads_the_unwrapped_shape() -> None:
+    assert grafana.select_uid(_REAL_DATASOURCES_PAYLOAD["datasources"]) == "df7wrp11a9hq8c"
+
+
+def test_select_uid_is_empty_when_the_type_is_absent() -> None:
+    payload = {"datasources": {"data": _REAL_DATASOURCES_PAYLOAD["datasources"]["data"][:1]}}
+    assert grafana.select_uid(payload) == ""
+    assert grafana.select_uid({"data": []}) == ""
+    assert grafana.select_uid(None) == ""
+
+
+def test_select_uid_ignores_malformed_rows() -> None:
+    payload = {"data": ["nope", {"uid": "x"}, {"type": "prometheus", "uid": "ok"}]}
+    assert grafana.select_uid(payload) == "ok"
+
+
+def test_datasource_summary_exposes_the_backend_url() -> None:
+    out = grafana.summarize(
+        "datasources",
+        [
+            {
+                "uid": "p",
+                "name": "prometheus",
+                "type": "prometheus",
+                "url": "https://prometheus.example.invalid",
+                "secureJsonData": {"password": "x"},
+            }
+        ],
+    )
+    assert out[0]["url"] == "https://prometheus.example.invalid"
+    assert "secureJsonData" not in out[0]
+
+
 def test_build_query_instant_is_bounded() -> None:
     request = grafana.parse_query_request(b'{"datasource_uid":"P1","expr":"up","minutes":5}')
     ds = {"uid": "P1", "type": "prometheus", "name": "p"}
@@ -382,6 +447,51 @@ def test_build_query_range_caps_points_and_sets_loki_type() -> None:
     assert query["intervalMs"] == 60_000
     assert query["queryType"] == "range"
     assert query["maxLines"] == 100
+
+
+def test_audit_file_follows_the_directory_group() -> None:
+    import types
+
+    calls: list[tuple[str, tuple]] = []
+
+    class _Stat:
+        st_gid = 105
+
+    shim = types.SimpleNamespace(
+        geteuid=lambda: 0,
+        fchmod=lambda fd, mode: calls.append(("fchmod", (fd, mode))),
+        fchown=lambda fd, uid, gid: calls.append(("fchown", (fd, uid, gid))),
+        stat=lambda path: _Stat(),
+    )
+    original = grafana.os
+    grafana.os = shim  # type: ignore[assignment]
+    try:
+        grafana._apply_audit_ownership(7, "/var/log/turnstone-grafana")
+    finally:
+        grafana.os = original
+
+    assert ("fchmod", (7, 0o640)) in calls
+    # -1 leaves the owner (root) alone; the group follows the directory.
+    assert ("fchown", (7, -1, 105)) in calls
+
+
+def test_audit_ownership_is_a_no_op_for_non_root() -> None:
+    import types
+
+    calls: list[str] = []
+    shim = types.SimpleNamespace(
+        geteuid=lambda: 1001,
+        fchmod=lambda fd, mode: calls.append("fchmod"),
+        fchown=lambda fd, uid, gid: calls.append("fchown"),
+        stat=lambda path: types.SimpleNamespace(st_gid=105),
+    )
+    original = grafana.os
+    grafana.os = shim  # type: ignore[assignment]
+    try:
+        grafana._apply_audit_ownership(7, "/tmp")
+    finally:
+        grafana.os = original
+    assert calls == []
 
 
 def test_post_is_used_only_for_the_fixed_query_path() -> None:
@@ -471,9 +581,9 @@ def test_query_summary_is_bounded() -> None:
     assert out["A"]["series"][0]["label_count"] == 1
 
 
-def test_aggregate_verb_never_runs_a_query() -> None:
+def test_aggregate_verb_covers_every_read_endpoint() -> None:
     assert "query" not in grafana.ALL_VERBS
-    assert set(grafana.ALL_VERBS) <= set(grafana.ENDPOINTS)
+    assert set(grafana.ALL_VERBS) == set(grafana.ENDPOINTS)
 
 
 def test_sudoers_verbs_match_the_launcher_exactly() -> None:
@@ -488,18 +598,22 @@ def test_sudoers_verbs_match_the_launcher_exactly() -> None:
         if line.strip().startswith("identity|")
     )
     launcher_verbs = set(case_line.split(")")[0].split("|"))
-    assert rule_verbs == launcher_verbs
-    assert rule_verbs == {
-        "identity",
-        "permissions",
-        "health",
-        "dashboards",
-        "folders",
-        "datasources",
-        "alerts",
-        "all",
-        "query",
-    }
+    # Derived from the module, never a hand-maintained list: a verb the module
+    # serves but the launcher or the sudoers template omits is unreachable at
+    # runtime (the deployed 'org' verb was exactly that defect).
+    expected = set(grafana.ENDPOINTS) | {"all", "query"}
+    assert launcher_verbs == expected
+    assert rule_verbs == expected
+
+
+def test_every_endpoint_verb_is_reachable_through_the_grant() -> None:
+    import re
+
+    rule_verbs = set(
+        re.findall(r"launch-grafana-readonly\.sh ([a-z]+)$", SUDOERS.read_text(), re.M)
+    )
+    missing = set(grafana.ENDPOINTS) - rule_verbs
+    assert not missing, f"verbs served by the module but grantless: {sorted(missing)}"
 
 
 def test_sudoers_grants_no_wildcards_or_unrestricted_powers() -> None:
@@ -507,7 +621,8 @@ def test_sudoers_grants_no_wildcards_or_unrestricted_powers() -> None:
     assert "*" not in text
     assert "NOPASSWD: ALL" not in text
     assert "SETENV:" not in text
-    assert text.count("NOPASSWD:") == 9
+    expected = set(grafana.ENDPOINTS) | {"all", "query"}
+    assert text.count("NOPASSWD:") == len(expected)
     # The existing self-management bridge grant must not be touched here.
     assert "launch-self-mcp" not in text
 

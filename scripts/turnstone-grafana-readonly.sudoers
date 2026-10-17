@@ -16,6 +16,7 @@ Defaults!/opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh identity
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh permissions
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh health
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh org
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh dashboards
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh folders
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh datasources

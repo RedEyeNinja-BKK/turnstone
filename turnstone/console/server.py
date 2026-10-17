@@ -70,6 +70,7 @@ from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
+    DIRECT_OAUTH_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
     MAX_MODEL_CONCURRENCY,
     MODEL_AUTH_MODE_PROFILES,
@@ -12901,6 +12902,16 @@ def _validate_dynamic_model_auth(
     # mcp_oauth reference each other lazily, so this stays off the module
     # import graph.
     from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    # A DIRECT-OAUTH mode does not exchange an OIDC grant for a delegated
+    # token: its credential is a locally stored rotating refresh token, so the
+    # OIDC and OBO-posture checks below do not describe it. Requiring them
+    # would accept the mode in the registry and then refuse every write with
+    # "single sign-on is not set up" - a half-installed feature. The audience
+    # allow-list check above still applies, because the audience IS the OAuth
+    # resource.
+    if auth_mode in DIRECT_OAUTH_MODEL_AUTH_MODES:
+        return None
 
     # Check ORDER mirrors the MCP sibling: token store first, then
     # OIDC-configured, then profile semantics — so a no-SSO host is told

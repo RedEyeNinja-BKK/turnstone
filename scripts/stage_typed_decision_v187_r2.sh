@@ -62,7 +62,16 @@ die() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
 # private mktemp directory, removed on every exit path.
 WORKDIR=$(mktemp -d /var/tmp/turnstone-r2.XXXXXXXX) || die "cannot create a private work directory"
 chmod 0700 "$WORKDIR"
-cleanup() { [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]] && find "$WORKDIR" -mindepth 0 -delete 2>/dev/null; }
+# The service identity needs its own tree. Placing a chowned subdirectory INSIDE
+# a 0700 root-owned parent does NOT work: the unprivileged user then lacks the
+# execute bit on the parent and cannot traverse in, so every staged test would
+# fail for a permission reason unrelated to the code under test.
+RUNDIR=""
+cleanup() {
+  [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]] && find "$WORKDIR" -mindepth 0 -delete 2>/dev/null
+  [[ -n "${RUNDIR:-}" && -d "$RUNDIR" ]] && find "$RUNDIR" -mindepth 0 -delete 2>/dev/null
+  return 0
+}
 trap cleanup EXIT INT TERM
 say() { printf '%s\n' "$*"; }
 
@@ -90,7 +99,6 @@ version=$("$PY" -c 'import importlib.metadata as m; print(m.version("turnstone")
 
 # Files applied whole. Each MUST have a byte-identical base in repository HEAD.
 FULL_FILES=(
-  "core/model_registry.py"
   "core/output_guard_judge.py"
   "cli.py"
   "console/server.py"
@@ -106,6 +114,62 @@ check_full_file_bases() {
       die "base mismatch for $f: repository base $BASE_COMMIT differs from $BASE_TREE; \
 refusing to overlay a divergent module"
   done
+}
+
+patch_model_registry() {
+  # R2 is a TYPED-DECISION revision. The repository's model_registry.py also
+  # carries the LC-RD-007 openai_oauth auth mode, and the R2 candidate does NOT
+  # ship the token store, the dispatch branch or the settings entry that mode
+  # needs. Copying the whole file would load a registry that ACCEPTS
+  # auth_mode=openai_oauth while every layer underneath refuses it -- a
+  # partially deployed feature, which is worse than an absent one.
+  #
+  # So this file is patched, not copied: exactly one method is added.
+  local target="$1"
+  "$PY" - "$target" <<'PYEOF'
+import pathlib, sys
+target = pathlib.Path(sys.argv[1])
+text = target.read_text(encoding="utf-8")
+
+if "openai_oauth" in text:
+    raise SystemExit(
+        "refusing: the 1.8.7 base already mentions openai_oauth; this revision "
+        "must not ship a partial implementation of that auth mode"
+    )
+if "def list_generative_aliases" in text:
+    raise SystemExit("refusing: list_generative_aliases already present in the base")
+
+anchor = (
+    '    def list_aliases(self) -> list[str]:\n'
+    '        """Return all registered model aliases."""\n'
+    '        return list(self._models.keys())\n'
+)
+addition = (
+    '\n'
+    '    def list_generative_aliases(self) -> list[str]:\n'
+    '        """Return the aliases that can actually generate assistant text.\n'
+    '\n'
+    '        A row declaring ``capabilities["supports_typed_decision"]`` is a\n'
+    '        decision backend: it answers with a typed decision object and\n'
+    '        generates no assistant text, so offering it as a session or\n'
+    '        task-agent model choice is a guaranteed failure. Those surfaces use\n'
+    '        this accessor.\n'
+    '\n'
+    '        The row stays in the registry: ``list_aliases`` still enumerates it\n'
+    '        (the Models tab and the reload endpoint manage it) and the Output\n'
+    '        Guard still resolves and executes it through the typed-decision seam.\n'
+    '        """\n'
+    '        return [\n'
+    '            alias\n'
+    '            for alias, cfg in self._models.items()\n'
+    '            if not (cfg.capabilities or {}).get("supports_typed_decision")\n'
+    '        ]\n'
+)
+if anchor not in text:
+    raise SystemExit("model_registry.py source drift: list_aliases anchor not found")
+target.write_text(text.replace(anchor, anchor + addition, 1), encoding="utf-8")
+print("model_registry.py patched: list_generative_aliases added (no auth-mode change)")
+PYEOF
 }
 
 patch_session() {
@@ -189,6 +253,7 @@ cmd_stage() {
     install -o "$STAGE_OWNER" -g "$STAGE_GROUP" -m 0644 "$REPO/turnstone/$f" "$NEW/turnstone/$f"
     cmp -s "$REPO/turnstone/$f" "$NEW/turnstone/$f" || die "copy mismatch: $f"
   done
+  patch_model_registry "$NEW/turnstone/core/model_registry.py"
   patch_session "$NEW/turnstone/core/session.py"
   patch_openai_responses "$NEW/turnstone/core/providers/_openai_responses.py"
 
@@ -220,6 +285,13 @@ cmd_verify() {
   fi
   grep -q 'caps.supports_tool_search and any' "$NEW/turnstone/core/providers/_openai_responses.py" \
     || die "staged _openai_responses.py is missing the tool_search guard"
+  grep -q 'def list_generative_aliases' "$NEW/turnstone/core/model_registry.py" \
+    || die "staged model_registry.py is missing list_generative_aliases"
+  # R2 must not carry a half-installed openai_oauth auth mode. That feature is
+  # staged separately, with its own store, dispatch branch and settings entry.
+  if grep -rq 'openai_oauth' "$NEW/turnstone/core" "$NEW/turnstone/console" "$NEW/turnstone/cli.py"; then
+    die "staged tree references openai_oauth without the rest of that feature; refusing a partially deployed auth mode"
+  fi
   say "file integrity: OK"
 
   # Prove the code the tests exercise is the STAGED BYTES, not the repo tree.
@@ -233,11 +305,16 @@ cmd_verify() {
     runner=(runuser -u "$SERVICE_USER" --)
   fi
 
-  # Writable per-run artifacts, outside the protected overlay.
-  local RUNDIR="$WORKDIR/run" TMPRUN="$WORKDIR/tmp"
-  install -d -m 0700 "$RUNDIR" "$TMPRUN"
+  # Writable per-run artifacts, outside the protected overlay, owned by the
+  # identity that must write them. /var/tmp is 1777, so this directory needs no
+  # traversal through the root-owned workdir.
+  RUNDIR=$(mktemp -d /var/tmp/turnstone-r2run.XXXXXXXX) || die "cannot create the run directory"
+  chmod 0700 "$RUNDIR"
+  local TMPRUN="$RUNDIR/tmp"
+  install -d -m 0700 "$TMPRUN"
   if [[ "$SANDBOX" != "1" ]]; then
-    chown "$SERVICE_USER:$SERVICE_USER" "$RUNDIR" "$TMPRUN"
+    chown "$SERVICE_USER:$SERVICE_USER" "$RUNDIR"
+    chown "$SERVICE_USER:$SERVICE_USER" "$TMPRUN"
   fi
 
   # ``-P`` keeps CWD off sys.path while still honouring PYTHONPATH (``-I``

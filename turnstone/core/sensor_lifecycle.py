@@ -575,15 +575,35 @@ class SensorHook:
 _HOOK: SensorHook | None = None
 
 #: Registry-scoped hooks, keyed by the registry object's ``id`` and validated by
-#: a weak reference before use. This is a *cache*, not a registry binding: no
-#: module global ever holds "the" registry, and a hook is only ever returned for
-#: the exact object it was built from. Two sessions backed by different
-#: registries therefore get independent endpoints and independent dedupe state;
-#: when a registry is rebound (hot reload) the new object simply misses the
-#: cache and a fresh hook is built. Dead entries are pruned while the lock is
-#: held, so a long-lived process cannot accumulate them.
-_HOOKS: dict[int, tuple[Any, SensorHook]] = {}
+#: BOTH a weak reference and the registry's generation. This is a *cache*, not a
+#: registry binding: no module global ever holds "the" registry, and a hook is
+#: only ever returned for the exact object and generation it was built from.
+#:
+#: Two sessions backed by different registries therefore get independent
+#: endpoints and independent dedupe state.
+#:
+#: The generation matters because ``ModelRegistry.reload()`` swaps models IN
+#: PLACE on the same object. Validating identity alone served the endpoint
+#: resolved before a reload - graded questions would have kept flowing to a lane
+#: the operator had already changed, silently. A reload bumps ``generation``, so
+#: the next event misses the cache and rebuilds. Dead entries are pruned while
+#: the lock is held, so a long-lived process cannot accumulate them.
+_HOOKS: dict[int, tuple[Any, Any, SensorHook]] = {}
 _HOOK_LOCK = threading.Lock()
+
+
+def _generation_of(registry: Any) -> Any:
+    """The registry's reload generation, or ``None`` when it has no such notion.
+
+    Read defensively: a registry that raises from this attribute (or does not
+    define it) simply caches on identity alone, which is the historical
+    behaviour and is correct for an object that cannot be mutated in place.
+    """
+    try:
+        generation = getattr(registry, "generation", None)
+    except Exception:  # noqa: BLE001 - a hostile/incomplete registry must not raise
+        return None
+    return generation if isinstance(generation, int) else None
 
 
 def _build_hook(registry: Any) -> SensorHook:
@@ -622,23 +642,24 @@ def hook(registry: Any = None) -> SensorHook:
         return _HOOK
 
     key = id(registry)
+    generation = _generation_of(registry)
     with _HOOK_LOCK:
         entry = _HOOKS.get(key)
         if entry is not None:
-            ref, existing = entry
-            if ref() is registry:
+            ref, cached_generation, existing = entry
+            if ref() is registry and cached_generation == generation:
                 return existing
         # Prune entries whose registry has been collected, then (re)build. The
         # weakref check above makes an id reused after GC safe: identity, not
         # the integer, is what decides a cache hit.
-        for stale_key in [k for k, (ref, _) in _HOOKS.items() if ref() is None]:
+        for stale_key in [k for k, (ref, _gen, _hook) in _HOOKS.items() if ref() is None]:
             del _HOOKS[stale_key]
         try:
             ref = weakref.ref(registry)
         except TypeError:  # registry is not weak-referenceable
             ref = _strong_ref(registry)
         built = _build_hook(registry)
-        _HOOKS[key] = (ref, built)
+        _HOOKS[key] = (ref, generation, built)
         return built
 
 

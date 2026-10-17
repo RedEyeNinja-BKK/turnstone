@@ -1205,3 +1205,67 @@ def test_exploding_registry_cannot_raise_into_the_task(monkeypatch):
     # And so is the seam itself.
     _sensor_observe_substantive("do the work", workstream="ws", registry=_Exploding())
     lifecycle.reset_hooks()
+
+
+def test_registry_reload_does_not_leave_a_stale_endpoint(tmp_path, monkeypatch):
+    """A same-object reload must invalidate the cached hook.
+
+    ModelRegistry.reload() swaps models IN PLACE on the same object and bumps
+    `generation`. A hook cache keyed only by object identity would therefore
+    keep answering with the endpoint resolved before the reload - graded
+    questions would silently go to a lane the operator has since changed.
+    """
+    monkeypatch.setattr(lifecycle, "ENABLED", True)
+    monkeypatch.setenv("TURNSTONE_SENSOR_STORE_DIR", str(tmp_path))
+    lifecycle.reset_hooks()
+
+    registry = _registry_with(**{DECISION_CAPABILITY: _typed_row("https://before.example")})
+    first = lifecycle.hook(registry)
+    assert first._sensor.switchyard == "https://before.example"
+
+    # Same object, mutated in place - exactly what the node's reload path does.
+    same_id = id(registry)
+    from turnstone.core.model_registry import KEY_GUARD_DEFERRED_TO_LIFESPAN
+
+    registry.reload(
+        {DECISION_CAPABILITY: _typed_config("https://after.example")},
+        DECISION_CAPABILITY,
+        [],
+        None,
+        app_state=KEY_GUARD_DEFERRED_TO_LIFESPAN,
+    )
+    assert id(registry) == same_id, "the registry must be the same object"
+    assert registry.generation > 0
+
+    second = lifecycle.hook(registry)
+    assert second._sensor.switchyard == "https://after.example", (
+        "hook cache served a stale endpoint after an in-place registry reload"
+    )
+    assert second is not first
+    lifecycle.reset_hooks()
+
+
+def _typed_config(base_url):
+    from turnstone.core.model_registry import ModelConfig
+
+    return ModelConfig(
+        alias=DECISION_CAPABILITY,
+        base_url=base_url,
+        api_key="synthetic-not-a-credential",
+        model="synthetic-model",
+        provider="openrouter",
+        capabilities={"supports_typed_decision": True},
+    )
+
+
+def test_hook_cache_is_stable_without_a_reload(tmp_path, monkeypatch):
+    """Generation-aware caching must still be a cache, not a rebuild per event."""
+    monkeypatch.setattr(lifecycle, "ENABLED", True)
+    monkeypatch.setenv("TURNSTONE_SENSOR_STORE_DIR", str(tmp_path))
+    lifecycle.reset_hooks()
+
+    registry = _registry_with(**{DECISION_CAPABILITY: _typed_row()})
+    first = lifecycle.hook(registry)
+    for _ in range(20):
+        assert lifecycle.hook(registry) is first
+    lifecycle.reset_hooks()

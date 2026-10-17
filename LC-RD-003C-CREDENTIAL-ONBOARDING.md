@@ -46,15 +46,22 @@ service identity can use the existing Grafana credential from its own runtime,
 without an operator shell. The credential remains root-owned and unreadable by
 the service identity; the grant carries one literal rule per verb.
 
-- `scripts/turnstone_grafana_readonly.py` — bounded read-only surface:
+- `scripts/turnstone_grafana_runtime.py` — bounded read surface:
   authenticated identity, organization, permissions, health, datasources,
-  folders, dashboards, alerts, and one bounded Prometheus/Loki query. Only one
-  POST exists (the fixed query proxy); its body is built from a validated
-  request. SQL datasource types are refused because read-only cannot be
-  structurally guaranteed.
+  folders, dashboard listing, dashboard detail, alerts, and one bounded
+  Prometheus/Loki query. Read verbs issue GET only against a fixed allow-list;
+  the query body is built from a validated request, and SQL datasource types
+  are refused because read-only cannot be structurally guaranteed.
+- `dashboard-write` — the single mutating entry point: create, update and
+  delete one dashboard. Update requires the dashboard's current version, so a
+  concurrent edit fails as a conflict instead of being overwritten; every
+  mutation writes the current document to `/var/log/turnstone-grafana/backups/`
+  first; delete is restricted to the `turnstone-` uid namespace; and a
+  non-empty revision message is mandatory so Grafana's own history records why.
 - `scripts/launch-grafana-readonly.sh` — accepts one verb from a closed set and
   execs the root-owned module. No daemon, no socket, no free-form argument.
-- `scripts/turnstone-grafana-readonly.sudoers` — nine rules, no wildcards.
+- `scripts/turnstone-grafana-readonly.sudoers` — one literal rule per verb, no
+  wildcards.
 - `scripts/install_grafana_runtime.sh install` — idempotent install with
   backup-before-replace and a `visudo` syntax gate.
 

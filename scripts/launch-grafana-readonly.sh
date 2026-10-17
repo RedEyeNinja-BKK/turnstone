@@ -35,7 +35,7 @@ if [ "$#" -ne 1 ]; then
 fi
 
 case "$1" in
-  identity|permissions|health|org|dashboards|folders|datasources|alerts|all|query|dashboard) ;;
+  identity|permissions|health|org|dashboards|folders|datasources|alerts|all|query|dashboard|dashboard-write) ;;
   *)
     echo "REFUSED: unknown verb" >&2
     exit 2

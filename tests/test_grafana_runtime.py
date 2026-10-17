@@ -28,7 +28,7 @@ from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-_SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "turnstone_grafana_readonly.py"
+_SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "turnstone_grafana_runtime.py"
 _spec = importlib.util.spec_from_file_location("grafana_readonly", _SCRIPT)
 assert _spec and _spec.loader
 grafana = importlib.util.module_from_spec(_spec)
@@ -590,7 +590,7 @@ def test_sudoers_verbs_match_the_launcher_exactly() -> None:
     import re
 
     rule_verbs = set(
-        re.findall(r"launch-grafana-readonly\.sh ([a-z]+)$", SUDOERS.read_text(), re.M)
+        re.findall(r"launch-grafana-readonly\.sh ([a-z-]+)$", SUDOERS.read_text(), re.M)
     )
     case_line = next(
         line.strip()
@@ -601,7 +601,7 @@ def test_sudoers_verbs_match_the_launcher_exactly() -> None:
     # Derived from the module, never a hand-maintained list: a verb the module
     # serves but the launcher or the sudoers template omits is unreachable at
     # runtime (the deployed 'org' verb was exactly that defect).
-    expected = set(grafana.ENDPOINTS) | {"all", "query", "dashboard"}
+    expected = set(grafana.ENDPOINTS) | {"all", "query", "dashboard", "dashboard-write"}
     assert launcher_verbs == expected
     assert rule_verbs == expected
 
@@ -610,7 +610,7 @@ def test_every_endpoint_verb_is_reachable_through_the_grant() -> None:
     import re
 
     rule_verbs = set(
-        re.findall(r"launch-grafana-readonly\.sh ([a-z]+)$", SUDOERS.read_text(), re.M)
+        re.findall(r"launch-grafana-readonly\.sh ([a-z-]+)$", SUDOERS.read_text(), re.M)
     )
     missing = set(grafana.ENDPOINTS) - rule_verbs
     assert not missing, f"verbs served by the module but grantless: {sorted(missing)}"
@@ -621,10 +621,232 @@ def test_sudoers_grants_no_wildcards_or_unrestricted_powers() -> None:
     assert "*" not in text
     assert "NOPASSWD: ALL" not in text
     assert "SETENV:" not in text
-    expected = set(grafana.ENDPOINTS) | {"all", "query", "dashboard"}
+    expected = set(grafana.ENDPOINTS) | {"all", "query", "dashboard", "dashboard-write"}
     assert text.count("NOPASSWD:") == len(expected)
     # The existing self-management bridge grant must not be touched here.
     assert "launch-self-mcp" not in text
+
+
+def _write(raw: bytes) -> dict:
+    return grafana.parse_dashboard_write_request(raw)
+
+
+def _refuses_write(raw: bytes) -> str:
+    try:
+        grafana.parse_dashboard_write_request(raw)
+    except grafana.GrafanaError as exc:
+        return str(exc)
+    raise AssertionError(f"write request must be refused: {raw!r}")
+
+
+_PANEL = {"title": "p", "type": "stat", "targets": [{"expr": "vector(1)"}]}
+
+
+def _create(uid: str = "turnstone-probe", **extra: Any) -> bytes:
+    body = {
+        "op": "create",
+        "uid": uid,
+        "message": "test create",
+        "dashboard": {"title": "T", "panels": []},
+        **extra,
+    }
+    return json.dumps(body).encode()
+
+
+def test_write_create_parses() -> None:
+    req = _write(_create())
+    assert req["op"] == "create"
+    assert req["uid"] == "turnstone-probe"
+    assert req["expected_version"] is None
+
+
+def test_write_refuses_non_owned_delete() -> None:
+    raw = json.dumps({"op": "delete", "uid": "switchyard-dashboard-v6"}).encode()
+    message = _refuses_write(raw)
+    assert "turnstone-" in message
+
+
+def test_write_allows_owned_delete() -> None:
+    req = _write(json.dumps({"op": "delete", "uid": "turnstone-probe"}).encode())
+    assert req["op"] == "delete"
+
+
+def test_write_update_requires_expected_version() -> None:
+    raw = json.dumps(
+        {
+            "op": "update",
+            "uid": "turnstone-probe",
+            "message": "m",
+            "dashboard": {"title": "T", "panels": []},
+        }
+    ).encode()
+    assert "expected_version" in _refuses_write(raw)
+
+
+def test_write_refuses_expected_version_on_create() -> None:
+    message = _refuses_write(_create(expected_version=3))
+    assert "only" in message
+
+
+def test_write_refuses_missing_message() -> None:
+    raw = json.dumps(
+        {"op": "create", "uid": "turnstone-probe", "dashboard": {"title": "T", "panels": []}}
+    ).encode()
+    assert "message" in _refuses_write(raw)
+
+
+def test_write_refuses_uid_mismatch_inside_document() -> None:
+    raw = json.dumps(
+        {
+            "op": "create",
+            "uid": "turnstone-a",
+            "message": "m",
+            "dashboard": {"title": "T", "uid": "turnstone-b", "panels": []},
+        }
+    ).encode()
+    assert "match" in _refuses_write(raw)
+
+
+def test_write_refuses_unknown_fields_and_bad_op() -> None:
+    assert "url" in _refuses_write(_create(url="https://evil.invalid"))
+    assert "op" in _refuses_write(json.dumps({"op": "purge", "uid": "turnstone-x"}).encode())
+
+
+def test_write_refuses_oversize_and_deep_nesting() -> None:
+    big = _create() + b" " * grafana.MAX_DASHBOARD_BYTES
+    assert "size bound" in _refuses_write(big)
+
+    deep: Any = {}
+    cursor = deep
+    for _ in range(grafana.MAX_DEPTH + 2):
+        cursor["n"] = {}
+        cursor = cursor["n"]
+    raw = json.dumps(
+        {
+            "op": "create",
+            "uid": "turnstone-probe",
+            "message": "m",
+            "dashboard": {"title": "T", "panels": [], "deep": deep},
+        }
+    ).encode()
+    assert "nesting" in _refuses_write(raw)
+
+
+def test_write_refuses_panel_flood() -> None:
+    raw = json.dumps(
+        {
+            "op": "create",
+            "uid": "turnstone-probe",
+            "message": "m",
+            "dashboard": {
+                "title": "T",
+                "panels": [_PANEL] * (grafana.MAX_DASHBOARD_PANELS + 1),
+            },
+        }
+    ).encode()
+    assert "panels" in _refuses_write(raw)
+
+
+def test_write_refuses_folder_uid_traversal() -> None:
+    assert "folder_uid" in _refuses_write(_create(folder_uid="../x"))
+
+
+def test_update_sends_the_expected_version() -> None:
+    import os
+    import tempfile
+
+    original_get, original_post = grafana.get_json, grafana.post_json
+    sent: list[dict] = []
+
+    def fake_get(path: str, token: str, *, timeout: int = 12):  # noqa: ANN001
+        return 200, {"dashboard": {"uid": "turnstone-probe", "version": 7}}
+
+    def fake_post(path: str, token: str, payload: dict, *, timeout: int = 20):  # noqa: ANN001
+        sent.append(payload)
+        return 200, {"version": 8, "status": "success", "url": "/d/x"}
+
+    grafana.get_json, grafana.post_json = fake_get, fake_post  # type: ignore[assignment]
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
+        os.environ["GRAFANA_BACKUP_DIR"] = tmp
+        try:
+            req = _write(
+                json.dumps(
+                    {
+                        "op": "update",
+                        "uid": "turnstone-probe",
+                        "message": "m",
+                        "expected_version": 7,
+                        "dashboard": {"title": "T", "panels": []},
+                    }
+                ).encode()
+            )
+            out, _ = grafana.run_dashboard_write("tok", req)
+        finally:
+            os.environ.pop("GRAFANA_BACKUP_DIR", None)
+            grafana.get_json, grafana.post_json = original_get, original_post
+
+    assert sent[0]["dashboard"]["version"] == 7
+    assert sent[0]["overwrite"] is True
+    assert out["new_version"] == 8
+
+
+def test_update_refuses_a_stale_version_before_writing() -> None:
+    original_get, original_post = grafana.get_json, grafana.post_json
+    calls: list[str] = []
+
+    def fake_get(path: str, token: str, *, timeout: int = 12):  # noqa: ANN001
+        return 200, {"dashboard": {"uid": "turnstone-probe", "version": 9}}
+
+    def fake_post(*a: Any, **k: Any):  # noqa: ANN002, ANN003
+        calls.append("post")
+        return 200, {}
+
+    grafana.get_json, grafana.post_json = fake_get, fake_post  # type: ignore[assignment]
+    try:
+        req = _write(
+            json.dumps(
+                {
+                    "op": "update",
+                    "uid": "turnstone-probe",
+                    "message": "m",
+                    "expected_version": 7,
+                    "dashboard": {"title": "T", "panels": []},
+                }
+            ).encode()
+        )
+        try:
+            grafana.run_dashboard_write("tok", req)
+        except grafana.GrafanaError as exc:
+            assert "version conflict" in str(exc)
+        else:
+            raise AssertionError("a stale version must be refused")
+    finally:
+        grafana.get_json, grafana.post_json = original_get, original_post
+    assert calls == [], "no write may be issued when the version check fails"
+
+
+def test_create_refuses_an_existing_uid() -> None:
+    original_get, original_post = grafana.get_json, grafana.post_json
+    calls: list[str] = []
+
+    def fake_get(path: str, token: str, *, timeout: int = 12):  # noqa: ANN001
+        return 200, {"dashboard": {"uid": "turnstone-probe", "version": 2}}
+
+    def fake_post(*a: Any, **k: Any):  # noqa: ANN002, ANN003
+        calls.append("post")
+        return 200, {}
+
+    grafana.get_json, grafana.post_json = fake_get, fake_post  # type: ignore[assignment]
+    try:
+        try:
+            grafana.run_dashboard_write("tok", _write(_create()))
+        except grafana.GrafanaError as exc:
+            assert "already exists" in str(exc)
+        else:
+            raise AssertionError("creating over an existing uid must be refused")
+    finally:
+        grafana.get_json, grafana.post_json = original_get, original_post
+    assert calls == []
 
 
 def test_launcher_and_installer_parse() -> None:

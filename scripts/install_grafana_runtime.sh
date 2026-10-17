@@ -27,7 +27,7 @@ SERVICE_USER=turnstone
 PYTHON=${GRAFANA_RUNTIME_PYTHON:-/opt/turnstone-venv/bin/python}
 SRC=${GRAFANA_RUNTIME_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 
-MODULE_SRC="$SRC/scripts/turnstone_grafana_readonly.py"
+MODULE_SRC="$SRC/scripts/turnstone_grafana_runtime.py"
 LAUNCHER_SRC="$SRC/scripts/launch-grafana-readonly.sh"
 SUDOERS_SRC="$SRC/scripts/turnstone-grafana-readonly.sudoers"
 LAUNCHER="$DEST/launch-grafana-readonly.sh"
@@ -193,7 +193,6 @@ cmd_install() {
   heading "Install"
   install_files
   install_sudoers
-  heading "Drift check"
   cmd_check || return 1
   heading "Verify"
   if cmd_verify; then

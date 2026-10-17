@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Bounded read-only Grafana integration for the turnstone-mgmt credential.
+"""Bounded Grafana integration for the turnstone-mgmt credential.
+
+READ AND WRITE ARE SEPARATE SURFACES. Every verb except ``dashboard-write``
+issues GET only, against a fixed allow-list. ``dashboard-write`` is the single
+mutating entry point; see its own section for the guards that make it safe.
 
 WHY IT LOOKS LIKE THIS
   The service-account token lives in ``/srv/turnstone/credentials/grafana/
@@ -56,7 +60,7 @@ RUNTIME INTERFACE
   and duration -- never the token and never the expression text.
 
 Usage (direct, as root, for maintenance):
-    sudo python3 scripts/turnstone_grafana_readonly.py health
+    sudo python3 scripts/turnstone_grafana_runtime.py health
 """
 
 from __future__ import annotations
@@ -88,6 +92,11 @@ MAX_PAGES = 50
 # untrusted upstream data and caller data can cross this boundary.
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_QUERY_REQUEST_BYTES = 4096
+# A dashboard document is legitimately large; the write surface gets its own
+# bound rather than a shared one, so raising it cannot loosen a query.
+MAX_DASHBOARD_BYTES = 512 * 1024
+MAX_DASHBOARD_PANELS = 400
+MAX_DEPTH = 40
 MAX_EXPR_CHARS = 512
 MAX_RANGE_MINUTES = 1440
 MAX_STEP_SECONDS = 3600
@@ -99,8 +108,20 @@ MAX_PANELS_REPORTED = 200
 MAX_VALUES_SCANNED = 20000
 
 QUERY_PATH = "/api/ds/query"
+DASHBOARD_WRITE_PATH = "/api/dashboards/db"
 QUERY_DATASOURCE_TYPES = frozenset({"prometheus", "loki"})
 AUDIT_PATH = "/var/log/turnstone-grafana/audit.jsonl"
+BACKUP_DIR = "/var/log/turnstone-grafana/backups"
+
+# Deleting is the one irreversible dashboard operation, so it is restricted to
+# the uid namespace this integration owns. Create and update are recoverable
+# (every mutation is backed up first); delete is not, and must never be able to
+# remove an operator-authored production dashboard.
+OWNED_UID_PREFIX = "turnstone-"
+WRITE_OPS = frozenset({"create", "update", "delete"})
+_ALLOWED_WRITE_KEYS = frozenset(
+    {"op", "uid", "expected_version", "folder_uid", "message", "dashboard"}
+)
 
 _UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 _ALLOWED_QUERY_KEYS = frozenset({"datasource_uid", "expr", "kind", "minutes", "step_s"})
@@ -601,6 +622,206 @@ def run_dashboard(token: str, uid: str) -> dict[str, Any]:
     return {"status": status, "dashboard": summarize_dashboard(body)}
 
 
+# ---------------------------------------------------------------------------
+# dashboard writes
+# ---------------------------------------------------------------------------
+#
+# This is the only mutating surface. It is deliberately narrow:
+#
+#   * three operations, each mapped to one fixed route -- there is no
+#     caller-supplied path, method or verb;
+#   * create and update are refused unless the dashboard's *current* version
+#     is supplied, so a concurrent edit is a 412 rather than silent loss;
+#   * every mutation first writes the current document to BACKUP_DIR, so any
+#     change is revertible without Grafana's version history;
+#   * delete is restricted to the OWNED_UID_PREFIX namespace because it is the
+#     one operation a backup cannot make safe;
+#   * a non-empty ``message`` is mandatory, so Grafana's own revision log
+#     records why the version changed, not just that it did.
+
+
+def _check_depth(value: Any, depth: int = 0) -> None:
+    if depth > MAX_DEPTH:
+        raise GrafanaError(f"dashboard nesting exceeds {MAX_DEPTH} levels")
+    if isinstance(value, dict):
+        for item in value.values():
+            _check_depth(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _check_depth(item, depth + 1)
+
+
+def parse_dashboard_write_request(raw: bytes) -> dict[str, Any]:
+    """Validate one write request. Returns a normalised, bounded dict."""
+    if not raw:
+        raise GrafanaError("write request is empty")
+    if len(raw) > MAX_DASHBOARD_BYTES:
+        raise GrafanaError("write request exceeds the size bound")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise GrafanaError("write request is not valid JSON") from None
+    if not isinstance(data, dict):
+        raise GrafanaError("write request must be a JSON object")
+
+    unknown = set(data) - _ALLOWED_WRITE_KEYS
+    if unknown:
+        raise GrafanaError("unsupported write field(s): " + ", ".join(sorted(unknown)))
+
+    op = data.get("op")
+    if op not in WRITE_OPS:
+        raise GrafanaError("op must be one of: " + ", ".join(sorted(WRITE_OPS)))
+
+    uid = data.get("uid")
+    if not isinstance(uid, str) or not _UID_RE.match(uid):
+        raise GrafanaError("uid must be 1-40 characters of [A-Za-z0-9_-]")
+
+    message = data.get("message")
+    if op in ("create", "update"):
+        if not isinstance(message, str) or not message.strip():
+            raise GrafanaError("message must be a non-empty string (it is the revision note)")
+        if len(message) > 256:
+            raise GrafanaError("message must be at most 256 characters")
+
+    if op == "delete":
+        if not uid.startswith(OWNED_UID_PREFIX):
+            raise GrafanaError(
+                f"delete is restricted to uids beginning with {OWNED_UID_PREFIX!r}; "
+                "operator-authored dashboards are never removed by this tool"
+            )
+        return {"op": op, "uid": uid, "message": message}
+
+    dashboard = data.get("dashboard")
+    if not isinstance(dashboard, dict):
+        raise GrafanaError("dashboard must be a JSON object")
+    _check_depth(dashboard)
+    title = dashboard.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise GrafanaError("dashboard.title must be a non-empty string")
+    if len(title) > 256:
+        raise GrafanaError("dashboard.title must be at most 256 characters")
+    panels = dashboard.get("panels")
+    if not isinstance(panels, list):
+        raise GrafanaError("dashboard.panels must be a list")
+    if len(panels) > MAX_DASHBOARD_PANELS:
+        raise GrafanaError(f"dashboard may hold at most {MAX_DASHBOARD_PANELS} panels")
+    inner_uid = dashboard.get("uid")
+    if inner_uid is not None and inner_uid != uid:
+        raise GrafanaError("dashboard.uid must match the request uid when present")
+
+    folder_uid = data.get("folder_uid")
+    if folder_uid is not None and (
+        not isinstance(folder_uid, str) or not _UID_RE.match(folder_uid)
+    ):
+        raise GrafanaError("folder_uid must be null or an allowed uid")
+
+    expected = data.get("expected_version")
+    if op == "update":
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise GrafanaError("expected_version is required for update; read the dashboard first")
+        if expected < 0:
+            raise GrafanaError("expected_version must be non-negative")
+    elif expected is not None:
+        raise GrafanaError("expected_version applies only to update")
+
+    return {
+        "op": op,
+        "uid": uid,
+        "message": message,
+        "dashboard": dashboard,
+        "folder_uid": folder_uid,
+        "expected_version": expected,
+    }
+
+
+def _backup_dashboard(uid: str, version: Any, body: Any) -> str | None:
+    """Persist the current document before mutating it. None when absent."""
+    if body is None:
+        return None
+    directory = os.environ.get("GRAFANA_BACKUP_DIR") or BACKUP_DIR
+    try:
+        os.makedirs(directory, mode=0o750, exist_ok=True)
+    except OSError as exc:
+        raise GrafanaError(f"backup directory unavailable ({type(exc).__name__})") from None
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    path = os.path.join(directory, f"{uid}-v{version}-{stamp}.json")
+    payload = json.dumps(body, indent=2, sort_keys=True).encode("utf-8")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise GrafanaError(f"backup write failed ({type(exc).__name__})") from None
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o640)
+        os.chown(path, -1, os.stat(directory).st_gid)
+    return path
+
+
+def run_dashboard_write(token: str, request: dict[str, Any]) -> tuple[dict[str, Any], list[int]]:
+    """Execute one validated dashboard mutation."""
+    op = request["op"]
+    uid = request["uid"]
+    current_status, current_body = get_json(f"/api/dashboards/uid/{uid}", token)
+    current = current_body.get("dashboard") if isinstance(current_body, dict) else None
+    current_version = current.get("version") if isinstance(current, dict) else None
+    statuses = [current_status]
+
+    if op == "create":
+        if current_status == 200:
+            raise GrafanaError("a dashboard with this uid already exists; use update")
+    elif op == "update":
+        if current_status != 200 or not isinstance(current, dict):
+            raise GrafanaError(f"dashboard not found (status {current_status})")
+        if current_version != request["expected_version"]:
+            raise GrafanaError(
+                f"version conflict: dashboard is at {current_version}, "
+                f"request expected {request['expected_version']}"
+            )
+    else:  # delete
+        if current_status != 200 or not isinstance(current, dict):
+            raise GrafanaError(f"dashboard not found (status {current_status})")
+
+    backup = _backup_dashboard(uid, current_version, current_body if current else None)
+
+    if op == "delete":
+        status, body = _request_json("DELETE", f"/api/dashboards/uid/{uid}", token)
+        statuses.append(status)
+        return (
+            {"op": op, "uid": uid, "status": status, "body": body, "backup": backup},
+            statuses,
+        )
+
+    document = dict(request["dashboard"])
+    document["uid"] = uid
+    if op == "update":
+        document["version"] = request["expected_version"]
+    payload: dict[str, Any] = {
+        "dashboard": document,
+        "message": request["message"],
+        "overwrite": True,
+    }
+    if request.get("folder_uid") is not None:
+        payload["folderUid"] = request["folder_uid"]
+    status, body = post_json(DASHBOARD_WRITE_PATH, token, payload)
+    statuses.append(status)
+    result: dict[str, Any] = {
+        "op": op,
+        "uid": uid,
+        "status": status,
+        "backup": backup,
+        "previous_version": current_version,
+    }
+    if isinstance(body, dict):
+        result["new_version"] = body.get("version")
+        result["url"] = body.get("url")
+        result["saved"] = body.get("status")
+    return result, statuses
+
+
 def run_query(token: str, request: dict[str, Any]) -> tuple[dict[str, Any], list[int]]:
     """Resolve, build and execute one bounded query."""
     datasource, ds_status = resolve_datasource(token, request["datasource_uid"])
@@ -782,14 +1003,19 @@ def _audit(fd: int, record: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Bounded read-only Grafana checks")
-    parser.add_argument("command", choices=[*ENDPOINTS, "query", "dashboard", "all"])
+    parser = argparse.ArgumentParser(description="Bounded Grafana integration")
+    parser.add_argument(
+        "command", choices=[*ENDPOINTS, "query", "dashboard", "dashboard-write", "all"]
+    )
     parser.add_argument("--limit", type=int, default=PAGE_LIMIT)
     args = parser.parse_args(argv)
 
+    stdin_limit = (
+        MAX_DASHBOARD_BYTES if args.command == "dashboard-write" else MAX_QUERY_REQUEST_BYTES
+    )
     raw = (
-        sys.stdin.buffer.read(MAX_QUERY_REQUEST_BYTES + 1)
-        if args.command in ("query", "dashboard")
+        sys.stdin.buffer.read(stdin_limit + 1)
+        if args.command in ("query", "dashboard", "dashboard-write")
         else b""
     )
     started = time.monotonic()
@@ -846,6 +1072,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(out, indent=2, sort_keys=True))
         return 0 if out["status"] == 200 else 4
+
+    if args.command == "dashboard-write":
+        try:
+            write_request = parse_dashboard_write_request(raw)
+        except GrafanaError as exc:
+            finish("refused", [], {"error": type(exc).__name__})
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 3
+        detail = {
+            "op": write_request["op"],
+            "dashboard_uid": write_request["uid"],
+            "expected_version": write_request.get("expected_version"),
+        }
+        try:
+            out, statuses = run_dashboard_write(token, write_request)
+        except GrafanaError as exc:
+            finish("error", [], {**detail, "error": type(exc).__name__})
+            print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True))
+            return 4
+        ok = out["status"] in (200, 202) and out.get("saved") != "error"
+        finish(
+            "ok" if ok else "upstream_error",
+            statuses,
+            {**detail, "new_version": out.get("new_version"), "backup": out.get("backup")},
+        )
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0 if ok else 4
 
     if args.command == "query":
         try:

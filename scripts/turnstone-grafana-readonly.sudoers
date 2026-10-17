@@ -24,3 +24,4 @@ turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/laun
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh all
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh query
 turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh dashboard
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh dashboard-write

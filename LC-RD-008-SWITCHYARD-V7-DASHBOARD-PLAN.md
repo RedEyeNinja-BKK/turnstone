@@ -1,12 +1,10 @@
 # LC-RD-008 — Switchyard Dashboard V7.0 deployment plan
 
-Status: **planned, not built, not deployed.**
-Measured 2026-10-17 against the live deployment on `switchyard-vm`.
-
+Status: **DEPLOYED 2026-10-17** — `turnstone-switchyard-v7`, version 1, 35
+panels. Scrape prerequisite satisfied; see §4.1.
 `SWITCHYARD DASHBOARD V6.7` (`switchyard-dashboard-v6`, version 16) is used as
-a **visual and structural reference only**. It describes the outgoing
-Switchyard, which is being retired; V7.0 neither extends it nor preserves its
-metric contract. The two coexist until the old deployment is decommissioned.
+a **visual and structural reference only**, remains unmodified, and its series
+are untouched.
 
 ---
 
@@ -127,6 +125,8 @@ dashboard one.
 
 ## 4. Blocking prerequisite: Prometheus is not scraping this deployment
 
+**Resolved 2026-10-17 — see §4.1.**
+
 | | Outgoing instance | This deployment |
 |---|---|---|
 | Where | `localclaw-vm` | `switchyard-vm` |
@@ -155,6 +155,49 @@ series and would look healthy while describing the wrong system.
    `switchyard_build_info{job="switchyard-v7"}` present. The tell is the
    **absence** of a `hostname` label, which is the fingerprint of this build.
 4. Only then build panels.
+
+### 4.1 What was actually done
+
+The scrape originates on **agent-vm**, the Alloy hub (`alloy.service`, Alloy
+v1.19.2, `/etc/alloy/config.alloy`). That host is the only one in the estate
+that reaches both the tailnet metrics endpoint and the central Prometheus.
+`switchyard-vm` itself cannot reach `10.10.20.33:9090`, so a push or a local
+scrape from that host was not an option.
+
+One component block was appended:
+
+```alloy
+prometheus.scrape "switchyard_v7" {
+	targets = [{
+		"__address__" = "switchyard-vm.tailc8ef7b.ts.net:443",
+		instance      = "switchyard-vm",
+		job           = "switchyard-v7",
+		origin_host   = "switchyard-vm",
+		vlan          = "50",
+	}]
+	scheme          = "https"
+	scrape_interval = "15s"
+	scrape_timeout  = "10s"
+	forward_to      = [prometheus.relabel.canonicalize_metrics.receiver]
+}
+```
+
+`job="switchyard"` (the outgoing deployment, reported by localclaw-vm) is
+unchanged and still scraped; nothing was repointed in place.
+
+Evidence the gate is satisfied:
+
+| Check | Result |
+|---|---|
+| `alloy validate` on the candidate | pass |
+| backup before install | `/etc/alloy/config.alloy.bak-v7-20261017T125827Z` |
+| `alloy validate` on the installed file | pass |
+| `systemctl reload alloy` | exit 0, service active |
+| `up{job="switchyard-v7"}` | **1**, `instance=switchyard-vm` |
+| `switchyard_build_info{job="switchyard-v7"}` | present, `version=0.3.0` |
+| `switchyard_*` families for the new job | **32** (all emitted families) |
+| `hostname` label on the new series | absent — the fingerprint of this build |
+| outgoing `up{job="switchyard"}` | still 1, unchanged |
 
 ---
 
@@ -235,6 +278,8 @@ report on its predecessor.
 
 ## 6. Build and deploy procedure
 
+**Executed 2026-10-17. Outcome below.**
+
 1. **Prerequisite gate** — §4 items 1-4. Do not proceed otherwise.
 2. Generate the dashboard JSON from §5; validate locally with the runtime's own
    `parse_dashboard_write_request` so the 512 KiB / 400-panel / depth-40 bounds
@@ -260,22 +305,50 @@ unchanged during the overlap.
 
 ## 7. Open questions for the operator
 
-1. **Scrape path.** Is `switchyard-vm` reachable from the Prometheus/Alloy host
-   over the tailnet? If not, which host should scrape it?
-2. **Job naming and cutover.** Use `switchyard-v7` alongside the existing
-   `job="switchyard"` during comparison, or repoint `switchyard` at cutover?
-   The plan assumes the former and avoids mutating the old job.
-3. **Row coverage.** All seven rows, or should decisions/run-health be merged?
-4. **Annotations.** Should V7.0 carry any static note about the deployment
-   (unit name, config hash), or stay purely metric-driven?
+None blocking. Remaining choices are cosmetic: whether to promote `algorithm`
+when a second value appears, and when to retire the outgoing `job="switchyard"`
+series at cutover.
+
+---
+
+## 7.1 Deployment result
+
+| Item | Value |
+|---|---|
+| Dashboard | `turnstone-switchyard-v7` — `SWITCHYARD DASHBOARD V7.0` |
+| Version | 1 |
+| Panels | 35 (7 rows, 7 stat, 20 timeseries, 1 table) |
+| Variables | `model` (5 options), `algorithm` (1), `outcome` (4) |
+| Queries | 30, **all** pinned to `job="switchyard-v7"`, none unpinned |
+| Dashboard count in org | 21 |
+| `switchyard-dashboard-v6` | still version 16, 50 panels, unmodified |
+
+Every one of the 21 panel query shapes was executed against Prometheus before
+creation and returned at least one series. Rate-valued panels read 0 because
+the deployment carries only health traffic; `switchyard_total_requests` = 3413.
+Latency quantiles return no value until a histogram bucket is non-empty, which
+is expected and not a panel error.
 
 ---
 
 ## 8. Out of scope
 
 - Any change to `switchyard-vm`: no config, restart, instrumentation or lane
-  change. This document is read-only against that host.
+  change. This work was read-only against that host.
 - Any change to `SWITCHYARD DASHBOARD V6.7`, including extension or repair.
   It is a reference template for an outgoing system.
-- Prometheus/Alloy configuration changes; those live on another host and need
-  separate authorization.
+- Prometheus configuration on docker-vm: no edit was made there, because the
+  Alloy hub on agent-vm reaches both ends and the remote-write receiver was
+  already enabled.
+- Retiring the outgoing `job="switchyard"` series; that belongs to cutover.
+
+## 9. Rollback
+
+1. Remove the Alloy block and restore the timestamped backup:
+   `sudo cp /etc/alloy/config.alloy.bak-v7-20261017T125827Z /etc/alloy/config.alloy`
+   then `sudo systemctl reload alloy`.
+2. Delete the dashboard through the runtime:
+   `{"op":"delete","uid":"turnstone-switchyard-v7"}` via `dashboard-write`
+   (permitted by the `turnstone-` namespace rule).
+
+Neither step affects the outgoing deployment's series or V6.7.

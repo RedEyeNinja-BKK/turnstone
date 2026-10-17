@@ -38,3 +38,28 @@ It prompts twice, without echoing the value. Do not paste tokens into chat or a 
 Next: encrypted **off-VM** backup with operator-owned recovery authority; host-key pinning; additive new client-key authorization on agent-vm (keep legacy grants), and new full-management account on switchyard-vm (keep operator account). Test SSH as unprivileged Turnstone OS user using the pinned host keys and explicit `IdentityFile` then `sudo -n` and remote tool health before claiming access. Any new remote service account with `NOPASSWD:ALL` and full agent tool access is explicitly requested by the operator; do not silently reduce it.
 
 Do not duplicate existing model keys in root-only files and call the work complete: pinned 1.8.7 lacks model secret references and the process cannot read root-only Grafana files until an approved runtime integration exists. No Switchyard route import, smart/tier reformation, dashboard redeploy, Codex OAuth, HTPC/comfyninja mutations or per-node service changes are authorized by these scripts.
+
+## Runtime integration added, 2026-10-17
+
+The operator approved an additive, exact-argv sudo grant so the Turnstone
+service identity can use the existing Grafana credential from its own runtime,
+without an operator shell. The credential remains root-owned and unreadable by
+the service identity; the grant carries only these nine literal invocations.
+
+- `scripts/turnstone_grafana_readonly.py` — bounded read-only surface:
+  authenticated identity, organization, permissions, health, datasources,
+  folders, dashboards, alerts, and one bounded Prometheus/Loki query. Only one
+  POST exists (the fixed query proxy); its body is built from a validated
+  request. SQL datasource types are refused because read-only cannot be
+  structurally guaranteed.
+- `scripts/launch-grafana-readonly.sh` — accepts one verb from a closed set and
+  execs the root-owned module. No daemon, no socket, no free-form argument.
+- `scripts/turnstone-grafana-readonly.sudoers` — nine rules, no wildcards.
+- `scripts/install_grafana_runtime.sh install` — idempotent install with
+  backup-before-replace and a `visudo` syntax gate.
+
+The existing self-management MCP bridge grant is unchanged. Installation is a
+root step: the service identity cannot write `/etc/sudoers.d`. After installing,
+`install_grafana_runtime.sh check` reports drift and `verify` exercises the
+interface as `turnstone`.
+

@@ -1,7 +1,8 @@
-# LC-RD-008 — Switchyard Dashboard V7.0 deployment plan
+# LC-RD-008 — Switchyard Dashboard V7
 
-Status: **DEPLOYED 2026-10-17** — `turnstone-switchyard-v7`, version 1, 35
-panels. Scrape prerequisite satisfied; see §4.1.
+Status: **DEPLOYED 2026-10-17** — `turnstone-switchyard-v7`,
+`SWITCHYARD DASHBOARD V7.1` (Grafana version 3). Scrape prerequisite satisfied;
+see §4.1. Revision history in §7.2-7.3.
 `SWITCHYARD DASHBOARD V6.7` (`switchyard-dashboard-v6`, version 16) is used as
 a **visual and structural reference only**, remains unmodified, and its series
 are untouched.
@@ -311,7 +312,7 @@ series at cutover.
 
 ---
 
-## 7.1 Deployment result
+## 7.1 Deployment result — V7.0 (initial)
 
 | Item | Value |
 |---|---|
@@ -328,6 +329,86 @@ creation and returned at least one series. Rate-valued panels read 0 because
 the deployment carries only health traffic; `switchyard_total_requests` = 3413.
 Latency quantiles return no value until a histogram bucket is non-empty, which
 is expected and not a panel error.
+
+---
+
+## 7.2 Revision convention
+
+The dashboard title carries the **published revision**, and each revision bumps
+it. The uid stays `turnstone-switchyard-v7` for the life of the dashboard.
+
+| Title | Grafana version | Meaning |
+|---|---|---|
+| `SWITCHYARD DASHBOARD V7.0` | 1 | initial build |
+| `SWITCHYARD DASHBOARD V7.1` | 3 | adds ROUTE LINEUP & PROVIDER ACCESS |
+
+Grafana's own `version` increments on every API write, so a correction made
+while a revision is still unpublished consumes a version without consuming a
+revision. V7.1 was written twice: version 2 introduced the row, version 3
+corrected the direct/primitive classification inside it before publication.
+Both share the title `V7.1` because no published revision changed.
+
+From V7.1 onward: each published change increments the title (V7.2, V7.3 …)
+and the plan records the title, Grafana version and what changed.
+
+---
+
+## 7.3 Revision V7.1 — ROUTE LINEUP & PROVIDER ACCESS
+
+Added as the **first** row, matching where V6.7 placed it. It is a reference
+for layout only; the content is derived from this deployment's manifest.
+
+### Panels
+
+| Panel | Type | Source |
+|---|---|---|
+| CATALOG SUMMARY | text | manifest counts + `/v1/models` |
+| MODELS WITH TRAFFIC | stat | `count(count by (model) (switchyard_requests_total))` |
+| UPSTREAM ERRORS (24h) | stat | `sum(increase(upstream_attempts_total{outcome!="ok"}[24h]))` |
+| PROVIDER ACCESS | text | manifest join: provider → endpoint, routes, ids, egress |
+| REQUESTS BY PROVIDER | timeseries | one series per provider, matched on the `model` label |
+| ROUTE LINEUP | text | all 28 routes with provider, id, ctx, tool, vision, policy, candidates |
+| TIERS · DECISION LANES · CAPABILITIES | text | composites, decision lanes, embedding/rerank |
+| UPSTREAM ATTEMPTS BY OUTCOME / CODE | timeseries | the live provider-access signal |
+
+### Why the catalog is text, not a query
+
+Prometheus carries no `route` or `provider` label. A stat panel showing "28
+routes" would have to be `count(...) * 0 + 28` — a fabricated metric. The
+catalog therefore renders from the manifest at build time, and every panel that
+*is* a query shows only what the metric surface can prove.
+
+### Manifest review findings
+
+- **28/28 consistency.** Every route in `routes.toml` appears in `/v1/models`
+  and vice versa. Declared `context_window`, `tool_calling` and `vision` match
+the served `context_length` and `capabilities` for all 28 — zero drift.
+- **7 provider clients.** Six serve completion traffic (`deepseek`, `htpc`,
+  `thaillm`, `openai`, `openrouter`, `comfyninja`); `openai_nt` is a second
+  client over the same endpoint and credential with reasoning disabled.
+- **Egress verified from `switchyard-vm`** without credentials: all seven
+  endpoints reachable (401 where a key is required, 200 where the model list is
+  public). Decision backends: `:8011` returns 405 and `:8765` returns 404 to a
+  GET on `/v1/systemone`, i.e. both listening and expecting POST.
+- **`model`-label collision.** `gpt-6-luna` is the upstream id for both
+  `direct-openai-gpt-6-luna` and `direct-openai-gpt-6-luna-nt`, so the metrics
+  cannot separate thinking from non-thinking on that provider. The panel groups
+  them as `openai + openai_nt` and says so.
+- **Two routes lack tool calling:** `direct-thaillm-qwen3_5-9b` and
+  `direct-thaillm-qwen3_6-35b-a3b` — streaming only, as the manifest declares.
+- **28 catalog entries, 5 with live traffic** at build time.
+
+### Result
+
+| Item | Value |
+|---|---|
+| Title | `SWITCHYARD DASHBOARD V7.1` |
+| Grafana version | 3 |
+| Panels | 44 (8 rows, 2 stat, 21 timeseries, 4 text, 1 table) |
+| Queries | 39, all pinned to `job="switchyard-v7"`, none unpinned |
+| Duplicate panel ids | none |
+| `switchyard-dashboard-v6` | still version 16, 50 panels, unmodified |
+
 
 ---
 

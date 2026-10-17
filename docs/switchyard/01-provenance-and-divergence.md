@@ -16,21 +16,23 @@ Reference for the Switchyard running on `switchyard-vm`. Measured 2026-10-17.
 | Host | `switchyard-vm` (`100.65.106.53`) |
 | Unit | `switchyard-neutral-green.service` (`User=switchyard`) |
 | Binary | `/opt/switchyard/bin/switchyard-server` |
-| Binary sha256 | `74963b1d57c664172175f820f2b94c8ad790629feb2965538c9a09983387d147` |
+| Binary sha256 (deployed) | `b183a87157eaf1917e61601343a84df2fb08be4b20f959d562d8b75cf4b1196c` (media gate; baseline was `74963b1d57c664…`) |
 | Build id | `7f4d76212f363150ad13382fedb27cafec9c06da` |
 | Reported version | `switchyard-server 0.3.0` |
 | Config | `/etc/switchyard/routes.toml` sha256 `7b8445b20346670fa712f1e2b82b81730126df738054e6aef5340ea5dbcc326f` (V7.2; was `9a6448ef…` before the rerank `top_n` change) |
-| Source tree | `/home/vincent/switchyard-migration/production-src` — **a clone of the bundle, not the build tree** (see below) |
-| Source commit | `2c6e6df53e9dbac9f6121d9780e4c09930d51b40` (2026-10-04), detached HEAD, clean working tree |
-| Decision | `fix(translation): let a Responses upstream require a list-shaped input` |
+| Source tree | `localclaw-vm:/home/vincent/.local/lib/localclaw-switchyard/src` (original build host, clean) |
+| Source commit | `6de85da15b68294cfda1775a1afa6e30ebd3cf16` (2026-10-05), branch `fix/decision-named-lane-composition-20261004` |
+| Fork on GitHub | `RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005` |
+| Built with | rustc `1.99.0 (b940084d7 2026-09-28)`, Ubuntu 24.04, GCC 13.3 — reproduces this hash bitwise |
+| Decision | `fix(decision): an unaddressed request is served by the DECLARED default lane` |
 | Bind | `127.0.0.1:4000`, published on the tailnet TLS listener (`:443`) |
-| Started | `2026-10-16 00:19:07 +07` |
+| Started | restarted 2026-10-18 00:39 +07 for the media gate |
 
-`--version` prints the crate version only. There is no embedded commit hash in
-the binary (`2c6e6df` does not appear in the image; the two 40-hex strings it
-does carry, `b940084d…` and `1b9c0d5f…`, match no known commit), so provenance
-comes from the source tree, not from the artifact. **Record the source commit,
-not just `0.3.0`, in any deployment receipt.**
+`--version` prints the crate version only; no commit hash is embedded. The two
+40-hex strings the image does carry are toolchain identifiers, not revisions:
+`b940084d7…` is the rustc commit for 1.99.0 and `1b9c0d5f…` is LLD 23.1.1.
+They identify the build environment, not the source, so **record the source
+commit, not just `0.3.0`, in any deployment receipt**.
 
 ### The local source bundle does not match this binary
 
@@ -91,12 +93,68 @@ The tarball contains no sources and records no commit: the only provenance
 file inside it, `PRE-STATE`, lists hashes, the unit fragment and the argv the
 process was started with.
 
-**Consequence:** a rebuild from the bundle — or from the `production-src`
-clone, which is the same tree — cannot be deployed. It would reject the live
-manifest at startup. Any source change to this deployment needs the tree that
-produced `74963b1d…`, which is not present on `switchyard-vm`, `agent-vm` or
-`turnstone-vm`; regenerating the bundle from it and re-verifying against the
-running binary is the only verified alternative.
+### The authentic source: `localclaw-vm` and the fork on GitHub
+
+The project was developed and built on **`localclaw-vm`** (tailnet
+`100.106.125.92`), not on `switchyard-vm`. `switchyard-vm` is the October 15
+migration destination. Reaching the original host needs root there; from
+`agent-vm` or `switchyard-vm`, `sudo ssh 100.106.125.92` works, and the tree is
+read as `sudo -u vincent` so git does not trip on ownership.
+
+| Fact | Value |
+|---|---|
+| Original tree | `localclaw-vm:/home/vincent/.local/lib/localclaw-switchyard/src` |
+| Branch | `fix/decision-named-lane-composition-20261004` |
+| HEAD | `6de85da15b68294cfda1775a1afa6e30ebd3cf16` |
+| Working tree | clean (`git status --porcelain` empty) |
+| Cargo.lock | `5262f62deb3ca69e7900ea3b89dd68af5e857bd3a3c3efe6cc66d03cb7e61f16` |
+| Toolchain pin | `rust-toolchain.toml` → 1.99 |
+| Preserved on GitHub | `RedEyeNinja-BKK/Switchyard`, branch `v6-decision-planes-20261005`, same HEAD |
+
+The six commits between `2c6e6df5` and `6de85da1` are the missing work, and
+they touch exactly five files: `config.rs`, `decision_executor.rs`,
+`runner.rs`, `tests/decision_lane_naming.rs`, and `decision_surface.rs`.
+`default_decision_lane` and `decision_lane_composition` appear in `config.rs`.
+
+The build is recorded in shared-workspace evidence on `localclaw-vm`:
+`shared-workspace/operations/evidence/v6-decision-named-lanes-20261004/`
+holds `candidate-switchyard-server` (sha256 `74963b1d…`, 26,984,312 bytes),
+its `SHA256SUMS`, the five source files and the patch, written at 07:08 on
+2026-10-05 — two minutes after the final commit at 07:06.
+
+### Reproduction is bitwise
+
+`git archive` of `6de85da1`, built with rustc **1.99.0**
+(`b940084d7 2026-09-28`) on Ubuntu 24.04 with GCC 13.3, reproduces the
+deployed binary **exactly**:
+
+```
+74963b1d57c664172175f820f2b94c8ad790629feb2965538c9a09983387d147
+```
+
+Recipe: `cargo build --release --locked -p switchyard-server` with
+`CARGO_HOME=$HOME/.cargo`, from a checkout at `6de85da1`. Bitwise identity
+depends on all four: the commit, that rustc release, that GCC, and the
+crate-registry path. Building on `agent-vm` (rustc 1.99.1, Debian GCC 14.2)
+compiles and passes every test but yields `becc1143…` — 59,600 bytes larger,
+with `.text` differing by 0.15% and every crate disambiguator different. That
+is a toolchain difference, not a source difference.
+
+`switchyard-vm` itself never compiled the project: no `cargo`, `rustc`,
+`~/.cargo`, `~/.rustup` or `target/` exists there. `~/.bash_history` shows an
+unpack-and-install of a prebuilt tarball, `switchyard-runtime.tgz`
+(sha256 `2dd21ecf42a3…`) → `runtime-unpacked/…/switchyard-server` → `sudo install`.
+All four copies on that host are byte-identical (`74963b1d…`) except the
+`decision-lanes-20261005T033957Z` rollback anchor (`2de55530…`), which is the
+binary that preceded the lane feature. The tarball carries no sources and no
+commit; its only provenance file, `PRE-STATE`, lists hashes and the unit argv.
+
+### Consequence for the stale bundle
+
+A rebuild from the bundle — or from the `production-src` clone on
+`switchyard-vm`, which is the same tree — cannot be deployed: it rejects the
+live manifest at startup (`unknown field decision_lane_composition`). Use
+`6de85da1` from the fork, or the original host, for any source change.
 
 ---
 

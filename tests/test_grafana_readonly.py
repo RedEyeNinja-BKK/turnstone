@@ -16,6 +16,7 @@ Run standalone::
 
     TMPDIR=/var/tmp /opt/turnstone-venv/bin/python tests/test_grafana_readonly.py
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -39,8 +40,9 @@ class _Response:
         self.status = status
         self._body = body
 
-    def read(self) -> bytes:
-        return json.dumps(self._body).encode()
+    def read(self, n: int = -1) -> bytes:
+        raw = json.dumps(self._body).encode()
+        return raw if n is None or n < 0 else raw[:n]
 
     def __enter__(self) -> _Response:
         return self
@@ -59,7 +61,11 @@ class _Opener:
         self.requests.append(request)
         if self.status >= 400:
             raise urllib.error.HTTPError(
-                request.full_url, self.status, "err", {}, None  # type: ignore[arg-type]
+                request.full_url,
+                self.status,
+                "err",
+                {},
+                None,  # type: ignore[arg-type]
             )
         return _Response(self.status, self.body)
 
@@ -239,6 +245,278 @@ def test_alert_summary_counts_by_state() -> None:
 def test_permissions_summary_counts_without_listing() -> None:
     out = grafana.summarize("permissions", {"dashboards:read": ["*"], "orgs:read": ["*"]})
     assert out == {"action_count": 2}
+
+
+# ---------------------------------------------------------------------------
+# runtime interface: identity, discovery, bounded queries
+# ---------------------------------------------------------------------------
+
+_SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
+LAUNCHER = _SCRIPTS / "launch-grafana-readonly.sh"
+SUDOERS = _SCRIPTS / "turnstone-grafana-readonly.sudoers"
+INSTALLER = _SCRIPTS / "install_grafana_runtime.sh"
+
+
+def _refuses(raw: bytes) -> str:
+    try:
+        grafana.parse_query_request(raw)
+    except grafana.GrafanaError as exc:
+        return str(exc)
+    raise AssertionError(f"request must be refused: {raw!r}")
+
+
+def test_identity_summary_omits_email() -> None:
+    out = grafana.summarize(
+        "identity",
+        {
+            "id": 7,
+            "login": "svc",
+            "name": "Service",
+            "email": "person@example.invalid",
+            "orgId": 1,
+            "isGrafanaAdmin": False,
+        },
+    )
+    assert "email" not in out
+    assert out["login"] == "svc"
+    assert out["orgId"] == 1
+
+
+def test_folder_and_dashboard_search_kinds_are_distinct() -> None:
+    assert "type=dash-folder" in grafana.ENDPOINTS["folders"](100)
+    assert "type=dash-db" in grafana.ENDPOINTS["dashboards"](100)
+
+
+def test_query_request_defaults_are_normalised() -> None:
+    req = grafana.parse_query_request(b'{"datasource_uid":"P1abc","expr":"vector(1)"}')
+    assert req == {
+        "datasource_uid": "P1abc",
+        "expr": "vector(1)",
+        "kind": "instant",
+        "minutes": 15,
+        "step_s": 30,
+    }
+
+
+def test_query_request_refuses_unknown_fields() -> None:
+    message = _refuses(b'{"datasource_uid":"P1","expr":"up","url":"https://evil.invalid"}')
+    assert "url" in message
+
+
+def test_query_request_refuses_control_characters_and_non_ascii() -> None:
+    assert "ASCII" in _refuses(b'{"datasource_uid":"P1","expr":"up\\nvector(1)"}')
+    assert "ASCII" in _refuses('{"datasource_uid":"P1","expr":"üp"}'.encode())
+
+
+def test_query_request_refuses_bool_as_integer() -> None:
+    assert "integer" in _refuses(b'{"datasource_uid":"P1","expr":"up","minutes":true}')
+
+
+def test_query_request_refuses_an_oversized_window() -> None:
+    message = _refuses(
+        b'{"datasource_uid":"P1","expr":"up","kind":"range","minutes":120,"step_s":5}'
+    )
+    assert "points" in message
+
+
+def test_query_request_refuses_excess_bytes() -> None:
+    raw = b'{"datasource_uid":"P1","expr":"' + b"a" * grafana.MAX_QUERY_REQUEST_BYTES + b'"}'
+    assert "size bound" in _refuses(raw)
+
+
+def test_datasource_resolution_refuses_sql_by_type() -> None:
+    original = grafana.get_json
+
+    def fake(path: str, token: str, *, timeout: int = 12):  # noqa: ANN001
+        return 200, [{"uid": "sql1", "name": "pg", "type": "postgres"}]
+
+    grafana.get_json = fake  # type: ignore[assignment]
+    try:
+        grafana.resolve_datasource("tok", "sql1")
+    except grafana.GrafanaError as exc:
+        assert "not queryable" in str(exc)
+    else:
+        raise AssertionError("a SQL datasource must be refused")
+    finally:
+        grafana.get_json = original
+
+
+def test_datasource_resolution_refuses_an_unknown_uid() -> None:
+    original = grafana.get_json
+
+    def fake(path: str, token: str, *, timeout: int = 12):  # noqa: ANN001
+        return 200, [{"uid": "prom1", "name": "p", "type": "prometheus"}]
+
+    grafana.get_json = fake  # type: ignore[assignment]
+    try:
+        try:
+            grafana.resolve_datasource("tok", "other")
+        except grafana.GrafanaError as exc:
+            assert "not present" in str(exc)
+        else:
+            raise AssertionError("an unknown uid must be refused")
+    finally:
+        grafana.get_json = original
+
+
+def test_build_query_instant_is_bounded() -> None:
+    request = grafana.parse_query_request(b'{"datasource_uid":"P1","expr":"up","minutes":5}')
+    ds = {"uid": "P1", "type": "prometheus", "name": "p"}
+    payload = grafana.build_query(request, ds, now_ms=1_700_000_000_000)
+    assert payload["to"] == "1700000000000"
+    assert payload["from"] == str(1_700_000_000_000 - 5 * 60 * 1000)
+    query = payload["queries"][0]
+    assert query["instant"] is True
+    assert query["range"] is False
+    assert query["maxDataPoints"] == 1
+    assert "queryType" not in query  # Prometheus, not Loki
+
+
+def test_build_query_range_caps_points_and_sets_loki_type() -> None:
+    request = grafana.parse_query_request(
+        b'{"datasource_uid":"L1","expr":"{job=~\\".+\\"}","kind":"range","minutes":10,"step_s":60}'
+    )
+    ds = {"uid": "L1", "type": "loki", "name": "l"}
+    query = grafana.build_query(request, ds, now_ms=1_700_000_000_000)["queries"][0]
+    assert query["maxDataPoints"] == 10
+    assert query["intervalMs"] == 60_000
+    assert query["queryType"] == "range"
+    assert query["maxLines"] == 100
+
+
+def test_post_is_used_only_for_the_fixed_query_path() -> None:
+    opener = _Opener(200, {"results": {}})
+    _patch(opener)
+    grafana.post_json(grafana.QUERY_PATH, "SUPER-SECRET-TOKEN", {"queries": []})
+    request = opener.requests[0]
+    assert request.get_method() == "POST"
+    assert request.full_url.endswith("/api/ds/query")
+    assert "SUPER-SECRET-TOKEN" not in request.full_url
+    assert request.get_header("Authorization", "").startswith("Bearer ")
+
+
+def test_oversized_response_is_refused() -> None:
+    class _Big:
+        status = 200
+
+        def read(self, n: int = -1) -> bytes:
+            return b"x" * (grafana.MAX_RESPONSE_BYTES + 1)
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+    class _BigOpener:
+        def open(self, request, timeout=None):  # noqa: ANN001
+            return _Big()
+
+    grafana._opener = lambda: _BigOpener()  # type: ignore[assignment]
+    try:
+        grafana.get_json("/api/health", "tok")
+    except grafana.GrafanaError as exc:
+        assert "size bound" in str(exc)
+    else:
+        raise AssertionError("an oversized response must be refused")
+
+
+def test_audit_record_hashes_the_expression_and_never_the_token() -> None:
+    import hashlib
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
+        path = os.path.join(tmp, "audit.jsonl")
+        fd = grafana._open_audit(path)
+        try:
+            grafana._audit(
+                fd,
+                {
+                    "verb": "query",
+                    "detail": {
+                        "expr_len": 2,
+                        "expr_sha256": hashlib.sha256(b"up").hexdigest(),
+                        "datasource_uid": "P1",
+                    },
+                },
+            )
+        finally:
+            os.close(fd)
+        line = pathlib.Path(path).read_text(encoding="utf-8")
+    record = json.loads(line)
+    assert record["detail"]["expr_sha256"] == hashlib.sha256(b"up").hexdigest()
+    assert "expr" not in record["detail"]
+    assert "SUPER-SECRET-TOKEN" not in line
+
+
+def test_query_summary_is_bounded() -> None:
+    body = {
+        "results": {
+            "A": {
+                "status": 200,
+                "frames": [
+                    {
+                        "schema": {"name": "f", "fields": [{}, {"labels": {"a": "b"}}]},
+                        "data": {"values": [[1000, 2000], [1, 2]]},
+                    }
+                ],
+            }
+        }
+    }
+    out = grafana.summarize_query(body)
+    assert out is not None
+    assert out["A"]["points"] == 2
+    assert out["A"]["series"][0]["last"] == 2
+    assert out["A"]["series"][0]["label_count"] == 1
+
+
+def test_aggregate_verb_never_runs_a_query() -> None:
+    assert "query" not in grafana.ALL_VERBS
+    assert set(grafana.ALL_VERBS) <= set(grafana.ENDPOINTS)
+
+
+def test_sudoers_verbs_match_the_launcher_exactly() -> None:
+    import re
+
+    rule_verbs = set(
+        re.findall(r"launch-grafana-readonly\.sh ([a-z]+)$", SUDOERS.read_text(), re.M)
+    )
+    case_line = next(
+        line.strip()
+        for line in LAUNCHER.read_text().splitlines()
+        if line.strip().startswith("identity|")
+    )
+    launcher_verbs = set(case_line.split(")")[0].split("|"))
+    assert rule_verbs == launcher_verbs
+    assert rule_verbs == {
+        "identity",
+        "permissions",
+        "health",
+        "dashboards",
+        "folders",
+        "datasources",
+        "alerts",
+        "all",
+        "query",
+    }
+
+
+def test_sudoers_grants_no_wildcards_or_unrestricted_powers() -> None:
+    text = SUDOERS.read_text()
+    assert "*" not in text
+    assert "NOPASSWD: ALL" not in text
+    assert "SETENV:" not in text
+    assert text.count("NOPASSWD:") == 9
+    # The existing self-management bridge grant must not be touched here.
+    assert "launch-self-mcp" not in text
+
+
+def test_launcher_and_installer_parse() -> None:
+    import subprocess
+
+    for script in (LAUNCHER, INSTALLER):
+        subprocess.run(["bash", "-n", str(script)], check=True)
 
 
 def _run_all() -> int:

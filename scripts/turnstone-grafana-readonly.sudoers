@@ -1,0 +1,24 @@
+# Installed to /etc/sudoers.d/turnstone-grafana-readonly (root:root 0440).
+#
+# Bounded read-only Grafana runtime interface for the Turnstone service
+# identity. ADDITIVE: it grants nothing beyond these exact argv forms and does
+# not touch the existing self-management MCP bridge grant.
+#
+# Exact argv only -- one literal verb per rule, no wildcards, no SETENV. The
+# only variable input is a bounded JSON request on stdin, validated by the
+# root-owned module and never by sudo.
+#
+# !use_pty keeps JSON on stdout byte-clean and avoids terminal allocation for a
+# non-interactive, non-terminating command.
+
+Defaults!/opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh !use_pty
+
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh identity
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh permissions
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh health
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh dashboards
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh folders
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh datasources
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh alerts
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh all
+turnstone ALL=(root) NOPASSWD: /opt/turnstone-integrations/grafana-readonly/launch-grafana-readonly.sh query

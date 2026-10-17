@@ -473,6 +473,18 @@ def test_store_creates_a_private_root() -> None:
         assert stat.S_IMODE(root.stat().st_mode) == 0o700
 
 
+def test_lock_file_is_private() -> None:
+    with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        root = pathlib.Path(tmp) / "store"
+        _seed(root, expires_in=-1)
+        OAuthTokenStore(root, post_form=_CountingPost()).access_token()
+        lock = root / "credentials.lock"
+        assert lock.exists()
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600, (
+            "a lock file inside the credential store must not be world-readable"
+        )
+
+
 def test_store_refuses_to_overlap_codex_credentials() -> None:
     try:
         OAuthTokenStore(pathlib.Path.home() / ".codex" / "turnstone-oauth")

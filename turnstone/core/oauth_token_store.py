@@ -319,7 +319,13 @@ class OAuthTokenStore:
             return str(creds["access_token"])
 
         self._ensure_root()
-        with open(self.lock_path, "a+", encoding="utf-8") as lock:
+        # Create the lock at 0600 rather than inheriting the process umask: the
+        # file holds no data, but a world-readable artifact inside a 0700
+        # credential store is an invitation to confuse it with content.
+        lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        with contextlib.suppress(OSError):
+            os.chmod(self.lock_path, 0o600)
+        with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 # (1) A peer may have refreshed while we waited for the lock.

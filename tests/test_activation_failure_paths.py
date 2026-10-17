@@ -670,6 +670,39 @@ def test_benign_sse_disconnect_does_not_fail_activation() -> None:
     _with_harness(body)
 
 
+def test_benign_disconnect_split_across_journal_lines() -> None:
+    """journald may store a traceback as separately prefixed entries.
+
+    The console's JSON record usually arrives as one line with escaped newlines,
+    but journald can split it. Both shapes must be classified the same way, and
+    the journal prefix must not defeat the indentation rule.
+    """
+
+    split = "\n".join(
+        [
+            'Oct 17 18:05:28 host turnstone-console[1]: {"event": "SSE failed", '
+            '"exception": "Traceback (most recent call last):',
+            'Oct 17 18:05:28 host turnstone-console[1]:   File "/opt/x/httpx/_models.py", '
+            "line 1055, in aiter_raw",
+            "Oct 17 18:05:28 host turnstone-console[1]:     async for chunk in self.stream:",
+            'Oct 17 18:05:28 host turnstone-console[1]:   File "/opt/x/httpx_sse/_api.py", '
+            "line 42, in aiter_sse",
+            "Oct 17 18:05:28 host turnstone-console[1]:     async for line in lines:",
+            "Oct 17 18:05:28 host turnstone-console[1]: httpx.RemoteProtocolError: "
+            'peer closed connection without sending complete message body"}',
+        ]
+    )
+
+    def body(h: Harness) -> None:
+        (h.state / "journal_error").write_text(split + "\n")
+        p = h.run("activate", "--confirm")
+        out = p.stdout + p.stderr
+        assert p.returncode == 0, f"prefixed benign traceback failed activation: {out[-600:]}"
+        assert "ACTIVATED" in p.stdout
+
+    _with_harness(body)
+
+
 def test_fatal_import_error_still_fails_activation() -> None:
     """Narrowing the gate must not blind it to a genuine startup failure."""
 

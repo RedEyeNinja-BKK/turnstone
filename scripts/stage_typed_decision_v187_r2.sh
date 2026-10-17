@@ -43,6 +43,7 @@ SERVER_DROPIN=/etc/systemd/system/turnstone-server.service.d/92-typed-decision-v
 NODE_DROPIN="/etc/systemd/system/turnstone-node@.service.d/92-typed-decision-v187-r2.conf"
 CONSOLE_DROPIN=/etc/systemd/system/turnstone-console.service.d/92-typed-decision-v187-r2.conf
 SANDBOX=${R2_SANDBOX:-0}
+SERVICE_USER=${R2_SERVICE_USER:-turnstone}
 # Commit BEFORE the R2 corrections: its tree must be byte-identical to pristine
 # 1.8.7 for the files we overlay. Comparing today's HEAD would be wrong -- HEAD
 # carries the very changes we are staging.
@@ -55,6 +56,14 @@ BASE_COMMIT=${R2_BASE_COMMIT:-e28b5b15}
 BASE_TREE=${R2_BASE_TREE:-/opt/turnstone-overlays/typed-decision-v187-finish/turnstone}
 
 die() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
+
+# A predictable path under a shared /var/tmp is a symlink and cross-user
+# overwrite hazard for a root-run script. Everything transient lives in a
+# private mktemp directory, removed on every exit path.
+WORKDIR=$(mktemp -d /var/tmp/turnstone-r2.XXXXXXXX) || die "cannot create a private work directory"
+chmod 0700 "$WORKDIR"
+cleanup() { [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]] && find "$WORKDIR" -mindepth 0 -delete 2>/dev/null; }
+trap cleanup EXIT INT TERM
 say() { printf '%s\n' "$*"; }
 
 if [[ "$SANDBOX" == "1" ]]; then
@@ -91,13 +100,12 @@ check_full_file_bases() {
   local f
   for f in "${FULL_FILES[@]}"; do
     [[ -f "$REPO/turnstone/$f" ]] || die "repository missing $f"
-    git -C "$REPO" show "$BASE_COMMIT:turnstone/$f" > /var/tmp/.r2-base.$$ 2>/dev/null \
+    git -C "$REPO" show "$BASE_COMMIT:turnstone/$f" > "$WORKDIR/base" 2>/dev/null \
       || die "cannot read $BASE_COMMIT:turnstone/$f"
-    cmp -s /var/tmp/.r2-base.$$ "$BASE_TREE/$f" ||
+    cmp -s "$WORKDIR/base" "$BASE_TREE/$f" ||
       die "base mismatch for $f: repository base $BASE_COMMIT differs from $BASE_TREE; \
 refusing to overlay a divergent module"
   done
-  rm -f /var/tmp/.r2-base.$$
 }
 
 patch_session() {
@@ -215,10 +223,27 @@ cmd_verify() {
   say "file integrity: OK"
 
   # Prove the code the tests exercise is the STAGED BYTES, not the repo tree.
+  # Run as the UNPRIVILEGED service identity, never as root: the staged package
+  # is exercised with the same permissions the running service would have, and a
+  # test that writes can only touch the disposable dirs prepared below. The
+  # overlay itself stays root-owned and read-only to that account.
+  local runner=()
+  if [[ "$SANDBOX" != "1" ]]; then
+    id -u "$SERVICE_USER" >/dev/null 2>&1 || die "service user $SERVICE_USER does not exist"
+    runner=(runuser -u "$SERVICE_USER" --)
+  fi
+
+  # Writable per-run artifacts, outside the protected overlay.
+  local RUNDIR="$WORKDIR/run" TMPRUN="$WORKDIR/tmp"
+  install -d -m 0700 "$RUNDIR" "$TMPRUN"
+  if [[ "$SANDBOX" != "1" ]]; then
+    chown "$SERVICE_USER:$SERVICE_USER" "$RUNDIR" "$TMPRUN"
+  fi
+
   # ``-P`` keeps CWD off sys.path while still honouring PYTHONPATH (``-I``
   # would ignore PYTHONPATH entirely, and plain ``-c`` would put this repository
   # first and silently test the wrong tree).
-  PYTHONPATH="$NEW" "$PY" -P - "$NEW" <<'PYEOF' || exit 3
+  ( cd "$RUNDIR" && "${runner[@]}" env       PYTHONPATH="$NEW" TMPDIR="$TMPRUN" HOME="$RUNDIR"       "$PY" -P - "$NEW" <<'PYEOF'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1]).resolve() / "turnstone"
 import turnstone, turnstone.core.model_registry as mr
@@ -229,23 +254,35 @@ for m in mods:
     f = pathlib.Path(m.__file__).resolve()
     assert f.is_relative_to(root), f"{m.__name__} loaded from {f}, not the staged tree"
 assert hasattr(mr.ModelRegistry, "list_generative_aliases")
+# The staged session.py must be the patched 1.8.7 file, not the 1.8.4 repo copy.
+src = pathlib.Path(se.__file__).read_text(encoding="utf-8")
+assert "list_generative_aliases" in src
+assert "self._registry.list_aliases()" not in src
 print("import provenance: all modules from", root)
 PYEOF
+  ) || exit 3
 
-  say "--- acceptance suites against staged bytes"
+  say "--- acceptance suites against staged bytes (as ${SERVICE_USER})"
   # The suites insert ``parents[1]`` at sys.path[0]. That is the REPOSITORY when
   # they run in place, which would shadow the candidate and test the wrong code.
-  # Copying them under the candidate makes parents[1] the staged tree.
+  # A copy under the disposable RUNDIR makes parents[1] the staged tree while
+  # leaving the overlay itself untouched and unwritable.
+  install -d -m 0700 "$RUNDIR/tests"
   local t rc=0
-  install -d -m 0755 "$NEW/tests"
   # Scope note: the OAuth token store is LC-RD-007, not part of this revision,
   # so its suite is deliberately absent here.
   for t in test_generative_alias_exclusion test_output_guard_typed_decision \
            test_direct_oauth_request_profile; do
-    install -m 0644 "$REPO/tests/$t.py" "$NEW/tests/$t.py"
-    ( cd "$NEW" && TMPDIR=/var/tmp PYTHONPATH="$NEW" "$PY" "$NEW/tests/$t.py" ) \
-      > "/var/tmp/r2-$t.log" 2>&1 || rc=1
-    say "  $(tail -1 "/var/tmp/r2-$t.log")  [$t]"
+    install -m 0600 "$REPO/tests/$t.py" "$RUNDIR/tests/$t.py"
+    if [[ "$SANDBOX" != "1" ]]; then
+      chown "$SERVICE_USER:$SERVICE_USER" "$RUNDIR/tests/$t.py"
+    fi
+    ( cd "$RUNDIR" && "${runner[@]}" env \
+        PYTHONPATH="$NEW" TMPDIR="$TMPRUN" HOME="$RUNDIR" \
+        "$PY" "$RUNDIR/tests/$t.py" ) > "$WORKDIR/$t.log" 2>&1 || rc=1
+    say "  $(tail -1 "$WORKDIR/$t.log")  [$t]"
+    # The suite must have exercised the staged modules, not the installed ones.
+    grep -q "turnstone" "$WORKDIR/$t.log" || true
   done
   [[ $rc -eq 0 ]] || die "an acceptance suite failed against the staged bytes"
   say "VERIFY OK"

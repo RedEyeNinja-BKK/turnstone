@@ -139,8 +139,12 @@ def test_cli_banner_excludes_typed_aliases() -> None:
     Read as source text rather than importing turnstone.cli: the module pulls
     the full interactive dependency stack, which a unit test should not need.
     """
-    cli = pathlib.Path(__file__).resolve().parents[1] / "turnstone" / "cli.py"
-    src = cli.read_text(encoding="utf-8")
+    # Resolve from the IMPORTED module, never from this file's location: the
+    # suite is copied into a disposable directory when run against a staged
+    # candidate, so ``parents[1]`` would not be the package under test.
+    import turnstone.cli as cli_mod
+
+    src = pathlib.Path(cli_mod.__file__).read_text(encoding="utf-8")
     assert "registry.list_generative_aliases()" in src
     assert "registry.list_aliases()" not in src
 
@@ -158,8 +162,9 @@ def test_console_picker_excludes_typed_aliases() -> None:
     reach it. The handler must skip a typed-decision row itself, and must skip
     BEFORE appending.
     """
-    server = pathlib.Path(__file__).resolve().parents[1] / "turnstone" / "console" / "server.py"
-    src = server.read_text(encoding="utf-8")
+    import turnstone.console.server as console_mod
+
+    src = pathlib.Path(console_mod.__file__).read_text(encoding="utf-8")
     assert 'is_typed_decision = bool(caps.get("supports_typed_decision"))' in src
     guard = src.index("if is_typed_decision:")
     append = src.index("models.append(entry)")

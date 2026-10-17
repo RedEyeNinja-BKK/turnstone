@@ -368,6 +368,26 @@ cmd_stage() {
   say "compileall: OK"
 }
 
+# Create the test-copy directory so the TEST IDENTITY can traverse it, then prove
+# it before any suite runs. `install -d -m 0700` creates it root-owned: chowning
+# only the copied FILES leaves a root-owned 0700 parent that the unprivileged
+# identity cannot enter, and every suite dies with "Permission denied" for a
+# reason that has nothing to do with the code under test.
+prepare_tests_dir() {
+  local dir="$1" who="$2" sandbox="$3"
+  install -d -m 0700 "$dir"
+  if [[ "$sandbox" != "1" ]]; then
+    chown "$who:$who" "$dir"
+  fi
+  # 0700 and owned by the test identity: private, and only they can write.
+  [[ "$(stat -c '%a' "$dir")" == "700" ]] || die "test directory is not 0700: $dir"
+  if [[ "$sandbox" != "1" ]]; then
+    [[ "$(stat -c '%U' "$dir")" == "$who" ]] || die "test directory not owned by $who: $dir"
+    runuser -u "$who" -- test -x "$dir" ||
+      die "TESTS_DIR_NOT_TRAVERSABLE by $who: $dir"
+  fi
+}
+
 cmd_verify() {
   [[ -d "$NEW/turnstone" ]] || die "no staged candidate at $NEW"
   local f
@@ -442,7 +462,7 @@ PYEOF
   # they run in place, which would shadow the candidate and test the wrong code.
   # A copy under the disposable RUNDIR makes parents[1] the staged tree while
   # leaving the overlay itself untouched and unwritable.
-  install -d -m 0700 "$RUNDIR/tests"
+  prepare_tests_dir "$RUNDIR/tests" "$SERVICE_USER" "$SANDBOX"
   local t rc=0
   # Scope note: the OAuth token store is LC-RD-007, not part of this revision,
   # so its suite is deliberately absent here.
@@ -451,6 +471,10 @@ PYEOF
     install -m 0600 "$REPO/tests/$t.py" "$RUNDIR/tests/$t.py"
     if [[ "$SANDBOX" != "1" ]]; then
       chown "$SERVICE_USER:$SERVICE_USER" "$RUNDIR/tests/$t.py"
+      # Prove the identity that will run it can actually READ it, rather than
+      # inferring that from a successful chown.
+      runuser -u "$SERVICE_USER" -- test -r "$RUNDIR/tests/$t.py" ||
+        die "TEST_FILE_NOT_READABLE by $SERVICE_USER: $RUNDIR/tests/$t.py"
     fi
     ( cd "$RUNDIR" && "${runner[@]}" env \
         PYTHONPATH="$NEW" TMPDIR="$TMPRUN" HOME="$RUNDIR" \

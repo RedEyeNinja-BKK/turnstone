@@ -106,6 +106,26 @@ cmd_stage() {
   say "compileall: OK"
 }
 
+# Create the test-copy directory so the TEST IDENTITY can traverse it, then prove
+# it before any suite runs. `install -d -m 0700` creates it root-owned: chowning
+# only the copied FILES leaves a root-owned 0700 parent that the unprivileged
+# identity cannot enter, and every suite dies with "Permission denied" for a
+# reason that has nothing to do with the code under test.
+prepare_tests_dir() {
+  local dir="$1" who="$2" sandbox="$3"
+  install -d -m 0700 "$dir"
+  if [[ "$sandbox" != "1" ]]; then
+    chown "$who:$who" "$dir"
+  fi
+  # 0700 and owned by the test identity: private, and only they can write.
+  [[ "$(stat -c '%a' "$dir")" == "700" ]] || die "test directory is not 0700: $dir"
+  if [[ "$sandbox" != "1" ]]; then
+    [[ "$(stat -c '%U' "$dir")" == "$who" ]] || die "test directory not owned by $who: $dir"
+    runuser -u "$who" -- test -x "$dir" ||
+      die "TESTS_DIR_NOT_TRAVERSABLE by $who: $dir"
+  fi
+}
+
 cmd_verify() {
   [[ -d "$NEW/turnstone" ]] || die "no staged candidate at $NEW"
 
@@ -160,13 +180,19 @@ PYEOF
   say "imports: staged bytes confirmed"
 
   # --- acceptance suites, as the unprivileged identity --------------------
-  install -d -m 0700 "$RUNDIR/tests"
+  prepare_tests_dir "$RUNDIR/tests" "$SERVICE_USER" "$SANDBOX"
   local t rc=0
   for t in test_openai_oauth_auth_mode test_oauth_token_store \
            test_generative_alias_exclusion test_output_guard_typed_decision \
            test_direct_oauth_request_profile; do
     install -m 0600 "$REPO/tests/$t.py" "$RUNDIR/tests/$t.py"
-    if [[ "$SANDBOX" != "1" ]]; then chown "$SERVICE_USER:$SERVICE_USER" "$RUNDIR/tests/$t.py"; fi
+    if [[ "$SANDBOX" != "1" ]]; then
+      chown "$SERVICE_USER:$SERVICE_USER" "$RUNDIR/tests/$t.py"
+      # Prove the identity that will run it can actually READ it, rather than
+      # inferring that from a successful chown.
+      runuser -u "$SERVICE_USER" -- test -r "$RUNDIR/tests/$t.py" ||
+        die "TEST_FILE_NOT_READABLE by $SERVICE_USER: $RUNDIR/tests/$t.py"
+    fi
     ( cd "$RUNDIR" && "${runner[@]}" env PYTHONPATH="$NEW" TMPDIR="$RUNDIR" HOME="$RUNDIR" \
         "$PY" "$RUNDIR/tests/$t.py" ) > "$WORKDIR/$t.log" 2>&1 || rc=1
     say "  $(tail -1 "$WORKDIR/$t.log")  [$t]"

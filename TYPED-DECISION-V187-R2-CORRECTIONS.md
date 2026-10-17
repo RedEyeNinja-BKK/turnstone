@@ -283,3 +283,71 @@ sudo bash scripts/stage_openai_oauth_v187.sh verify
 ```
 
 `activate` refuses on both scripts; production activation remains a separate gate.
+
+## Verifier permission defect (2026-10-17, post-staging)
+
+R2 staging succeeded; verification then failed with `Permission denied` for all
+three acceptance suites.
+
+**Cause.** `install -d -m 0700 "$RUNDIR/tests"` creates the directory as **root**,
+and only the copied *files* were chowned. A root-owned 0700 parent denies the
+unprivileged identity the execute bit, so `turnstone` could not enter the
+directory even though it owned and could read every file inside it. The same
+pattern existed in `stage_openai_oauth_v187.sh`.
+
+**Fix.** A shared `prepare_tests_dir` helper in both scripts:
+
+* creates the directory, then **chowns the directory itself** (not just files);
+* asserts mode is `700` and owner is the test identity, so it stays private and
+  writable only by that identity;
+* proves traversability with `runuser -u <who> -- test -x <dir>` **before** any
+  suite starts, instead of inferring it from a successful chown;
+* per copied file, proves readability with `test -r` as that same identity.
+
+The overlay itself remains root-owned and unwritable by `turnstone`; nothing in
+the protected slot is chowned.
+
+**No restaging.** The existing `/opt/turnstone-overlays/typed-decision-v187-r2`
+candidate was inspected read-only and is sound - `model_registry.py` and
+`console/server.py` carry the patches and zero `openai_oauth` references,
+`session.py` has all five patched sites, `_openai_responses.py` has the
+`tool_search` guard, and the two whole-file copies match the repository. This was
+a harness defect only, so R2 is re-**verified**, not rebuilt.
+
+### Tier 3 fixture - same class of defect
+
+The privileged Git-ownership fixture used `TemporaryDirectory`, which is `0700`
+owned by root; chowning the repo to the service identity left the parent
+impassable, so the owner-side read failed on a permission error and the fixture
+would have reported a false negative about the very guard it tests. The fixture
+now chmods its parent `0755` and asserts traversability with `test -x` as the
+service identity *before* the authoritative assertions.
+
+### Reporting
+
+`tests/test_staging_git_ownership.py` now prints
+`executed / passed / failed / skipped / total` separately, names each skip, and
+states plainly that skipped tiers were **not verified** in that run. A
+self-reporting skip is no longer also counted as a pass.
+
+Baseline on this host (unprivileged): `executed: 12 passed: 12 failed: 0 skipped: 1`.
+
+### Operator sequence (unchanged slots)
+
+```bash
+cd /var/lib/turnstone/github/turnstone
+
+# R2: verify the EXISTING candidate - do not restage
+sudo bash scripts/stage_typed_decision_v187_r2.sh verify
+
+# Then the OAuth package
+sudo bash scripts/stage_openai_oauth_v187.sh stage
+sudo bash scripts/stage_openai_oauth_v187.sh verify
+```
+
+Optional authoritative Tier 3:
+
+```bash
+sudo TMPDIR=/var/tmp /opt/turnstone-venv/bin/python \
+  tests/test_staging_git_ownership.py
+```

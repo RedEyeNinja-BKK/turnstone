@@ -130,6 +130,39 @@ def test_oauth_script_invokes_no_git_at_all() -> None:
     assert "subprocess" not in src
 
 
+def test_both_staging_scripts_prepare_a_traversable_tests_dir() -> None:
+    """Regression: a root-owned 0700 tests dir blocked every suite.
+
+    `install -d -m 0700` creates the directory as root; chowning only the copied
+    FILES leaves a root-owned parent the test identity cannot enter, and each
+    suite fails with "Permission denied" for a reason unrelated to the code.
+    """
+    for script in (R2_SCRIPT, OAUTH_SCRIPT):
+        src = script.read_text(encoding="utf-8")
+        assert "prepare_tests_dir() {" in src, script.name
+        assert 'prepare_tests_dir "$RUNDIR/tests"' in src, script.name
+        helper = src[src.index("prepare_tests_dir() {"):]
+        helper = helper[: helper.index("\n}\n") + 3]
+        assert 'chown "$who:$who" "$dir"' in helper, "directory must be chowned, not just files"
+        assert 'test -x "$dir"' in helper, "traversability must be proven, not assumed"
+        assert '"700"' in helper, "the directory must stay private"
+
+
+def test_test_files_are_proven_readable_by_the_test_identity() -> None:
+    for script in (R2_SCRIPT, OAUTH_SCRIPT):
+        src = script.read_text(encoding="utf-8")
+        assert 'test -r "$RUNDIR/tests/$t.py"' in src, script.name
+
+
+def test_verify_never_removes_an_existing_slot() -> None:
+    """Repairing a verifier must never destroy an immutable candidate."""
+    src = R2_SCRIPT.read_text(encoding="utf-8")
+    verify = src[src.index("cmd_verify() {"):]
+    verify = verify[: verify.index("\n}\n")]
+    assert "-delete" not in verify
+    assert "rm -r" not in verify and "rm -f" not in verify
+
+
 # ---------------------------------------------------------------------------
 # TIER 2 — the guard is real on this host (measured, not assumed)
 # ---------------------------------------------------------------------------
@@ -161,6 +194,13 @@ def test_git_really_refuses_a_repo_owned_by_another_uid() -> None:
 def test_sandbox_repo_owned_by_the_invoker_is_readable() -> None:
     """Control: the same code path works when owner == invoker."""
     with tempfile.TemporaryDirectory(dir=_TMP) as tmp:
+        # TemporaryDirectory creates a 0700 directory owned by THIS uid (root
+        # here). Chowning the repo to the service identity is not enough: that
+        # identity still cannot traverse a root-owned 0700 parent, so the
+        # owner-side read would fail on a permission error and the fixture
+        # would report a false negative about the very thing it tests.
+        os.chmod(tmp, 0o755)
+        assert _run(["test", "-x", str(_TMP)]).returncode == 0
         repo = pathlib.Path(tmp) / "r"
         assert _run(["git", "init", "-q", str(repo)]).returncode == 0
         assert _run(
@@ -205,6 +245,13 @@ def test_root_can_read_a_repo_owned_by_the_service_user() -> None:
         assert bare.returncode != 0, "expected Git to refuse the foreign-owned repo"
         assert "dubious ownership" in (bare.stdout + bare.stderr)
 
+        # Intermediate proof: the fixture itself must be reachable by the
+        # identity, or every later assertion would measure the fixture.
+        traversable = _run(["runuser", "-u", service_user, "--", "test", "-x", str(repo)])
+        assert traversable.returncode == 0, (
+            "fixture unreachable by the service identity; the parent chain is not traversable"
+        )
+
         # (b) the same read as the owner MUST succeed
         owned = _run(
             ["runuser", "-u", service_user, "--", "git", "-C", str(repo),
@@ -223,18 +270,33 @@ def _uid_gid(name: str) -> tuple[int, int]:
 
 def _run_all() -> int:
     tests = [(n, o) for n, o in sorted(globals().items()) if n.startswith("test_") and callable(o)]
-    passed = failed = 0
+    passed = failed = skipped = 0
     for name, fn in tests:
+        skipped_before = len(_SKIPPED)
         try:
             fn()
-            passed += 1
-            print(f"  PASS {name}")
+            if len(_SKIPPED) > skipped_before:
+                # A test that self-reported a skip must not also count as a pass.
+                skipped += 1
+                print(f"  SKIP {name}")
+            else:
+                passed += 1
+                print(f"  PASS {name}")
         except Exception as exc:  # noqa: BLE001
             failed += 1
             print(f"  FAIL {name}: {type(exc).__name__}: {exc}")
     for reason in _SKIPPED:
         print(f"  SKIP {reason}")
-    print(f"\n  {passed} passed, {failed} failed, {len(tests)} total, {len(_SKIPPED)} skipped")
+    # Report the two counts separately and never let a skip read as a pass: an
+    # unprivileged run exercises tiers 1-2 only, and saying so is the difference
+    # between "verified" and "not measured here".
+    executed = len(tests) - skipped
+    print(
+        f"\n  executed: {executed}  passed: {passed}  failed: {failed}  "
+        f"skipped: {skipped}  total: {len(tests)}"
+    )
+    if _SKIPPED:
+        print("  NOTE: skipped tiers were NOT verified in this run.")
     return 1 if failed else 0
 
 

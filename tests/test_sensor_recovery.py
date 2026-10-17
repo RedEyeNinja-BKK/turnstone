@@ -914,3 +914,30 @@ def test_unavailable_records_also_carry_mode(tmp_path, monkeypatch):
     row = _read_jsonl(tmp_path / "o.jsonl")[0]
     assert row["content_mode"] == "sanitized"
     assert row["reason"] == "decision_endpoint_unresolved"
+
+
+def test_sanitized_catches_prefixed_assignments_and_jwts():
+    """S4 regressions: OPENAI_API_KEY=... and JWT segments must not survive."""
+    prefixed = lifecycle.project_value(
+        "objective", "OPENAI_API_KEY=synthetic-value-123", mode="sanitized"
+    )
+    assert "synthetic-value-123" not in prefixed
+
+    jwt = lifecycle.project_value(
+        "objective",
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF123",
+        mode="sanitized",
+    )
+    assert "eyJhbGciOiJIUzI1NiJ9" not in jwt
+
+    dsn = lifecycle.project_value(
+        "objective", "postgresql://user:pass@db.example:5432/app", mode="sanitized"
+    )
+    assert "user:pass@" not in dsn
+
+
+def test_sanitized_catches_padded_base64_runs():
+    # A realistic opaque token: one long run with trailing '=' padding.
+    blob = "QWxhZGRpbjpvcGVuIHNlc2FtZVF3aGljaGlzYmFzZTY0cGFkZGVk" + "=="
+    cleaned = lifecycle.project_value("objective", blob, mode="sanitized")
+    assert blob[:40] not in cleaned

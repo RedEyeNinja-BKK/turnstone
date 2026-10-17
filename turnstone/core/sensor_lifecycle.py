@@ -109,14 +109,31 @@ if CONTENT_MODE not in {"full", "sanitized", "metadata"}:
 #: forms, then long opaque runs. Matching is linear-time by construction: no
 #: nested quantifiers and no backreferences.
 _SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
-    re.compile(r"\b(?:bearer|token|api[_-]?key|password|passwd|secret)\s*[:=]\s*\S+", re.I),
+    # PEM blocks first: they span lines and must be removed whole.
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.S,
+    ),
+    # JWTs: three base64url segments. Without this the header segment survives
+    # the long-token rule (dots split it) - measured in the S4 battery.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+    # NAME=value assignments whose NAME carries a secret word. The leading
+    # character class is deliberate: a plain \b fails on OPENAI_API_KEY=...,
+    # because "_" is a word character, which let the value through in the S4
+    # battery. This matches the whole assignment, including the prefix.
+    re.compile(
+        r"[\w.-]*(?:key|token|secret|password|passwd|credential)[\w.-]*"
+        r"\s*[:=]\s*\S+",
+        re.I,
+    ),
+    re.compile(r"\b(?:bearer)\s+\S+", re.I),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+    re.compile(r"[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])"),
 )
+_URL_USERINFO = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@", re.I)
 _EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _ABS_PATH = re.compile(r"(?<![\w/])/(?:[\w.@+-]+/)+[\w.@+-]+")
 
@@ -126,6 +143,7 @@ _ERROR_PREFIX = re.compile(r"^\s*Task error:\s*([A-Za-z_][\w.]*)")
 def _sanitize_text(text: str) -> str:
     """Remove secrets, absolute paths and e-mails; keep the task sentence."""
     cleaned = text
+    cleaned = _URL_USERINFO.sub(r"\1[redacted]@", cleaned)
     for pattern in _SECRET_PATTERNS:
         cleaned = pattern.sub("[redacted]", cleaned)
     cleaned = _EMAIL.sub("[email]", cleaned)

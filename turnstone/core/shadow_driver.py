@@ -75,10 +75,51 @@ REQUEST_TIMEOUT_SECONDS = float(
     os.environ.get("TURNSTONE_SENSOR_TIMEOUT_SECONDS", "2.5")
 )
 
+#: 2026-10-17: ``urlopen(timeout=)`` is a per-socket-operation timeout. Measured
+#: on this host it bounds connect and each read, but NOT DNS resolution and NOT
+#: total wall time when a response trickles in. The sensor therefore enforces a
+#: wall-clock deadline around the whole call. The socket timeout stays as the
+#: first line; the deadline is the guarantee.
+DEADLINE_SECONDS = float(
+    os.environ.get("TURNSTONE_SENSOR_DEADLINE_SECONDS", "3.5")
+)
+
+#: A timed-out call abandons its worker thread, which exits at its own socket
+#: timeout. The cap keeps abandoned threads from accumulating under a persistent
+#: stall; at the cap the sensor refuses to start another call and records
+#: ``deadline_saturated`` instead of queueing.
+MAX_ABANDONED_CALLS = int(
+    os.environ.get("TURNSTONE_SENSOR_MAX_ABANDONED", "8")
+)
+
 #: How many workstream dedupe states one process retains. Bounded so a long-
 #: lived host process cannot grow without limit; eviction is LRU and only
 #: costs dedupe precision for long-dormant workstreams, never correctness.
 DEDUPE_CAPACITY = int(os.environ.get("TURNSTONE_SENSOR_DEDUPE_CAPACITY", "256"))
+
+
+#: Serialises append attempts inside one process. Cross-process atomicity comes
+#: from a single ``os.write`` on an O_APPEND descriptor: on POSIX each write to
+#: a regular file opened with O_APPEND is placed at the current end of file, and
+#: a record is written in one call, so concurrent appenders cannot interleave
+#: within a line. Records are bounded well below the usual atomic write size.
+_APPEND_LOCK = threading.Lock()
+
+
+def append_jsonl(path: pathlib.Path, record: dict[str, Any]) -> None:
+    """Append one JSON line atomically. Raises on failure (caller decides)."""
+    line = (json.dumps(record, separators=(",", ":"), default=str) + "\n").encode(
+        "utf-8"
+    )
+    with _APPEND_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+        try:
+            written = os.write(fd, line)
+            if written != len(line):
+                raise OSError("short write to observation store")
+        finally:
+            os.close(fd)
 
 
 @dataclass
@@ -191,6 +232,7 @@ class ShadowSensor:
         self._dedupe: OrderedDict[str, list] = OrderedDict()
         self._dedupe_capacity = max(1, int(dedupe_capacity))
         self._dedupe_lock = threading.Lock()
+        self._abandoned = 0
         # Called with (workstream, fingerprint, reason) when the observation
         # record could not be persisted. The hook uses this to keep the
         # cadence ledger honest: every sensor_call row is then paired with
@@ -271,6 +313,7 @@ class ShadowSensor:
         force: bool = False,
         decided: bool = False,
         workstream: str = "",
+        event_id: str = "",
     ):
         """Take one advisory observation, or record why none was taken.
 
@@ -308,12 +351,18 @@ class ShadowSensor:
             # anywhere. Silence about an unresolved lane would be the same
             # dishonesty as a fabricated reading.
             self.metrics.unresolved_endpoint_count += 1
-            return unavailable(
+            # Still an ATTEMPTED observation: an admitted call must always
+            # produce exactly one record, even when the reason is that no
+            # endpoint could be resolved. Returning without recording would
+            # leave a sensor_call cadence row with no paired observation.
+            return self._record(unavailable(
                 trigger=Trigger.MATERIAL,
                 fingerprint=fingerprint,
                 serializer_version=SERIALIZER_VERSION,
                 reason="decision_endpoint_unresolved",
-            )
+                event_id=event_id,
+                workstream=workstream,
+            ))
         if decided:
             # The caller owns cadence and already committed the fingerprint.
             # Re-gating here is exactly the double-gate defect.
@@ -332,6 +381,8 @@ class ShadowSensor:
                 fingerprint=fingerprint,
                 serializer_version=SERIALIZER_VERSION,
                 reason=why,
+                event_id=event_id,
+                workstream=workstream,
             )
 
         serialised: SerializedState | None = None
@@ -352,6 +403,8 @@ class ShadowSensor:
                     serializer_version=SERIALIZER_VERSION,
                     reason=admission.reason or "state_not_admitted",
                     latency_ms=int((time.monotonic() - started) * 1000),
+                    event_id=event_id,
+                    workstream=workstream,
                     state_truncated=serialised.state_truncated,
                     evicted_by_tier=serialised.evicted_by_tier,
                     overflowed_budget=serialised.overflowed_budget,
@@ -367,6 +420,8 @@ class ShadowSensor:
                 serializer_version=SERIALIZER_VERSION,
                 reason=f"serializer_error:{type(error).__name__}",
                 latency_ms=int((time.monotonic() - started) * 1000),
+                event_id=event_id,
+                workstream=workstream,
             )
             return self._record(snapshot)
 
@@ -385,6 +440,8 @@ class ShadowSensor:
                 serializer_version=SERIALIZER_VERSION,
                 reason=transport_error or "invalid_response",
                 latency_ms=latency_ms,
+                event_id=event_id,
+                workstream=workstream,
                 state_truncated=serialised.state_truncated,
                 evicted_by_tier=serialised.evicted_by_tier,
                 overflowed_budget=serialised.overflowed_budget,
@@ -402,6 +459,8 @@ class ShadowSensor:
                 serializer_version=SERIALIZER_VERSION,
                 reason="invalid_response:no_answers",
                 latency_ms=latency_ms,
+                event_id=event_id,
+                workstream=workstream,
                 state_truncated=serialised.state_truncated,
                 evicted_by_tier=serialised.evicted_by_tier,
                 overflowed_budget=serialised.overflowed_budget,
@@ -451,6 +510,8 @@ class ShadowSensor:
             unqualified_raw=(None if qualified else {
                 str(name): raw for name, raw in answers.items()
             }),
+            event_id=event_id,
+            workstream=workstream,
         )
         return self._record(snapshot)
 
@@ -480,19 +541,47 @@ class ShadowSensor:
         )
 
     def _post(self, body: Mapping[str, Any]) -> tuple[Any, str | None]:
+        """POST one decision request under a wall-clock deadline.
+
+        The socket timeout bounds connect and each individual read. The
+        deadline bounds the CALL: measured 2026-10-17, DNS resolution and a
+        trickling response both exceed the socket timeout, so neither is
+        covered by it. A call that misses the deadline is abandoned (its worker
+        exits at its own socket timeout) and recorded honestly.
+        """
+        if self._abandoned >= MAX_ABANDONED_CALLS:
+            return None, "transport:deadline_saturated"
         request = urllib.request.Request(
             f"{self.switchyard.rstrip('/')}/v1/decisions",
             data=json.dumps(body).encode(),
             method="POST",
         )
         request.add_header("content-type", "application/json")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read()), None
-        except urllib.error.HTTPError as error:
-            return None, f"http_{error.code}"
-        except Exception as error:  # noqa: BLE001 - timeout, refused, malformed
-            return None, f"transport:{type(error).__name__}"
+
+        result: dict[str, Any] = {}
+
+        def _call() -> None:
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout
+                ) as response:
+                    result["ok"] = json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                result["error"] = f"http_{error.code}"
+            except Exception as error:  # noqa: BLE001 - timeout, refused, malformed
+                result["error"] = f"transport:{type(error).__name__}"
+
+        worker = threading.Thread(
+            target=_call, name="turnstone-sensor-post", daemon=True
+        )
+        worker.start()
+        worker.join(DEADLINE_SECONDS)
+        if worker.is_alive():
+            self._abandoned += 1
+            return None, "transport:deadline_exceeded"
+        if "error" in result:
+            return None, result["error"]
+        return result.get("ok"), None
 
     def _record(self, snapshot):
         self.metrics.observation_count += 1
@@ -508,9 +597,7 @@ class ShadowSensor:
         if snapshot.fallback_used:
             self.metrics.fallback_count += 1
         try:
-            self.store.parent.mkdir(parents=True, exist_ok=True)
-            with self.store.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(snapshot.to_dict()) + "\n")
+            append_jsonl(self.store, snapshot.to_dict())
         except Exception:  # noqa: BLE001 - storage failure must not fail a task
             # 2026-10-17 hardening: a storage failure is counted, not silent.
             # The admitted call still produced its ATTEMPTED observation, but
@@ -520,7 +607,11 @@ class ShadowSensor:
             callback = self.on_record_failure
             if callback is not None:
                 try:
-                    callback(snapshot.state_fingerprint, snapshot.reason or "")
+                    callback(
+                        snapshot.event_id,
+                        snapshot.state_fingerprint,
+                        snapshot.reason or "",
+                    )
                 except Exception:  # noqa: BLE001 - the callback must not raise
                     pass
         return snapshot

@@ -36,13 +36,15 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from typing import Any
 
-from .shadow_driver import ShadowSensor
-from .shadow_observation import is_material, state_fingerprint
+from .shadow_driver import ShadowSensor, append_jsonl
+from .shadow_observation import PROCESS_ID, is_material, state_fingerprint
 
 #: Cadence rows go here, deliberately separate from the observation store. A
 #: suppressed event writes no observation, so counting the calls that did NOT
@@ -86,6 +88,85 @@ UNWIRED_TRIGGERS = ("phase_transition", "new_evidence")
 #: fingerprint cheaply and to stay inside the serializer's token budget.
 MAX_HISTORY_ITEMS = 6
 MAX_ITEM_CHARS = 400
+
+#: How much operator/task TEXT may leave the VM when the sensor is enabled.
+#:
+#: ``sanitized`` (default) keeps the sentence but removes secrets, credentials,
+#: absolute paths and e-mail addresses, so the graded questions still see task
+#: shape. ``metadata`` sends no free text at all - only bounded descriptors
+#: (lengths, word counts, error class, categorical phase/tool/agent values).
+#: ``full`` reproduces the historical projection and exists only so the
+#: qualification comparison can be run; it must be opted into explicitly.
+#:
+#: Activation requires an explicit operator decision on this exposure; the
+#: default is the middle setting so an accidental enable is not a full-text
+#: export.
+CONTENT_MODE = os.environ.get("TURNSTONE_SENSOR_CONTENT_MODE", "sanitized").strip().lower()
+if CONTENT_MODE not in {"full", "sanitized", "metadata"}:
+    CONTENT_MODE = "sanitized"
+
+#: Credential/secret shapes. Whole-value patterns come first, then key-prefix
+#: forms, then long opaque runs. Matching is linear-time by construction: no
+#: nested quantifiers and no backreferences.
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(r"\b(?:bearer|token|api[_-]?key|password|passwd|secret)\s*[:=]\s*\S+", re.I),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+)
+_EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+_ABS_PATH = re.compile(r"(?<![\w/])/(?:[\w.@+-]+/)+[\w.@+-]+")
+
+_ERROR_PREFIX = re.compile(r"^\s*Task error:\s*([A-Za-z_][\w.]*)")
+
+
+def _sanitize_text(text: str) -> str:
+    """Remove secrets, absolute paths and e-mails; keep the task sentence."""
+    cleaned = text
+    for pattern in _SECRET_PATTERNS:
+        cleaned = pattern.sub("[redacted]", cleaned)
+    cleaned = _EMAIL.sub("[email]", cleaned)
+    cleaned = _ABS_PATH.sub("[path]", cleaned)
+    return cleaned
+
+
+def _metadata_text(name: str, text: str) -> str:
+    """No free text: a bounded descriptor of the field instead."""
+    if name == "blocker":
+        match = _ERROR_PREFIX.match(text)
+        if match:
+            return f"[blocker error={match.group(1)}]"
+        return f"[blocker chars={len(text)}]"
+    words = len(text.split())
+    return f"[{name} chars={len(text)} words={words}]"
+
+
+def project_value(name: str, value: Any, *, mode: str | None = None) -> Any:
+    """Apply the active content mode to one projected field.
+
+    ``full`` is the historical behaviour. ``sanitized`` removes secrets but
+    keeps the text. ``metadata`` removes all free text, leaving descriptors -
+    the mode to choose when the exposure decision is "nothing leaves".
+    Categorical fields (phase/tool/agent) pass through in every mode; they are
+    closed-class values the caller chose, not operator content.
+    """
+    active = (mode or CONTENT_MODE).strip().lower()
+    if not isinstance(value, str):
+        return value
+    # An absent field stays absent in every mode: a descriptor for "" would be
+    # a fake fact ("chars=0") that also defeats the empty-field drop.
+    if not value.strip():
+        return ""
+    if name in {"phase", "tool", "tools", "agent"}:
+        return value
+    if active == "full":
+        return value
+    if active == "metadata":
+        return _metadata_text(name, value)
+    return _sanitize_text(value)
 
 #: Keys that must never enter the fingerprint. A volatile field here would make
 #: identical work look new and defeat dedupe entirely.
@@ -152,6 +233,7 @@ def build_state(
     tools: Any = "",
     agent: str = "",
     history: Any = "",
+    content_mode: str | None = None,
     **extra: Any,
 ) -> dict[str, str]:
     """Assemble the bounded semantic projection the sensor observes.
@@ -171,7 +253,7 @@ def build_state(
     }
     state: dict[str, str] = {}
     for name, value in _drop_volatile(raw).items():
-        text = _clean(value)
+        text = _clean(project_value(name, value, mode=content_mode))
         if text:
             state[name] = text
     return state
@@ -244,6 +326,11 @@ class SensorHook:
         persist: bool = True,
     ) -> None:
         self._sensor = sensor if sensor is not None else ShadowSensor()
+        # 2026-10-17: when a record cannot be persisted, the ledger says so.
+        # A sensor_call row then pairs with either exactly one observation or
+        # exactly one observation_write_failed row - never with silence.
+        if getattr(self._sensor, "on_record_failure", None) is None:
+            self._sensor.on_record_failure = self._on_record_failure
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {}
         self._workstreams: dict[str, int] = {}
@@ -260,6 +347,17 @@ class SensorHook:
             else cadence_store
         )
         self._started = time.time()
+
+    def _on_record_failure(
+        self, event_id: str, fingerprint: str, reason: str
+    ) -> None:
+        """Pair a lost observation with its cadence row (best effort)."""
+        try:
+            self._record_cadence(
+                "", "observation_write_failed", "", fingerprint, event_id
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- counters -------------------------------------------------------
 
@@ -282,6 +380,7 @@ class SensorHook:
         outcome: str,
         workstream: str = "",
         fingerprint: str = "",
+        event_id: str = "",
     ) -> None:
         """Append one cadence row. Best-effort: a storage failure is swallowed.
 
@@ -299,12 +398,15 @@ class SensorHook:
                     "outcome": outcome,
                     "workstream": workstream,
                     "fingerprint": fingerprint,
+                    # Correlation + attribution: a sensor_call row pairs with
+                    # exactly one observation carrying this event_id, and the
+                    # node:pid says which of the six processes observed it.
+                    "event_id": event_id,
+                    "process_id": PROCESS_ID,
                 }
             if self._cadence_store is None:
                 return
-            self._cadence_store.parent.mkdir(parents=True, exist_ok=True)
-            with self._cadence_store.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row) + "\n")
+            append_jsonl(self._cadence_store, row)
         except Exception:  # noqa: BLE001
             pass
 
@@ -337,11 +439,16 @@ class SensorHook:
         workstream: str = "",
     ) -> None:
         """Observe one material event. Never raises; the result is discarded."""
+        # One id per admitted event, minted before anything can fail. It is the
+        # join key between the cadence ledger and the observation store.
+        event_id = uuid.uuid4().hex
         try:
             with self._lock:
                 fingerprint = state_fingerprint(state) if state else ""
             if not force and not is_material(event):
-                self._record_cadence(event, "rejected_not_material", workstream, fingerprint)
+                self._record_cadence(
+                    event, "rejected_not_material", workstream, fingerprint, event_id
+                )
                 return
             # Eager, validated copy. `dict(state)` alone can defer an exploding
             # mapping into the sensor, where a different layer would have to
@@ -351,9 +458,13 @@ class SensorHook:
                 projection, event=event, force=force, workstream=workstream
             )
             if not allowed:
-                self._record_cadence(event, "dedupe_suppressed", workstream, fingerprint)
+                self._record_cadence(
+                    event, "dedupe_suppressed", workstream, fingerprint, event_id
+                )
                 return
-            self._record_cadence(event, "sensor_call", workstream, fingerprint)
+            self._record_cadence(
+                event, "sensor_call", workstream, fingerprint, event_id
+            )
             # `decided=True`: the should_sense() above is the SINGLE cadence
             # decision and the single fingerprint commit for this event. Without
             # this flag observe() gated a second time, saw its own just-committed
@@ -372,11 +483,15 @@ class SensorHook:
             # the observation's own workstream attribution) is per workstream,
             # not per process.
             self._sensor.observe(
-                projection, event=event, decided=True, workstream=workstream
+                projection,
+                event=event,
+                decided=True,
+                workstream=workstream,
+                event_id=event_id,
             )
         except Exception:  # noqa: BLE001 - a sensor must never fail a task
             try:
-                self._record_cadence(event, "hook_error", workstream, "")
+                self._record_cadence(event, "hook_error", workstream, "", event_id)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -425,3 +540,80 @@ def observe_event(
     if not ENABLED:
         return
     hook().observe_event(event, state, force=force, workstream=workstream)
+
+
+def verify_correlation(
+    cadence_store: pathlib.Path,
+    observations_store: pathlib.Path,
+) -> dict[str, Any]:
+    """Audit the ledger/store pairing for one telemetry root.
+
+    Operational tool, not a production path. Returns counts only - no state
+    text is read into the result. The invariants it checks:
+
+    * every admitted ``sensor_call`` has exactly one observation or exactly one
+      ``observation_write_failed`` row with the same ``event_id``;
+    * no observation exists without a matching admitted cadence row;
+    * no ``event_id`` is duplicated on either side.
+    """
+    def _rows(path: pathlib.Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        rows = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:  # noqa: BLE001 - a torn line is reported, not fatal
+                rows.append({"__unparseable__": True})
+        return rows
+
+    cadence = _rows(cadence_store)
+    observations = _rows(observations_store)
+
+    admitted = [r for r in cadence if r.get("outcome") == "sensor_call"]
+    failed = [r for r in cadence if r.get("outcome") == "observation_write_failed"]
+    admitted_ids = [r.get("event_id", "") for r in admitted]
+    observed_ids = [r.get("event_id", "") for r in observations]
+    failed_ids = {r.get("event_id", "") for r in failed}
+
+    observed_set = set(observed_ids)
+    unmatched = [
+        eid for eid in admitted_ids
+        if eid and eid not in observed_set and eid not in failed_ids
+    ]
+    orphans = [eid for eid in observed_ids if eid and eid not in set(admitted_ids)]
+
+    return {
+        "admitted_calls": len(admitted),
+        "observations": len(observations),
+        "write_failures": len(failed),
+        "unparseable_cadence": sum(1 for r in cadence if r.get("__unparseable__")),
+        "unparseable_observations": sum(
+            1 for r in observations if r.get("__unparseable__")
+        ),
+        "unmatched_admitted": unmatched,
+        "orphan_observations": orphans,
+        "duplicate_admitted_ids": sorted(
+            {eid for eid in admitted_ids if admitted_ids.count(eid) > 1}
+        ),
+        "duplicate_observation_ids": sorted(
+            {eid for eid in observed_ids if observed_ids.count(eid) > 1}
+        ),
+        "processes": sorted(
+            {
+                str(r.get("process_id", ""))
+                for r in cadence + observations
+                if r.get("process_id")
+            }
+        ),
+        "workstreams": sorted(
+            {
+                str(r.get("workstream", ""))
+                for r in cadence + observations
+                if r.get("workstream")
+            }
+        ),
+    }

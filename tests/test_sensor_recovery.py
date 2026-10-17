@@ -400,7 +400,6 @@ def test_resolve_on_a_blank_base_url_is_unresolved():
 
 def test_unresolved_sensor_sends_no_request(tmp_path, monkeypatch):
     """The invariant behind the removal: no endpoint => no network, ever."""
-    import urllib.request
 
     def _must_not_be_called(*_a, **_k):
         raise AssertionError("unresolved sensor attempted a network request")
@@ -512,7 +511,7 @@ def test_substantive_guard_survives_an_exploding_input():
     """The operator seam's substance check must be inside the boundary."""
     # Direct lifecycle call raises (documented), but the session wrapper must
     # not.
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         lifecycle.is_substantive_instruction(_Exploding())  # type: ignore[arg-type]
     import turnstone.core.session as session_mod
 
@@ -598,3 +597,294 @@ def test_state_construction_happens_inside_the_seam_wrapper():
         "projection construction moved into the guarded wrapper"
     )
     assert "def _sensor_observe_delegation(" in source
+
+
+# ------------------------------------------------- telemetry integrity (2026-10-17)
+
+
+def _read_jsonl(path):
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _hook_with_store(tmp_path, *, timeout=0.3):
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    sensor = ShadowSensor(
+        store=tmp_path / "observations.jsonl",
+        decision_id="tier1-decision",
+        base_url="http://127.0.0.1:9",
+        timeout=timeout,
+    )
+    hook = lifecycle.SensorHook(
+        sensor, cadence_store=tmp_path / "cadence.jsonl", persist=False
+    )
+    return hook, sensor
+
+
+def test_every_admitted_call_pairs_with_exactly_one_observation(tmp_path):
+    hook, _sensor = _hook_with_store(tmp_path)
+    for i in range(5):
+        hook.observe_event(
+            "operator_instruction", {"objective": f"work {i}"}, workstream="ws-a"
+        )
+
+    report = lifecycle.verify_correlation(
+        tmp_path / "cadence.jsonl", tmp_path / "observations.jsonl"
+    )
+    assert report["admitted_calls"] == 5
+    assert report["observations"] == 5
+    assert report["unmatched_admitted"] == []
+    assert report["orphan_observations"] == []
+    assert report["duplicate_admitted_ids"] == []
+    assert report["duplicate_observation_ids"] == []
+
+
+def test_event_ids_are_unique_per_event(tmp_path):
+    hook, _sensor = _hook_with_store(tmp_path)
+    for i in range(20):
+        hook.observe_event(
+            "operator_instruction", {"objective": f"work {i}"}, workstream="ws-a"
+        )
+    ids = [r["event_id"] for r in _read_jsonl(tmp_path / "cadence.jsonl")]
+    assert len(ids) == 20
+    assert len(set(ids)) == 20
+
+
+def test_cadence_and_observation_carry_the_same_correlation(tmp_path):
+    hook, _sensor = _hook_with_store(tmp_path)
+    hook.observe_event("delegation_result", {"objective": "p"}, workstream="ws-z")
+
+    cadence = _read_jsonl(tmp_path / "cadence.jsonl")[0]
+    observation = _read_jsonl(tmp_path / "observations.jsonl")[0]
+    assert cadence["event_id"] == observation["event_id"]
+    assert cadence["workstream"] == observation["workstream"] == "ws-z"
+    assert cadence["process_id"] == observation["process_id"]
+
+
+def test_process_attribution_is_present_on_every_record(tmp_path):
+    from turnstone.core.shadow_observation import PROCESS_ID
+
+    hook, _sensor = _hook_with_store(tmp_path)
+    hook.observe_event("operator_instruction", {"objective": "a"}, workstream="w")
+    for path in (tmp_path / "cadence.jsonl", tmp_path / "observations.jsonl"):
+        for row in _read_jsonl(path):
+            assert row["process_id"] == PROCESS_ID
+
+
+def test_storage_failure_is_paired_not_silent(tmp_path, monkeypatch):
+    """A lost observation must leave an observation_write_failed row."""
+    hook, sensor = _hook_with_store(tmp_path)
+
+    import turnstone.core.shadow_driver as driver
+
+    def _boom(path, record):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(driver, "append_jsonl", _boom)
+    hook.observe_event("operator_instruction", {"objective": "x"}, workstream="w")
+
+    outcomes = [r["outcome"] for r in _read_jsonl(tmp_path / "cadence.jsonl")]
+    assert "sensor_call" in outcomes
+    assert "observation_write_failed" in outcomes
+    assert sensor.metrics.record_failure_count == 1
+
+
+def test_concurrent_writers_do_not_interleave_records(tmp_path):
+    """Six processes append to one root; no line may be torn or interleaved."""
+    import threading
+
+    from turnstone.core.shadow_driver import append_jsonl
+
+    store = tmp_path / "observations.jsonl"
+    start = threading.Barrier(8)
+
+    def _writer(n):
+        start.wait()
+        for i in range(40):
+            append_jsonl(store, {"writer": n, "i": i, "payload": "x" * 200})
+
+    threads = [threading.Thread(target=_writer, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    rows = _read_jsonl(store)
+    assert len(rows) == 8 * 40
+    # Every line parsed and carries an intact payload.
+    assert all(len(r["payload"]) == 200 for r in rows)
+    per_writer = {}
+    for r in rows:
+        per_writer.setdefault(r["writer"], []).append(r["i"])
+    for n, indices in per_writer.items():
+        assert sorted(indices) == list(range(40)), n
+
+
+def test_concurrent_hooks_keep_correlation_per_process(tmp_path):
+    """Concurrent events in one process still pair one-to-one."""
+    import threading
+
+    hook, _sensor = _hook_with_store(tmp_path)
+    start = threading.Barrier(4)
+
+    def _emit(n):
+        start.wait()
+        for i in range(15):
+            hook.observe_event(
+                "operator_instruction",
+                {"objective": f"t{n}-{i}"},
+                workstream=f"ws-{n}",
+            )
+
+    threads = [threading.Thread(target=_emit, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    report = lifecycle.verify_correlation(
+        tmp_path / "cadence.jsonl", tmp_path / "observations.jsonl"
+    )
+    assert report["admitted_calls"] == 60
+    assert report["observations"] == 60
+    assert report["unmatched_admitted"] == []
+    assert report["duplicate_observation_ids"] == []
+    assert len(report["workstreams"]) == 4
+
+
+def test_unresolved_observation_is_recorded_and_paired(tmp_path):
+    """No endpoint is still an attempted observation with a matching record."""
+    from turnstone.core.shadow_driver import ShadowSensor
+
+    sensor = ShadowSensor(store=tmp_path / "observations.jsonl", timeout=0.2)
+    hook = lifecycle.SensorHook(
+        sensor, cadence_store=tmp_path / "cadence.jsonl", persist=False
+    )
+    hook.observe_event("operator_instruction", {"objective": "x"}, workstream="w")
+
+    report = lifecycle.verify_correlation(
+        tmp_path / "cadence.jsonl", tmp_path / "observations.jsonl"
+    )
+    assert report["admitted_calls"] == 1
+    assert report["observations"] == 1
+    assert report["unmatched_admitted"] == []
+    row = _read_jsonl(tmp_path / "observations.jsonl")[0]
+    assert row["reason"] == "decision_endpoint_unresolved"
+
+
+# --------------------------------------------------- content-minimization modes
+
+
+def test_sanitized_mode_redacts_secrets_paths_and_emails():
+    state = lifecycle.build_state(
+        content_mode="sanitized",
+        objective=(
+            "Deploy with token=abc123SECRET to /home/vincent/.ssh/id_rsa "
+            "and mail ops@example.com"
+        ),
+        phase="operator_instruction",
+    )
+    text = state["objective"]
+    assert "abc123SECRET" not in text
+    assert "/home/vincent/.ssh/id_rsa" not in text
+    assert "ops@example.com" not in text
+    assert "\u005bredacted\u005d" in text
+    assert "\u005bpath\u005d" in text
+    assert "\u005bemail\u005d" in text
+    # The task sentence survives: sanitized is not metadata.
+    assert "Deploy with" in text
+
+
+def test_metadata_mode_carries_no_free_text():
+    state = lifecycle.build_state(
+        content_mode="metadata",
+        objective="Reverse engineer the billing service and patch the outage",
+        phase="operator_instruction",
+        blocker="Task error: TimeoutError: upstream stalled",
+        history="a long tool result with secrets token=abcdef",
+    )
+    assert state["objective"].startswith("[objective chars=")
+    assert "billing" not in json.dumps(state)
+    assert state["blocker"] == "[blocker error=TimeoutError]"
+    assert state["history"].startswith("[history chars=")
+    # Categorical values pass through: they are closed-class, not content.
+    assert state["phase"] == "operator_instruction"
+
+
+def test_full_mode_reproduces_the_historical_projection():
+    state = lifecycle.build_state(
+        content_mode="full",
+        objective="Keep token=abc visible",
+        phase="operator_instruction",
+    )
+    assert state["objective"] == "Keep token=abc visible"
+
+
+def test_empty_fields_stay_absent_in_every_mode():
+    for mode in ("full", "sanitized", "metadata"):
+        state = lifecycle.build_state(
+            content_mode=mode, objective="x", history="", blockers=""
+        )
+        assert "history" not in state
+        assert "blocker" not in state
+
+
+def test_default_content_mode_is_sanitized():
+    """The shipped default must never be full-text export."""
+    assert lifecycle.CONTENT_MODE in {"sanitized", "metadata"}
+    assert lifecycle.CONTENT_MODE == "sanitized"
+
+
+# ------------------------------------------------ wall-clock deadline (2026-10-17)
+
+
+def test_deadline_bounds_a_stalled_dns_resolution(monkeypatch):
+    """The socket timeout does not bound DNS; the call deadline does."""
+    import socket
+    import time
+
+    import turnstone.core.shadow_driver as driver
+
+    real = socket.getaddrinfo
+
+    def _slow(*a, **k):
+        time.sleep(2.0)
+        return real(*a, **k)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _slow)
+    monkeypatch.setattr(driver, "DEADLINE_SECONDS", 0.4)
+
+    sensor = ShadowSensor(
+        store=None, decision_id="tier1-decision",
+        base_url="http://example.invalid:9", timeout=0.2,
+    )
+    started = time.monotonic()
+    snapshot = sensor.observe(
+        {"objective": "x"}, event="operator_instruction", workstream="w"
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.5, f"call was not deadline-bounded: {elapsed:.2f}s"
+    assert snapshot.reason == "transport:deadline_exceeded"
+    assert sensor._abandoned == 1
+
+
+def test_abandoned_call_cap_refuses_new_calls():
+    """At the cap the sensor records saturation instead of queueing threads."""
+    import turnstone.core.shadow_driver as driver
+
+    sensor = ShadowSensor(
+        store=None, decision_id="tier1-decision",
+        base_url="http://127.0.0.1:9", timeout=0.2,
+    )
+    sensor._abandoned = driver.MAX_ABANDONED_CALLS
+    payload, error = sensor._post({"state": "x"})
+    assert payload is None
+    assert error == "transport:deadline_saturated"
+
+
+def test_deadline_defaults_are_sane():
+    import turnstone.core.shadow_driver as driver
+
+    assert 1.0 <= driver.DEADLINE_SECONDS <= 10.0
+    assert driver.DEADLINE_SECONDS >= driver.REQUEST_TIMEOUT_SECONDS
+    assert driver.MAX_ABANDONED_CALLS >= 1

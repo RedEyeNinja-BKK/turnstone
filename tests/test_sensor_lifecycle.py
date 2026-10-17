@@ -51,7 +51,7 @@ class _RecordingSensor:
         return True, Trigger.MATERIAL.value
 
     def observe(self, state, *, event=None, force=False, decided=False,
-                workstream=""):
+                workstream="", event_id=""):
         # `decided` mirrors the real ShadowSensor signature. Without it the hook's
         # `decided=True` call raised TypeError, which the fail-open boundary
         # swallowed -- so this stub silently recorded ZERO calls and the suite
@@ -565,7 +565,13 @@ def test_cadence_rows_carry_no_state_text_or_signals():
     assert rows, "a cadence row must be written"
     blob = json.dumps(rows)
     assert "SECRET" not in blob, "cadence must not carry state text"
-    assert set(rows[0]) == {"ts", "event", "outcome", "workstream", "fingerprint"}
+    # 2026-10-17: `event_id` and `process_id` joined the row so a cadence
+    # decision can be paired with exactly one observation and attributed to the
+    # node:pid that made it. Neither carries state text.
+    assert set(rows[0]) == {
+        "ts", "event", "outcome", "workstream", "fingerprint",
+        "event_id", "process_id",
+    }
     assert rows[0]["workstream"] == "ws-123"
     for control in ("model", "provider", "route", "reasoning_effort", "output_guard"):
         assert control not in blob

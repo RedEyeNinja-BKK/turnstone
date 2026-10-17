@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import socket
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -31,6 +33,15 @@ from enum import Enum
 from typing import Any
 
 SENSOR_VERSION = "turnstone-sensor-shadow:v1"
+
+#: Process identity for telemetry. The five-node fleet runs six processes that
+#: append to the same store root; a record with no process attribution cannot
+#: be attributed to the node that observed it. ``TURNSTONE_NODE_ID`` is set by
+#: every unit; the pid disambiguates restarts.
+PROCESS_ID = (
+    f"{os.environ.get('TURNSTONE_NODE_ID') or socket.gethostname()}"
+    f":{os.getpid()}"
+)
 
 #: The one capability this module may name by default. It deliberately knows
 #: nothing about OpenRouter, Span, the HTPC address, Laya, the fallback rule, or
@@ -158,6 +169,14 @@ class SensorSnapshot:
     serialized_chars: int
     serialized_state_tokens: int
     dropped_field_count: int
+    #: Correlation id minted once per admitted event by the hook. The cadence
+    #: ledger and the observation record carry the same value, so a
+    #: ``sensor_call`` row is provably paired with exactly one observation.
+    event_id: str = ""
+    #: The workstream whose state was observed (per-workstream dedupe key).
+    workstream: str = ""
+    #: Node:pid that produced this record.
+    process_id: str = ""
     #: Dropped because a higher tier was present, or the low-tier reserve had to
     #: be protected. Policy working as designed; NOT capacity pressure.
     evicted_by_tier: bool = False
@@ -184,6 +203,9 @@ class SensorSnapshot:
             "serialized_chars": self.serialized_chars,
             "serialized_state_tokens": self.serialized_state_tokens,
             "dropped_field_count": self.dropped_field_count,
+            "event_id": self.event_id,
+            "workstream": self.workstream,
+            "process_id": self.process_id,
             "signals": [s.to_dict() for s in self.signals],
             "reason": self.reason,
             "extra": self.extra,
@@ -219,6 +241,9 @@ def unavailable(
     overflowed_budget: bool = False,
     backend: str = "none",
     fallback_used: bool = False,
+    event_id: str = "",
+    workstream: str = "",
+    process_id: str = "",
 ) -> SensorSnapshot:
     """The fail-open snapshot. A task must never fail because sensing did.
 
@@ -261,6 +286,9 @@ def unavailable(
         serialized_chars=serialized_chars,
         serialized_state_tokens=serialized_state_tokens,
         dropped_field_count=dropped_field_count,
+        event_id=event_id,
+        workstream=workstream,
+        process_id=process_id or PROCESS_ID,
         signals=signals,
         reason=reason,
     )
@@ -283,6 +311,9 @@ def build_snapshot(
     overflowed_budget: bool = False,
     qualified: bool = True,
     unqualified_raw: dict[str, Any] | None = None,
+    event_id: str = "",
+    workstream: str = "",
+    process_id: str = "",
 ) -> SensorSnapshot:
     """Build a successful observation from a decision response.
 
@@ -354,6 +385,9 @@ def build_snapshot(
         serialized_chars=serialized_chars,
         serialized_state_tokens=serialized_state_tokens,
         dropped_field_count=dropped_field_count,
+        event_id=event_id,
+        workstream=workstream,
+        process_id=process_id or PROCESS_ID,
         signals=tuple(signals),
         extra=(dict(unqualified_raw) if unqualified_raw else {}),
     )

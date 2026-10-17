@@ -54,8 +54,6 @@ def test_session_wiring_changes_no_control_flow():
     if not diff.stdout.strip():
         pytest.skip("session.py matches HEAD: the wiring is committed, no diff to check")
 
-    removed = [line[1:].strip() for line in diff.stdout.splitlines()
-               if line.startswith("-") and not line.startswith("---")]
     added = [line[1:].strip() for line in diff.stdout.splitlines()
              if line.startswith("+") and not line.startswith("+++")]
 

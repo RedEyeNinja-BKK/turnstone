@@ -1,0 +1,81 @@
+diff --git a/crates/switchyard-runner/src/request_fit.rs b/crates/switchyard-runner/src/request_fit.rs
+index ffa0ff1..2044de3 100644
+--- a/crates/switchyard-runner/src/request_fit.rs
++++ b/crates/switchyard-runner/src/request_fit.rs
+@@ -118,7 +118,15 @@ fn unsupported_preserved_content(
+         if capabilities.vision == Some(false)
+             && matches!(
+                 kind,
+-                "image" | "image_url" | "input_image" | "computer_screenshot"
++                "image"
++                    | "image_url"
++                    | "input_image"
++                    | "computer_screenshot"
++                    | "video"
++                    | "video_url"
++                    | "input_video"
++                    | "audio"
++                    | "input_audio"
+             )
+         {
+             return Some("vision");
+@@ -153,7 +161,13 @@ fn unsupported_content(
+     content: &[ContentBlock],
+ ) -> Option<&'static str> {
+     content.iter().find_map(|block| match block {
+-        ContentBlock::Image { .. } if capabilities.vision == Some(false) => Some("vision"),
++        ContentBlock::Image { .. }
++        | ContentBlock::Audio { .. }
++        | ContentBlock::Video { .. }
++            if capabilities.vision == Some(false) =>
++        {
++            Some("vision")
++        }
+         ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+             if capabilities.tool_calling == Some(false) =>
+         {
+@@ -287,6 +301,44 @@ mod tests {
+         Ok(())
+     }
+ 
++    // Audio and video are distinct content variants and must obey the same
++    // multimodal gate as images. Before this test they passed admission on a
++    // vision = false route and were rejected only by the upstream provider.
++    #[test]
++    fn rejects_audio_and_video_when_vision_is_disabled() -> TestResult {
++        let capabilities = ModelCapabilities {
++            vision: Some(false),
++            ..Default::default()
++        };
++        for body in [
++            json!({"input": [{"role": "user", "content": [
++                {"type": "input_video", "video_url": "https://example.test/clip.mp4"}]}]}),
++            json!({"input": [{"role": "user", "content": [
++                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}]}]}),
++        ] {
++            assert_requires_capability(OpenAiResponses, &body, capabilities, "vision")?;
++        }
++        Ok(())
++    }
++
++    // Decoded Anthropic media blocks reach the same gate as a preserved body.
++    #[test]
++    fn rejects_decoded_audio_and_video_blocks() -> TestResult {
++        let body = json!({"messages": [{"role": "user", "content": [
++            {"type": "video", "source": {"type": "url", "url": "https://example.test/clip.mp4"}}
++        ]}]});
++        assert_requires_capability(
++            AnthropicMessages,
++            &body,
++            ModelCapabilities {
++                vision: Some(false),
++                ..Default::default()
++            },
++            "vision",
++        )?;
++        Ok(())
++    }
++
+     // Allowing tool results must not hide unsupported images nested in their content.
+     #[test]
+     fn rejects_images_inside_tool_results_when_tools_are_allowed() -> TestResult {

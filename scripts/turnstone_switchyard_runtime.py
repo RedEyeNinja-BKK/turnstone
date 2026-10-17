@@ -68,6 +68,15 @@ MAX_LOG_RETURN = 200
 MAX_STDIN_BYTES = 4096
 MAX_ROUTE_NAME = 64
 MAX_TEXT_LINES = 40
+MAX_DIAGNOSTIC_BYTES = 8 * 1024
+MAX_DIAGNOSTIC_LINE = 400
+
+# ``validate`` sources the unit's environment files, so the binary's own
+# diagnostics are the one place a credential value could reach this process.
+# The binary does not print them today; treat that as a property to enforce,
+# not to assume. Only ``NAME=value`` shapes are redacted, because that is the
+# only shape an environment dump can take.
+_SECRET_ASSIGNMENT_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})=([^\s\"']{16,})")
 
 # Declared by switchyard-neutral-green.service. Used only by ``validate`` so the
 # dry-run sees the same environment the deployed process does.
@@ -453,6 +462,29 @@ def filter_log(lines: list[str], route: str | None, limit: int) -> list[dict[str
     return picked[-limit:]
 
 
+def _redact_assignments(text: str) -> str:
+    """Replace the value of any ``NAME=long-value`` pair in diagnostic text.
+
+    The environment is never printed by the binary, but a dry-run is the one
+    path that sources it, so the boundary is enforced rather than trusted.
+    """
+    return _SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
+
+
+def _diagnostic(raw: bytes, limit: int = MAX_DIAGNOSTIC_BYTES) -> list[str]:
+    """Project one captured stream to bounded, redacted lines.
+
+    Byte-bounded before decoding so a single enormous line cannot slip past a
+    line-count limit, and redacted because this is the one verb that runs with
+    the unit environment loaded.
+    """
+    text = raw[:limit].decode("utf-8", "replace")
+    lines = [line[:MAX_DIAGNOSTIC_LINE] for line in text.splitlines() if line.strip()]
+    if len(raw) > limit:
+        lines.append(f"[output truncated at {limit} bytes]")
+    return [_redact_assignments(line) for line in lines[-MAX_TEXT_LINES:]]
+
+
 def _tail(text: str, limit: int = MAX_TEXT_LINES) -> list[str]:
     return [line for line in text.strip().splitlines() if line][-limit:]
 
@@ -519,12 +551,19 @@ def verb_validate() -> dict[str, Any]:
     )
     remote = f"sudo -n bash -c {_shquote(script)}"
     proc = _ssh(remote, timeout=60)
+    # 255 is ssh's own failure status, not the binary's. Reporting it as a
+    # failed dry-run would let an unreachable host look like an invalid config.
+    if proc.returncode == 255:
+        detail = _diagnostic(proc.stderr)
+        raise TransportError(
+            "ssh could not run the dry-run" + (f": {detail[-1]}" if detail else "")
+        )
     return {
         "unit": UNIT,
         "dry_run_ok": proc.returncode == 0,
         "returncode": proc.returncode,
-        "stdout": _tail(proc.stdout.decode("utf-8", "replace")),
-        "stderr": _tail(proc.stderr.decode("utf-8", "replace")),
+        "stdout": _diagnostic(proc.stdout),
+        "stderr": _diagnostic(proc.stderr),
     }
 
 

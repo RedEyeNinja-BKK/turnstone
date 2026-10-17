@@ -330,6 +330,78 @@ def test_tail_bounds_and_drops_blanks() -> None:
     assert out == ["line97", "line98", "line99"]
 
 
+# --------------------------------------------------------------------------
+# validate diagnostics: bounding and redaction
+# --------------------------------------------------------------------------
+
+
+def test_redacts_environment_assignments() -> None:
+    line = "could not load SWITCHYARD_OPENROUTER_API_KEY=sk-or-v1-0123456789abcdef"
+    out = sy._redact_assignments(line)
+    assert "sk-or-v1" not in out
+    assert "SWITCHYARD_OPENROUTER_API_KEY=[REDACTED]" in out
+
+
+def test_leaves_short_or_non_secret_text_alone() -> None:
+    for line in (
+        "server OK: smartfree, tier1",
+        "SWITCHYARD_DEPLOYMENT=v6",
+        "warning: retry budget exhausted",
+    ):
+        assert sy._redact_assignments(line) == line
+
+
+def test_diagnostic_bounds_bytes_before_decoding() -> None:
+    huge = b"x" * (sy.MAX_DIAGNOSTIC_BYTES * 3)
+    out = sy._diagnostic(huge)
+    assert out[-1].startswith("[output truncated")
+    assert all(len(line) <= sy.MAX_DIAGNOSTIC_LINE for line in out[:-1])
+
+
+def test_diagnostic_truncates_each_line() -> None:
+    out = sy._diagnostic(b"y" * 5000)
+    assert len(out) == 1
+    assert len(out[0]) == sy.MAX_DIAGNOSTIC_LINE
+
+
+def test_diagnostic_redacts_before_returning() -> None:
+    out = sy._diagnostic(
+        b"client openrouter failed: SWITCHYARD_OPENROUTER_API_KEY=abcdefghijklmnopqrstuvwx"
+    )
+    assert "abcdefghij" not in "".join(out)
+
+
+def test_validate_raises_on_ssh_transport_failure(monkeypatch=None) -> None:
+    class _P:
+        returncode = 255
+        stdout = b""
+        stderr = b"ssh: connect to host switchyard-vm.example.invalid port 22: No route to host"
+
+    original = sy._ssh
+    sy._ssh = lambda *a, **k: _P()  # type: ignore[assignment]
+    try:
+        assert _raises_as(sy.TransportError, sy.verb_validate)
+    finally:
+        sy._ssh = original  # type: ignore[assignment]
+
+
+def test_validate_reports_config_failure_as_exit_zero() -> None:
+    class _P:
+        returncode = 1
+        stdout = b""
+        stderr = b"invalid server config: unknown route"
+
+    original = sy._ssh
+    sy._ssh = lambda *a, **k: _P()  # type: ignore[assignment]
+    try:
+        out = sy.verb_validate()
+    finally:
+        sy._ssh = original  # type: ignore[assignment]
+    assert out["dry_run_ok"] is False
+    assert out["returncode"] == 1
+    assert out["stderr"] == ["invalid server config: unknown route"]
+
+
 def test_verb_table_is_closed() -> None:
     assert set(sy.VERBS) == {"status", "catalog", "stats", "metrics", "validate", "route", "log"}
 

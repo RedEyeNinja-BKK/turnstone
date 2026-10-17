@@ -119,9 +119,32 @@ import provenance: all modules from <slot>/turnstone
     34 passed  [test_output_guard_typed_decision]
      7 passed  [test_direct_oauth_request_profile]
     14 passed  [test_combined_activation]
-     9 passed  [test_activation_failure_paths]
+    21 passed  [test_activation_failure_paths]
 VERIFY OK
 ```
+
+## 2d. Activation-control corrections after independent review
+
+Two defects were found in the activation script itself; the application bytes
+are unchanged, so **the revision-2 slot is not restaged**.
+
+| Finding | Before | After |
+|---|---|---|
+| A partial pre-existing `94-` set was completed by activation, then removed by a later rollback as if this run had created it | `all_present=0` allowed the run to continue | three-way classification; `drift` refuses and changes nothing; adoption only through `reconcile --confirm`, which backs up first |
+| Rollback failure was discarded (`rollback_core \|\| true`) and then reported as "rolled back" | failure reported as success | `ROLLBACK VERIFIED` / `ROLLBACK INCOMPLETE`, exit 3/4, affected units named, recovery receipt written |
+
+Mutation-checked: restoring either old behaviour fails the new tests (1 failure
+for the suppressed-rollback mutant, 2 for the permissive-classification mutant);
+the restored script is green.
+
+`tests/test_activation_failure_paths.py` grew from 9 to 21 executable cases,
+adding: partial state refused, divergent state refused, already-active verified
+without a restart, configured-but-not-live converges without deleting
+pre-existing files, converge failure leaves those files in place, reconcile
+backs up then adopts, reconcile refuses without `--confirm`, rollback restart
+failure, rollback health failure with the port named, lost configuration during
+rollback reported per unit, verified rollback reported as verified, and a
+surviving drop-in failing the rollback.
 
 ## 3. Canary evidence already obtained
 
@@ -150,7 +173,7 @@ bash scripts/stage_openai_oauth_v187.sh plan
 sudo bash scripts/stage_typed_decision_v187_r2.sh verify
 sudo bash scripts/stage_openai_oauth_v187.sh verify
 
-# 2. Optional: exercise the full preflight without writing
+# 2. Rehearse the full preflight without writing
 bash scripts/stage_openai_oauth_v187.sh activate --confirm --dry-run
 
 # --- approval boundary ---
@@ -158,29 +181,57 @@ bash scripts/stage_openai_oauth_v187.sh activate --confirm --dry-run
 # 3. One restart window
 sudo bash scripts/stage_openai_oauth_v187.sh activate --confirm
 
-# Rollback, if needed
+# If the 94- set is ever left partial or divergent, adoption is a separate,
+# explicit decision (backup first):
+sudo bash scripts/stage_openai_oauth_v187.sh reconcile --confirm
+
+# Rollback
 sudo bash scripts/stage_openai_oauth_v187.sh rollback --confirm
 ```
 
-The script refuses to activate without the literal `--confirm` and without root.
-It writes the three `94-` drop-ins (all-or-nothing), records a receipt
-under `/var/log/turnstone-v187/` **before** the switch, `daemon-reload`s, then
-restarts `turnstone-server`, `turnstone-node@2..5` and `turnstone-console` in a
-single `systemctl restart`. It declares success only after, for **every** unit:
+### Pre-existing drop-in state is classified, never absorbed
 
-* `is-active` is `active`,
-* the live process's `PYTHONPATH` equals the slot (proven from `/proc/PID/environ`,
-  not inferred from the drop-in),
-* `GET /health` returns 2xx on 8080, 8082–8085 and 8090,
-* the journal since the restart contains no `ModuleNotFoundError`, `ImportError:`
-  or traceback.
+`activate` classifies the `94-` set before doing anything:
 
-Any failure triggers automatic rollback (remove the three drop-ins,
-`daemon-reload`, restart the same units) and a non-zero exit.
+| State | Condition | Behaviour |
+|---|---|---|
+| **absent** | 0/3 present | fresh activation: write, restart, verify |
+| **active** | 3/3 present and byte-identical | verify the **live** state; report `ALREADY ACTIVE` with no restart if it passes |
+| **active but not live** | 3/3 identical, processes still on the old code | converge with a restart, verified; on failure the pre-existing files are **left in place** |
+| **drift** | any other combination | **REFUSE** and change nothing |
 
-The gate itself is pinned by `tests/test_combined_activation.py` (13 executed,
-0 skipped on this host): the refusals and the dry run are executed, and the
-restart/provenance/rollback wiring is asserted structurally.
+A divergent or partial set is never completed and never treated as ours. If
+activation went ahead, a later rollback would remove files this invocation did
+not create. `reconcile --confirm` is the separate, operator-controlled adoption
+path: it lists each file's state and hash, copies every file it is about to
+replace into the receipt directory, then runs the same write/restart/verify
+path.
+
+### Success and rollback are both proven
+
+The switch declares `ACTIVATED` only after, for **every** unit: `is-active` is
+`active`, the live process's `PYTHONPATH` equals the slot (read from
+`/proc/PID/environ`, not inferred from the drop-in), every non-`PYTHONPATH`
+environment key recorded in the receipt still exists, `GET /health` returns 2xx
+on 8080, 8082-8085 and 8090, and the journal since the restart has no
+`ModuleNotFoundError`, `ImportError:` or traceback.
+
+Any failure routes to one place that runs rollback and **acts on its result**:
+
+* `ROLLBACK VERIFIED` - all six units active, healthy, configured and running
+  their recorded pre-activation `PYTHONPATH`; exit 3, activation failed but the
+  previous overlay is live.
+* `ROLLBACK INCOMPLETE` - exit 4, the affected units and the failed dimension
+  are named, and a `recovery-<stamp>.txt` is written with per-unit
+  active/configured/running values, drop-in hashes, and the remediations.
+
+Rollback compares against the **absolute baseline recorded before the switch**,
+not against the post-removal unit config: if a removal or rewrite went wrong,
+the post-hoc config is exactly what cannot be trusted. A `94-` file that cannot
+be removed is itself a rollback failure.
+
+Nothing is suppressed: there is no `rollback_core || true` anywhere in the
+script.
 
 **Scope of this switch.** It changes code only. No model row, credential, setting
 or database row is touched, and no alias is repointed. `auth_mode=openai_oauth`
@@ -188,12 +239,12 @@ remains unreachable until a canary row is deliberately created (section 5). The
 SIWC runtime store and the audience allow-list are prerequisites for that
 **canary**, not for this activation.
 
-**Rollback** removes only the three `94-` drop-ins. The `90-`/`91-` anchors restore
-`typed-decision-v187-finish`, which is what is running today. There is **no `92-`
-anchor on this host** because the R2 slot was never activated on its own; if it
-ever is, `92-` sorts before `94-` and removing `94-` would land on R2 instead.
-Both `92-` and the superseded `93-` family are refused at preflight for that reason.
-Model rows are untouched by activation and rollback.
+**Rollback target** removes only the three `94-` drop-ins. The `90-`/`91-` anchors
+restore `typed-decision-v187-finish`. There is **no `92-` anchor on this host**
+because the R2 slot was never activated on its own; if it ever is, `92-` sorts
+before `94-` and removing `94-` would land on R2 instead. Both `92-` and the
+superseded `93-` family are refused at preflight for that reason. Model rows are
+untouched by activation and rollback.
 
 ## 5. Alias cutover (a separate, later gate)
 

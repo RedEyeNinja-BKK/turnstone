@@ -31,6 +31,7 @@
 #   sudo bash stage_openai_oauth_v187.sh verify
 #   bash stage_openai_oauth_v187.sh status                   # read-only
 #   sudo bash stage_openai_oauth_v187.sh activate --confirm
+#   sudo bash stage_openai_oauth_v187.sh reconcile --confirm   # partial state
 #   sudo bash stage_openai_oauth_v187.sh rollback --confirm
 #
 # `plan`, `status` and `--dry-run` write nothing and need no privilege.
@@ -352,7 +353,7 @@ unit_specs() {  # "unit|dropin" pairs, so one loop can serve both
 }
 
 # The last-sorting drop-in that sets PYTHONPATH wins in systemd's merge order.
-# Refuse to activate if something would silently override the 93- file.
+# Refuse to activate if something would silently override the 94- file.
 higher_pythonpath_override() {
   local unit=$1 ours=$2 d base ours_base
   ours_base=$(basename "$ours")
@@ -488,7 +489,7 @@ write_dropins_atomically() {
       cleanup_partial_writes "${written[@]}"
       return 1
     fi
-    if ! tmp=$(mktemp "$dir/.93-oauth.XXXXXXXX"); then
+    if ! tmp=$(mktemp "$dir/.94-oauth.XXXXXXXX"); then
       say "WRITE FAILED: cannot create a temporary file in $dir" >&2
       cleanup_partial_writes "${written[@]}"
       return 1
@@ -545,7 +546,7 @@ capture_receipt() {
   } > "$out"
   chmod 0640 "$out"; chown "${OWNER[0]}" "$out"
 
-  # Byte-exact copies of whatever the 93- paths held, so an operator can diff
+  # Byte-exact copies of whatever the 94- paths held, so an operator can diff
   # after the fact even though the switch replaces the files.
   local bak="$RECEIPTS_DIR/dropin-backup-$stamp"
   install -d -m 0700 "$bak"
@@ -554,7 +555,20 @@ capture_receipt() {
     install -m 0600 "$p" "$bak/$(echo "$p" | tr '/' '_')"
   done < <(dropin_paths)
   RECEIPT_FILE="$out"
+
+  # Absolute pre-activation PYTHONPATH per unit. Rollback compares against THIS,
+  # not against the post-removal unit config, so a failed removal or a later
+  # rewrite cannot make a wrong value look correct.
+  BASELINE_FILE="$RECEIPTS_DIR/baseline-$stamp.txt"
+  : > "$BASELINE_FILE"
+  for u in "${UNITS[@]}"; do
+    pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo 0)
+    cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
+    printf '%s|%s\n' "$u" "${cur:-(none)}" >> "$BASELINE_FILE"
+  done
+  chmod 0640 "$BASELINE_FILE"; chown "${OWNER[0]}" "$BASELINE_FILE"
   say "receipt: $out"
+  say "baseline: $BASELINE_FILE"
   say "backups: $bak"
 }
 
@@ -632,50 +646,219 @@ remove_dropins() {
   say "drop-ins removed: $removed"
 }
 
+# --- pre-existing drop-in state: three-way classification -------------------
+#
+# Activation must be able to tell "nothing of ours is installed", "ours is
+# installed and correct", and "the tree is in some intermediate state". The
+# third case must never be treated as either of the first two: continuing would
+# overwrite state we did not create, and a later rollback would then remove that
+# same state as though this invocation had created it.
+classify_dropins() {
+  STATE_TOTAL=0; STATE_PRESENT=0; STATE_MATCH=0
+  local p
+  while read -r p; do
+    STATE_TOTAL=$((STATE_TOTAL + 1))
+    [[ -e "$p" ]] || continue
+    STATE_PRESENT=$((STATE_PRESENT + 1))
+    if cmp -s <(dropin_body) "$p"; then
+      STATE_MATCH=$((STATE_MATCH + 1))
+    fi
+  done < <(dropin_paths)
+}
+
+# absent   all three missing                -> fresh activation
+# active   all three present and identical  -> verify the LIVE state
+# drift    anything else                    -> refuse; reconcile deliberately
+dropin_state() {
+  if (( STATE_PRESENT == 0 )); then
+    printf 'absent'
+  elif (( STATE_PRESENT == STATE_TOTAL && STATE_MATCH == STATE_TOTAL )); then
+    printf 'active'
+  else
+    printf 'drift'
+  fi
+}
+
+report_dropin_state() {
+  local p base
+  while read -r p; do
+    base=$(basename "$p")
+    if [[ ! -e "$p" ]]; then
+      say "  absent    $p"
+    elif cmp -s <(dropin_body) "$p"; then
+      say "  matches   $p"
+    else
+      say "  DIFFERS   $p (sha256 $(sha256sum "$p" | cut -d' ' -f1))"
+    fi
+  done < <(dropin_paths)
+  say "  summary: ${STATE_PRESENT}/${STATE_TOTAL} present, ${STATE_MATCH}/${STATE_TOTAL} identical to this package"
+}
+
+# The expected PRE-ACTIVATION value for one unit, recorded before the switch.
+# Rollback verifies against this absolute baseline rather than against whatever
+# the unit config says afterwards: if a removal or a rewrite went wrong, the
+# post-hoc config is exactly the thing that cannot be trusted.
+expected_prior_pythonpath() {
+  local u=$1 file=${BASELINE_FILE:-} val
+  if [[ -z "$file" ]]; then
+    file=$(ls -1t "$RECEIPTS_DIR"/baseline-*.txt 2>/dev/null | head -1 || true)
+  fi
+  if [[ -n "$file" && -r "$file" ]]; then
+    val=$(awk -F'|' -v k="$u" '$1 == k { print $2 }' "$file" | tail -1)
+    if [[ -n "$val" ]]; then
+      [[ "$val" == "(none)" ]] && val=""
+      printf '%s' "$val"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# A usable recovery record is part of reporting failure, not a courtesy: the
+# operator needs the exact per-unit state and the commands that follow.
+report_rollback_failure() {
+  local reason=$1; shift
+  local stamp out tmp u pid cur want active line
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  out="$RECEIPTS_DIR/recovery-$stamp.txt"
+  tmp=$(mktemp "${TMPDIR:-/var/tmp}/recovery.XXXXXXXX" 2>/dev/null || true)
+  {
+    echo "operation=rollback-incomplete"
+    echo "utc=$stamp"
+    echo "reason=$reason"
+    echo "slot=$NEW"
+    echo "affected=$*"
+    echo "baseline=${BASELINE_FILE:-${RECEIPTS_DIR}/baseline-*.txt}"
+    for u in "${UNITS[@]}"; do
+      pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo 0)
+      cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
+      want=$(expected_prior_pythonpath "$u" 2>/dev/null || true)
+      active=$(systemctl is-active "$u" 2>/dev/null || echo unknown)
+      echo "unit=$u active=$active expected=${want:-(unknown)} configured=$(configured_pythonpath "$u") running=${cur:-(none)}"
+      echo "unit=$u journal=journalctl -u $u --since '-15 min'"
+    done
+    while read -r p; do
+      if [[ -e "$p" ]]; then
+        echo "dropin=$p present sha256=$(sha256sum "$p" | cut -d' ' -f1)"
+      else
+        echo "dropin=$p absent"
+      fi
+    done < <(dropin_paths)
+    echo "remediation=systemctl daemon-reload"
+    echo "remediation=systemctl restart ${UNITS[*]}"
+    echo "remediation=inspect ${RECEIPTS_DIR} for the pre-activation drop-in backup"
+    echo "remediation=sudo bash $0 rollback --confirm    # retry once the cause is fixed"
+  } > "${tmp:-/dev/stdout}" 2>/dev/null || true
+
+  if [[ -n "$tmp" ]]; then
+    if install -d -m 0755 "$RECEIPTS_DIR" 2>/dev/null &&
+       install -m 0640 "$tmp" "$out" 2>/dev/null; then
+      chown "${OWNER[0]}" "$out" 2>/dev/null || true
+      rm -f "$tmp"
+    else
+      say "WARNING: could not write the recovery receipt to $out" >&2
+      sed 's/^/  recovery: /' "$tmp" >&2 || true
+      rm -f "$tmp"
+      out="(not written; see the recovery lines above)"
+    fi
+  else
+    out="(not written)"
+  fi
+
+  say "ROLLBACK INCOMPLETE: $reason" >&2
+  for u in "$@"; do
+    say "  affected: $u" >&2
+  done
+  say "  recovery receipt: $out" >&2
+  return 1
+}
+
 rollback_core() {
-  local u pid cur want p ok deadline
+  local u pid cur want cfg ok deadline p affected=() leftover=0
   trap - EXIT INT TERM
   remove_dropins
   systemctl daemon-reload
+
   if ! systemctl restart "${UNITS[@]}"; then
-    say "ROLLBACK INCOMPLETE: restart returned nonzero" >&2
+    # One failed restart does not say WHICH units came back, so every unit is
+    # reported as affected rather than guessing.
+    for u in "${UNITS[@]}"; do affected+=("$u"); done
+    report_rollback_failure "restart returned nonzero" "${affected[@]}"
     return 1
   fi
   say "rollback restarted: ${UNITS[*]}"
-  ok=1; deadline=$((SECONDS + HEALTH_TIMEOUT))
+
+  deadline=$((SECONDS + HEALTH_TIMEOUT))
   while (( SECONDS < deadline )); do
-    ok=1
+    affected=()
     for u in "${UNITS[@]}"; do
-      want=$(configured_pythonpath "$u")
+      want=$(expected_prior_pythonpath "$u" 2>/dev/null) || want=$(configured_pythonpath "$u")
+      cfg=$(configured_pythonpath "$u")
       pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo 0)
       cur=$(proc_pythonpath "$pid" 2>/dev/null || true)
-      [[ "$cur" == "$want" ]] || ok=0
-      [[ "$(systemctl is-active "$u")" == active ]] || ok=0
+      [[ "$(systemctl is-active "$u")" == active ]] || affected+=("$u (not active)")
+      [[ "$cur" == "$want" ]] || affected+=("$u (running PYTHONPATH=${cur:-(none)}, expected ${want:-(none)})")
+      [[ "$cfg" == "$want" ]] || affected+=("$u (configured PYTHONPATH=${cfg:-(none)}, expected ${want:-(none)})")
     done
-    for p in "${HEALTH_PORTS[@]}"; do check_http "$p" || ok=0; done
-    (( ok )) && break
+    for p in "${HEALTH_PORTS[@]}"; do
+      check_http "$p" || affected+=("port $p (no 2xx from /health)")
+    done
+    (( ${#affected[@]} == 0 )) && break
     sleep 2
   done
-  if (( ok )); then
-    while read -r p; do
-      [[ ! -e "$p" ]] || { say "ROLLBACK INCOMPLETE: $p still present" >&2; return 1; }
-    done < <(dropin_paths)
-    say "ROLLBACK OK: previous overlay is live, healthy, and no 93- drop-in remains"
-    return 0
+
+  if (( ${#affected[@]} != 0 )); then
+    report_rollback_failure "verification did not pass before the deadline" "${affected[@]}"
+    return 1
   fi
+
+  while read -r p; do
+    if [[ -e "$p" ]]; then
+      say "  leftover: $p" >&2
+      leftover=1
+    fi
+  done < <(dropin_paths)
+  if (( leftover != 0 )); then
+    for u in "${UNITS[@]}"; do affected+=("$u (a 94- drop-in could not be removed)"); done
+    report_rollback_failure "a 94- drop-in could not be removed" "${affected[@]}"
+    return 1
+  fi
+
+  say "ROLLBACK VERIFIED: all ${#UNITS[@]} units active, healthy, and importing their expected prior configuration"
   for u in "${UNITS[@]}"; do
-    pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo 0)
-    say "  $u active=$(systemctl is-active "$u") pythonpath=$(proc_pythonpath "$pid" 2>/dev/null || echo '(none)')" >&2
+    want=$(expected_prior_pythonpath "$u" 2>/dev/null) || want=$(configured_pythonpath "$u")
+    say "  $u -> ${want:-(none)}"
   done
-  say "ROLLBACK INCOMPLETE: units restarted but verification did not pass" >&2
-  return 1
+  return 0
+}
+
+# Every activation failure funnels through here. The rollback RESULT decides what
+# is reported and what the exit status is; it is never discarded.
+fail_with_rollback() {
+  local reason=$1
+  ACTIVATION_WROTE=0
+  trap - EXIT INT TERM
+  say "ACTIVATION FAILED: $reason" >&2
+  if rollback_core; then
+    say "Activation did not complete. The previous overlay is live and verified." >&2
+    exit 3
+  fi
+  say "REFUSED: activation failed and rollback is INCOMPLETE - manual intervention required" >&2
+  exit 4
 }
 
 on_unexpected_exit() {
   local rc=$?
+  trap - EXIT INT TERM
   if (( rc != 0 )) && [[ "${ACTIVATION_WROTE:-0}" == "1" ]]; then
+    ACTIVATION_WROTE=0
     say "UNEXPECTED EXIT ($rc) after the drop-ins were written; rolling back" >&2
-    rollback_core || true
+    if rollback_core; then
+      say "ROLLBACK VERIFIED after unexpected exit $rc" >&2
+    else
+      say "ROLLBACK INCOMPLETE after unexpected exit $rc" >&2
+      exit 4
+    fi
   fi
   exit "$rc"
 }
@@ -688,10 +871,20 @@ require_sandbox_paths() {
   [[ "$PROCROOT" == /var/tmp/* ]] || die "sandbox requires ACTIVATION_PROC_ROOT under /var/tmp"
 }
 
-cmd_plan() { preflight_slot; preflight_units; print_plan; }
+cmd_plan() { preflight_slot; preflight_units; classify_dropins; print_plan; }
+
+# Prove the LIVE state for an already-configured tree, without writing anything.
+verify_live_slot() {
+  local want=$1
+  if wait_healthy "$want"; then
+    say "  all units active, running PYTHONPATH=$want, /health 2xx on ${HEALTH_PORTS[*]}"
+    return 0
+  fi
+  return 1
+}
 
 cmd_activate() {
-  local confirm=0 dry=0 arg p all_present=1 identical=1
+  local confirm=0 dry=0 arg state
   for arg in "$@"; do
     case "$arg" in
       --confirm) confirm=1 ;;
@@ -706,18 +899,50 @@ cmd_activate() {
   preflight_slot
   preflight_units
   preflight_no_conflict
+  classify_dropins
+  state=$(dropin_state)
 
-  while read -r p; do
-    [[ -e "$p" ]] || { all_present=0; continue; }
-    cmp -s <(dropin_body) "$p" || identical=0
-  done < <(dropin_paths)
-
-  if (( all_present == 1 && identical == 1 )); then
-    say "ALREADY ACTIVE: all three 93- drop-ins already point at $NEW"
-    say "No restart performed."
-    return 0
+  if [[ "$state" == "drift" ]]; then
+    say "REFUSED: the 94- drop-in set is in an intermediate state." >&2
+    report_dropin_state >&2
+    say "" >&2
+    say "Nothing has been changed. Activation will neither complete nor overwrite a" >&2
+    say "partially present set, because a later rollback would then remove state this" >&2
+    say "invocation did not create." >&2
+    say "" >&2
+    say "Choose deliberately:" >&2
+    say "  sudo bash $0 reconcile --confirm   # back up, then adopt this package's three files" >&2
+    say "  sudo bash $0 rollback --confirm    # remove the 94- files and return to the anchors" >&2
+    exit 2
   fi
-  (( all_present == 0 )) || die "a 93- drop-in exists with different content; inspect before overriding"
+
+  if [[ "$state" == "active" ]]; then
+    say "Configured: all three 94- drop-ins already point at $NEW."
+    say "Verifying the running services before claiming anything."
+    if verify_live_slot "$NEW"; then
+      say "ALREADY ACTIVE: all ${#UNITS[@]} units are live on $NEW and healthy. No restart performed."
+      return 0
+    fi
+    # The drop-ins are ours but the processes are not. Restarting converges the
+    # tree; nothing is written. These files PRE-EXISTED this invocation, so a
+    # failure here must not remove them.
+    say "CONFIGURED BUT NOT LIVE: the drop-ins are correct, the running processes are not." >&2
+    say "Converging with a restart and the full verification path (no files are written)." >&2
+    ACTIVATION_WROTE=0
+    ACTIVATION_START_EPOCH=$(date +%s)
+    if ! systemctl restart "${UNITS[@]}"; then
+      say "CONVERGE FAILED: restart returned nonzero; the pre-existing 94- drop-ins were left in place" >&2
+      report_rollback_failure "converge restart failed; pre-existing drop-ins retained" "${UNITS[@]}"
+      exit 4
+    fi
+    if wait_healthy "$NEW" && journal_scan "${ACTIVATION_START_EPOCH}"; then
+      say "ACTIVE: all ${#UNITS[@]} units are live on $NEW and healthy."
+      return 0
+    fi
+    say "CONVERGE FAILED: services did not reach a healthy state on $NEW; the pre-existing 94- drop-ins were left in place" >&2
+    report_rollback_failure "converge verification failed; pre-existing drop-ins retained" "${UNITS[@]}"
+    exit 4
+  fi
 
   print_plan
   if (( dry == 1 )); then say "DRY RUN: nothing written, nothing restarted"; return 0; fi
@@ -734,27 +959,18 @@ cmd_activate() {
   ACTIVATION_START_EPOCH=$(date +%s)
   systemctl daemon-reload
   if ! systemctl restart "${UNITS[@]}"; then
-    say "ACTIVATION FAILED: restart returned nonzero; some units may already be new" >&2
-    rollback_core || true
-    ACTIVATION_WROTE=0; trap - EXIT INT TERM
-    die "activation rolled back"
+    fail_with_rollback "restart returned nonzero; some units may already be new"
   fi
   say "restarted: ${UNITS[*]}"
 
-  local failure=""
   if ! wait_healthy "$NEW"; then
-    failure="health or provenance checks did not pass"
-  elif ! verify_environment_preserved; then
-    failure="a unit lost one of its existing environment variables"
-  elif ! journal_scan "${ACTIVATION_START_EPOCH}"; then
-    failure="fatal import error in the journal"
+    fail_with_rollback "health or provenance checks did not pass"
   fi
-
-  if [[ -n "$failure" ]]; then
-    say "ACTIVATION FAILED: $failure; rolling back" >&2
-    rollback_core || true
-    ACTIVATION_WROTE=0; trap - EXIT INT TERM
-    die "activation rolled back"
+  if ! verify_environment_preserved; then
+    fail_with_rollback "a unit lost one of its existing environment variables"
+  fi
+  if ! journal_scan "${ACTIVATION_START_EPOCH}"; then
+    fail_with_rollback "fatal import error in the journal"
   fi
 
   ACTIVATION_WROTE=0; trap - EXIT INT TERM
@@ -762,8 +978,72 @@ cmd_activate() {
   say "Rollback: sudo bash $0 rollback --confirm"
 }
 
+# Operator-controlled adoption of an intermediate 94- state. Every file that is
+# replaced is first copied byte-for-byte into the receipt directory, and the
+# switch itself runs the same verification and rollback path as activation.
+cmd_reconcile() {
+  local confirm=0 dry=0 arg state
+  for arg in "$@"; do
+    case "$arg" in
+      --confirm) confirm=1 ;;
+      --dry-run) dry=1 ;;
+      *) die "usage: $0 reconcile --confirm [--dry-run]" ;;
+    esac
+  done
+  (( confirm == 1 )) || die "refusing to reconcile without --confirm (operator gate)"
+  [[ "$EUID" -eq 0 || "$dry" -eq 1 || "$SANDBOX" == "1" ]] || die "must run as root to reconcile"
+
+  require_sandbox_paths
+  preflight_slot
+  preflight_units
+  preflight_no_conflict
+  classify_dropins
+  state=$(dropin_state)
+  say "Current 94- state:"
+  report_dropin_state
+  case "$state" in
+    absent)
+      say "Nothing to reconcile: no 94- drop-in is present. Use 'activate --confirm'."
+      return 0 ;;
+    active)
+      say "Nothing to reconcile: the set is already this package's. Use 'activate --confirm' to verify the live state."
+      return 0 ;;
+  esac
+
+  say ""
+  say "This will BACK UP every 94- file listed above, then replace all three with:"
+  say "  $(dropin_body | tr '\n' ' ')"
+  say "and restart ${UNITS[*]}, verifying provenance, health and environment."
+  if (( dry == 1 )); then say "DRY RUN: nothing written, nothing restarted"; return 0; fi
+
+  capture_receipt
+  ACTIVATION_WROTE=1
+  trap on_unexpected_exit EXIT INT TERM
+  if ! write_dropins_atomically; then
+    # Only the files this run wrote are unwound; pre-existing ones were backed
+    # up and are restored by hand if the operator wants them back.
+    ACTIVATION_WROTE=0; trap - EXIT INT TERM
+    die "reconcile aborted during the write phase; nothing was restarted"
+  fi
+
+  ACTIVATION_START_EPOCH=$(date +%s)
+  systemctl daemon-reload
+  if ! systemctl restart "${UNITS[@]}"; then
+    fail_with_rollback "restart returned nonzero after reconcile"
+  fi
+  if ! wait_healthy "$NEW"; then
+    fail_with_rollback "health or provenance checks did not pass after reconcile"
+  fi
+  if ! journal_scan "${ACTIVATION_START_EPOCH}"; then
+    fail_with_rollback "fatal import error in the journal after reconcile"
+  fi
+
+  ACTIVATION_WROTE=0; trap - EXIT INT TERM
+  say "RECONCILED: all ${#UNITS[@]} units import from $NEW"
+}
+
 cmd_rollback() {
-  local confirm=0 dry=0 arg p present=0
+  local confirm=0 dry=0 arg present=0
   for arg in "$@"; do
     case "$arg" in
       --confirm) confirm=1 ;;
@@ -775,24 +1055,26 @@ cmd_rollback() {
   [[ "$EUID" -eq 0 || "$dry" -eq 1 || "$SANDBOX" == "1" ]] || die "must run as root to roll back"
 
   require_sandbox_paths
-  while read -r p; do [[ -e "$p" ]] && present=$((present + 1)); done < <(dropin_paths)
-  (( present > 0 )) || { say "NOT ACTIVE: no 93- drop-ins present; nothing to roll back"; return 0; }
+  classify_dropins
+  present=$STATE_PRESENT
+  (( present > 0 )) || { say "NOT ACTIVE: no 94- drop-ins present; nothing to roll back"; return 0; }
 
   if (( dry == 1 )); then
     print_plan
-    say "DRY RUN: would remove the three 93- drop-ins and restart ${UNITS[*]}"
+    say "DRY RUN: would remove the 94- drop-ins present ($STATE_PRESENT/${STATE_TOTAL}) and restart ${UNITS[*]}"
     return 0
   fi
 
-  rollback_core || die "rollback did not reach a verified state; intervene manually"
+  rollback_core || exit 4
 }
 
 case "${1:-}" in
   stage)    [[ $# -eq 1 ]] || die "usage: $0 stage";    cmd_stage ;;
   verify)   [[ $# -eq 1 ]] || die "usage: $0 verify";   cmd_verify ;;
   status)   [[ $# -eq 1 ]] || die "usage: $0 status";   cmd_status ;;
-  plan)     [[ $# -eq 1 ]] || die "usage: $0 plan";     cmd_plan ;;
-  activate) shift; cmd_activate "$@" ;;
-  rollback) shift; cmd_rollback "$@" ;;
-  *) die "usage: $0 {stage|verify|status|plan|activate --confirm|rollback --confirm}" ;;
+  plan)      [[ $# -eq 1 ]] || die "usage: $0 plan";      cmd_plan ;;
+  activate)  shift; cmd_activate "$@" ;;
+  reconcile) shift; cmd_reconcile "$@" ;;
+  rollback)  shift; cmd_rollback "$@" ;;
+  *) die "usage: $0 {stage|verify|status|plan|activate --confirm|reconcile --confirm|rollback --confirm}" ;;
 esac

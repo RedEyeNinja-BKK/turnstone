@@ -60,6 +60,16 @@ case "$cmd" in
   daemon-reload) exit 0 ;;
   restart)
     n=0
+    # A rollback restart is recognisable: the package's drop-ins are gone.
+    is_rollback=0
+    for d in "$ACTIVATION_SYSROOT"/turnstone-*.d/94-openai-oauth-v187-r2.conf; do
+      [[ -e "$d" ]] || continue
+      is_rollback=1
+    done
+    (( is_rollback == 1 )) && is_rollback=0 || is_rollback=1
+    if (( is_rollback == 1 )) && [[ -f "$S/rollback_restart_fail" ]]; then
+      exit 1
+    fi
     for u in "$@"; do
       n=$((n+1))
       if [[ -f "$S/fail_restart_after" ]] && (( n > $(cat "$S/fail_restart_after") )); then
@@ -79,6 +89,10 @@ case "$cmd" in
       fi
       pid=$(cat "$S/pid.$u" 2>/dev/null || echo 0)
       mkdir -p "$PROCROOT/$pid"
+      if (( is_rollback == 1 )) && [[ -f "$S/rollback_lose_config" ]] \
+         && [[ "$(cat "$S/rollback_lose_config")" == "$u" ]]; then
+        eff=""
+      fi
       if [[ -f "$S/lose_env" && "$(cat "$S/lose_env")" == "$u" ]]; then
         printf 'PYTHONPATH=%s\n' "$eff" > "$S/env.$u"
         printf 'PYTHONPATH=%s\0' "$eff" > "$PROCROOT/$pid/environ"
@@ -110,6 +124,16 @@ STUB_CURL = r"""#!/usr/bin/env bash
 url=""
 for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done
 port="${url##*:}"; port="${port%%/*}"
+is_rollback=0
+for d in "$ACTIVATION_SYSROOT"/turnstone-*.d/94-openai-oauth-v187-r2.conf; do
+  [[ -e "$d" ]] || continue
+  is_rollback=1
+done
+(( is_rollback == 1 )) && is_rollback=0 || is_rollback=1
+if (( is_rollback == 1 )) && [[ -f "$STUB_STATE/rollback_health.$port" ]]; then
+  [[ "$(cat "$STUB_STATE/rollback_health.$port")" == "1" ]] && exit 0
+  exit 22
+fi
 [[ "$(cat "$STUB_STATE/health.$port" 2>/dev/null || echo 1)" == "1" ]] && exit 0
 exit 22
 """
@@ -361,7 +385,7 @@ def test_rollback_returns_to_the_anchor_and_verifies() -> None:
         }
         for u in UNITS:
             assert not h.dropin(u).exists()
-        assert "ROLLBACK OK" in p.stdout
+        assert "ROLLBACK VERIFIED" in p.stdout
 
     _with_harness(body)
 
@@ -375,6 +399,222 @@ def test_already_active_is_idempotent_without_restart() -> None:
         assert p.returncode == 0, p.stderr
         assert "ALREADY ACTIVE" in p.stdout
         assert "No restart performed" in p.stdout
+
+    _with_harness(body)
+
+
+# ---------------------------------------------------------------------------
+# A. pre-existing 94- state is classified, never absorbed
+# ---------------------------------------------------------------------------
+
+
+def _write_dropin(h: Harness, unit: str, body: str) -> None:
+    path = h.dropin(unit)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    path.chmod(0o644)
+
+
+def _our_body(h: Harness) -> str:
+    return f'[Service]\nEnvironment="PYTHONPATH={h.slot}"\n'
+
+
+def test_partial_state_is_refused_and_changes_nothing() -> None:
+    """One of three present must not be treated as a fresh activation."""
+
+    def body(h: Harness) -> None:
+        _write_dropin(h, "turnstone-server.service", _our_body(h))
+        before_proc = {u: h.proc(u) for u in UNITS}
+        before_bytes = h.dropin("turnstone-server.service").read_bytes()
+        p = h.run("activate", "--confirm")
+        assert p.returncode != 0, "a partial set must not activate"
+        assert "intermediate state" in p.stderr
+        assert "1/3 present" in p.stderr, p.stderr
+        assert {u: h.proc(u) for u in UNITS} == before_proc, "a refusal restarted something"
+        assert h.dropin("turnstone-server.service").read_bytes() == before_bytes
+        assert not h.dropin("turnstone-node@2.service").exists(), "a refusal wrote a drop-in"
+        assert list(h.receipts.glob("combined-v187-*")) == [], "a refusal wrote a receipt"
+
+    _with_harness(body)
+
+
+def test_divergent_state_is_refused_and_changes_nothing() -> None:
+    """All three present but one differs: still not ours to overwrite."""
+
+    def body(h: Harness) -> None:
+        for u in UNITS:
+            _write_dropin(h, u, _our_body(h))
+        divergent = h.dropin("turnstone-node@2.service")
+        divergent.write_text('[Service]\nEnvironment="PYTHONPATH=/somewhere/else"\n')
+        before = divergent.read_bytes()
+        p = h.run("activate", "--confirm")
+        assert p.returncode != 0
+        assert "DIFFERS" in p.stderr
+        assert "3/3 present, 2/3 identical" in p.stderr, p.stderr
+        assert divergent.read_bytes() == before, "pre-existing content was replaced"
+
+    _with_harness(body)
+
+
+def test_all_present_and_identical_is_already_active_without_restart() -> None:
+    def body(h: Harness) -> None:
+        for u in UNITS:
+            _write_dropin(h, u, _our_body(h))
+            pid = 2000 + UNITS.index(u)
+            (h.procroot / str(pid) / "environ").write_text(
+                f"PYTHONPATH={h.slot}\0HOME=/var/lib/turnstone\0"
+                "TURNSTONE_CONFIG=/etc/turnstone/config.toml\0"
+            )
+        (h.state / "fail_restart_after").write_text("0\n")  # any restart would fail
+        p = h.run("activate", "--confirm")
+        assert p.returncode == 0, p.stderr
+        assert "ALREADY ACTIVE" in p.stdout
+        assert "No restart performed" in p.stdout
+
+    _with_harness(body)
+
+
+def test_all_present_but_not_live_converges_without_removing_files() -> None:
+    """Drop-ins match, processes do not: restart, but never delete their files."""
+
+    def body(h: Harness) -> None:
+        for u in UNITS:
+            _write_dropin(h, u, _our_body(h))
+        # Processes still on the anchors.
+        p = h.run("activate", "--confirm")
+        assert p.returncode == 0, p.stderr + p.stdout
+        assert "CONFIGURED BUT NOT LIVE" in p.stderr
+        assert "ACTIVE:" in p.stdout
+        for u in UNITS:
+            assert h.dropin(u).exists(), "a pre-existing drop-in was removed"
+
+    _with_harness(body)
+
+
+def test_converge_failure_leaves_pre_existing_dropins_in_place() -> None:
+    def body(h: Harness) -> None:
+        for u in UNITS:
+            _write_dropin(h, u, _our_body(h))
+        (h.state / "health.8090").write_text("0\n")
+        p = h.run("activate", "--confirm")
+        assert p.returncode != 0, "an unconverged tree must not report success"
+        assert "left in place" in (p.stderr + p.stdout)
+        for u in UNITS:
+            assert h.dropin(u).exists(), f"{u} drop-in was removed after a converge failure"
+
+    _with_harness(body)
+
+
+def test_reconcile_backs_up_then_adopts_a_partial_state() -> None:
+    def body(h: Harness) -> None:
+        _write_dropin(h, "turnstone-server.service", '[Service]\nEnvironment="PYTHONPATH=/old"\n')
+        p = h.run("reconcile", "--confirm")
+        assert p.returncode == 0, p.stderr + p.stdout
+        assert "RECONCILED" in p.stdout
+        assert h.all_proc() == {str(h.slot)}, h.all_proc()
+        backups = list(h.receipts.glob("dropin-backup-*"))
+        assert backups, "reconcile replaced a file without backing it up"
+        saved = [f for f in backups[0].iterdir()]
+        assert any("/old" in f.read_text() for f in saved), "the replaced content was not preserved"
+
+    _with_harness(body)
+
+
+def test_reconcile_refuses_without_confirmation() -> None:
+    def body(h: Harness) -> None:
+        _write_dropin(h, "turnstone-server.service", _our_body(h))
+        p = h.run("reconcile")
+        assert p.returncode != 0
+        assert "without --confirm" in p.stderr
+
+    _with_harness(body)
+
+
+# ---------------------------------------------------------------------------
+# B. a failed rollback is reported, never suppressed
+# ---------------------------------------------------------------------------
+
+
+def test_failed_restart_reports_rollback_incomplete() -> None:
+    """Activation fails, and rollback's own restart fails."""
+
+    def body(h: Harness) -> None:
+        (h.state / "health.8084").write_text("0\n")     # activation fails
+        (h.state / "rollback_restart_fail").write_text("1\n")
+        p = h.run("activate", "--confirm")
+        assert p.returncode != 0
+        out = p.stdout + p.stderr
+        assert "ROLLBACK INCOMPLETE" in out, out
+        assert "ROLLBACK VERIFIED" not in out
+        assert "restart returned nonzero" in out
+        recovery = list(h.receipts.glob("recovery-*.txt"))
+        assert recovery, "no recovery receipt was written"
+        text = recovery[0].read_text()
+        for u in UNITS:
+            assert f"unit={u}" in text, f"{u} missing from the recovery receipt"
+        assert "remediation=" in text
+
+    _with_harness(body)
+
+
+def test_rollback_health_failure_is_reported_with_the_port() -> None:
+    def body(h: Harness) -> None:
+        (h.state / "journal_error").write_text("ImportError: boom\n")  # activation fails
+        (h.state / "rollback_health.8090").write_text("0\n")           # rollback stays unhealthy
+        p = h.run("activate", "--confirm")
+        assert p.returncode != 0
+        out = p.stdout + p.stderr
+        assert "ROLLBACK INCOMPLETE" in out
+        assert "port 8090" in out, out
+        assert list(h.receipts.glob("recovery-*.txt")), "no recovery receipt"
+
+    _with_harness(body)
+
+
+def test_lost_configuration_during_rollback_is_reported_per_unit() -> None:
+    def body(h: Harness) -> None:
+        (h.state / "journal_error").write_text("ModuleNotFoundError: x\n")
+        (h.state / "rollback_lose_config").write_text("turnstone-node@3.service\n")
+        p = h.run("activate", "--confirm")
+        assert p.returncode != 0
+        out = p.stdout + p.stderr
+        assert "ROLLBACK INCOMPLETE" in out
+        assert "affected: turnstone-node@3.service" in out, out
+        assert "expected /opt/turnstone-overlays/typed-decision-v187-finish" in out, out
+
+    _with_harness(body)
+
+
+def test_verified_rollback_is_reported_as_verified() -> None:
+    def body(h: Harness) -> None:
+        (h.state / "journal_error").write_text("ImportError: boom\n")
+        p = h.run("activate", "--confirm")
+        out = p.stdout + p.stderr
+        assert p.returncode != 0, "activation must still fail"
+        assert "ROLLBACK VERIFIED" in out, out
+        assert "ROLLBACK INCOMPLETE" not in out
+        assert "The previous overlay is live and verified" in out
+        for u in UNITS:
+            assert not h.dropin(u).exists()
+
+    _with_harness(body)
+
+
+def test_rollback_refuses_to_claim_success_when_a_dropin_survives() -> None:
+    """A removal that silently fails must not be reported as verified."""
+
+    def body(h: Harness) -> None:
+        assert h.run("activate", "--confirm").returncode == 0
+        # Make the node drop-in directory immutable-by-stub: replace the file
+        # with a directory so `rm -f` cannot remove it.
+        target = h.dropin("turnstone-node@2.service")
+        target.unlink()
+        target.mkdir()
+        p = h.run("rollback", "--confirm")
+        out = p.stdout + p.stderr
+        assert p.returncode != 0, "a surviving drop-in must fail rollback"
+        assert "ROLLBACK INCOMPLETE" in out
+        assert "leftover" in out or "could not be removed" in out
 
     _with_harness(body)
 

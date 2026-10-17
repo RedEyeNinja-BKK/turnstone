@@ -87,12 +87,12 @@ def test_the_switch_is_three_dropins_for_six_units() -> None:
         assert unit.replace(".service", "") in src, f"unit not in the restart set: {unit}"
     # Every unit is restarted by one command, not one at a time.
     activate = _body("cmd_activate")
-    assert 'systemctl restart "${UNITS[@]}"' in activate, (
-        "units must be restarted in a single window"
-    )
-    assert activate.count("systemctl restart") == 1
-    # ...and a nonzero status must not abort before the rollback branch.
-    assert 'if ! systemctl restart "${UNITS[@]}"; then' in activate
+    # Two restart sites, both guarded: the fresh-activation window and the
+    # converge path for an already-configured tree. A nonzero status must route
+    # to the rollback path instead of aborting under `set -e`.
+    assert activate.count('systemctl restart "${UNITS[@]}"') == 2
+    assert activate.count('if ! systemctl restart "${UNITS[@]}"; then') == 2
+    assert "fail_with_rollback" in activate
 
 
 def test_the_activation_prefix_sorts_after_the_existing_anchors() -> None:
@@ -228,10 +228,17 @@ def test_activation_proves_provenance_and_health_before_declaring_success() -> N
     body = _body("cmd_activate")
     assert 'wait_healthy "$NEW"' in body, "must verify the running code, not just restart"
     assert body.index('wait_healthy "$NEW"') < body.index("ACTIVATED:")
-    # Rollback is wired to both failure modes.
-    assert body.count("rollback_core || true") >= 2
     assert "journal_scan" in body
     assert body.index("journal_scan") < body.index("ACTIVATED:")
+    # Every failure funnels through the one place that decides the rollback
+    # result - and that place must never discard it.
+    assert body.count("fail_with_rollback") == 4, (
+        "restart, health, environment and journal failures must all route to "
+        "fail_with_rollback"
+    )
+    assert "rollback_core || true" not in _src(), (
+        "a rollback failure must never be suppressed"
+    )
 
 
 def test_health_check_covers_every_listening_port() -> None:

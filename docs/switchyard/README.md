@@ -47,6 +47,30 @@ upstream `v0.3.0`, and the difference determines what is safe to assume.
 
 ---
 
+## Bounded runtime access
+
+`scripts/turnstone_switchyard_runtime.py` is the read-only path a Turnstone
+session uses to inspect the deployment. It runs as the service user — the SSH
+key is already `turnstone:turnstone` 0600 — so it needs no sudo grant, no
+launcher and no daemon. Every remote command is a module constant; the two
+verbs that take input apply it only as an in-process filter. Nothing here
+mutates the deployment: `validate` runs the binary's `--dry-run`.
+
+| Verb | Returns |
+|---|---|
+| `status` | unit state, PID, start time, version, `/health`, manifest sha256 |
+| `catalog` | routes, composites, targets, capabilities, composition references |
+| `route` | one route or composite with resolved target and candidates (stdin JSON) |
+| `stats` | `/v1/stats` totals and per-model calls/latency |
+| `metrics` | declared metric families with type, help and sample counts |
+| `validate` | `--dry-run` under the unit's own environment files |
+| `log` | recent routing records, optionally filtered by `route_id` (stdin JSON) |
+
+Exit codes: 0 success, 2 refused request, 3 transport failure, 4 remote
+failure.
+
+---
+
 ## Provenance of this package
 
 | Fact | Source |

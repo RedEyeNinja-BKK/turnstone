@@ -229,3 +229,57 @@ and `/opt/turnstone-overlays/typed-decision-v187-finish` (second pass, currently
 active). The live overlay was not modified; its four files hash to
 `session.py 386626fc…`, `output_guard_judge.py d325d5dd…`,
 `tool_advisory.py cb77e8e7…`, `typed_decision.py 5e9f5ae9…`.
+
+## Root Git ownership boundary (2026-10-17)
+
+Staging runs as root; the repository belongs to `turnstone`. Git refuses that
+combination - `detected dubious ownership in repository` - so the base-commit
+read failed before anything was staged.
+
+**Fix:** one `repo_git` helper. When the caller is root and the repository owner
+is not, the *read* runs as the owner via `runuser -u "$REPO_OWNER" -- git …`.
+The write stays on the root side: the output redirection is performed by the
+root shell, so `$WORKDIR/base` and the immutable candidate remain root-owned.
+
+**Deliberately NOT done:** no global `safe.directory` exception (it would disable
+the check for every repository on the host for every invocation), and no chown of
+the working tree. Both are pinned as negative assertions in
+`tests/test_staging_git_ownership.py`.
+
+Failures are now distinct: `GIT_OWNERSHIP_REFUSED` (the guard fired - do not
+weaken it) versus `GIT_READ_FAILED` (the read failed for another reason).
+
+**Audit of `stage_openai_oauth_v187.sh`:** no Git invocations at all. It copies
+repository files with `install`/`cmp`, which root may read across the ownership
+boundary without tripping the guard. Recorded in the script header.
+
+### Regression check - three tiers
+
+`tests/test_staging_git_ownership.py`:
+
+| Tier | What it proves | Needs root |
+|---|---|---|
+| 1 structural | every Git read goes through one helper; no `safe.directory=`, no `git config`, no chown of the source tree; OAuth script invokes no git | no |
+| 2 mechanism | on this host Git **really does** refuse a repository owned by another uid (measured on a foreign-owned repo), with a control showing owner==invoker succeeds | no |
+| 3 boundary | the production scenario: as root, a bare `git` fails on a `turnstone`-owned repo and the owner-side read succeeds | **yes** |
+
+Tier 3 reports `SKIP` - never a silent pass - when not run as root:
+
+```bash
+sudo TMPDIR=/var/tmp /opt/turnstone-venv/bin/python \
+  /var/lib/turnstone/github/turnstone/tests/test_staging_git_ownership.py
+```
+
+### Corrected root commands
+
+```bash
+cd /var/lib/turnstone/github/turnstone
+
+sudo bash scripts/stage_typed_decision_v187_r2.sh stage
+sudo bash scripts/stage_typed_decision_v187_r2.sh verify
+
+sudo bash scripts/stage_openai_oauth_v187.sh stage
+sudo bash scripts/stage_openai_oauth_v187.sh verify
+```
+
+`activate` refuses on both scripts; production activation remains a separate gate.

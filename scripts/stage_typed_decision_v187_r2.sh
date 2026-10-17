@@ -103,12 +103,43 @@ FULL_FILES=(
   "cli.py"
 )
 
+# --- Git reads across a privilege boundary ---------------------------------
+# Git refuses to read a repository whose owner is not the invoking uid
+# ("detected dubious ownership"). On this host the repository belongs to the
+# `turnstone` service identity while staging runs as root, so the read fails.
+#
+# The correct response is neither a global `safe.directory` exception (that
+# disables the check for EVERY repository on the host, for every invocation) nor
+# a chown of the working tree. Run the READ as the repository's owner and keep
+# the write on the root side: the redirection is performed by this shell, so the
+# protected temp file and the immutable candidate stay root-owned.
+REPO_OWNER="$(stat -c '%U' "$REPO" 2>/dev/null || true)"
+
+repo_git() {
+  if [[ "$EUID" -eq 0 && -n "$REPO_OWNER" && "$REPO_OWNER" != "root" ]]; then
+    command -v runuser >/dev/null 2>&1 ||
+      die "runuser is required to read a $REPO_OWNER-owned repository as root"
+    local owner_home
+    owner_home="$(getent passwd "$REPO_OWNER" 2>/dev/null | cut -d: -f6)"
+    runuser -u "$REPO_OWNER" -- env HOME="${owner_home:-/}" git -C "$REPO" "$@"
+  else
+    git -C "$REPO" "$@"
+  fi
+}
+
 check_full_file_bases() {
   local f
   for f in "${FULL_FILES[@]}"; do
     [[ -f "$REPO/turnstone/$f" ]] || die "repository missing $f"
-    git -C "$REPO" show "$BASE_COMMIT:turnstone/$f" > "$WORKDIR/base" 2>/dev/null \
-      || die "cannot read $BASE_COMMIT:turnstone/$f"
+    # Read as the repository owner; this shell (root) still creates and owns
+    # "$WORKDIR/base" because the redirection is applied by the caller.
+    if ! repo_git show "$BASE_COMMIT:turnstone/$f" > "$WORKDIR/base" 2>"$WORKDIR/git.err"; then
+      if grep -qi 'dubious ownership' "$WORKDIR/git.err" 2>/dev/null; then
+        die "GIT_OWNERSHIP_REFUSED reading $BASE_COMMIT:turnstone/$f as $REPO_OWNER; \
+refusing to weaken the check with safe.directory (repo owner: ${REPO_OWNER:-unknown}, euid: $EUID)"
+      fi
+      die "GIT_READ_FAILED for $BASE_COMMIT:turnstone/$f (repo owner: ${REPO_OWNER:-unknown})"
+    fi
     cmp -s "$WORKDIR/base" "$BASE_TREE/$f" ||
       die "base mismatch for $f: repository base $BASE_COMMIT differs from $BASE_TREE; \
 refusing to overlay a divergent module"
@@ -332,6 +363,7 @@ cmd_stage() {
   chmod -R a+rX "$NEW/turnstone"
 
   say "STAGED: $NEW"
+  say "  repo owner: ${REPO_OWNER:-unknown}   effective uid: $EUID (git reads run as the owner)"
   "$PY" -m compileall -q "$NEW/turnstone" >/dev/null || die "staged tree does not compile"
   say "compileall: OK"
 }

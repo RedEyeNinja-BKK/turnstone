@@ -19,6 +19,12 @@
 #   error. This script therefore COPIES all four and then ASSERTS the complete
 #   set is present before it will finish.
 #
+# OWNERSHIP NOTE (audited): this script invokes NO git commands. It copies
+# repository files with `install`/`cmp`, which root may read across the
+# turnstone-owned working tree without tripping Git's dubious-ownership guard.
+# The R2 script, whose base-commit check DOES read Git objects, runs those reads
+# as the repository owner for the same reason.
+#
 # Usage (root):
 #   sudo bash stage_openai_oauth_v187.sh stage
 #   sudo bash stage_openai_oauth_v187.sh verify

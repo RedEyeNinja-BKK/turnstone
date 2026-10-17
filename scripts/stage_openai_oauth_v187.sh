@@ -474,7 +474,7 @@ print_plan() {
   say "Then: systemctl daemon-reload; systemctl restart ${UNITS[*]}"
   say "Then: verify PID PYTHONPATH, unit state, /health and preserved env; otherwise roll back."
   say ""
-  say "No model row is changed. auth_mode=openai_oauth stays unreachable until a"
+  say "No model row is changed. auth_mode=openai_oauth stays unreachable until"
   say "the three existing aliases are migrated deliberately (separate gate)."
 }
 

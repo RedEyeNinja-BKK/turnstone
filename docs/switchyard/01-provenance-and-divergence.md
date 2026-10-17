@@ -20,16 +20,17 @@ Reference for the Switchyard running on `switchyard-vm`. Measured 2026-10-17.
 | Build id | `7f4d76212f363150ad13382fedb27cafec9c06da` |
 | Reported version | `switchyard-server 0.3.0` |
 | Config | `/etc/switchyard/routes.toml` sha256 `7b8445b20346670fa712f1e2b82b81730126df738054e6aef5340ea5dbcc326f` (V7.2; was `9a6448ef…` before the rerank `top_n` change) |
-| Source tree | `/home/vincent/switchyard-migration/production-src` (owner `vincent`, clean) |
-| Source commit | `2c6e6df53e9dbac9f6121d9780e4c09930d51b40` (2026-10-04) |
+| Source tree | `/home/vincent/switchyard-migration/production-src` — **a clone of the bundle, not the build tree** (see below) |
+| Source commit | `2c6e6df53e9dbac9f6121d9780e4c09930d51b40` (2026-10-04), detached HEAD, clean working tree |
 | Decision | `fix(translation): let a Responses upstream require a list-shaped input` |
 | Bind | `127.0.0.1:4000`, published on the tailnet TLS listener (`:443`) |
 | Started | `2026-10-16 00:19:07 +07` |
 
 `--version` prints the crate version only. There is no embedded commit hash in
-the binary (`strings` finds no 40-hex revision), so provenance comes from the
-source tree, not from the artifact. **Record the source commit, not just
-`0.3.0`, in any deployment receipt.**
+the binary (`2c6e6df` does not appear in the image; the two 40-hex strings it
+does carry, `b940084d…` and `1b9c0d5f…`, match no known commit), so provenance
+comes from the source tree, not from the artifact. **Record the source commit,
+not just `0.3.0`, in any deployment receipt.**
 
 ### The local source bundle does not match this binary
 
@@ -48,10 +49,54 @@ So the bundle predates at least one fork commit that the deployed binary
 contains. Treat the bundle as a *reference for behaviour*, never as the
 build input for a replacement artifact.
 
-**Consequence:** a rebuild from the bundle cannot be deployed. It would reject
-the live manifest at startup. Any source change to this deployment needs the
-true tree from `production-src` first, or the bundle must be regenerated from
-it and re-verified against the running binary.
+### The cited `production-src` is a clone of the same bundle
+
+Measured 2026-10-17. `/home/vincent/switchyard-migration/production-src` was
+believed to be the authoritative tree. It is not:
+
+| Check | Result |
+|---|---|
+| `git reflog` | `clone: from /home/vincent/switchyard-migration/switchyard-production-source.bundle` |
+| HEAD | `2c6e6df5`, detached, 543 commits — the bundle's HEAD |
+| `git status --porcelain` | empty; no local modifications, no stashes |
+| `git for-each-ref` | no branches, no tags |
+| `git fsck --unreachable` | no unreachable commits |
+| `decision_lane_composition` in the tree | absent (0 files) |
+
+Both artifacts carry the same content: the bundle's sha256 is
+`cd58531b88110e1d805681bf8be28c27d88d1d8c6663cc753ac7ddc282a23ca3`, matching the
+checksum recorded when it was staged.
+
+The gap is now exact rather than "at least one commit". `DeploymentConfig` in
+`crates/switchyard-runner/src/config.rs` declares `schema_version`,
+`fallback_client`, `llm_clients`, `targets`, `routes`, `capability_clients`,
+`capabilities`, `decision_lanes`, `composites`. The deployed binary's struct
+also understands `default_decision_lane` and `decision_lane_composition`, and
+embeds `validate_decision_lane` / `validate_default_decision_lane`, which the
+source has no equivalent of. Decision *lanes* exist in the source (36
+references); only those two fields and their behaviour are new.
+
+### Where the deployed binary actually came from
+
+`switchyard-vm` never compiled this project. There is no `cargo`, `rustc`,
+`~/.cargo`, `~/.rustup` or `target/` directory on the host. `~/.bash_history`
+shows the deployment was an unpack-and-install of a prebuilt tarball:
+`switchyard-runtime.tgz` (sha256 `2dd21ecf42a3…`) →
+`runtime-unpacked/opt/switchyard/bin/switchyard-server` → `sudo install` into
+`/opt/switchyard/bin/`. All four copies on disk are byte-identical
+(`74963b1d…`), except the `decision-lanes-20261005T033957Z` rollback anchor
+(`2de55530…`), which is the binary that preceded the lane feature.
+
+The tarball contains no sources and records no commit: the only provenance
+file inside it, `PRE-STATE`, lists hashes, the unit fragment and the argv the
+process was started with.
+
+**Consequence:** a rebuild from the bundle — or from the `production-src`
+clone, which is the same tree — cannot be deployed. It would reject the live
+manifest at startup. Any source change to this deployment needs the tree that
+produced `74963b1d…`, which is not present on `switchyard-vm`, `agent-vm` or
+`turnstone-vm`; regenerating the bundle from it and re-verifying against the
+running binary is the only verified alternative.
 
 ---
 

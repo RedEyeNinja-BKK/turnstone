@@ -1,6 +1,6 @@
 # LC-RD-007 — native OpenAI OAuth: deployment package
 
-Status: **candidate staged and verified in sandbox. Not activated.** The
+Status: **revision 2 candidate staged and verified in sandbox. Not activated.** The
 Switchyard-backed `gpt-6.1-sol` alias remains authoritative.
 
 ## 1. What this package changes
@@ -75,7 +75,7 @@ receipt text:
 
 | Claim | Measurement |
 |---|---|
-| `openai-oauth-v187` is a superset of the R2 slot | 263 `.py` vs 262; **no file present in R2 is absent**; exactly 4 files differ (`model_registry`, `model_backend_auth`, `settings_registry`, `console/server`) + 1 added (`oauth_token_store.py`) |
+| `openai-oauth-v187` (rev 1) is a superset of the R2 slot | 263 `.py` vs 262; **no file present in R2 is absent**; exactly 4 files differ (`model_registry`, `model_backend_auth`, `settings_registry`, `console/server`) + 1 added (`oauth_token_store.py`) |
 | R2 content preserved | the 4 differing files contain only OAuth additions; all other R2 files are byte-identical |
 | all four cooperating changes | 14/14 structural markers present; the dispatch branch precedes the delegated-user check |
 | syntax | 263/263 files compile |
@@ -88,6 +88,40 @@ and `tools.rerank_timeout_cap_s`. Their implementation is *not* in this slot, so
 they change no behaviour; they are visible in the Settings tab and do nothing.
 They were not stripped because the slot is verified and immutable and is not
 being restaged. `model.openai_oauth_store` is the only intended new setting.
+
+## 2c. Revision 2 - security corrections (2026-10-17)
+
+Revision 1 is preserved and unmodified. Two findings required application
+changes, so the package moves to a new immutable slot
+(`/opt/turnstone-overlays/openai-oauth-v187-r2`) with `94-` drop-ins.
+
+| Finding | Correction | Pinned by |
+|---|---|---|
+| Fail-closed was conditional on `api_key`/`model.auth_fail_closed`; a missing resource returned `None` (= "use the static key") | Direct-OAuth failure is unconditional; resource must be present and exact | `test_static_key_never_enables_a_fallback`, `test_global_fail_closed_flag_is_irrelevant`, `test_missing_resource_refuses_instead_of_returning_none` |
+| The bearer was not bound to an endpoint | Shared predicate + dispatch check: exact resource, provider `openai`, exact https base_url, no userinfo/query/fragment/port; redirects disabled on this lane's transport; Console create **and** update call the same predicate on the post-merge row | `test_alternate_host_is_refused`, `test_plain_http_is_refused`, `test_trailing_slash_variant_is_refused`, `test_credential_bearing_url_is_refused`, `test_non_default_port_is_refused`, `test_compat_provider_is_refused`, `test_direct_oauth_client_disables_redirects` |
+| Direct-OAuth-only deployments inherited the MCP token-store boot requirement | Guards read `has_token_store_dynamic_auth()`; mixed registries still require it | `test_direct_oauth_only_does_not_require_the_mcp_token_store`, `test_entra_still_requires_the_mcp_token_store` |
+| Inert settings arrived with the whole-file `settings_registry.py` copy | The staging step patches in only `model.openai_oauth_store`; verify refuses an inert row | verify step `settings: model.openai_oauth_store only` |
+
+Both negative families were mutation-checked: restoring the old semantics makes
+the new tests fail (`2 failed` for the fallback mutation, `4 failed` for the
+binding mutation), and the restored tree is green again.
+
+Staged verification (rev 2, sandbox, real 1.8.7 base):
+
+```
+completeness: all four cooperating changes present
+settings: model.openai_oauth_store only (no inert rows)
+R2 content: preserved
+import provenance: all modules from <slot>/turnstone
+    29 passed  [test_openai_oauth_auth_mode]
+    28 passed  [test_oauth_token_store]
+    13 passed  [test_generative_alias_exclusion]
+    34 passed  [test_output_guard_typed_decision]
+     7 passed  [test_direct_oauth_request_profile]
+    14 passed  [test_combined_activation]
+     9 passed  [test_activation_failure_paths]
+VERIFY OK
+```
 
 ## 3. Canary evidence already obtained
 
@@ -129,7 +163,7 @@ sudo bash scripts/stage_openai_oauth_v187.sh rollback --confirm
 ```
 
 The script refuses to activate without the literal `--confirm` and without root.
-It writes the three `93-` drop-ins atomically (root:root, 0644), records a receipt
+It writes the three `94-` drop-ins (all-or-nothing), records a receipt
 under `/var/log/turnstone-v187/` **before** the switch, `daemon-reload`s, then
 restarts `turnstone-server`, `turnstone-node@2..5` and `turnstone-console` in a
 single `systemctl restart`. It declares success only after, for **every** unit:
@@ -154,10 +188,11 @@ remains unreachable until a canary row is deliberately created (section 5). The
 SIWC runtime store and the audience allow-list are prerequisites for that
 **canary**, not for this activation.
 
-**Rollback** removes only the three `93-` drop-ins. The `90-`/`91-` anchors restore
+**Rollback** removes only the three `94-` drop-ins. The `90-`/`91-` anchors restore
 `typed-decision-v187-finish`, which is what is running today. There is **no `92-`
 anchor on this host** because the R2 slot was never activated on its own; if it
-ever is, `92-` sorts before `93-` and removing `93-` would land on R2 instead.
+ever is, `92-` sorts before `94-` and removing `94-` would land on R2 instead.
+Both `92-` and the superseded `93-` family are refused at preflight for that reason.
 Model rows are untouched by activation and rollback.
 
 ## 5. Alias cutover (a separate, later gate)
@@ -166,7 +201,7 @@ The canary is a **new** alias; the existing `gpt-6.1-sol` row keeps pointing at
 Switchyard until the canary passes.
 
 1. Add a canary row, e.g. `gpt-6.1-sol-native`:
-   `provider=openai-responses`, `model=gpt-6.1-sol`,
+   `provider=openai`, `model=gpt-6.1-sol`,
    `base_url=https://api.openai.com/v1`,
    `auth_mode=openai_oauth`, `obo_audience=https://api.openai.com/v1`,
    `api_key=''` (keyless ⇒ fail-closed), `context_window` as measured.
@@ -180,14 +215,82 @@ Switchyard until the canary passes.
 
 `gpt-6-luna` and `gpt-6-luna-nt` are not touched by this package or the cutover.
 
-## 6. Credential cutover
+## 6. Credential cutover (single-writer handoff)
 
 The working store `/var/lib/turnstone/github/siwc-creds` stays authoritative until
-this package is live. At cutover:
+this package is live. Two stores holding one grant is the failure mode this module
+exists to prevent: the first refresh retires the token the other store still
+holds.
 
-- point every consumer at the runtime store in one step — never two independent
-  writers refreshing one grant;
-- the runtime copy was byte-identical at staging time; if a refresh has happened
-  since, re-copy rather than assuming;
-- retire the old store as an **inactive** historical reference, and never revive a
-  rotated token from it.
+**Measured state (2026-10-17, before handoff):**
+
+| Fact | Value |
+|---|---|
+| `credentials.json` in both stores | byte-identical, `sha256 2e228446…` |
+| `host_id` in both stores | byte-identical, `sha256 7d66be05…` |
+| `resource` | `https://api.openai.com/v1` |
+| access token | **already expired** (`expires_at` 3.9 h in the past) |
+| refresh token | present, not yet rotated |
+
+Because the access token is expired, the **first** call through either store
+performs a refresh and rotates the refresh token. The handoff therefore cannot
+be deferred until after the canary starts: it must complete before the first
+call on the new path.
+
+**Handoff - one step, in this order:**
+
+1. Confirm both copies are still byte-identical. If a refresh has happened since
+   the date above, the copies have diverged: stop, and copy the *writer's* file
+   over the runtime store rather than assuming.
+2. Archive the old store without deleting it - `mv siwc-creds
+   siwc-creds.archived-<date>`. Renaming removes it as a refreshable path while
+   preserving the bytes; do not `chmod` in place, because the probe script's
+   default still points there.
+3. Re-point every consumer at the runtime store
+   (`/srv/turnstone/credentials/runtime/openai-siwc`, or the
+   `model.openai_oauth_store` setting) in the same step. The probe script
+   `scripts/siwc_direct_oauth_probe.py` defaults to the archived path
+   (`SIWC_STORE_DIR` overrides it) - set it, or it becomes a second writer.
+4. Never revive a rotated token from the archive.
+
+Only then create the canary row.
+
+## 7. Audience allow-list (additive)
+
+`model.auth_audience_allowlist` is a comma/newline-separated list of exact
+resources. The direct-OAuth row needs `https://api.openai.com/v1` added; existing
+entries must be preserved.
+
+```bash
+# Read the current value (deployment-wide state; not in the service file store)
+CURRENT=$(curl -sS -H "Authorization: Bearer $TURNSTONE_ADMIN_TOKEN" \
+  http://127.0.0.1:8090/v1/api/admin/settings \
+  | jq -r '.settings[] | select(.key=="model.auth_audience_allowlist") | .value')
+
+# Union: append, de-duplicate, never reorder or drop.
+NEW_VALUE=$(printf '%s\n%s\n' "$CURRENT" "https://api.openai.com/v1" \
+  | tr ',' '\n' | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++' | paste -sd, -)
+
+curl -sS -X PUT -H "Authorization: Bearer $TURNSTONE_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -nc --arg v "$NEW_VALUE" '{value:$v}')" \
+  http://127.0.0.1:8090/v1/api/admin/settings/model.auth_audience_allowlist
+```
+
+Re-read afterwards and confirm every previous entry is still present before
+creating the canary row. This write needs the `admin.settings` scope and is
+audited. It belongs to the canary gate, not to code activation.
+
+## 8. Rollback target, measured on the live host
+
+| Unit | Current `PYTHONPATH` | Rollback expectation |
+|---|---|---|
+| `turnstone-server` | `typed-decision-v187-finish` | same |
+| `turnstone-node@2..5` | `typed-decision-v187-finish` | same |
+| `turnstone-console` | *(none)* | none |
+| `92-*` drop-ins | **none present** | must stay absent |
+| `93-*` / `94-*` drop-ins | **none present** | removed by rollback |
+
+Measured with `systemctl show -p Environment` and a directory listing of the
+three `.d` paths on 2026-10-17. `rollback_core` asserts exactly this shape and
+returns nonzero if it cannot prove it.

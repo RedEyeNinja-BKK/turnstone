@@ -106,6 +106,20 @@ TARGET_FIELDS = (
     "max_context_tokens",
 )
 COMPOSITE_FIELDS = ("children", "context_window", "tool_calling", "reasoning", "vision")
+CAPABILITY_FIELDS = (
+    "id",
+    "target",
+    "contract",
+    "dimensions",
+    "normalization",
+    "max_batch",
+    "max_candidates",
+    "top_n",
+    "max_doc_chars",
+    "max_query_chars",
+)
+DECISION_LANE_FIELDS = ("targets", "children")
+LLM_CLIENT_FIELDS = ("format", "base_url", "requires_list_input", "max_retries")
 LOG_FIELDS = (
     "ts",
     "route_id",
@@ -290,7 +304,27 @@ def build_catalog(doc: dict[str, Any]) -> dict[str, Any]:
         "composites": composites,
         "targets": targets,
         "capabilities": sorted((doc.get("capabilities") or {}).keys()),
+        # Bodies as well as names. A caller that has to render what the
+        # deployment declares would otherwise re-parse the manifest itself,
+        # which is how a second, drifting copy of the inventory gets created.
+        # These sections hold contracts and limits, never credentials.
+        "capability_defs": {
+            name: _pick(body, CAPABILITY_FIELDS)
+            for name, body in sorted((doc.get("capabilities") or {}).items())
+        },
         "decision_lanes": sorted((doc.get("decision_lanes") or {}).keys()),
+        "decision_lane_defs": {
+            name: _pick(body, DECISION_LANE_FIELDS)
+            for name, body in sorted((doc.get("decision_lanes") or {}).items())
+        },
+        "decision_lane_composition": {
+            name: _pick(body, DECISION_LANE_FIELDS)
+            for name, body in sorted((doc.get("decision_lane_composition") or {}).items())
+        },
+        "llm_clients": {
+            name: _pick(body, LLM_CLIENT_FIELDS)
+            for name, body in sorted((doc.get("llm_clients") or {}).items())
+        },
         "counts": {
             "routes": len(routes),
             "composites": len(composites),

@@ -12155,6 +12155,40 @@ class ChatSession:
                 content.append(part)
         return content, atts
 
+    def _append_pending_system_turns(
+        self,
+        pending: list[tuple[str, str, dict[str, Any]]],
+        *,
+        deferred_persistence: list[Callable[[], None]],
+    ) -> None:
+        """Append collected operator context as first-class system turns.
+
+        Extracted from the tool-batch publish (2026-10-18) so the advisory
+        lane's ONE observation seam is driven by the same code the send loop
+        runs, instead of an inline loop only a full model exchange could
+        reach. Behaviour is unchanged: same order, same attach rule.
+
+        Seam 1 folds a queued mid-turn interjection in as a system turn, so
+        the model sees it without any new ``send()``. Observe the RAW
+        operator words the meta carries, not the model-facing framing in
+        ``content`` — and only AFTER the append, because a spec that was
+        collected but never appended never reached the model and must not
+        be counted as an instruction the model received.
+        """
+        for source, content, meta in pending:
+            self._append_system_turn(
+                source,
+                content,
+                deferred_persistence=deferred_persistence,
+                **meta,
+            )
+            if source == "user_interjection":
+                _sensor_observe_substantive(
+                    meta.get("message", ""),
+                    workstream=getattr(self, "_ws_id", ""),
+                    registry=getattr(self, "_registry", None),
+                )
+
     def _append_system_turn(
         self,
         source: str,
@@ -13742,23 +13776,10 @@ class ChatSession:
 
                     # Emit accumulated operator context only after the complete
                     # tool block, preserving the native-system placement rule.
-                    for source, content, meta in pending_system_turns:
-                        self._append_system_turn(
-                            source,
-                            content,
-                            deferred_persistence=durable,
-                            **meta,
-                        )
-                        # Seam 1 folds a queued mid-turn interjection in as
-                        # a system turn: the model sees it without any new
-                        # send(). Observe the RAW operator words the meta
-                        # carries, not the model-facing framing in `content`.
-                        if source == "user_interjection":
-                            _sensor_observe_substantive(
-                                meta.get("message", ""),
-                                workstream=getattr(self, "_ws_id", ""),
-                                registry=getattr(self, "_registry", None),
-                            )
+                    self._append_pending_system_turns(
+                        pending_system_turns,
+                        deferred_persistence=durable,
+                    )
                     # Seam 2: fold approval feedback into one trailing USER
                     # turn. Queued interjections present at admission ride the
                     # system advisory seam immediately above; later arrivals

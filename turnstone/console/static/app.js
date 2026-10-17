@@ -1,0 +1,2980 @@
+// --- Shared hooks ---
+window.onLoginSuccess = function () {
+  connectSSE();
+  // Refresh permission-gated home-landing UI (admin.coordinator etc).
+  if (typeof _refreshHomeComposerVisibility === "function") {
+    _refreshHomeComposerVisibility();
+  }
+  // Re-warm ALL FOUR home-composer caches now that auth has landed.  The initial
+  // page-load pass runs before login completes, so /v1/api/{skills,models,
+  // projects,personas} all 401 (fail-open: the caches keep their empty state);
+  // without this re-run the launcher dropdowns — and the rail's group-by-project +
+  // the saved-coordinator project/persona columns — stay empty until a reload.
+  // {force:true} so a still-in-flight failing pre-auth fetch yields a trailing
+  // AUTHENTICATED refetch rather than coalescing onto the 401 (skills/personas
+  // have no *_changed event to recover otherwise).
+  if (typeof _refreshAndPopulateSkills === "function") {
+    _refreshAndPopulateSkills({ force: true });
+  }
+  if (typeof _refreshAndPopulateModels === "function") {
+    _refreshAndPopulateModels({ force: true });
+  }
+  if (typeof _refreshAndPopulateProjects === "function") {
+    _refreshAndPopulateProjects({ force: true });
+  }
+  if (typeof _refreshAndPopulatePersonas === "function") {
+    _refreshAndPopulatePersonas({ force: true });
+  }
+  // Active-coordinators list is SSE-driven via the console pseudo-node
+  // (#9) — no poller to restart after login.  The home-view renderer
+  // reads from clusterState.nodes["console"].workstreams on every SSE
+  // patch, so authenticating just unblocks the normal event stream.
+  if (typeof loadSavedCoordinators === "function") {
+    loadSavedCoordinators();
+  }
+};
+window.onLogout = function () {
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
+  if (evtSource) {
+    evtSource.close();
+    evtSource = null;
+  }
+  if (typeof _refreshHomeComposerVisibility === "function") {
+    _refreshHomeComposerVisibility();
+  }
+};
+window.onThemeChange = function (next) {
+  const btn = document.getElementById("theme-toggle");
+  if (btn) {
+    const isLight = next === "light";
+    btn.textContent = isLight ? "\u2600" : "\u263E";
+    btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
+    btn.setAttribute(
+      "aria-label",
+      isLight ? "Switch to dark theme" : "Switch to light theme",
+    );
+  }
+  // Persist to server so admin settings and node UIs see the change
+  const themeValue = next === "light" ? "light" : "dark";
+  authFetch("/v1/api/admin/settings/interface.theme", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value: themeValue }),
+  }).catch(function () {});
+};
+// Set initial theme button text and aria
+(function () {
+  const btn = document.getElementById("theme-toggle");
+  if (btn) {
+    const isLight = document.documentElement.dataset.theme === "light";
+    btn.textContent = isLight ? "\u2600" : "\u263E";
+    btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
+    btn.setAttribute(
+      "aria-label",
+      isLight ? "Switch to dark theme" : "Switch to light theme",
+    );
+  }
+})();
+
+// --- State ---
+let currentView = "home"; // "home" | "overview" | "filtered" | "admin"
+let currentFilter = { state: null, node: null, page: 1, per_page: 50 };
+let evtSource = null;
+let retryDelay = 1000;
+// Pending reconnect handle — tracked so logout (and a fresh connectSSE) can
+// cancel it; an untracked timer fired post-logout and opened a new
+// EventSource that 401s and re-probes in a loop.
+let sseReconnectTimer = null;
+let clusterState = null;
+let _navigatingFromPopstate = false;
+
+// --- Constants ---
+const STATE_DISPLAY = {
+  running: { symbol: "\u25b8", label: "run" },
+  thinking: { symbol: "\u25cc", label: "think" },
+  attention: { symbol: "\u25c6", label: "attn" },
+  idle: { symbol: "\u00b7", label: "idle" },
+  error: { symbol: "\u2716", label: "err" },
+};
+
+const PERSISTENCE_DISPLAY = {
+  pending: {
+    label: "History save pending",
+    tooltip:
+      "An accepted conversation turn has not reached durable history yet.",
+  },
+  retrying: {
+    label: "History save retrying",
+    tooltip:
+      "An accepted conversation turn has not reached durable history yet. Automatic recovery is in progress.",
+  },
+  conflict: {
+    label: "History save blocked",
+    tooltip:
+      "An accepted conversation turn cannot reach durable history automatically. Operator intervention is required.",
+  },
+};
+
+function appendPersistenceStatus(container, ws) {
+  const display = PERSISTENCE_DISPLAY[ws.persistence_state];
+  if (!display) return;
+  const badge = document.createElement("span");
+  badge.className = "dash-persistence-badge";
+  badge.dataset.state = ws.persistence_state;
+  badge.textContent = display.label;
+  badge.title = display.tooltip;
+  badge.setAttribute("role", "status");
+  badge.setAttribute("aria-label", display.label + ". " + display.tooltip);
+  container.appendChild(badge);
+}
+
+// --- Cluster State Model ---
+function applySnapshot(data) {
+  clusterState = {
+    nodes: {},
+    overview: data.overview || {},
+    timestamp: data.timestamp || 0,
+  };
+  (data.nodes || []).forEach(function (n) {
+    clusterState.nodes[n.node_id] = n;
+  });
+  renderFromState();
+}
+
+function patchClusterState(data) {
+  if (!clusterState) return;
+  const t = data.type;
+  if (t === "cluster_state") {
+    const node = clusterState.nodes[data.node_id];
+    if (node) {
+      (node.workstreams || []).forEach(function (ws) {
+        if (ws.id === data.ws_id) {
+          if ("state" in data) ws.state = data.state;
+          if ("tokens" in data) ws.tokens = data.tokens;
+          if ("context_ratio" in data) ws.context_ratio = data.context_ratio;
+          if ("activity" in data) ws.activity = data.activity;
+          if ("activity_state" in data) ws.activity_state = data.activity_state;
+          if ("persistence_state" in data)
+            ws.persistence_state = data.persistence_state;
+        }
+      });
+    }
+  } else if (t === "ws_created") {
+    const targetNode = clusterState.nodes[data.node_id];
+    if (targetNode) {
+      targetNode.workstreams = targetNode.workstreams || [];
+      targetNode.workstreams.push({
+        id: data.ws_id,
+        name: data.name || "",
+        state: "idle",
+        node: data.node_id,
+        server_url: targetNode.server_url || "",
+        title: data.title || "",
+        tokens: 0,
+        context_ratio: 0.0,
+        activity: "",
+        activity_state: "",
+        tool_calls: 0,
+        persistence_state: data.persistence_state || "healthy",
+        // ws_created SSE events carry kind / parent_ws_id / user_id /
+        // project_id / persona; preserve them on the in-memory ws so the
+        // home-landing active-coordinators list and the tree grouping both
+        // pick up newly-created rows without needing a snapshot refetch.
+        kind: data.kind || "interactive",
+        parent_ws_id: data.parent_ws_id || null,
+        user_id: data.user_id || null,
+        project_id: data.project_id || null,
+        persona: data.persona || "",
+      });
+    }
+  } else if (t === "ws_closed") {
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      const n = clusterState.nodes[nid];
+      n.workstreams = (n.workstreams || []).filter(function (ws) {
+        return ws.id !== data.ws_id;
+      });
+    });
+    // The saved list spans BOTH kinds now, so refresh on any close — the
+    // in-flight coalescing guard in loadSavedCoordinators (single fetch +
+    // one catch-up) prevents per-close fan-out into the saved endpoint.
+    if (typeof loadSavedCoordinators === "function") {
+      loadSavedCoordinators();
+    }
+    // An open pane on this session closes with it — the coordinator just
+    // closed its child (or the session ended elsewhere); a lingering tab
+    // would only reconnect-poll a stream that is gone (the shell owns the
+    // pane lifecycle; this is the Tier-1 → pane seam).
+    if (
+      window.TS_SHELL &&
+      typeof window.TS_SHELL.notifySessionClosed === "function"
+    ) {
+      window.TS_SHELL.notifySessionClosed(data.ws_id);
+    }
+  } else if (t === "ws_rename") {
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
+        if (ws.id === data.ws_id) ws.name = data.name || "";
+      });
+    });
+  } else if (t === "node_joined") {
+    if (!clusterState.nodes[data.node_id]) {
+      clusterState.nodes[data.node_id] = {
+        node_id: data.node_id,
+        server_url: "",
+        max_ws: 10,
+        reachable: true,
+        version: "",
+        health: {},
+        aggregate: {},
+        workstreams: [],
+      };
+    }
+  } else if (t === "node_lost") {
+    delete clusterState.nodes[data.node_id];
+  } else {
+    return;
+  }
+  scheduleRender();
+}
+
+let _renderTimer = null;
+function scheduleRender() {
+  if (_renderTimer) return;
+  _renderTimer = requestAnimationFrame(function () {
+    _renderTimer = null;
+    recomputeOverview();
+    renderFromState();
+  });
+}
+
+function recomputeOverview() {
+  if (!clusterState) return;
+  const states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  let totalTokens = 0,
+    totalToolCalls = 0,
+    totalWs = 0;
+  let mcpServers = 0,
+    mcpResources = 0,
+    mcpPrompts = 0;
+  const versions = {};
+  Object.keys(clusterState.nodes).forEach(function (nid) {
+    // Skip the "console" pseudo-node — coordinators aren't compute-
+    // node workstreams, and counting them here would inflate the
+    // cluster totals.  The active-coordinators list surfaces them
+    // separately.
+    if (nid === "console") return;
+    const node = clusterState.nodes[nid];
+    let nodeWsTokens = 0;
+    (node.workstreams || []).forEach(function (ws) {
+      const s = ws.state || "idle";
+      states[s] = (states[s] || 0) + 1;
+      totalWs++;
+      nodeWsTokens += ws.tokens || 0;
+    });
+    const aggTokens = (node.aggregate || {}).total_tokens || 0;
+    totalTokens += aggTokens || nodeWsTokens;
+    totalToolCalls += (node.aggregate || {}).total_tool_calls || 0;
+    if (node.version) versions[node.version] = true;
+    const mcp = (node.health || {}).mcp || {};
+    mcpServers += mcp.servers || 0;
+    mcpResources += mcp.resources || 0;
+    mcpPrompts += mcp.prompts || 0;
+  });
+  const versionList = Object.keys(versions).sort();
+  // Count only real compute nodes for the cluster summary — the
+  // "console" pseudo-node hosts coordinators, which are surfaced
+  // separately by the active-coordinators list.
+  const realNodeCount = Object.keys(clusterState.nodes).filter(function (nid) {
+    return nid !== "console";
+  }).length;
+  clusterState.overview = {
+    nodes: realNodeCount,
+    workstreams: totalWs,
+    states: states,
+    aggregate: {
+      total_tokens: totalTokens,
+      total_tool_calls: totalToolCalls,
+    },
+    version_drift: versionList.length > 1,
+    versions: versionList,
+  };
+  if (mcpServers > 0) {
+    clusterState.overview.mcp_servers = mcpServers;
+    clusterState.overview.mcp_resources = mcpResources;
+    clusterState.overview.mcp_prompts = mcpPrompts;
+  }
+}
+
+function buildNodeInfoFromSnapshot(node) {
+  const states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  const ws = node.workstreams || [];
+  ws.forEach(function (w) {
+    const s = w.state || "idle";
+    states[s] = (states[s] || 0) + 1;
+  });
+  let aggTokens = (node.aggregate || {}).total_tokens || 0;
+  if (!aggTokens) {
+    ws.forEach(function (w) {
+      aggTokens += w.tokens || 0;
+    });
+  }
+  return {
+    node_id: node.node_id,
+    server_url: node.server_url || "",
+    ws_total: ws.length,
+    ws_running: states.running,
+    ws_thinking: states.thinking,
+    ws_attention: states.attention,
+    ws_idle: states.idle,
+    ws_error: states.error,
+    total_tokens: aggTokens,
+    ws_tokens: aggTokens,
+    max_ws: node.max_ws || 10,
+    started: node.started || 0,
+    reachable: node.reachable !== false,
+    reachable_reason: node.reachable_reason || "",
+    health: node.health || {},
+    version: node.version || "",
+  };
+}
+
+function renderFromState() {
+  if (!clusterState) return;
+  if (currentView === "filtered") {
+    let allWs = [];
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
+        allWs.push(ws);
+      });
+    });
+    if (currentFilter.state) {
+      allWs = allWs.filter(function (ws) {
+        return ws.state === currentFilter.state;
+      });
+    }
+    if (currentFilter.node) {
+      allWs = allWs.filter(function (ws) {
+        return ws.node === currentFilter.node;
+      });
+    }
+    const stateOrder = {
+      running: 0,
+      thinking: 1,
+      attention: 2,
+      error: 3,
+      idle: 4,
+    };
+    allWs.sort(function (a, b) {
+      return (stateOrder[a.state] || 9) - (stateOrder[b.state] || 9);
+    });
+    const total = allWs.length;
+    const perPage = currentFilter.per_page || 50;
+    const pages = Math.max(1, Math.ceil(total / perPage));
+    const page = Math.min(currentFilter.page || 1, pages);
+    const start = (page - 1) * perPage;
+    const pageWs = allWs.slice(start, start + perPage);
+    document.getElementById("filtered-summary").textContent =
+      "Page " + page + " of " + pages + " (" + total + " total)";
+    renderWsTable(document.getElementById("filtered-ws-table"), pageWs);
+    renderPagination(
+      document.getElementById("filtered-pagination"),
+      page,
+      pages,
+    );
+  }
+  _fireRenderSubs();
+}
+
+// Notify the L-shell rail (rail.js) that cluster state was (re)rendered.
+function _fireRenderSubs() {
+  const subs = (window.TS_APP && window.TS_APP._renderSubs) || [];
+  for (const cb of subs) {
+    try {
+      cb(clusterState);
+    } catch (e) {
+      console.error("onRender subscriber failed", e);
+    }
+  }
+}
+
+// --- SSE Connection ---
+function connectSSE() {
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
+  if (evtSource) {
+    evtSource.close();
+    evtSource = null;
+  }
+  evtSource = new EventSource("/v1/api/cluster/events");
+  const statusBar = document.getElementById("status-bar");
+  evtSource.onopen = function () {
+    retryDelay = 1000;
+    statusBar.classList.remove("disconnected");
+    statusBar.textContent = "";
+  };
+  evtSource.onmessage = function (e) {
+    try {
+      const data = JSON.parse(e.data);
+      handleClusterEvent(data);
+    } catch (err) {
+      /* ignore malformed SSE */
+    }
+  };
+  evtSource.onerror = function () {
+    evtSource.close();
+    evtSource = null;
+    // Don't show reconnecting state if login overlay is visible
+    const loginOverlay = document.getElementById("login-overlay");
+    if (loginOverlay && loginOverlay.style.display !== "none") return;
+    statusBar.textContent = "Reconnecting\u2026";
+    statusBar.classList.add("disconnected");
+    // Raw fetch (not authFetch) — need to inspect status before throwing
+    fetch("/v1/api/cluster/overview")
+      .then(function (r) {
+        if (r.status === 401) {
+          showLogin();
+          return;
+        }
+        sseReconnectTimer = setTimeout(connectSSE, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 30000);
+      })
+      .catch(function () {
+        sseReconnectTimer = setTimeout(connectSSE, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 30000);
+      });
+  };
+}
+
+function handleClusterEvent(data) {
+  if (data.type === "snapshot") {
+    applySnapshot(data);
+    return;
+  }
+  if (
+    data.type === "cluster_state" ||
+    data.type === "ws_created" ||
+    data.type === "ws_closed" ||
+    data.type === "ws_rename" ||
+    data.type === "node_joined" ||
+    data.type === "node_lost"
+  ) {
+    patchClusterState(data);
+  }
+  if (data.type === "ws_closed" && data.reason === "evicted") {
+    showToast("Evicted" + (data.name ? ": " + data.name : "") + " (capacity)");
+  }
+  if (data.type === "models_changed") {
+    // Server emits this when a model definition or a role-assignment
+    // setting (model.default_alias, judge.model, coordinator.model_alias,
+    // coordinator.reasoning_effort) changes.  Refresh anything that
+    // renders model aliases so labels stay accurate without a reload.  Pass
+    // {force:true} so a burst of changes converges to the latest (the coalesced
+    // open/startup path stays plain — see _refreshAndPopulateModels).
+    if (typeof _refreshAndPopulateModels === "function") {
+      _refreshAndPopulateModels({ force: true });
+    }
+    if (typeof _sklcInvalidateModelsCache === "function") {
+      _sklcInvalidateModelsCache();
+    }
+    if (typeof _sklcScheduleEffortLadder === "function") {
+      // Re-annotate from the fresh cache — an edited model's ladder
+      // would otherwise stay stale until the next keystroke in the
+      // launch-config form.
+      _sklcScheduleEffortLadder();
+    }
+    if (
+      typeof _adminTab !== "undefined" &&
+      _adminTab === "models" &&
+      typeof loadAdminModels === "function"
+    ) {
+      loadAdminModels();
+    }
+  }
+}
+
+// --- Home View ---
+//
+// Coordinator-first landing: composer + active-coordinators list +
+// inline node list.  The node list is self-collapsing (consecutive
+// same-prefix nodes group into a single row) so it stays visible
+// without dominating the page.
+function showHome() {
+  currentView = "home";
+  currentFilter = { state: null, node: null, page: 1, per_page: 50 };
+  _setLandingView("home");
+  // #view-admin is its own pane now; re-focus the Dashboard pane (home/filtered
+  // sub-views live inside it) instead of toggling the old in-#main admin view.
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("dashboard");
+  const adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
+  document.getElementById("breadcrumb").style.display = "none";
+  document.getElementById("main").scrollTop = 0;
+  if (clusterState) renderFromState();
+  else loadOverview();
+  _ensureHomeComposerInit();
+  if (!_navigatingFromPopstate) history.pushState({ view: "home" }, "");
+}
+
+function _setLandingView(which) {
+  // Toggle the two top-level landing panes.  The node list lives inside
+  // #view-home as a sibling section, and clicking a node navigates
+  // straight to /node/<id>/ rather than swapping in a detail pane.
+  const views = ["home", "filtered"];
+  views.forEach(function (name) {
+    const el = document.getElementById("view-" + name);
+    if (!el) return;
+    el.style.display = name === which ? "" : "none";
+  });
+}
+
+function loadOverview() {
+  authFetch("/v1/api/cluster/snapshot")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      applySnapshot(data);
+    })
+    .catch(function () {
+      showToast("Failed to load cluster data");
+    });
+}
+
+// --- Drill-down: Filtered ---
+function drillDownByState(state) {
+  currentView = "filtered";
+  currentFilter = { state: state, node: null, page: 1, per_page: 50 };
+  _setLandingView("filtered");
+  // #view-admin is its own pane now; re-focus the Dashboard pane (home/filtered
+  // sub-views live inside it) instead of toggling the old in-#main admin view.
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("dashboard");
+  const adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
+  document.getElementById("breadcrumb").style.display = "";
+  const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+  document.getElementById("breadcrumb-label").textContent =
+    sd.symbol + " " + sd.label;
+  document.getElementById("filtered-title").textContent =
+    "WORKSTREAMS — " + sd.label.toUpperCase();
+  document.getElementById("main").scrollTop = 0;
+  if (clusterState) renderFromState();
+  else loadFilteredWorkstreams();
+  document.getElementById("breadcrumb-home").focus();
+  if (!_navigatingFromPopstate)
+    history.pushState({ view: "filtered", filter: currentFilter }, "");
+}
+
+function drillDownByNode(nodeId) {
+  currentView = "filtered";
+  currentFilter = { state: null, node: nodeId, page: 1, per_page: 50 };
+  _setLandingView("filtered");
+  // #view-admin is its own pane now; re-focus the Dashboard pane (home/filtered
+  // sub-views live inside it) instead of toggling the old in-#main admin view.
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("dashboard");
+  const adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
+  document.getElementById("breadcrumb").style.display = "";
+  document.getElementById("breadcrumb-label").textContent = nodeId;
+  document.getElementById("filtered-title").textContent =
+    "WORKSTREAMS — " + nodeId;
+  document.getElementById("main").scrollTop = 0;
+  if (clusterState) renderFromState();
+  else loadFilteredWorkstreams();
+  document.getElementById("breadcrumb-home").focus();
+  if (!_navigatingFromPopstate)
+    history.pushState({ view: "filtered", filter: currentFilter }, "");
+}
+
+function loadFilteredWorkstreams() {
+  authFetch("/v1/api/cluster/snapshot")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      applySnapshot(data);
+    })
+    .catch(function () {
+      document
+        .getElementById("filtered-ws-table")
+        .replaceChildren(makeEmptyState("Failed to load"));
+    });
+}
+
+function renderPagination(container, page, pages) {
+  container.replaceChildren();
+  if (pages <= 1) return;
+  const prev = document.createElement("button");
+  prev.textContent = "\u25c4 Prev";
+  prev.disabled = page <= 1;
+  prev.onclick = function () {
+    currentFilter.page--;
+    if (clusterState) renderFromState();
+    else loadFilteredWorkstreams();
+  };
+  container.appendChild(prev);
+  const info = document.createElement("span");
+  info.textContent = page + " / " + pages;
+  container.appendChild(info);
+  const next = document.createElement("button");
+  next.textContent = "Next \u25ba";
+  next.disabled = page >= pages;
+  next.onclick = function () {
+    currentFilter.page++;
+    if (clusterState) renderFromState();
+    else loadFilteredWorkstreams();
+  };
+  container.appendChild(next);
+}
+
+// --- Workstream table renderer (shared) ---
+//
+// Group rows by parent_ws_id so coordinator workstreams render with
+// their spawned children nested beneath (tree grouping).  A
+// coordinator row gets an expand/collapse caret; its children render as
+// indented sub-rows when expanded.  Orphaned children (parent missing
+// from the pool) fall through to the top level with an "orphan" badge.
+//
+// Expansion state persists in localStorage keyed by coordinator ws_id so
+// the browser remembers the operator's preferred layout across reloads.
+const _DASH_EXPAND_KEY_PREFIX = "coord-dashboard-expanded-";
+
+function _isExpanded(coordWsId) {
+  if (!coordWsId) return false;
+  try {
+    const v = localStorage.getItem(_DASH_EXPAND_KEY_PREFIX + coordWsId);
+    return v === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
+function _setExpanded(coordWsId, expanded) {
+  if (!coordWsId) return;
+  try {
+    localStorage.setItem(
+      _DASH_EXPAND_KEY_PREFIX + coordWsId,
+      expanded ? "1" : "0",
+    );
+  } catch (_) {
+    /* storage quota / private mode — silently drop */
+  }
+}
+
+function _bucketByParent(wsList) {
+  const byId = {};
+  wsList.forEach(function (ws) {
+    if (ws.id) byId[ws.id] = ws;
+  });
+  const childrenMap = {};
+  const roots = [];
+  const orphans = [];
+  wsList.forEach(function (ws) {
+    const parent = ws.parent_ws_id || null;
+    if (parent && byId[parent]) {
+      (childrenMap[parent] = childrenMap[parent] || []).push(ws);
+    } else if (parent) {
+      orphans.push(ws);
+    } else {
+      roots.push(ws);
+    }
+  });
+  return { roots: roots, childrenMap: childrenMap, orphans: orphans };
+}
+
+function renderWsTable(container, wsList) {
+  container.replaceChildren();
+  if (!wsList.length) {
+    const empty = document.createElement("div");
+    empty.className = "dashboard-empty";
+    empty.textContent = "No workstreams";
+    container.appendChild(empty);
+    return;
+  }
+  const groups = _bucketByParent(wsList);
+
+  function appendRow(ws, opts) {
+    opts = opts || {};
+    const row = _renderWsRow(ws, opts, container);
+    container.appendChild(row);
+    // Render children ALWAYS — expand/collapse is a CSS display toggle
+    // on the child rows.  This lets the caret swap a class instead of
+    // rebuilding the table, which preserves focus, avoids SR re-
+    // announcement, and stays cheap regardless of row count.
+    if (opts.childCount != null) {
+      const kids = groups.childrenMap[ws.id] || [];
+      kids.forEach(function (child) {
+        const childRow = _renderWsRow(
+          child,
+          { isChild: true, parentWsId: ws.id, collapsed: !opts.expanded },
+          container,
+        );
+        container.appendChild(childRow);
+      });
+    }
+  }
+
+  groups.roots.forEach(function (ws) {
+    const kids = groups.childrenMap[ws.id] || [];
+    const isCoord = ws.kind === "coordinator" || kids.length > 0;
+    if (isCoord) {
+      appendRow(ws, {
+        isCoordinator: true,
+        childCount: kids.length,
+        expanded: _isExpanded(ws.id),
+      });
+    } else {
+      appendRow(ws, {});
+    }
+  });
+  groups.orphans.forEach(function (ws) {
+    appendRow(ws, { isOrphan: true });
+  });
+}
+
+function _renderWsRow(ws, opts, container) {
+  opts = opts || {};
+  const state = ws.state || "idle";
+  const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+
+  const row = document.createElement("div");
+  row.className = "dash-row";
+  if (opts.isCoordinator) row.classList.add("dash-row--coordinator");
+  if (opts.isChild) {
+    row.classList.add("dash-row--child");
+    if (opts.parentWsId) row.dataset.parentWsId = opts.parentWsId;
+    // Child rows render in the collapsed state by default when the
+    // parent coordinator was last left collapsed.  Caret toggle
+    // flips this class in place — no table rebuild.
+    if (opts.collapsed) row.classList.add("dash-row--collapsed");
+  }
+  if (opts.isOrphan) row.classList.add("dash-row--orphan");
+  row.dataset.wsId = ws.id || "";
+  row.dataset.state = state;
+  row.setAttribute("tabindex", "0");
+  row.setAttribute("role", "button");
+  let ariaLabel = sd.label + ": " + (ws.name || ws.id || "unnamed");
+  if (ws.model_alias || ws.model)
+    ariaLabel += ", model: " + (ws.model_alias || ws.model);
+  if (ws.node) ariaLabel += " on " + ws.node;
+  if (ws.title) ariaLabel += ", task: " + ws.title;
+  if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
+  if (ws.context_ratio > 0)
+    ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
+  const persistenceDisplay = PERSISTENCE_DISPLAY[ws.persistence_state];
+  if (persistenceDisplay)
+    ariaLabel += ", " + persistenceDisplay.label.toLowerCase();
+  if (opts.isCoordinator && opts.childCount != null)
+    ariaLabel += ", " + opts.childCount + " children";
+  if (opts.isOrphan) ariaLabel += ", orphan";
+  row.setAttribute("aria-label", ariaLabel);
+
+  const main = document.createElement("div");
+  main.className = "dash-row-main";
+
+  // Expand / collapse caret — coordinator rows only.  The caret is a
+  // button so it's keyboard-reachable; clicking it toggles without
+  // bubbling to the row-level deep link handler.
+  if (opts.isCoordinator && opts.childCount != null && opts.childCount > 0) {
+    const caret = document.createElement("button");
+    caret.type = "button";
+    caret.className = "dash-caret";
+    caret.setAttribute("aria-expanded", opts.expanded ? "true" : "false");
+    // aria-controls intentionally omitted — children render as sibling
+    // rows in the same flat list, not a nested container, so there's
+    // no stable id to target.  aria-expanded alone is a valid SR
+    // affordance per WAI-ARIA 1.1 when the controlled relationship
+    // isn't strict (mirrors the admin sidebar carets elsewhere here).
+    caret.setAttribute(
+      "aria-label",
+      (opts.expanded ? "Collapse" : "Expand") + " children",
+    );
+    caret.textContent = opts.expanded ? "\u25BE" : "\u25B8"; // ▾ / ▸
+    caret.onclick = function (e) {
+      e.stopPropagation();
+      const coordWsId = ws.id;
+      const nowExpanded = caret.getAttribute("aria-expanded") !== "true";
+      _setExpanded(coordWsId, nowExpanded);
+      // Toggle CSS class on child rows — no table rebuild, so focus
+      // stays on the caret and screen readers don't re-announce the
+      // list.  See .dash-row--collapsed in style.css for the hide
+      // rule.
+      caret.setAttribute("aria-expanded", nowExpanded ? "true" : "false");
+      caret.setAttribute(
+        "aria-label",
+        (nowExpanded ? "Collapse" : "Expand") + " children",
+      );
+      caret.textContent = nowExpanded ? "\u25BE" : "\u25B8";
+      row.dataset.expanded = nowExpanded ? "true" : "false";
+      if (container) {
+        const selector =
+          '.dash-row--child[data-parent-ws-id="' + cssEscape(coordWsId) + '"]';
+        const kids = container.querySelectorAll(selector);
+        kids.forEach(function (k) {
+          k.classList.toggle("dash-row--collapsed", !nowExpanded);
+        });
+      }
+    };
+    // Tag the parent row so CSS can key off expansion state
+    // (e.g. hide the "(N children)" summary when expanded).
+    row.dataset.expanded = opts.expanded ? "true" : "false";
+    main.appendChild(caret);
+  } else if (opts.isChild) {
+    // Indentation placeholder so child rows align visually with their
+    // parent's post-caret content.  Not a caret — nested coordinators
+    // aren't supported in v1.
+    const indent = document.createElement("span");
+    indent.className = "dash-caret-placeholder";
+    indent.setAttribute("aria-hidden", "true");
+    main.appendChild(indent);
+  }
+
+  // STATE
+  const stateCell = document.createElement("span");
+  stateCell.className = "dash-cell-state";
+  const dot = document.createElement("span");
+  dot.className = "dash-state-dot";
+  dot.dataset.state = state;
+  dot.setAttribute("aria-hidden", "true");
+  stateCell.appendChild(dot);
+  const stateLabel = document.createElement("span");
+  stateLabel.className = "dash-state-label";
+  stateLabel.dataset.state = state;
+  stateLabel.textContent = sd.symbol + " " + sd.label;
+  stateCell.appendChild(stateLabel);
+  main.appendChild(stateCell);
+
+  // NAME (with optional child-count summary for collapsed coordinators)
+  const nameCell = document.createElement("span");
+  nameCell.className = "dash-cell-name";
+  const nameText = ws.name || ws.title || ws.id || "";
+  // The name truncates in its own element so the trailing markers (child-count,
+  // orphan, project) stay visible instead of being clipped by the fixed cell.
+  const nameTextEl = document.createElement("span");
+  nameTextEl.className = "dash-cell-name-text";
+  nameTextEl.textContent = nameText;
+  nameCell.appendChild(nameTextEl);
+  if (opts.isCoordinator && opts.childCount != null && opts.childCount > 0) {
+    // Render the "(N children)" summary only when there actually are
+    // children — the home view feeds a coordinator-only pool into
+    // renderWsTable so _bucketByParent sees no children and would
+    // otherwise always print "(0 children)".  CSS hides it when the
+    // row is expanded (see [data-expanded="true"] .dash-child-count
+    // in style.css).
+    const summary = document.createElement("span");
+    summary.className = "dash-child-count";
+    summary.textContent =
+      " (" +
+      opts.childCount +
+      (opts.childCount === 1 ? " child)" : " children)");
+    nameCell.appendChild(summary);
+  }
+  if (opts.isOrphan) {
+    const orphanBadge = document.createElement("span");
+    orphanBadge.className = "dash-orphan-badge";
+    orphanBadge.textContent = " orphan";
+    nameCell.appendChild(orphanBadge);
+  }
+  // Project pill (shared .dash-project-pill) when the ws is attached to a
+  // project the viewer can name — rides inside the name cell like the others.
+  const projName =
+    ws.project_id && window.TurnstoneProjects
+      ? window.TurnstoneProjects.projectName(ws.project_id)
+      : "";
+  if (projName) {
+    const pill = document.createElement("span");
+    pill.className = "dash-project-pill";
+    pill.textContent = "▣";
+    pill.title = "Project: " + projName;
+    pill.setAttribute("role", "img");
+    pill.setAttribute("aria-label", "Project: " + projName);
+    nameCell.appendChild(pill);
+  }
+  main.appendChild(nameCell);
+
+  // MODEL
+  const modelCell = document.createElement("span");
+  modelCell.className = "dash-cell-model";
+  modelCell.textContent = ws.model_alias || ws.model || "";
+  if (ws.model) modelCell.title = ws.model;
+  main.appendChild(modelCell);
+
+  // NODE (clickable)
+  const nodeCell = document.createElement("span");
+  nodeCell.className = "dash-cell-node";
+  nodeCell.textContent = ws.node || "";
+  nodeCell.onclick = function (e) {
+    e.stopPropagation();
+    if (ws.node) drillDownByNode(ws.node);
+  };
+  main.appendChild(nodeCell);
+
+  // TASK
+  const taskCell = document.createElement("span");
+  taskCell.className = "dash-cell-task";
+  taskCell.textContent = ws.title || "";
+  main.appendChild(taskCell);
+
+  // TOKENS
+  const tokensCell = document.createElement("span");
+  tokensCell.className = "dash-cell-tokens";
+  tokensCell.textContent = ws.tokens ? formatTokens(ws.tokens) : "";
+  main.appendChild(tokensCell);
+
+  // CTX
+  const ctxCell = document.createElement("span");
+  ctxCell.className = "dash-cell-ctx " + ctxClass(ws.context_ratio || 0);
+  ctxCell.textContent =
+    ws.context_ratio > 0 ? Math.round(ws.context_ratio * 100) + "%" : "";
+  main.appendChild(ctxCell);
+
+  row.appendChild(main);
+
+  // Sub-line
+  const sub = document.createElement("div");
+  sub.className = "dash-row-sub";
+  if (ws.activity_state === "approval") sub.classList.add("sub-attention");
+  appendPersistenceStatus(sub, ws);
+  if (ws.activity) {
+    if (sub.childNodes.length) sub.append(" \u00b7 ");
+    sub.append(ws.activity);
+  }
+  row.appendChild(sub);
+
+  // Deep link: click opens proxied server UI at this workstream.
+  // Row clicks open an L-shell PANE (coordinator → coordinator pane; node-backed
+  // → node-proxied interactive pane); full-page nav is the shell-absent fallback.
+  const wsNodeId = ws.node;
+  if (opts.isCoordinator || ws.kind === "coordinator") {
+    row.classList.add("has-link");
+    (function (wsId) {
+      row.onclick = function () {
+        if (!wsId) return;
+        const pm = window.TS_SHELL && window.TS_SHELL.panes;
+        if (pm) pm.openPane("coordinator", wsId);
+        else window.location.href = "/coordinator/" + encodeURIComponent(wsId);
+      };
+      row.onkeydown = function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          row.onclick();
+        }
+      };
+    })(ws.id);
+  } else if (wsNodeId) {
+    row.classList.add("has-link");
+    (function (nodeId, wsId) {
+      row.onclick = function () {
+        const pm = window.TS_SHELL && window.TS_SHELL.panes;
+        if (pm) pm.openPane("interactive", wsId, { nodeId: nodeId });
+        else
+          window.location.href =
+            "/node/" +
+            encodeURIComponent(nodeId) +
+            "/?ws_id=" +
+            encodeURIComponent(wsId);
+      };
+      row.onkeydown = function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          row.onclick();
+        }
+      };
+    })(wsNodeId, ws.id);
+  } else {
+    row.removeAttribute("role");
+    row.removeAttribute("tabindex");
+  }
+
+  return row;
+}
+
+// --- Navigation ---
+window.addEventListener("popstate", function (e) {
+  const overlay = document.getElementById("login-overlay");
+  if (overlay && overlay.style.display !== "none") return;
+  _navigatingFromPopstate = true;
+  try {
+    if (!e.state) {
+      showHome();
+      return;
+    }
+    if (e.state.view === "home" || e.state.view === "overview") showHome();
+    else if (e.state.view === "filtered" && e.state.filter) {
+      currentFilter = e.state.filter;
+      if (currentFilter.state) drillDownByState(currentFilter.state);
+      else if (currentFilter.node) drillDownByNode(currentFilter.node);
+    } else showHome();
+  } finally {
+    _navigatingFromPopstate = false;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Permission checks use the console page's ONE cache-skew shim pair —
+// _consoleHasPermission / _consoleWhenPermissionsReady, defined in admin.js
+// (which index.html loads first). The skew rationale lives on the pair.
+// ---------------------------------------------------------------------------
+// Coordinator session creation — used by the home-landing composer.
+// Permission check lives in _hasCoordPermission (admin.coordinator);
+// _createCoordinator does the POST + redirect.
+// ---------------------------------------------------------------------------
+
+function _hasCoordPermission() {
+  // Deny-on-absent parse lives in the shared hasPermission (auth.js, the
+  // module that populates the storage) — one contract for every surface.
+  return _consoleHasPermission(_launcherPerm("coordinator"));
+}
+
+// POST /v1/api/workstreams/new.  Accepts the three request fields
+// directly + an errEl / setBusy callback so the caller owns the
+// loading-state UX (button label swap, composer disabled flag, etc.).
+// On success redirects to /coordinator/{ws_id}; on failure surfaces
+// the server's error text inline through errEl.
+// Build the fetch options for a workstream-create POST: multipart (a `meta`
+// JSON field + one `file` part per staged attachment) when files are present,
+// else plain JSON.  Shared by the coordinator and interactive launchers so the
+// create wire shape lives in one place.
+function _createWorkstreamFetchOpts(body, files) {
+  if (files.length > 0) {
+    const form = new FormData();
+    form.append("meta", JSON.stringify(body));
+    for (let i = 0; i < files.length; i++) {
+      form.append("file", files[i], files[i].name);
+    }
+    // Don't set Content-Type — the browser adds the correct multipart boundary.
+    return { method: "POST", body: form };
+  }
+  return {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
+}
+
+function _createCoordinator(opts) {
+  const name = (opts.name || "").trim();
+  const skill = opts.skill || "";
+  const persona = (opts.persona || "").trim();
+  const model = (opts.model || "").trim();
+  const judgeModel = (opts.judge_model || "").trim();
+  const project = (opts.project_id || "").trim();
+  const task = (opts.task || "").trim();
+  const errEl = opts.errEl;
+  const setBusy = opts.setBusy || function () {};
+  const onSuccess = opts.onSuccess || function () {};
+
+  // Error region is always rendered with reserved min-height (see
+  // .home-composer-error in style.css) so toggling validation messages
+  // doesn't reflow the active-coordinators list below — clear the
+  // textContent only, no display toggle.
+  errEl.textContent = "";
+  setBusy(true);
+
+  const body = {};
+  if (name) body.name = name;
+  if (skill) body.skill = skill;
+  if (persona) body.persona = persona;
+  if (model) body.model = model;
+  if (judgeModel) body.judge_model = judgeModel;
+  if (project) body.project_id = project;
+  if (task) body.initial_message = task;
+
+  // Multipart when files are staged (meta JSON + file parts); the coord create
+  // endpoint reserves the attachments for the very first turn.  Plain JSON
+  // otherwise.
+  const files = Array.isArray(opts.files) ? opts.files : [];
+  const fetchOpts = _createWorkstreamFetchOpts(body, files);
+
+  authFetch("/v1/api/workstreams/new", fetchOpts)
+    .then(function (r) {
+      return r.json().then(function (data) {
+        return { ok: r.ok, status: r.status, data: data };
+      });
+    })
+    .then(function (res) {
+      setBusy(false);
+      if (!res.ok || !res.data || !res.data.ws_id) {
+        errEl.textContent =
+          (res.data && res.data.error) || "HTTP " + res.status;
+        return;
+      }
+      onSuccess(res);
+      // Open the new coordinator as an L-shell PANE (the renovation: sessions
+      // open as tabs, not full-page nav).  Full-page nav stays as the
+      // shell-absent fallback.  The session was just created + is live in the
+      // console, so the coordinator pane connects straight away (no /open hop).
+      const pm = window.TS_SHELL && window.TS_SHELL.panes;
+      if (pm) pm.openPane("coordinator", res.data.ws_id);
+      else
+        window.location.href =
+          "/coordinator/" + encodeURIComponent(res.data.ws_id);
+    })
+    .catch(function () {
+      setBusy(false);
+      errEl.textContent = "Request failed";
+    });
+}
+
+// Which workstream KIND the launcher creates: "coordinator" (console-local),
+// "interactive" (proxied to a compute node), or "scheduled" (an interactive
+// session the console's scheduler starts later, on a timer).  The composer
+// is shared; only the field set, the submit endpoint and what follows differ.
+let _launcherKind = "coordinator";
+
+// The kinds in toggle order, each with its radio id and the ONE place its
+// permission is named: the gate (`can`) reads `perm` (as does
+// _hasCoordPermission, for its other caller), so the refusal toast can never
+// name a permission the gate stopped checking.  The click wiring, the
+// arrow-key cycle, the availability fallback and the submit gate all walk
+// this list.
+const _LAUNCHER_KINDS = [
+  { kind: "coordinator", id: "kind-coordinator", perm: "admin.coordinator" },
+  { kind: "interactive", id: "kind-interactive", perm: "workstreams.create" },
+  { kind: "scheduled", id: "kind-scheduled", perm: "admin.schedules" },
+].map(function (k) {
+  k.can = function () {
+    return _consoleHasPermission(k.perm);
+  };
+  return k;
+});
+
+function _launcherPerm(kind) {
+  const entry = _LAUNCHER_KINDS.find(function (k) {
+    return k.kind === kind;
+  });
+  return entry ? entry.perm : "";
+}
+
+// The kind an arrow key lands on: the neighbour of `current` in `avail`
+// (wrapping at either end), or an end of the list when `current` is no
+// longer offered (a permission refresh mid-session).
+function _nextLauncherKind(current, avail, back) {
+  if (!avail.length) return current;
+  const at = avail.indexOf(current);
+  if (at === -1) return back ? avail[avail.length - 1] : avail[0];
+  return avail[(at + (back ? -1 : 1) + avail.length) % avail.length];
+}
+
+// A schedule dispatches an interactive workstream, so the Scheduled kind
+// draws its personas from the interactive shelf.
+function _launcherPersonaKind() {
+  return _launcherKind === "scheduled" ? "interactive" : _launcherKind;
+}
+
+// The When builder under the composer (Scheduled kind).  Mounted once with
+// the composer from the shared template; hidden with its section otherwise.
+let _launcherWhen = null;
+
+// Shown when files are staged in the Scheduled kind — at the switch (the
+// paperclip that staged them has just disappeared) and again at submit —
+// and, without the "remove them" clause, when a file is dropped on the
+// composer in that kind (nothing is staged then).
+const _SCHEDULE_NO_FILES_MSG =
+  "A schedule can't carry attachments; remove them first.";
+const _SCHEDULE_NO_DROP_MSG = "A schedule can't carry attachments.";
+
+// No try/catch around the constructor on purpose: the template, this mount
+// and the builder script ship in the one index.html, served no-cache with
+// content ETags, so a page can never load a newer app.js than its own
+// markup — a missing template is a build error, not a runtime state.  The
+// null checks below (and the "failed to load" message in _createSchedule)
+// only keep the rest of the launcher usable if that ever regresses.
+function _mountLauncherWhen() {
+  const mount = document.getElementById("launcher-when-mount");
+  const SB = window.TurnstoneScheduleBuilder;
+  if (!mount || !SB || _launcherWhen) return;
+  _launcherWhen = new SB.ScheduleBuilder(mount);
+}
+
+// Sentinel value for the project picker's "+ New project…" row — selecting it
+// prompts for a name, creates, then re-selects the new project (see
+// _applyLauncherFields' onChange branch).
+const _PROJECT_NEW = "__new__";
+
+function _setLauncherKind(kind, focus) {
+  _launcherKind = kind;
+  _homeShowError(""); // a message about the previous kind no longer applies
+  _LAUNCHER_KINDS.forEach(function (k) {
+    const btn = document.getElementById(k.id);
+    if (!btn) return;
+    const on = k.kind === kind;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-checked", on ? "true" : "false");
+    btn.tabIndex = on ? 0 : -1; // roving tabindex — the radiogroup is one tab stop
+    if (on && focus) btn.focus();
+  });
+  _applyLauncherFields();
+  // The persona shelves are disjoint per kind — swap the picker's choices
+  // (and default preselect) whenever the kind toggles.
+  _populateHomePersonaDropdown();
+}
+
+// Reflect the active kind in the shared launcher composer: the task-prompt
+// hint, the send label, and which option fields are relevant.  Node
+// placement applies to every kind that runs on a compute node (interactive
+// and scheduled; coordinators run in the console); its node list appears
+// only under the "Specific node" strategy.  The Scheduled kind drops the
+// judge model and attachments (a schedule carries neither) and reveals the
+// When builder beneath the composer.
+function _applyLauncherFields() {
+  if (!_homeCoordComposer) return;
+  const scheduled = _launcherKind === "scheduled";
+  const onNode = _launcherKind !== "coordinator";
+  _homeCoordComposer.setPlaceholder(
+    scheduled
+      ? "What should run on this schedule?"
+      : onNode
+        ? "What do you want to work on?"
+        : "What should this coordinator orchestrate?",
+  );
+  _homeCoordComposer.setSendLabel(
+    scheduled ? "Schedule" : "Start",
+    scheduled ? "Scheduling…" : "Starting…",
+  );
+  _homeCoordComposer.setOptionFieldVisible("node_strategy", onNode);
+  const specific =
+    onNode && _homeCoordComposer.getOptionValue("node_strategy") === "node";
+  _homeCoordComposer.setOptionFieldVisible("node_id", specific);
+  if (specific) _populateLauncherNodes();
+  _homeCoordComposer.setOptionFieldVisible("judge_model", !scheduled);
+  _homeCoordComposer.setAttachVisible(!scheduled);
+  // A schedule's name is derived client-side (the Name option stays
+  // optional); the other kinds get a server-generated name.
+  _homeCoordComposer.setOptionPlaceholder(
+    "name",
+    scheduled ? "Named from the task's first line" : "Auto-generated if empty",
+  );
+  const when = document.getElementById("launcher-when");
+  if (when && _launcherWhen) {
+    // This runs on every option change too, so act on the transitions
+    // only: preview on reveal, drop a pending preview on hide.  The block's
+    // own `hidden` is the edge on purpose — nothing else toggles it, and a
+    // tracked previous kind would be parallel state that can drift.  Files
+    // staged before the switch are refused at submit; say so now, where the
+    // paperclip that staged them has just disappeared.
+    const revealed = scheduled && when.hidden;
+    const hidden = !scheduled && !when.hidden;
+    when.hidden = !scheduled;
+    if (revealed) {
+      _launcherWhen.preview();
+      if (_homeStagedFiles.length) _homeShowError(_SCHEDULE_NO_FILES_MSG);
+    }
+    if (hidden) _launcherWhen.cancelPreview();
+  }
+
+  // "+ New project…" — reset the field FIRST so the sentinel can't stick (or
+  // loop on re-entry), then reveal the inline creator beneath the picker.
+  if (_homeCoordComposer.getOptionValue("project") === _PROJECT_NEW) {
+    _homeCoordComposer.setOptionValue("project", "");
+    if (_homeProjectCreator) _homeProjectCreator.open();
+  }
+}
+
+// Populate the launcher's "Specific node" picker from the live Tier-1 snapshot
+// (the SAME clusterState the rail node list reads), excluding the `console`
+// pseudo-node (interactive sessions run on compute nodes) and unreachable
+// nodes.  Re-read on each reveal so a node that just (dis)appeared is current.
+function _populateLauncherNodes() {
+  if (!_homeCoordComposer) return;
+  // Preserve the operator's current pick across the rebuild: selecting a node
+  // fires the composer `change` event → onChange → _applyLauncherFields → here,
+  // and setOptionChoices() resets the <select> to its placeholder.  Without this
+  // the selection is wiped the instant it's made, so a Specific-node session can
+  // never be launched.  Restored only if the node still exists (else it falls
+  // back to the placeholder, which is correct — the picked node disappeared).
+  const previous = _homeCoordComposer.getOptionValue("node_id");
+  const choices = [];
+  if (clusterState && clusterState.nodes) {
+    Object.keys(clusterState.nodes)
+      .filter(function (nid) {
+        return nid !== "console";
+      })
+      .sort()
+      .forEach(function (nid) {
+        const n = clusterState.nodes[nid];
+        if (n && n.reachable === false) return;
+        const count = n && n.workstreams ? n.workstreams.length : 0;
+        choices.push({ value: nid, text: nid + " (" + count + " ws)" });
+      });
+  }
+  _homeCoordComposer.setOptionChoices("node_id", choices);
+  if (previous) _homeCoordComposer.setOptionValue("node_id", previous);
+}
+
+function _wireLauncherToggle() {
+  const group = document.getElementById("launcher-kinds");
+  _LAUNCHER_KINDS.forEach(function (k) {
+    const btn = document.getElementById(k.id);
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      _setLauncherKind(k.kind);
+    });
+  });
+  if (group) {
+    // WAI-ARIA radiogroup contract: arrow keys move the selection (+ focus)
+    // among the kinds this user can create, wrapping at either end.
+    group.addEventListener("keydown", function (e) {
+      if (
+        ["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].indexOf(e.key) ===
+        -1
+      ) {
+        return;
+      }
+      e.preventDefault();
+      const avail = _LAUNCHER_KINDS
+        .filter(function (k) {
+          return k.can();
+        })
+        .map(function (k) {
+          return k.kind;
+        });
+      if (!avail.length) return;
+      const back = e.key === "ArrowLeft" || e.key === "ArrowUp";
+      _setLauncherKind(_nextLauncherKind(_launcherKind, avail, back), true);
+    });
+  }
+  _setLauncherKind(_launcherKind); // seed the initial roving-tabindex state
+}
+
+// Node placement from the launcher's node-strategy picker, shared by every
+// kind that runs on a compute node: "node" pins to the chosen node, anything
+// else is "auto" (the console or the scheduler picks the least-loaded node).
+// Pure — returns { placement, requiredNodeId? } or { error } without touching
+// the DOM or the busy flag, so callers validate BEFORE flipping busy and a
+// missing pick surfaces inline without a stuck spinner.
+function _resolveNodePlacement(opts) {
+  if (opts.node_strategy !== "node") return { placement: "auto" };
+  const placement = (opts.node_id || "").trim();
+  if (!placement) return { error: "Choose a node, or switch to Least loaded." };
+  return { placement: placement, requiredNodeId: placement };
+}
+
+// POST /v1/api/cluster/workstreams/new — the console picks a node and PROXIES
+// the create; interactive sessions run on compute nodes (only coordinators
+// live in the console).  On success redirects to the node's session view.
+function _createInteractive(opts) {
+  const name = (opts.name || "").trim();
+  const skill = opts.skill || "";
+  const persona = (opts.persona || "").trim();
+  const model = (opts.model || "").trim();
+  const judgeModel = (opts.judge_model || "").trim();
+  const project = (opts.project_id || "").trim();
+  const task = (opts.task || "").trim();
+  const errEl = opts.errEl;
+  const setBusy = opts.setBusy || function () {};
+  const onSuccess = opts.onSuccess || function () {};
+
+  const placed = _resolveNodePlacement(opts);
+  if (placed.error) {
+    errEl.textContent = placed.error;
+    return;
+  }
+  const placement = placed.placement;
+
+  errEl.textContent = "";
+  setBusy(true);
+
+  const body = { node_id: placement };
+  if (placed.requiredNodeId) body.required_node_id = placed.requiredNodeId;
+  if (opts.resume_ws) {
+    body.resume_ws = opts.resume_ws;
+    body.resume_ws_exact = true;
+  }
+  if (name) body.name = name;
+  if (skill) body.skill = skill;
+  if (persona) body.persona = persona;
+  if (model) body.model = model;
+  if (judgeModel) body.judge_model = judgeModel;
+  if (project) body.project_id = project;
+  if (task) body.initial_message = task;
+
+  // Multipart when files are staged (meta JSON + file parts); the cluster proxy
+  // picks the node (node_id in meta) and forwards the files to its create
+  // endpoint.  Plain JSON otherwise.
+  const files = Array.isArray(opts.files) ? opts.files : [];
+  const fetchOpts = _createWorkstreamFetchOpts(body, files);
+
+  authFetch("/v1/api/cluster/workstreams/new", fetchOpts)
+    .then(function (r) {
+      return r.json().then(function (data) {
+        return { ok: r.ok, status: r.status, data: data };
+      });
+    })
+    .then(function (res) {
+      setBusy(false);
+      const data = res.data || {};
+      const wsId = data.correlation_id || data.ws_id;
+      const node = data.target_node;
+      if (!res.ok || !wsId) {
+        errEl.textContent = data.error || "HTTP " + res.status;
+        return;
+      }
+      onSuccess(res);
+      // Open the new session as an L-shell PANE (interactive sessions are
+      // node-proxied; the pane resolves + opens on its node before streaming).
+      // Full-page nav stays as the shell-absent fallback.
+      const pm = window.TS_SHELL && window.TS_SHELL.panes;
+      if (pm) {
+        // target_node is the just-created live node; pass it as the open-time
+        // hint so the pane pins there (origin-first) instead of re-routing.  A
+        // missing node (server-contract drift) still recovers via the pane's
+        // rendezvous fallback.
+        pm.openPane("interactive", wsId, { nodeId: node || null });
+      } else if (node) {
+        window.location.href =
+          "/node/" +
+          encodeURIComponent(node) +
+          "/?ws_id=" +
+          encodeURIComponent(wsId);
+      } else {
+        // Defensive: a 200 without target_node (a server-contract drift, e.g. an
+        // async-dispatch response) would otherwise strand the user silently.
+        errEl.textContent = "Session created but no target node was reported";
+      }
+    })
+    .catch(function () {
+      setBusy(false);
+      errEl.textContent = "Request failed";
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Home-landing session launcher (coordinator, interactive or scheduled) +
+// saved sessions.
+// The composer renders as a persistent panel on the home view.  The
+// active list and
+// cluster summary render from clusterState, so every SSE-driven patch
+// picks them up automatically via scheduleRender → renderFromState.
+// ---------------------------------------------------------------------------
+
+let _homeComposerInit = false;
+let _homeCoordComposer = null; // shared Composer instance
+let _homeCoordBusy = false;
+
+// Attachment staging for the home coord composer.  The coord ws_id
+// doesn't exist until the create POST resolves, so we hold File
+// objects in memory and ship them as multipart parts on submit (same
+// pattern interactive uses for its new-ws modal + dashboard composer).
+let _homeStagedFiles = [];
+
+// Per-kind size caps + allowlist mirrored from turnstone/core/attachments.py
+// so the browser can fail fast.  Keep in sync with the interactive
+// UI's _ATTACH_* constants in turnstone/ui/static/app.js.
+const _HOME_IMAGE_CAP = 4 * 1024 * 1024;
+const _HOME_TEXT_CAP = 512 * 1024;
+const _HOME_MAX_FILES = 10;
+const _HOME_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp"];
+const _HOME_TEXT_APP_MIMES = [
+  "application/json",
+  "application/xml",
+  "application/x-yaml",
+  "application/yaml",
+  "application/toml",
+];
+const _HOME_TEXT_EXTENSIONS = [
+  ".c",
+  ".conf",
+  ".cpp",
+  ".css",
+  ".go",
+  ".h",
+  ".hpp",
+  ".html",
+  ".ini",
+  ".java",
+  ".js",
+  ".json",
+  ".jsx",
+  ".md",
+  ".py",
+  ".rs",
+  ".sh",
+  ".sql",
+  ".toml",
+  ".ts",
+  ".tsx",
+  ".txt",
+  ".xml",
+  ".yaml",
+  ".yml",
+];
+
+function _homeFormatSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function _homeIsAttachmentAllowed(file) {
+  const mime = (file.type || "").toLowerCase();
+  if (_HOME_IMAGE_MIMES.indexOf(mime) !== -1) return true;
+  if (mime.indexOf("text/") === 0) return true;
+  if (_HOME_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
+  const name = (file.name || "").toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot >= 0 && _HOME_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
+    return true;
+  }
+  return false;
+}
+
+// One owner for the launcher's message row (#home-coord-error): validation
+// and request errors, and the Scheduled kind's post-submit confirmation
+// (`ok`).  The create paths write their errEl directly, but only after
+// submitHomeCoord has cleared the row through here, and a kind switch
+// clears it too — so an error never lands in a confirmation-styled row.
+function _homeShowMessage(text, ok) {
+  const el = document.getElementById("home-coord-error");
+  if (!el) return;
+  // Element is always rendered (min-height reserves the row); just
+  // toggle the message text so layout doesn't shift on validation.
+  el.textContent = text || "";
+  el.classList.toggle("is-ok", !!(ok && text));
+}
+
+function _homeShowError(msg) {
+  _homeShowMessage(msg, false);
+}
+
+function _homeRenderChips() {
+  if (!_homeCoordComposer || !_homeCoordComposer.chipsEl) return;
+  const chipsEl = _homeCoordComposer.chipsEl;
+  chipsEl.textContent = "";
+  for (let i = 0; i < _homeStagedFiles.length; i++) {
+    (function (idx) {
+      const f = _homeStagedFiles[idx];
+      const isImage = (f.type || "").indexOf("image/") === 0;
+      const chip = document.createElement("span");
+      chip.className =
+        "composer-chip composer-chip-" + (isImage ? "image" : "text");
+      chip.setAttribute("role", "listitem");
+
+      const icon = document.createElement("span");
+      icon.className = "composer-chip-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = isImage ? "🖼" : "📄";
+      chip.appendChild(icon);
+
+      const name = document.createElement("span");
+      name.className = "composer-chip-name";
+      name.textContent = f.name;
+      name.title = f.name + " (" + f.size + " bytes)";
+      chip.appendChild(name);
+
+      const size = document.createElement("span");
+      size.className = "composer-chip-size";
+      size.textContent = _homeFormatSize(f.size);
+      chip.appendChild(size);
+
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "composer-chip-remove";
+      rm.setAttribute("aria-label", "Remove " + f.name);
+      rm.title = "Remove";
+      rm.textContent = "×";
+      rm.onclick = function () {
+        _homeStagedFiles.splice(idx, 1);
+        _homeRenderChips();
+        // Whatever the row said about the files no longer applies.
+        if (!_homeStagedFiles.length) _homeShowError("");
+      };
+      chip.appendChild(rm);
+      chipsEl.appendChild(chip);
+    })(i);
+  }
+}
+
+function _homeStageFile(file) {
+  if (!file) return false;
+  const paste = window.TurnstonePasteText;
+  if (_launcherKind === "scheduled") {
+    // No paperclip in this kind; this catches drops and pasted files.  A
+    // false return keeps a large pasted text inline — that is the right
+    // outcome for a schedule's task, so the paste case says nothing; only
+    // a real drop gets the refusal.
+    if (!(paste && paste.isPastedTextFile && paste.isPastedTextFile(file)))
+      _homeShowError(_SCHEDULE_NO_DROP_MSG);
+    return false;
+  }
+  if (
+    paste &&
+    paste.isDuplicatePastedTextFile &&
+    paste.isDuplicatePastedTextFile(file, _homeStagedFiles)
+  ) {
+    return true;
+  }
+  if (_homeStagedFiles.length >= _HOME_MAX_FILES) {
+    _homeShowError(
+      "At most " + _HOME_MAX_FILES + " attachments per coordinator",
+    );
+    return false;
+  }
+  if (!_homeIsAttachmentAllowed(file)) {
+    _homeShowError(
+      "Unsupported file type: " +
+        file.name +
+        " (allowed: png/jpeg/gif/webp images, text)",
+    );
+    return false;
+  }
+  const isImage = (file.type || "").indexOf("image/") === 0;
+  const cap = isImage ? _HOME_IMAGE_CAP : _HOME_TEXT_CAP;
+  if (file.size > cap) {
+    _homeShowError(file.name + " exceeds the " + _homeFormatSize(cap) + " cap");
+    return false;
+  }
+  _homeShowError("");
+  _homeStagedFiles.push(file);
+  _homeRenderChips();
+  return true;
+}
+
+function _homeClearStagedFiles() {
+  _homeStagedFiles = [];
+  _homeRenderChips();
+}
+
+// Sole owner of sendBtn.disabled: disables while a submit is in flight.
+function _refreshHomeCoordSubmitEnabled() {
+  if (!_homeCoordComposer) return;
+  _homeCoordComposer.sendBtn.disabled = _homeCoordBusy;
+}
+
+function _ensureHomeComposerInit() {
+  if (_homeComposerInit) return;
+  _homeComposerInit = true;
+  _mountHomeCoordComposer();
+  _mountLauncherWhen();
+  _wireLauncherToggle();
+  _refreshAndPopulateSkills();
+  _refreshAndPopulateModels();
+  _refreshAndPopulateProjects();
+  _refreshAndPopulatePersonas();
+  _ensureHomeProjectCreator();
+  _refreshHomeComposerVisibility();
+}
+
+// One chokepoint for the launcher paint discipline shared by the four
+// _refreshAndPopulate* wrappers below: sync-paint NOW from the warm cache (no
+// empty flash for the refresh round-trip), then refresh-and-repaint (callOpts
+// threads {force:true} for invalidation callers — models_changed,
+// onLoginSuccess).  `refresh` absent = bridge missing (module still loading /
+// pre-auth): the wrapper no-ops and onLoginSuccess re-runs each once auth
+// lands.  If the module graph itself failed to load, the picker stays empty
+// until a reload — the ACCEPTED shared-cache tradeoff; see _paintFromCache in
+// ui/static/app.js for the full ruling (no per-picker retry, no inline-fetch
+// fallback).
+function _paintHomeFromCache(refresh, populate, callOpts) {
+  if (!refresh) return;
+  populate();
+  refresh(callOpts).then(function () {
+    populate();
+  });
+}
+
+// Restore a launcher-composer option pick after a choices rebuild IF it is
+// still a valid choice; returns whether it was restored (the persona caller
+// reverts to the kind default otherwise).  Console-composer setter idiom
+// ONLY — the ui twin (_populatePersonaSelect etc.) works on raw <select>
+// elements via sel.value/_optionExists and is deliberately NOT unified
+// across files.
+function _restorePick(fieldId, previous, choices) {
+  const still =
+    previous &&
+    choices.some(function (c) {
+      return c.value === previous;
+    });
+  if (still) _homeCoordComposer.setOptionValue(fieldId, previous);
+  return !!still;
+}
+
+// Refresh the shared personas cache (window.TurnstonePersonas — also feeds
+// the saved-list / rail labels) then repaint the launcher's Persona picker.
+// Safe when the bridge is absent (module still loading): the picker keeps
+// its "Default" placeholder, which the server resolves to the kind default.
+function _refreshAndPopulatePersonas(callOpts) {
+  const TP = window.TurnstonePersonas;
+  _paintHomeFromCache(
+    TP && TP.refreshPersonas,
+    _populateHomePersonaDropdown,
+    callOpts,
+  );
+}
+
+// Populate the launcher's Persona picker for the ACTIVE kind, preselecting
+// the kind's default so a zero-touch launch behaves exactly like today.
+// Re-run on kind toggle (_applyLauncherFields): the interactive and
+// coordinator shelves are disjoint persona sets.
+function _populateHomePersonaDropdown() {
+  if (!_homeCoordComposer) return;
+  const TP = window.TurnstonePersonas;
+  if (!TP) return;
+  const previous = _homeCoordComposer.getOptionValue("persona");
+  const choices = TP.personaChoices(_launcherPersonaKind());
+  _homeCoordComposer.setOptionChoices("persona", choices);
+  if (!_restorePick("persona", previous, choices)) {
+    const dflt = TP.defaultPersona(_launcherPersonaKind());
+    if (dflt) _homeCoordComposer.setOptionValue("persona", dflt.name);
+  }
+}
+
+// Refresh the shared projects cache (window.TurnstoneProjects — also feeds the
+// rail's group-by-project) then repaint the launcher's Project picker.  Safe
+// when the bridge is absent (project.read denied / module still loading): the
+// picker simply keeps its "No project" placeholder.
+function _refreshAndPopulateProjects(callOpts) {
+  const TP = window.TurnstoneProjects;
+  _paintHomeFromCache(
+    TP && TP.refreshProjects,
+    _populateHomeProjectDropdown,
+    callOpts,
+  );
+}
+
+// Populate the launcher's Project picker from the shared cache, preserving the
+// current pick across the rebuild (same reason as _populateLauncherNodes) and
+// always appending the "+ New project…" sentinel after the live list.
+//
+// Under server.require_project BOTH launcher kinds are authoritatively gated
+// server-side: interactive at the node create endpoint (refusal surfaced by
+// the console proxy, create_workstream), coordinator at the console's own
+// create mount (refusal rendered inline by _createCoordinator). The picker
+// mirrors the interactive dashboard's soft treatment — retitle the
+// placeholder so projectless reads as a prompt, never auto-select a real
+// project the operator didn't choose — and leaves enforcement to the
+// server's coded 400 (the composer has no per-option disable, so the
+// placeholder stays selectable; picking it just surfaces the server's
+// message).
+function _populateHomeProjectDropdown() {
+  if (!_homeCoordComposer) return;
+  const TP = window.TurnstoneProjects;
+  if (!TP) return;
+  const previous = _homeCoordComposer.getOptionValue("project");
+  const choices = TP.projectChoices();
+  const strict = !!TP.requireProject();
+  _homeCoordComposer.setOptionPlaceholder(
+    "project",
+    strict
+      ? choices.length
+        ? "Select a project…"
+        : "No projects available"
+      : "No project",
+  );
+  choices.push({ value: _PROJECT_NEW, text: "+ New project…" });
+  _homeCoordComposer.setOptionChoices("project", choices);
+  // Validate before restoring (via _restorePick, like the other pickers): a
+  // since-deleted project must fall back to the "No project" placeholder, not
+  // a blank selectedIndex=-1 select.  The "+ New project…" sentinel is never
+  // restored — it is a command, not a state (and it IS in `choices`, so the
+  // validity check alone would not exclude it).
+  if (previous !== _PROJECT_NEW) _restorePick("project", previous, choices);
+}
+
+// The inline "+ New project…" creator (project_creator.js), mounted once into
+// the composer's options panel right beneath the Project picker.  On Save it
+// refreshes the shared cache; we then repopulate the dropdown + select the new
+// project.  Replaces the old native window.prompt.  Full management — rename /
+// visibility / members — still lives in the manage shelf.
+let _homeProjectCreator = null;
+
+function _ensureHomeProjectCreator() {
+  if (_homeProjectCreator || !_homeCoordComposer) return;
+  const PC = window.TurnstoneProjectCreator;
+  if (!PC) return;
+  _homeProjectCreator = PC.make({
+    onCreated: function (proj) {
+      _populateHomeProjectDropdown();
+      _homeCoordComposer.setOptionValue("project", proj.project_id);
+    },
+  });
+  _homeCoordComposer.addOptionsRowAfter("project", _homeProjectCreator.el);
+}
+
+function _mountHomeCoordComposer() {
+  const mount = document.getElementById("home-coord-composer-mount");
+  if (!mount || _homeCoordComposer) return;
+  _homeCoordComposer = new Composer(mount, {
+    layout: "stacked",
+    rows: 3,
+    placeholder: "What should this coordinator orchestrate?",
+    ariaLabel: "Initial task",
+    sendLabel: "Start",
+    busyLabel: "Starting\u2026",
+    // The submit button's disabled flag is owned by
+    // _refreshHomeCoordSubmitEnabled, which combines busy state with
+    // the subsystem-ready probe.  Tell the composer to skip writing
+    // sendBtn.disabled so the reconciler has a single owner.
+    externalDisable: true,
+    // Ctrl/Cmd+Enter submit stays in the document keydown handler
+    // below — it wants to also work when focus is outside the
+    // composer (e.g. just after the admin banner dismisses).
+    options: {
+      storageKey: "turnstone.console.home_coord.options_open",
+      summary: function (v) {
+        const bits = [];
+        // Persona surfaces only when it's a non-default pick — the kind
+        // default is the zero-touch state and needs no summary line.
+        if (v.persona && window.TurnstonePersonas) {
+          const dflt = window.TurnstonePersonas.defaultPersona(
+            _launcherPersonaKind(),
+          );
+          if (!dflt || dflt.name !== v.persona)
+            bits.push(window.TurnstonePersonas.personaLabel(v.persona));
+        }
+        if (v.name) bits.push(v.name);
+        if (v.skill) bits.push(v.skill);
+        if (v.model) bits.push(v.model);
+        // The judge model is hidden (and not sent) in the Scheduled kind.
+        if (v.judge_model && _launcherKind !== "scheduled")
+          bits.push("judge: " + v.judge_model);
+        if (v.project && v.project !== _PROJECT_NEW) {
+          const pn = window.TurnstoneProjects
+            ? window.TurnstoneProjects.projectName(v.project)
+            : "";
+          bits.push("project: " + (pn || v.project));
+        }
+        // Node placement applies off the console only (interactive and
+        // scheduled); surface it only when a specific node is pinned (the
+        // "Least loaded" default needs no summary line).
+        if (
+          _launcherKind !== "coordinator" &&
+          v.node_strategy === "node" &&
+          v.node_id
+        )
+          bits.push("node: " + v.node_id);
+        return bits.join(" \u00b7 ");
+      },
+      // Re-evaluate the interactive node-picker visibility whenever a field
+      // changes (the node list appears only under the "Specific node" strategy).
+      onChange: function () {
+        _applyLauncherFields();
+      },
+      fields: [
+        {
+          // Persona — the capability/prompt envelope the workstream is
+          // created with (snapshotted server-side at create; edits to the
+          // persona never touch existing workstreams).  Choices are
+          // kind-filtered and repopulated by _populateHomePersonaDropdown
+          // with the kind's default preselected, so zero-touch = today.
+          id: "persona",
+          label: "Persona",
+          type: "select",
+          choices: [{ value: "", text: "Default" }],
+        },
+        {
+          id: "name",
+          label: "Name",
+          type: "input",
+          placeholder: "Auto-generated if empty",
+          autocomplete: "off",
+        },
+        {
+          id: "skill",
+          label: "Skill",
+          type: "select",
+          choices: [{ value: "", text: "Use defaults" }],
+        },
+        {
+          id: "model",
+          label: "Model",
+          type: "select",
+          choices: [{ value: "", text: "Default model" }],
+        },
+        {
+          id: "judge_model",
+          label: "Judge Model",
+          type: "select",
+          // Initial placeholder; _populateHomeModelDropdowns rewrites this
+          // to "Default model (<alias>)" once /v1/api/models reports the
+          // resolved judge alias (judge.model when set, otherwise the
+          // session model — see IntentJudge.__init__).
+          choices: [{ value: "", text: "Default model" }],
+        },
+        {
+          // Attached project — scopes the session's `project` memory + groups
+          // it in the rail.  Placeholder "No project" is preserved by
+          // setOptionChoices; _populateHomeProjectDropdown appends the live
+          // list + a "+ New project…" sentinel (handled in onChange).
+          id: "project",
+          label: "Project",
+          type: "select",
+          choices: [{ value: "", text: "No project" }],
+        },
+        // Node placement — INTERACTIVE kind only (coordinators run in the
+        // console, not on a compute node).  _applyLauncherFields shows/hides
+        // these per kind.  "auto" → the console picks the least-loaded node;
+        // "node" → reveal the live node picker below + pin to the chosen node.
+        {
+          id: "node_strategy",
+          label: "Node",
+          type: "select",
+          choices: [
+            { value: "auto", text: "Least loaded" },
+            { value: "node", text: "Specific node…" },
+          ],
+        },
+        {
+          id: "node_id",
+          label: "Pick node",
+          type: "select",
+          // First option is the placeholder; _populateLauncherNodes appends the
+          // live reachable compute nodes (excluding the console pseudo-node).
+          choices: [{ value: "", text: "Select a node" }],
+        },
+      ],
+    },
+    attachments: {
+      onAttach: function (file) {
+        return _homeStageFile(file);
+      },
+    },
+    dragDrop: { targetEl: mount, dropClass: "home-coord-drop" },
+    onSend: function (text) {
+      submitHomeCoord(text);
+    },
+  });
+}
+
+// Refresh the shared skills cache then repaint the launcher's Skill picker.
+// Sync paint from the warm cache first (no empty flash for the round-trip),
+// then refresh-and-repaint to catch a skill created elsewhere.  Safe when the
+// bridge is absent (module still loading / 401 pre-auth — onLoginSuccess re-runs
+// this once auth lands).
+function _refreshAndPopulateSkills(callOpts) {
+  const TS = window.TurnstoneSkills;
+  _paintHomeFromCache(
+    TS && TS.refreshSkills,
+    _populateHomeSkillDropdown,
+    callOpts,
+  );
+}
+
+// Populate the launcher's Skill picker from the shared cache, preserving the
+// current pick across the rebuild (the async repaint must not clobber a
+// mid-window choice).  The console label omits the " [MCP]" suffix the ui
+// pickers add — which is why the cache returns raw rows.
+function _populateHomeSkillDropdown() {
+  if (!_homeCoordComposer) return;
+  const TS = window.TurnstoneSkills;
+  if (!TS) return;
+  // Reads the shared skills cache, which is FAIL-OPEN by design: a transient
+  // non-OK refresh keeps the last-known rows rather than blanking to the
+  // placeholder (the pre-cache inline fetch blanked on any non-OK via
+  // `r.ok ? json : {skills:[]}`; this cache matches the projects/personas
+  // policy instead).  A since-removed skill is rejected server-side on
+  // launch — a narrow stale-selection window traded for not blanking on a blip.
+  const previous = _homeCoordComposer.getOptionValue("skill");
+  const choices = TS.getSkills().map(function (t) {
+    return {
+      value: t.name,
+      text: t.is_default ? t.name + " (default)" : t.name,
+    };
+  });
+  _homeCoordComposer.setOptionChoices("skill", choices);
+  _restorePick("skill", previous, choices);
+}
+
+// Refresh the shared models cache then repaint the launcher's Model + Judge
+// Model pickers.  Sync paint from the warm cache first (no empty flash for the
+// round-trip), then refresh-and-repaint.  This is ALSO the single repaint path
+// for the `models_changed` SSE event, which passes {force:true} so the refresh
+// converges to the latest server state (and its .then repaints from THAT) even
+// when a burst of model-config changes lands mid-fetch — no second
+// (subscription) path that would double-repaint.
+function _refreshAndPopulateModels(callOpts) {
+  const TM = window.TurnstoneModels;
+  _paintHomeFromCache(
+    TM && TM.refreshModels,
+    _populateHomeModelDropdowns,
+    callOpts,
+  );
+}
+
+// Populate the launcher's Model + Judge Model pickers from the shared cache —
+// same list the interactive new-ws modal uses.  One list feeds both selects;
+// each keeps its "Default …" placeholder (option 0) and its own preserved pick
+// (the async repaint must not clobber a mid-window choice).  The console reads
+// its OWN default-alias fields (coordinator_default_alias for the model,
+// judge_default_alias for the judge) — the node server sends different ones, so
+// the shared cache exposes all of them and each app picks its own.
+function _populateHomeModelDropdowns() {
+  if (!_homeCoordComposer) return;
+  const TM = window.TurnstoneModels;
+  if (!TM) return;
+  const choices = TM.modelChoices();
+  const defaults = TM.modelDefaults();
+  // The launcher composer is a PERSISTENT panel (it never reopens like the new-ws
+  // modal), so preserving the prior pick across a repaint is INTENDED — not the
+  // modal's fresh-on-open reset.  A background models_changed must not clobber a
+  // mid-window model/judge choice.
+  const prevModel = _homeCoordComposer.getOptionValue("model");
+  const prevJudge = _homeCoordComposer.getOptionValue("judge_model");
+  _homeCoordComposer.setOptionChoices("model", choices);
+  _homeCoordComposer.setOptionChoices("judge_model", choices);
+  // Both placeholders use the same "Default — alias (model)" template — the
+  // field-row labels (MODEL / JUDGE MODEL) already carry the role context, so an
+  // asymmetric "Default judge model" reads awkwardly alongside the plain
+  // "Default model" line above it.  Em-dash separator (rather than nested
+  // parens) keeps the alias's "(model)" suffix legible and matches the
+  // ``(default — alias (model))`` pattern used in the admin Roles tab.
+  const coordDefault = TM.modelLabel(defaults.coordinator_default_alias || "");
+  const judgeDefault = TM.modelLabel(defaults.judge_default_alias || "");
+  _homeCoordComposer.setOptionPlaceholder(
+    "model",
+    coordDefault ? "Default — " + coordDefault : "Default model",
+  );
+  _homeCoordComposer.setOptionPlaceholder(
+    "judge_model",
+    judgeDefault ? "Default — " + judgeDefault : "Default model",
+  );
+  // Preserve a mid-window pick on each select independently.
+  _restorePick("model", prevModel, choices);
+  _restorePick("judge_model", prevJudge, choices);
+}
+
+function _refreshHomeComposerVisibility() {
+  const panel = document.getElementById("coord-composer-panel");
+  if (!panel) return;
+  const avail = _LAUNCHER_KINDS.filter(function (k) {
+    return k.can();
+  });
+  panel.style.display = avail.length ? "" : "none";
+  _LAUNCHER_KINDS.forEach(function (k) {
+    const btn = document.getElementById(k.id);
+    if (btn) btn.style.display = k.can() ? "" : "none";
+  });
+  // Hide the toggle when only one kind is available.
+  const kinds = document.getElementById("launcher-kinds");
+  if (kinds) kinds.style.display = avail.length > 1 ? "" : "none";
+  // Default to a kind the user can actually create.
+  const allowed = avail.some(function (k) {
+    return k.kind === _launcherKind;
+  });
+  if (!allowed && avail.length) _setLauncherKind(avail[0].kind);
+}
+
+function submitHomeCoord(textFromComposer) {
+  const kind = _launcherKind;
+  const entry = _LAUNCHER_KINDS.find(function (k) {
+    return k.kind === kind;
+  });
+  if (!entry || !entry.can()) {
+    showToast((entry ? entry.perm : kind) + " permission required");
+    return;
+  }
+  if (!_homeCoordComposer) return;
+  _homeShowError(""); // a stale confirmation must not frame a new error
+  // text arg is passed when the Composer's Enter-key handler fires;
+  // direct callers (Ctrl/Cmd+Enter) invoke with no argument and we
+  // read from the composer.
+  const task =
+    textFromComposer != null ? textFromComposer : _homeCoordComposer.value;
+  const opts = _homeCoordComposer.getOptionValues();
+  // Snapshot at submit time so a chip remove mid-request can't race
+  // the multipart payload (the actual reset only fires on the success
+  // branch, after the response lands).
+  const files = _homeStagedFiles.slice();
+  // A schedule carries no attachments: refuse before the files-need-a-task
+  // guard below, whose "add a message" advice could never resolve this.
+  if (kind === "scheduled" && files.length > 0) {
+    _homeShowError(_SCHEDULE_NO_FILES_MSG);
+    return;
+  }
+  // Files-without-text would upload pending attachment rows but the
+  // server's _coord_create_post_install only reserves+dispatches when
+  // initial_message is non-empty — uploaded files would orphan as
+  // pending storage rows until the GC sweep.  Require text whenever
+  // attachments are staged so the first turn always picks them up.
+  if (files.length > 0 && !(task || "").trim()) {
+    _homeShowError("Add a message to send with this attachment.");
+    return;
+  }
+  const shared = {
+    name: opts.name || "",
+    skill: opts.skill || "",
+    persona: opts.persona || "",
+    model: opts.model || "",
+    judge_model: opts.judge_model || "",
+    // A pending "+ New project…" sentinel never reaches submit (it's reset in
+    // onChange); guard anyway so it can't leak onto the wire as a project_id.
+    project_id:
+      opts.project && opts.project !== _PROJECT_NEW ? opts.project : "",
+    task: task,
+    errEl: document.getElementById("home-coord-error"),
+    setBusy: function (b) {
+      _homeCoordBusy = b;
+      if (_homeCoordComposer) _homeCoordComposer.setBusy(b);
+      _refreshHomeCoordSubmitEnabled();
+    },
+    onSuccess: function () {
+      _homeClearStagedFiles();
+    },
+  };
+  if (kind === "interactive") {
+    // Create-with-attachments rides multipart through the cluster proxy to the
+    // node (see _createInteractive); the files-need-a-task guard above already
+    // ensures an initial turn to dispatch them on.
+    shared.files = files;
+    // Node placement from the launcher's node-strategy picker (interactive-only).
+    shared.node_strategy = opts.node_strategy || "auto";
+    shared.node_id = (opts.node_id || "").trim();
+    _createInteractive(shared);
+  } else if (kind === "scheduled") {
+    // Same placement picker as interactive; no files (refused above).
+    shared.node_strategy = opts.node_strategy || "auto";
+    shared.node_id = (opts.node_id || "").trim();
+    _createSchedule(shared);
+  } else {
+    shared.files = files;
+    _createCoordinator(shared);
+  }
+}
+
+// The schedule API keeps this many characters of the initial message and of
+// the name (SCHEDULE_MESSAGE_MAX_CHARS / SCHEDULE_NAME_MAX_CHARS in
+// console/server.py; a test keeps them in step).  Counted in code points,
+// as the server counts.
+const _SCHEDULE_TASK_MAX_CHARS = 4096;
+const _SCHEDULE_NAME_MAX_CHARS = 256;
+// A derived name is cut to this many code points (ellipsis included).
+const _SCHEDULE_NAME_CUT_CHARS = 60;
+
+// Code points, as the server counts — with the cheap UTF-16 length as a
+// short-circuit so a huge pasted task is not boxed into an array just to be
+// refused (a UTF-16 length under the cap can never exceed it in code points).
+function _overCap(text, cap) {
+  return text.length > cap && Array.from(text).length > cap;
+}
+
+// A schedule needs a name (the admin list is keyed on it).  When the Name
+// option is empty, take the (trimmed, non-empty) task's first line, cut to
+// _SCHEDULE_NAME_CUT_CHARS — code points, so the cut can't split a
+// surrogate pair.
+function _scheduleNameFromTask(task) {
+  const first = task.split("\n")[0].replace(/\s+/g, " ").trim();
+  const cp = Array.from(first);
+  if (cp.length <= _SCHEDULE_NAME_CUT_CHARS) return first;
+  return (
+    cp
+      .slice(0, _SCHEDULE_NAME_CUT_CHARS - 1)
+      .join("")
+      .trimEnd() + "…"
+  );
+}
+
+// POST /v1/api/admin/schedules — store a schedule the console's scheduler
+// dispatches later as an interactive workstream on a compute node (the same
+// create the admin shelf performs, fed from the launcher's fields).  Nothing
+// opens on success, so the confirmation is inline and persistent (a toast
+// would be gone before the first-run time is read): it names the first run
+// and where the schedule is managed from here on.  The When builder keeps
+// its state on purpose — the next schedule often shares the timing.
+function _createSchedule(opts) {
+  const errEl = opts.errEl;
+  const setBusy = opts.setBusy || function () {};
+  const onSuccess = opts.onSuccess || function () {};
+  const submittedKind = _launcherKind; // busy disables send, not the toggle
+  const task = (opts.task || "").trim();
+  if (!task) {
+    errEl.textContent = "Describe what should run on this schedule.";
+    return;
+  }
+  if (_overCap(task, _SCHEDULE_TASK_MAX_CHARS)) {
+    // The server would silently keep only the first _SCHEDULE_TASK_MAX_CHARS.
+    errEl.textContent =
+      "A schedule's task is limited to " +
+      _SCHEDULE_TASK_MAX_CHARS.toLocaleString() +
+      " characters; shorten it.";
+    return;
+  }
+  const when = _launcherWhen
+    ? _launcherWhen.compile()
+    : { error: "The schedule builder failed to load." };
+  if (when.error) {
+    // Flag the builder too: an untouched mode shows its gap as a hint until
+    // a submit is refused on it (the admin shelf does the same).
+    if (_launcherWhen) _launcherWhen.showErrors();
+    errEl.textContent = when.error;
+    return;
+  }
+  // The same picker as interactive; for a schedule "auto" means the
+  // scheduler picks the node with the most headroom at dispatch time.
+  const placed = _resolveNodePlacement(opts);
+  if (placed.error) {
+    errEl.textContent = placed.error;
+    return;
+  }
+  const target = placed.placement;
+  const name = (opts.name || "").trim() || _scheduleNameFromTask(task);
+  if (_overCap(name, _SCHEDULE_NAME_MAX_CHARS)) {
+    errEl.textContent =
+      "A schedule's name is limited to " +
+      _SCHEDULE_NAME_MAX_CHARS +
+      " characters; shorten it.";
+    return;
+  }
+
+  errEl.textContent = "";
+  setBusy(true);
+
+  const body = {
+    name: name,
+    schedule_type: when.schedule_type,
+    cron_expr: when.cron_expr,
+    at_time: when.at_time,
+    timezone: when.timezone,
+    target_mode: target,
+    initial_message: task,
+    model: (opts.model || "").trim(),
+    skill: opts.skill || "",
+    persona: (opts.persona || "").trim(),
+    project_id: (opts.project_id || "").trim(),
+  };
+  authFetch("/v1/api/admin/schedules", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      return r.json().then(function (data) {
+        return { ok: r.ok, status: r.status, data: data };
+      });
+    })
+    .then(function (res) {
+      setBusy(false);
+      const data = res.data || {};
+      if (!res.ok) {
+        errEl.textContent = data.error || "HTTP " + res.status;
+        return;
+      }
+      const SB = window.TurnstoneScheduleBuilder;
+      let msg = "Scheduled '" + (data.name || name) + "'";
+      if (data.next_run && SB) {
+        const rel = SB.relativeToNow(data.next_run);
+        msg +=
+          " — first run " +
+          (rel
+            ? rel + " (" + SB.formatLocal(data.next_run) + ")"
+            : SB.formatLocal(data.next_run));
+      }
+      if (_launcherKind !== submittedKind) {
+        // The user moved on to another kind while the create was in
+        // flight: leave their composer (and anything they staged since)
+        // alone and confirm in passing.
+        showToast(msg);
+        return;
+      }
+      onSuccess(res); // a schedule stages no files of its own; this clears any left over
+      if (_homeCoordComposer) {
+        _homeCoordComposer.clear();
+        // A typed name belongs to the schedule just made, not the next one
+        // (the When builder's state is kept on purpose; a name is not timing).
+        _homeCoordComposer.setOptionValue("name", "");
+      }
+      _homeShowMessage(msg + ". Manage it under Admin › Schedules.", true);
+    })
+    .catch(function () {
+      setBusy(false);
+      errEl.textContent = "Request failed";
+    });
+}
+
+// Ctrl/Cmd+Enter anywhere in the launcher panel submits it — consistent
+// with the modal's keyboard-shortcut convention.  The Composer's own Enter
+// handler already fires submitHomeCoord when focus is in the textarea; this
+// covers focus on the attach / options buttons, the kind toggle, and the
+// When block's fields.
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+  if (!_homeCoordComposer) return;
+  const panel = document.getElementById("coord-composer-panel");
+  if (!panel || !panel.contains(e.target)) return;
+  e.preventDefault();
+  if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
+});
+
+// Global pane accelerators for the console — switch panes and jump to the
+// Dashboard.  The per-pane tab-menu actions (close pane, edit/refresh title,
+// delete) are bound once in shell.js off the active pane's OWN menu, so they
+// match the standalone automatically; only these shell-level chords live here.
+// New workstream and Fork are omitted: the console starts work from the
+// Dashboard and has no interactive fork surface yet.
+//
+// Modifier per platform: Ctrl on macOS (the browser owns Cmd), Alt on
+// Windows/Linux (Ctrl is the browser's own switch-tab / bookmark accelerator).
+const _CONSOLE_IS_MAC =
+  (navigator.platform && navigator.platform.indexOf("Mac") > -1) || false;
+
+document.addEventListener("keydown", function (e) {
+  if (document.querySelector("dialog:modal")) return;
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (!pm) return;
+
+  // Ctrl+D: jump to the Dashboard pane.  Kept on Ctrl every platform — Alt+D is
+  // the browser's focus-address-bar.  Yields to macOS delete-forward in fields.
+  if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key === "d") {
+    if (window.TS_SHELL.inEditable(e.target)) return;
+    e.preventDefault();
+    pm.openPane("dashboard");
+    return;
+  }
+
+  const paneMod = _CONSOLE_IS_MAC
+    ? e.ctrlKey && !e.altKey && !e.metaKey
+    : e.altKey && !e.ctrlKey && !e.metaKey;
+  if (!paneMod || e.shiftKey) return;
+
+  // <mod>+1..9: switch among the open conversational panes (mirrors a browser's
+  // Ctrl+1..9); works while composing.
+  if (e.key >= "1" && e.key <= "9") {
+    const tabs = pm.statefulTabs();
+    const idx = parseInt(e.key, 10) - 1;
+    if (idx < tabs.length) {
+      e.preventDefault();
+      pm.activate(tabs[idx].id);
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Saved sessions share the standalone table substrate. The server admits
+// each kind independently; activation follows the returned kind and node.
+// ---------------------------------------------------------------------------
+
+// In-flight de-dup for loadSavedCoordinators.  ws_closed events can
+// arrive in bursts on a busy cluster; without this guard each one
+// triggers a parallel fetch.  Single boolean is enough because the
+// renderer reads from the latest response — a coalesced re-fetch right
+// after the in-flight one resolves catches any state change.
+let _savedCoordsInFlight = false;
+let _savedCoordsRetry = false;
+
+function loadSavedCoordinators() {
+  if (!hasScope("read") || !_coordTable) return;
+  // Freeze the list while the user is multi-selecting — re-rendering
+  // mid-mode would shuffle the visible page out from under them.  The
+  // delete-mode wrapper drains the retry flag on cancel/onClose.
+  if (_coordTable && _coordTable.controller.inMode()) {
+    _savedCoordsRetry = true;
+    return;
+  }
+  if (_savedCoordsInFlight) {
+    _savedCoordsRetry = true;
+    return;
+  }
+  _savedCoordsInFlight = true;
+  const generation = authGeneration();
+  authFetch("/v1/api/workstreams/saved")
+    .then(function (r) {
+      if (!r.ok)
+        throw new Error("Could not load saved sessions (" + r.status + ").");
+      return r.json();
+    })
+    .then(function (data) {
+      if (generation !== authGeneration()) return;
+      // Belt-and-braces: if the user entered delete mode while this
+      // fetch was already in flight, defer the render — re-rendering
+      // mid-selection would shuffle visible cards and reshape selections.
+      if (_coordTable && _coordTable.controller.inMode()) {
+        _savedCoordsRetry = true;
+        return;
+      }
+      const saved = data.workstreams || [];
+      _setSavedError("");
+      const sec = document.getElementById("saved-coordinators");
+      if (sec) sec.style.display = saved.length ? "" : "none";
+      _coordTable.setItems(saved);
+    })
+    .catch(function (error) {
+      if (generation !== authGeneration()) return;
+      _coordTable.setItems([]);
+      _setSavedError(error.message || "Could not load saved sessions.");
+      const sec = document.getElementById("saved-coordinators");
+      if (sec) sec.style.display = "";
+    })
+    .finally(function () {
+      if (generation !== authGeneration()) return;
+      _savedCoordsInFlight = false;
+      // If at least one call arrived while we were in flight, fire one
+      // catch-up fetch (not N) so the UI reflects the latest state
+      // without a per-event fan-out.
+      if (_savedCoordsRetry) {
+        _savedCoordsRetry = false;
+        loadSavedCoordinators();
+      }
+    });
+}
+
+function _setSavedError(message) {
+  const error = document.getElementById("coord-saved-error");
+  if (error) error.hidden = !message;
+  const text = document.getElementById("coord-saved-error-text");
+  if (text) text.textContent = message;
+  ["saved-coord-cards", "coord-saved-footer"].forEach(function (id) {
+    const element = document.getElementById(id);
+    if (element) element.style.display = message ? "none" : "";
+  });
+}
+
+function _savedAuthChanged() {
+  _savedCoordsInFlight = _savedCoordsRetry = false;
+  _setSavedError("");
+  if (_coordTable) _coordTable.reset();
+  const sec = document.getElementById("saved-coordinators");
+  if (sec) sec.style.display = "none";
+  if (typeof _refreshHomeComposerVisibility === "function") {
+    _refreshHomeComposerVisibility();
+  }
+  loadSavedCoordinators();
+}
+
+function _canActOnSavedSession(session) {
+  return (
+    hasScope("write") &&
+    (session.kind !== "coordinator" ||
+      hasScope("service") ||
+      _hasCoordPermission())
+  );
+}
+
+// Saved Coordinators table — same shared createSavedTable as the server UI
+// (/shared/cards.js), with a CHILDREN column instead of MSGS and the
+// body-keyed (router-proxied) delete.  Activation POSTs /open before
+// navigating so capacity limits surface as a toast, not a broken page.
+let _coordTable = null;
+
+// Built at boot, not parse: the saved-table substrate (/shared/cards.js) is a
+// deferred ES module now, so its bridged globals (SavedColumns,
+// createSavedTable) don't exist yet while this classic file parses.
+function _initSavedCoordTable() {
+  const COORD_COLUMNS = [
+    SavedColumns.name(),
+    {
+      key: "kind",
+      label: "KIND",
+      width: "62px",
+      cell: function (s) {
+        const tag = document.createElement("span");
+        const coord = s.kind === "coordinator";
+        tag.className = "kind-tag" + (coord ? " coord" : " int");
+        tag.textContent = coord ? "COORD" : "INT";
+        return tag;
+      },
+      sort: function (s) {
+        return s.kind || "";
+      },
+    },
+    SavedColumns.persona(),
+    SavedColumns.project(),
+    SavedColumns.model(),
+    SavedColumns.count("child_count", "CHILDREN", "92px"),
+    SavedColumns.ctx(),
+    SavedColumns.last(),
+    SavedColumns.id(),
+  ];
+  _coordTable = createSavedTable({
+    headerEl: document.getElementById("coord-saved-colheaders"),
+    bodyEl: document.getElementById("saved-coord-cards"),
+    filterEl: document.getElementById("coord-filter"),
+    footerEl: document.getElementById("coord-saved-footer"),
+    paginationEl: document.getElementById("coord-pagination"),
+    columns: COORD_COLUMNS,
+    noun: "session",
+    emptyText: "No saved sessions",
+    canActivate: _canActOnSavedSession,
+    canDelete: _canActOnSavedSession,
+    activateLabel: function (s) {
+      return (
+        "Resume " +
+        (s.kind === "coordinator" ? "coordinator" : "session") +
+        ": " +
+        (s.alias || s.title || s.name || s.ws_id)
+      );
+    },
+    onActivate: function (s, rowEl) {
+      // Open the session as an L-shell PANE (the renovation: rail + saved-list
+      // clicks open tabs, not full-page nav).  Fall back to full-page nav only if
+      // the shell isn't present.
+      const pm = window.TS_SHELL && window.TS_SHELL.panes;
+      // Interactive sessions live on a compute node and, unlike coordinators,
+      // have no warm pool: a dormant one must be routed to a live node and
+      // rehydrated there before its pane can stream.  The interactive pane does
+      // exactly that on first activate (resolveInteractiveNode: origin-first
+      // POST /open with a rendezvous fallback), so the saved-row click just opens
+      // the pane with the origin node as the hint.  Shell-absent falls back to a
+      // best-effort full-page nav to the origin node, whose detail page
+      // rehydrates lazily.
+      if (s.kind !== "coordinator") {
+        if (pm) {
+          pm.openPane("interactive", s.ws_id, { nodeId: s.node_id || null });
+        } else if (s.node_id) {
+          window.location.href =
+            "/node/" +
+            encodeURIComponent(s.node_id) +
+            "/?ws_id=" +
+            encodeURIComponent(s.ws_id);
+        } else {
+          showToast("Session node unknown");
+        }
+        return;
+      }
+      // POST /open BEFORE navigating so capacity issues surface as a toast
+      // instead of a broken-looking detail page.
+      if (rowEl) rowEl.classList.add("is-busy");
+      authFetch(
+        "/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open",
+        {
+          method: "POST",
+        },
+      )
+        .then(function (r) {
+          if (r.ok) {
+            if (rowEl) rowEl.classList.remove("is-busy");
+            if (pm) pm.openPane("coordinator", s.ws_id);
+            else
+              window.location.href =
+                "/coordinator/" + encodeURIComponent(s.ws_id);
+            return;
+          }
+          if (rowEl) rowEl.classList.remove("is-busy");
+          if (r.status === 429) {
+            showToast(
+              "All coordinator slots are active — close one first to restore this session",
+            );
+          } else if (r.status === 404) {
+            showToast("Coordinator no longer available");
+            loadSavedCoordinators();
+          } else if (r.status === 503) {
+            showToast("Coordinator subsystem not configured");
+          } else {
+            showToast("Failed to restore coordinator (" + r.status + ")");
+          }
+        })
+        .catch(function () {
+          if (rowEl) rowEl.classList.remove("is-busy");
+          showToast("Failed to restore coordinator");
+        });
+    },
+    delete: {
+      idPrefix: "coord-delete",
+      buttonId: "coord-delete-btn",
+      // Coordinators live on whichever node owns the ws_id; the router proxy
+      // reads ws_id from the body, resolves the owning node via rendezvous
+      // hashing, and forwards to that node's POST workstreams/{ws_id}/delete.
+      buildDeleteRequest: function (wsId) {
+        return {
+          url: "/v1/api/route/workstreams/delete",
+          options: {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ws_id: wsId }),
+          },
+        };
+      },
+      onClose: function () {
+        // Drain queued retries before the explicit reload (see the freeze
+        // gate in loadSavedCoordinators) so .finally() doesn't double-fetch.
+        _savedCoordsRetry = false;
+        loadSavedCoordinators();
+      },
+    },
+  });
+  // The PROJECT and PERSONA columns resolve names from the shared caches,
+  // which fill asynchronously — re-render once names arrive.
+  if (window.TurnstoneProjects) {
+    window.TurnstoneProjects.onProjectsChange(function () {
+      if (_coordTable) _coordTable.render();
+    });
+  }
+  if (window.TurnstonePersonas) {
+    window.TurnstonePersonas.onPersonasChange(function () {
+      if (_coordTable) _coordTable.render();
+    });
+  }
+}
+
+// HTML inline-onclick wrappers — keep the global names the markup binds
+// to and forward to the shared controller.
+function startCoordDeleteMode() {
+  _coordTable.controller.start();
+}
+function cancelCoordDeleteMode() {
+  _coordTable.controller.cancel();
+  // The freeze gate (see loadSavedCoordinators) may have queued retries
+  // while we were multi-selecting; drain them now that we're idle again.
+  if (_savedCoordsRetry) {
+    _savedCoordsRetry = false;
+    loadSavedCoordinators();
+  }
+}
+function toggleCoordSelectAll() {
+  _coordTable.controller.toggleAll();
+}
+function confirmCoordDeleteSelection() {
+  _coordTable.controller.confirmSelection();
+}
+
+// --- Init ---
+// SSE connects after auth is confirmed — either via onLoginSuccess after
+// login, or after the first successful data load (page refresh with valid cookie).
+let _sseStarted = false;
+function _ensureSSE() {
+  if (!_sseStarted) {
+    _sseStarted = true;
+    connectSSE();
+  }
+}
+// --- Boot ---
+// The L-shell (shared_static/shell.js, an ES module) is deferred and runs after
+// this classic script, so it drives boot() once the rail + status DOM exist —
+// init no longer auto-runs at parse time.  window.onLoginSuccess (top of file)
+// still starts the Tier-1 stream on both fresh login and refresh-with-cookie,
+// so that path is unchanged.
+window.TS_APP = window.TS_APP || {};
+// --- Rail seam (Tier-1) ---
+// The shell's rail.js reads cluster state + nav actions through this surface and
+// re-renders whenever renderFromState fires onRender.  app.js keeps owning
+// clusterState (no physical extraction); these closures see the live binding.
+window.TS_APP._renderSubs = window.TS_APP._renderSubs || [];
+window.TS_APP.getClusterState = function () {
+  return clusterState;
+};
+window.TS_APP.onRender = function (cb) {
+  window.TS_APP._renderSubs.push(cb);
+};
+window.TS_APP.drillDownByState = function (s) {
+  drillDownByState(s);
+};
+window.TS_APP.bucketByParent = function (list) {
+  return _bucketByParent(list);
+};
+window.TS_APP.buildNodeInfo = function (node) {
+  return buildNodeInfoFromSnapshot(node);
+};
+// Resolve the cluster node that should host an interactive pane's session AND
+// ensure the session is loaded there before the pane streams — the node /events
+// stream 404s on a ws not loaded on that node, and /history alone won't load it.
+// The shell's interactive pane factory calls this on first activate (fresh open,
+// saved-row resume, AND reload-rehydrate all funnel through here).
+//
+// Try the live/origin hint first to reuse an already loaded session. A missing,
+// unreachable, or wrong-node hint requires a fresh route lookup. The router
+// preserves durable node requirements; flexible sessions retain HRW recovery.
+// Both the router and the executing node enforce the requirement.
+window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
+  const readFailure = function (r) {
+    return Promise.resolve()
+      .then(function () {
+        return r.json();
+      })
+      .catch(function () {
+        return {};
+      })
+      .then(function (data) {
+        const required = data && data.required_node_id;
+        if (
+          data &&
+          ((r.status === 503 && data.code === "required_node_unavailable") ||
+            (r.status === 409 && data.code === "wrong_execution_node")) &&
+          typeof required === "string" &&
+          /^[A-Za-z0-9_.-]{1,256}$/.test(required)
+        ) {
+          return {
+            status: r.status,
+            code: data.code,
+            requiredNodeId: required,
+            error:
+              "This session requires node '" +
+              required +
+              "'. Retry when it returns, or continue elsewhere from saved history.",
+            canContinue: true,
+          };
+        }
+        return { status: r.status };
+      });
+  };
+  const openOn = function (nodeId) {
+    return authFetch(
+      "/node/" +
+        encodeURIComponent(nodeId) +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(wsId) +
+        "/open",
+      { method: "POST" },
+    ).then(function (r) {
+      return r.ok ? { nodeId: nodeId } : readFailure(r);
+    });
+  };
+  // Single error surface: the failure is returned as {error} and the interactive
+  // pane writes it into its .pane-status line (the pane is always the active tab
+  // when it resolves).  No toast — one source of truth, no wording drift.
+  const failResult = function (res) {
+    if (res.error) return res;
+    const status = res.status;
+    if (status === 429)
+      return { error: "Node at capacity — close a session and retry." };
+    if (status === 403)
+      return { error: "You don’t have permission to open this session." };
+    return {
+      error: "Could not open this session (" + status + ").",
+      canContinue: status === 502 || status === 503,
+    };
+  };
+  const routeFallback = function () {
+    return authFetch("/v1/api/route?ws_id=" + encodeURIComponent(wsId))
+      .then(function (r) {
+        if (!r.ok) {
+          return readFailure(r).then(failResult);
+        }
+        return r.json();
+      })
+      .then(function (route) {
+        if (!route || route.error)
+          return route || { error: "Could not locate the session node." };
+        if (!route.node_id)
+          return { error: "Could not locate the session node." };
+        return openOn(route.node_id).then(function (res) {
+          return res.nodeId ? res : failResult(res);
+        });
+      });
+  };
+  const flow = hintNodeId
+    ? openOn(hintNodeId).then(function (res) {
+        if (res.nodeId) return res;
+        if (
+          res.status === 404 ||
+          res.status === 502 ||
+          res.code === "wrong_execution_node"
+        )
+          return routeFallback();
+        return failResult(res);
+      })
+    : routeFallback();
+  return flow.catch(function () {
+    return { error: "Failed to open this session." };
+  });
+};
+
+window.TS_APP.continueInteractiveElsewhere = function (wsId, requiredNodeId) {
+  const dlg = document.getElementById("continue-session-dialog");
+  if (!dlg || dlg.open) return;
+  const select = document.getElementById("continue-session-node");
+  const error = document.getElementById("continue-session-error");
+  const submit = document.getElementById("continue-session-submit");
+  select.replaceChildren(new Option("Choose a destination node", ""));
+  Object.keys((clusterState && clusterState.nodes) || {})
+    .sort()
+    .forEach(function (nodeId) {
+      const node = clusterState.nodes[nodeId];
+      if (
+        nodeId !== "console" &&
+        nodeId !== requiredNodeId &&
+        node.reachable !== false
+      )
+        select.add(new Option(nodeId, nodeId));
+    });
+  error.textContent =
+    select.options.length === 1
+      ? "No other nodes are available. Retry when a node returns."
+      : "";
+  submit.disabled = select.options.length === 1;
+  submit.onclick = function () {
+    if (dlg.hasAttribute("data-busy")) return;
+    _createInteractive({
+      resume_ws: wsId,
+      node_strategy: "node",
+      node_id: select.value,
+      errEl: error,
+      setBusy: function (busy) {
+        window.TurnstoneHatch.setBusy(dlg, busy);
+      },
+      onSuccess: function () {
+        dlg.close();
+      },
+    });
+  };
+  window.TurnstoneHatch.openDialog(dlg);
+};
+// === MCP consent badge (console L-shell) ====================================
+// Mirror of the node dashboard's pending-consent subsystem (ui/static/app.js
+// §12), driving the rail's Admin > MCP Servers row badge through the shell
+// bridge.  The pending set is USER-scoped server truth — the Phase 9
+// mcp_oauth_pending table, which the console serves at
+// /v1/api/mcp/oauth/pending — hydrated at boot and fed live by hosted panes
+// through the window.TS_APP.onConsentDetected seam (the shared pane host
+// bridges an interactive pane's detections here, and the coordinator pane
+// forwards its error card's onConsent; both light up now that the seam
+// exists on the console).  admin.js re-syncs after the operator has SEEN
+// the MCP panel render (same semantics as the node's Connections flow).
+const _pendingConsentServers = new Set();
+
+function _refreshConsentBadge() {
+  const shell = window.TS_SHELL;
+  if (!shell || typeof shell.setRowBadge !== "function") return;
+  const n = _pendingConsentServers.size;
+  const label =
+    n === 0
+      ? ""
+      : n + " MCP server" + (n === 1 ? "" : "s") + " awaiting consent";
+  shell.setRowBadge("mcp", n, label);
+}
+
+function _onConsentDetected(server) {
+  if (typeof server === "string" && server) {
+    _pendingConsentServers.add(server);
+    _refreshConsentBadge();
+  }
+}
+
+function loadPendingConsents() {
+  authFetch("/v1/api/mcp/oauth/pending")
+    .then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.servers)) return;
+      for (let i = 0; i < data.servers.length; i++) {
+        const row = data.servers[i];
+        if (row && typeof row.server_name === "string") {
+          _pendingConsentServers.add(row.server_name);
+        }
+      }
+      _refreshConsentBadge();
+    })
+    .catch(function () {
+      // Endpoint failures must not block console boot.
+    });
+}
+
+// Live MCP-consent notifications from a hosted pane — the seam the shared
+// pane host bridges to (and the coordinator pane's card forwards to).
+window.TS_APP.onConsentDetected = _onConsentDetected;
+// Badge re-sync to DB truth after the operator has seen the admin MCP
+// panel render: clear-then-rehydrate, the node Connections-flow semantics
+// (a FAILED panel load keeps the pending signal instead).  The repaint
+// between clear and rehydrate keeps the badge↔set invariant even when the
+// rehydrate fetch fails — matching the node's _clearConsentBadge.
+window.TS_APP.syncConsentBadge = function () {
+  _pendingConsentServers.clear();
+  _refreshConsentBadge();
+  loadPendingConsents();
+};
+
+// Visibility-show resync (#874): the consent popup opens noopener — no
+// cross-window channel exists — so the only reliable signal that consent
+// completed is the user returning to this tab.  Merge-on-success:
+// entries the server no longer lists are dropped ONLY if they predate
+// this fetch (the preFetch snapshot) — a detection arriving through
+// _onConsentDetected while the fetch is in flight survives, since its
+// DB row may postdate the server's read.  A failed fetch changes
+// nothing, so a possibly-valid warning is never blanked (unlike
+// syncConsentBadge above, whose blind clear is justified by the
+// operator having just SEEN the MCP panel).
+let _resyncInFlight = false;
+let _resyncQueued = false;
+function _resyncPendingConsents() {
+  // Single-flight: overlapping fetches can resolve out of order, and
+  // every guard short of exclusion re-admits some interleaving (a stale
+  // read clobbering a newer one, a failed fetch suppressing a valid
+  // one, an older read's additions surviving a newer read's deletes).
+  // One flight at a time makes the whole class structurally impossible;
+  // an edge firing mid-flight queues exactly one rerun so the freshest
+  // truth still lands.
+  if (_resyncInFlight) {
+    _resyncQueued = true;
+    return;
+  }
+  // Bounded flight: a stalled fetch would otherwise hold the gate shut
+  // forever (the .finally below never runs, freezing self-heal); on
+  // timeout the chain rejects → .catch → .finally clears the gate and
+  // drains any queued rerun.  Feature-detected like the codebase's
+  // AbortController guards — old runtimes just run unbounded, as before
+  // — and computed BEFORE the gate is set so no throw can wedge it.
+  const signal =
+    typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(10000)
+      : undefined;
+  _resyncInFlight = true;
+  const preFetch = new Set(_pendingConsentServers);
+  authFetch("/v1/api/mcp/oauth/pending", { signal: signal })
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.servers)) return;
+      const fetched = new Set();
+      for (let i = 0; i < data.servers.length; i++) {
+        const row = data.servers[i];
+        if (row && typeof row.server_name === "string") {
+          fetched.add(row.server_name);
+        }
+      }
+      preFetch.forEach(function (s) {
+        if (!fetched.has(s)) _pendingConsentServers.delete(s);
+      });
+      fetched.forEach(function (s) {
+        _pendingConsentServers.add(s);
+      });
+      _refreshConsentBadge();
+    })
+    .catch(function () {})
+    .finally(function () {
+      _resyncInFlight = false;
+      if (_resyncQueued) {
+        _resyncQueued = false;
+        _resyncPendingConsents();
+      }
+    });
+}
+
+window.TS_APP.boot = function () {
+  history.replaceState({ view: "home" }, "");
+  _initSavedCoordTable(); // substrate modules have evaluated by boot time
+  initLogin();
+  // loadOverview fetches the cluster snapshot — both the node list AND
+  // the active-coordinators list come from the same snapshot + SSE patch
+  // pipeline (#9); the console pseudo-node carries coordinator
+  // ws_created / ws_closed / cluster_state events.
+  loadOverview();
+  // Hydrate the MCP pending-consent badge (#874): a coordinator or
+  // scheduled run that hit mcp_consent_required while nobody watched left
+  // a DB row — the badge is how the operator finds out.  Cheap no-op on
+  // installs with no user-scoped MCP servers; failures are silent.
+  loadPendingConsents();
+  // Self-heal the badge after the consent popup (see _resyncPendingConsents).
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") _resyncPendingConsents();
+  });
+  _ensureHomeComposerInit();
+  // Refresh the coord button visibility once auth.js has populated
+  // sessionStorage from the initial whoami.  The settling protocol lives in
+  // the shared whenPermissionsReady (auth.js), reached through the
+  // cache-skew shim so a stale-cached auth.js degrades to the timer.
+  //
+  // NOTE: permissionsReady is one-shot — it fires exactly once per page
+  // load (see auth.js).  Subsequent re-logins are caught by the
+  // onLoginSuccess hook above which calls loadSavedCoordinators() again.
+  _consoleWhenPermissionsReady(function () {
+    _refreshHomeComposerVisibility();
+    loadSavedCoordinators();
+  });
+  onAuthChange(_savedAuthChanged);
+};

@@ -1,0 +1,40 @@
+{
+  "name": "spawn_workstream",
+  "description": "Create a new child workstream, optionally dispatching an initial message. Kick off a focused sub-task on a different skill / model / node while the coordinator stays in charge. The child runs independently — drive it with send_to_workstream / inspect_workstream / close_workstream. Returns `{child_ws_id, name, node_id, routing_strategy}` — pass `child_ws_id` into `wait_for_workstream(ws_ids=[...])` and the other `ws_id`-taking tools. For this tool, `routing_strategy` is `rendezvous` (default placement on the live-node set) or `target_node` (an explicit execution requirement). An explicit target remains required after close or restart; unavailable targets do not fall back. Automatic placement remains flexible. The returned `node_id` describes placement at creation, not an exclusive ownership lease. Don't cache `node_id` for long-running callbacks — re-read with inspect_workstream. Lifecycle state (idle / running / etc.) is not in this response — read it via inspect_workstream.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "initial_message": {
+        "type": "string",
+        "description": "First user message to dispatch to the new workstream. If empty, the workstream is created idle and waits for send_to_workstream."
+      },
+      "skill": {
+        "type": "string",
+        "description": "Optional skill name to apply to the new workstream (overrides default skills, may select a model)."
+      },
+      "name": {
+        "type": "string",
+        "description": "Optional display name for the new workstream. Auto-generated when empty."
+      },
+      "model": {
+        "type": "string",
+        "description": "Optional model alias from the registry. Discover available aliases per node via `list_nodes` (the `model_aliases` field on each row lists the healthy aliases that node will accept). Omit to use the coordinator's default model (or the one the skill prescribes)."
+      },
+      "target_node": {
+        "type": "string",
+        "description": "Optional required node_id. Execution stays bound to this identity after close, timeout, or restart. An unavailable node fails without fallback. Omit for flexible placement; select a node when its local files, devices, or environment are required."
+      },
+      "project": {
+        "type": "string",
+        "description": "Optional project_id to attach the child to, overriding the project it would otherwise inherit from this coordinator. Omit to inherit the coordinator's project (the common case). The child only gains project access if its owning user can access the project."
+      },
+      "persona": {
+        "type": "string",
+        "description": "Optional persona name for the child (children are always interactive-kind, so the persona must apply to interactive workstreams). The persona is resolved and snapshotted at spawn time. Omit for the interactive default persona — the child never inherits this coordinator's persona."
+      }
+    },
+    "required": []
+  },
+  "coordinator": true,
+  "primary_key": "initial_message"
+}

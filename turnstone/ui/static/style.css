@@ -1,0 +1,1658 @@
+/* ==========================================================================
+   turnstone server UI — page-specific styles
+   Design tokens, reset, shared components live in /shared/base.css
+   ========================================================================== */
+
+/* ==========================================================================
+   Header — server-specific elements
+   ========================================================================== */
+#mcp-status {
+  color: var(--magenta);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  opacity: 0;
+  transition: opacity 0.3s;
+  cursor: default;
+}
+#health-indicator {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  transition:
+    opacity 0.3s ease,
+    background 0.3s ease;
+}
+#health-indicator.health-ok {
+  opacity: 0;
+  pointer-events: none;
+}
+#health-indicator.health-degraded {
+  background: var(--accent);
+  color: var(--bg);
+  opacity: 1;
+}
+.skip-permissions-warning {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--yellow);
+  padding: 2px 8px;
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  letter-spacing: 0.02em;
+}
+
+/* ==========================================================================
+   Theme toggle
+   ========================================================================== */
+#theme-toggle {
+  color: var(--fg);
+  margin-left: auto;
+  font-size: 14px;
+  line-height: 1;
+}
+/* .card-wsid moved to /shared/cards.css (with vertical-align added so it
+   aligns with .card-meta).  Single source for both surfaces. */
+
+/* Pane — the interactive pane root (interactive.js).  The split-pane chrome
+   that used to ride it (.split-handle, .pane-header, .pane-action-btn,
+   .focused) was retired with the step-6 fork collapse; the L-shell's tab bar
+   owns those affordances now (shared_static/shell.css). */
+.pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 200px;
+  min-height: 150px;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ==========================================================================
+   Messages
+   ========================================================================== */
+.pane-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  /* No flexbox gap — .msg supplies its own margin-bottom for inter-card
+     spacing.  A 14px gap here was stacking with the 4px card
+     margin-bottom and pushing the per-card spacing to ~18px. */
+}
+/* .msg (shared_static/chat.css) provides padding / border / radius /
+   line-height / word-wrap / margin / background.  The interactive UI
+   adds a brighter text colour on user messages so "the thing I said"
+   reads distinctly against the lower-chroma assistant colour. */
+.msg.user {
+  color: var(--fg-bright);
+}
+/* .msg.system-context (operator-context system turns) lives in
+   shared_static/chat.css so both the interactive UI and the console coord
+   viewer pick up the same yellow themed bubble. */
+/* .msg.assistant / .msg.info / .msg.error alignment + baseline visuals
+   come from shared_static/chat.css.  Interactive UI adds a pre-wrap
+   override for info messages and a tightened tool-message shape with
+   the cyan accent bar the instrument-panel look established. */
+.msg.info {
+  white-space: pre-wrap;
+}
+.msg.tool {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  /* Tool cards use --cyan to read distinctly from user (amber) and
+     assistant (neutral); the tool-name header carries the role
+     signal redundantly. */
+  border-left: 3px solid var(--cyan);
+  font-size: 12px;
+  padding: 8px 12px;
+}
+.msg.tool .tool-header {
+  color: var(--cyan);
+  font-weight: 600;
+  margin-bottom: 4px;
+  font-size: 11px;
+}
+.msg.tool .tool-preview {
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  font-size: 12px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* ==========================================================================
+   Markdown styling
+   ========================================================================== */
+/* Override KaTeX body rule — our layout requires body as a static flex container */
+body {
+  position: static;
+}
+.msg.assistant h1,
+.msg.assistant h2,
+.msg.assistant h3,
+.msg.assistant h4,
+.msg.assistant h5,
+.msg.assistant h6 {
+  color: var(--accent);
+  margin: 8px 0 4px;
+  font-family: var(--font-ui);
+}
+.msg.assistant h1 {
+  font-size: 18px;
+}
+.msg.assistant h2 {
+  font-size: 16px;
+}
+.msg.assistant h3 {
+  font-size: 14px;
+}
+.msg.assistant h4 {
+  font-size: 13px;
+  font-weight: 600;
+}
+.msg.assistant h5 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.msg.assistant h6 {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+.msg.assistant strong {
+  color: var(--fg-bright);
+}
+.msg.assistant em {
+  color: var(--magenta);
+}
+.msg.assistant del {
+  color: var(--fg-dim);
+  text-decoration: line-through;
+}
+.msg.assistant code {
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  border: 1px solid var(--border);
+}
+.msg.assistant pre {
+  background: var(--code-bg);
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  overflow-x: auto;
+  margin: 8px 0;
+  border: 1px solid var(--border);
+}
+.msg.assistant pre code {
+  background: none;
+  padding: 0;
+  border: none;
+}
+.msg.assistant ul,
+.msg.assistant ol {
+  margin: 4px 0 4px 20px;
+}
+.msg.assistant li {
+  margin: 2px 0;
+}
+.msg.assistant a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.msg.assistant blockquote {
+  border-left: 3px solid var(--accent-dim);
+  padding-left: 12px;
+  color: var(--fg-dim);
+  margin: 6px 0;
+}
+.msg.assistant hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 8px 0;
+}
+.msg.assistant p {
+  margin: 4px 0;
+}
+.msg.assistant .table-wrap {
+  overflow-x: auto;
+  margin: 8px 0;
+  -webkit-overflow-scrolling: touch;
+}
+.msg.assistant .table-wrap:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.msg.assistant table {
+  border-collapse: collapse;
+  width: auto;
+  min-width: 50%;
+  font-size: 13px;
+}
+.msg.assistant thead {
+  border-bottom: 2px solid var(--border-strong);
+}
+.msg.assistant th {
+  background: var(--code-bg);
+  font-weight: 600;
+  color: var(--fg-bright);
+}
+.msg.assistant th,
+.msg.assistant td {
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+}
+.msg.assistant tbody tr {
+  transition: background 0.12s ease;
+}
+.msg.assistant tbody tr:nth-child(even) {
+  background: var(--row-alt);
+}
+.msg.assistant tbody tr:hover {
+  background: var(--bg-highlight);
+}
+.msg.assistant .align-left {
+  text-align: left;
+}
+.msg.assistant .align-center {
+  text-align: center;
+}
+.msg.assistant .align-right {
+  text-align: right;
+}
+.msg.assistant img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius);
+  margin: 4px 0;
+}
+.msg.assistant .img-placeholder {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  margin: 4px 0;
+  background: var(--code-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.12s ease;
+}
+.msg.assistant .img-placeholder:hover {
+  border-color: var(--accent);
+}
+.msg.assistant .img-placeholder:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.msg.assistant .img-placeholder-icon {
+  font-size: 16px;
+}
+.msg.assistant .img-placeholder-label {
+  color: var(--fg-bright);
+  font-size: 13px;
+}
+.msg.assistant .img-placeholder-domain {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.msg.assistant li > input[type="checkbox"] {
+  margin-right: 6px;
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
+.msg.assistant blockquote blockquote {
+  margin: 4px 0;
+  border-left-color: var(--border-strong);
+}
+.msg.assistant blockquote blockquote blockquote {
+  border-left-color: var(--border);
+}
+/* Rendered-markdown decoration for code (highlight.js), math (KaTeX
+   .katex-display/.katex-error) and diagrams (Mermaid .mermaid-*) moved to
+   shared_static/chat.css.  These style the output of the SHARED renderer.js,
+   which runs on the server UI, the console AND the coordinator — but those
+   last two load /static/style.css from their own directory, not this file, so
+   the rules have to be shared.  Do not re-add them here. */
+
+/* Safe HTML elements */
+.msg.assistant details {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+.msg.assistant details summary {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--fg-bright);
+  user-select: none;
+}
+.msg.assistant details summary:hover {
+  color: var(--accent);
+}
+.msg.assistant details[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+.msg.assistant details > :not(summary) {
+  padding: 0 12px;
+}
+.msg.assistant kbd {
+  background: var(--bg-highlight);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  box-shadow: 0 1px 0 var(--border-strong);
+}
+.msg.assistant mark {
+  background: var(--yellow-glow);
+  color: var(--fg-bright);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* GFM Callouts / Alerts */
+.msg.assistant .callout {
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  margin: 8px 0;
+  overflow: hidden;
+}
+.msg.assistant .callout-title {
+  padding: 8px 12px 4px;
+  font-weight: 600;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.msg.assistant .callout-icon {
+  font-size: 14px;
+}
+.msg.assistant .callout-body {
+  padding: 0 12px 8px;
+  color: var(--fg);
+}
+.msg.assistant .callout-body p:first-child {
+  margin-top: 0;
+}
+.msg.assistant .callout-body p:last-child {
+  margin-bottom: 0;
+}
+.msg.assistant .callout-note {
+  border-left-color: var(--cyan);
+}
+.msg.assistant .callout-note .callout-title {
+  color: var(--cyan);
+}
+.msg.assistant .callout-tip {
+  border-left-color: var(--green);
+}
+.msg.assistant .callout-tip .callout-title {
+  color: var(--green);
+}
+.msg.assistant .callout-important {
+  border-left-color: var(--magenta);
+}
+.msg.assistant .callout-important .callout-title {
+  color: var(--magenta);
+}
+.msg.assistant .callout-warning {
+  border-left-color: var(--yellow);
+}
+.msg.assistant .callout-warning .callout-title {
+  color: var(--yellow);
+}
+.msg.assistant .callout-caution {
+  border-left-color: var(--red);
+}
+.msg.assistant .callout-caution .callout-title {
+  color: var(--red);
+}
+
+/* Definition lists */
+.msg.assistant dl {
+  margin: 8px 0;
+}
+.msg.assistant dt {
+  font-weight: 600;
+  color: var(--fg-bright);
+  margin-top: 8px;
+}
+.msg.assistant dt:first-child {
+  margin-top: 0;
+}
+.msg.assistant dd {
+  margin: 2px 0 0 20px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+}
+
+/* Footnotes */
+.msg.assistant .footnotes {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.msg.assistant .footnotes-sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.msg.assistant .footnotes-list {
+  margin: 0 0 0 20px;
+  padding: 0;
+}
+.msg.assistant .footnote-item {
+  margin: 4px 0;
+  line-height: 1.5;
+}
+.msg.assistant .fn-ref a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 600;
+}
+.msg.assistant .fn-ref a:hover {
+  text-decoration: underline;
+}
+.msg.assistant .fn-backref {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  margin-left: 4px;
+}
+.msg.assistant .fn-backref:hover {
+  text-decoration: underline;
+}
+.msg.assistant .fn-ref a:focus-visible,
+.msg.assistant .fn-backref:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+/* ==========================================================================
+   Input area — composer DOM + styling lives in /shared/composer.js +
+   /shared/chat.css.  No page-specific overrides needed.
+   ========================================================================== */
+
+/* Attachment chips — pill cluster above the textarea */
+.composer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.composer-chips:empty {
+  display: none;
+}
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 8px 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-width: 280px;
+}
+.composer-chip-icon {
+  font-size: 12px;
+  opacity: 0.7;
+}
+/* .composer-chip-name clamp now lives in shared chat.css (applies to every
+   surface; console main + coordinator previously left the span unclamped). */
+.composer-chip-size {
+  color: var(--fg-dim, var(--fg));
+  opacity: 0.65;
+  font-size: 10px;
+}
+.composer-chip-remove {
+  background: transparent;
+  color: var(--fg-dim, var(--fg));
+  border: none;
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.composer-chip-remove:hover {
+  color: var(--red, #c94040);
+  background: var(--bg-surface);
+}
+.composer-chip-remove:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* New-workstream dialog: attachment row + chips (the dialog chrome itself
+   is /shared/hatch.css; only the attach affordance is page-specific) */
+#new-ws-attach-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
+#new-ws-attach-btn {
+  align-self: flex-start;
+  padding: 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  cursor: pointer;
+}
+#new-ws-attach-btn:hover {
+  background: var(--bg-surface);
+}
+#new-ws-attach-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+#new-ws-attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+#new-ws-attach-chips:empty {
+  display: none;
+}
+.new-ws-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 8px 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-width: 280px;
+}
+.new-ws-attach-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.new-ws-attach-chip-size {
+  color: var(--fg-dim, var(--fg));
+  opacity: 0.65;
+  font-size: 10px;
+}
+.new-ws-attach-chip-remove {
+  background: transparent;
+  color: var(--fg-dim, var(--fg));
+  border: none;
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.new-ws-attach-chip-remove:hover {
+  color: var(--red, #c94040);
+  background: var(--bg-surface);
+}
+.new-ws-attach-chip-remove:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Drag-and-drop visual state on the pane */
+.pane.pane-drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+.pane.pane-drop-target::after {
+  content: "Drop file to attach";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-dim, rgba(0, 0, 0, 0.1));
+  color: var(--fg-bright, var(--fg));
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* Historical-message attachment pills — beneath the user bubble */
+.msg-user-attach {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.msg-user-attach-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-surface);
+  color: var(--fg-dim, var(--fg));
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.msg-user-attach-icon {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.msg-user-attach-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ts-approval.approved {
+  border-left-color: var(--green);
+}
+/* Early-paint shell (tool_pending): the call is rendered the instant the
+   model commits to it, before the judge verdict + approval gate resolve.
+   Dashed amber rail = "in flight, you can still Stop it" — deliberately the
+   one visually-distinct card in a stream of cyan tool surfaces (it's the
+   feature's whole point: notice the committed call and intervene).  The
+   authoritative tool_info / approve_request upgrade then swaps it for the
+   solid approved / pending construct.
+   Selector MUST out-specify `.msg.ts-approval--inline` (0,2,0), which sets
+   `border-left-color: var(--cyan)` to hold resolved inline cards cyan — at
+   (0,1,0) the announced rail rendered as dashed *cyan* (indistinguishable
+   from a normal tool card).  Full `--accent`, not `--accent-dim`: a 15%-alpha
+   rail is invisible at 3px. */
+.msg.ts-approval--inline.ts-approval--announced {
+  border-left-style: dashed;
+  border-left-color: var(--accent);
+}
+.ts-approval.error {
+  border-left-color: var(--red);
+}
+.ts-approval.denied {
+  border-left-color: var(--red);
+}
+.ts-approval.denied .ts-approval-tool {
+  opacity: 0.55;
+}
+.ts-approval.denied .ts-approval-tool .tool-name {
+  color: var(--fg-dim);
+}
+.ts-approval-tool .tool-cmd .dollar {
+  color: var(--green);
+}
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output,
+.ts-approval-tool[data-func-name="memory"] ~ .media-embed,
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning {
+  opacity: 0.55;
+  transition: opacity 120ms ease-out;
+}
+/* Reveal on hover OR focus-within across the entire dimmed
+   subtree.  Without :focus-within on the siblings, a keyboard user
+   tabbing into a link or collapsible toggle inside .tool-output
+   sees the content remain dimmed — a11y regression.  Cover the
+   warning pill too so it fully reveals alongside the result it
+   decorates. */
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .tool-output:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .tool-output:focus-within,
+.ts-approval-tool[data-func-name="memory"] ~ .media-embed:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .media-embed:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .media-embed:focus-within,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning:hover,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning:hover,
+.ts-approval-tool[data-func-name="memory"] ~ .output-warning:focus-within,
+.ts-approval-tool[data-func-name="recall"] ~ .output-warning:focus-within {
+  opacity: 1;
+}
+.ts-approval-btn .key {
+  display: inline-block;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0 4px;
+  font-size: 10px;
+  color: var(--accent);
+  font-weight: 600;
+  min-width: 18px;
+  text-align: center;
+}
+/* Approve / deny / always button hover + dashed styles are provided
+   by chat.css .ts-approval-btn--approve / --deny / --always; the
+   legacy .btn-approve / .btn-deny / .btn-always classes are gone
+   from app.js, so no local overrides needed here. */
+.ts-approval-feedback {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.ts-approval-feedback:focus {
+  border-color: var(--accent);
+}
+.ts-approval-feedback::placeholder {
+  color: var(--fg-dim);
+}
+.tool-output {
+  padding: 8px 12px;
+  background: var(--code-bg);
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: var(--fg-dim);
+  max-height: 300px;
+  overflow-y: auto;
+}
+.tool-output-error {
+  color: var(--red);
+}
+.tool-output-stream {
+  border-left: 2px solid var(--accent);
+  max-height: 400px;
+  animation: stream-pulse 2s ease-in-out infinite;
+}
+@keyframes stream-pulse {
+  0%,
+  100% {
+    border-left-color: var(--accent);
+  }
+  50% {
+    border-left-color: var(--accent-dim);
+  }
+}
+.tool-output.collapsed {
+  max-height: 150px;
+  position: relative;
+  overflow: hidden;
+}
+.tool-output.collapsed::after {
+  content: "click to expand";
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  text-align: center;
+  padding: 6px;
+  background: linear-gradient(transparent, var(--code-bg) 60%);
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  letter-spacing: 0.03em;
+}
+
+/* ==========================================================================
+   Media embed cards (MCP tool output with stream_url / results)
+   ========================================================================== */
+.media-embed {
+  border-top: 1px solid var(--border);
+  background: var(--code-bg);
+}
+.media-card {
+  display: flex;
+  gap: 12px;
+  padding: 10px 12px;
+  align-items: flex-start;
+}
+.media-card-thumb {
+  width: 80px;
+  height: 120px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+.media-card-info {
+  flex: 1;
+  min-width: 0;
+}
+.media-card-title {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-bright);
+  margin-bottom: 2px;
+}
+.media-card-meta {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+.media-play-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.media-play-btn:hover {
+  background: rgba(229, 160, 66, 0.1);
+}
+.media-play-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.media-play-btn:active {
+  background: rgba(229, 160, 66, 0.2);
+}
+.media-play-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.media-player {
+  width: 100%;
+  max-height: 480px;
+  background: #000;
+  border-radius: 0;
+}
+audio.media-player {
+  max-height: 54px;
+}
+.media-player-error {
+  color: var(--red);
+  font-size: 12px;
+  padding: 8px 12px;
+  background: var(--code-bg);
+}
+.media-results-list {
+  padding: 6px 12px;
+}
+.media-result-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  align-items: center;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.media-result-row:last-child {
+  border-bottom: none;
+}
+.media-result-thumb {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+.media-result-title {
+  color: var(--fg-bright);
+  font-weight: 500;
+}
+.media-result-meta {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.media-results-count {
+  text-align: right;
+  font-size: 10px;
+  color: var(--fg-dim);
+  padding: 4px 0;
+}
+@media (max-width: 480px) {
+  .media-card {
+    flex-direction: column;
+  }
+  .media-card-thumb {
+    width: 100%;
+    height: auto;
+    max-height: 200px;
+  }
+  .media-player {
+    max-height: 280px;
+  }
+}
+
+/* ==========================================================================
+   Focus indicators — server-specific overrides
+   ========================================================================== */
+/* Slightly thicker ring than chat.css (2px → 3px) — the interactive
+   pane sits over denser pane-bottom chrome, so the ring needs more
+   visual weight to pop. */
+.composer-input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* ==========================================================================
+   Empty state
+   ========================================================================== */
+.empty-state {
+  color: var(--fg-dim);
+  text-align: center;
+  padding: 48px 16px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-style: italic;
+  opacity: 0.7;
+}
+.dashboard-overlay.active {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+.dashboard-content {
+  width: 100%;
+  max-width: 960px;
+  padding: 32px 20px 24px;
+}
+.dashboard-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 24px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 10px;
+  /* position context for the .dashboard-composer-drop::before overlay */
+  position: relative;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.dashboard-composer:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.dashboard-composer-drop {
+  border-style: dashed;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow-strong);
+  background: var(--accent-glow);
+}
+/* Drag-over affordance — make the action explicit so users know what
+   dropping does.  Pseudo-element so the markup stays clean; the inner
+   composer controls remain interactive. */
+.dashboard-composer-drop::before {
+  content: "Drop to attach";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  background: var(--bg-surface);
+  opacity: 0.92;
+  border-radius: var(--radius);
+  pointer-events: none;
+  z-index: 1;
+}
+.dashboard-input {
+  background: transparent;
+  color: var(--fg);
+  border: none;
+  /* Hairline below the textarea so it reads as an input even before focus.
+     --border-strong (was --border) for light-mode visibility — at
+     rgba(0,0,0,0.08) the legacy --border was effectively invisible on
+     the white --bg-surface composer card. */
+  border-bottom: 1px solid var(--border-strong);
+  border-radius: 0;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+  resize: vertical;
+  min-height: 60px;
+  font-family: var(--font-mono);
+}
+.dashboard-input::placeholder {
+  color: var(--fg-dim);
+}
+.dashboard-input.dashboard-input-error {
+  outline: 2px solid var(--red);
+  outline-offset: -1px;
+}
+.dashboard-error {
+  color: var(--red);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  min-height: 14px;
+  padding: 0 4px;
+}
+.dashboard-error:empty {
+  display: none;
+}
+.dashboard-options-caret {
+  font-size: 9px;
+  opacity: 0.7;
+  transition: transform 0.15s;
+}
+.dashboard-options-btn[aria-expanded="true"] .dashboard-options-caret {
+  transform: rotate(180deg);
+  display: inline-block;
+}
+/* Inline summary of non-default options so users see at a glance which
+   defaults they've overridden, without having to expand the panel.
+   Hidden via [hidden] when everything is default. */
+.dashboard-options-summary {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 2px 6px;
+  border-left: 1px solid var(--border-strong);
+  margin-left: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+.dashboard-options-summary[hidden] {
+  display: none;
+}
+@media (max-width: 600px) {
+  /* On phones the action row stacks; the summary hides to keep the
+     row compact — power users on mobile can expand the panel itself. */
+  .dashboard-options-summary {
+    display: none;
+  }
+}
+.dashboard-composer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 4px;
+}
+.dashboard-composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dashboard-icon-btn {
+  background: transparent;
+  color: var(--fg-dim, var(--fg));
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  /* Larger comfortable hit target without growing the visible chrome */
+  min-height: 28px;
+}
+.dashboard-icon-btn:hover {
+  color: var(--fg);
+  background: var(--bg);
+}
+.dashboard-icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.dashboard-options-btn[aria-expanded="true"] {
+  color: var(--fg);
+  background: var(--bg);
+}
+#dashboard-attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 4px;
+}
+#dashboard-attach-chips:empty {
+  display: none;
+}
+.dashboard-options {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  align-items: center;
+  padding: 8px;
+  /* Recessed surface — --bg matched the page background and was
+     invisible against the composer wrapper in light mode.
+     --bg-highlight is one step deeper (off-white in light, slightly
+     raised in dark) so the options zone reads as its own tier. */
+  background: var(--bg-highlight);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.dashboard-options[hidden] {
+  display: none;
+}
+.dashboard-options label {
+  color: var(--fg-dim, var(--fg));
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+.dashboard-options select {
+  background: var(--bg-surface);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.dashboard-new-btn {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: var(--radius);
+  padding: 12px 20px;
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+  transition: filter 0.15s;
+}
+.dashboard-new-btn:hover {
+  filter: brightness(1.1);
+}
+.dashboard-new-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  filter: none;
+}
+.dashboard-section {
+  margin-bottom: 24px;
+}
+/* The saved-list table styling + the multi-select delete/modal rules are
+   owned by /shared/cards.css so console (Saved Coordinators) and ui/static
+   (Saved Workstreams) share one source of truth. */
+
+/* Server dashboard row — clickable */
+.dash-row {
+  cursor: pointer;
+}
+
+/* Single-node standalone drops the multi-node NODE column from the WORKSTREAMS
+   table (header + cells).  Override the --dash-grid VARIABLE locally (not the
+   grid-template-columns property — that keeps it the var's single declaration, no
+   cascade flip) so just this table goes 6-col; the shared --dash-grid and the
+   Saved Workstreams table keep 7-col.  Order: STATE NAME MODEL TASK TOKENS CTX. */
+#dash-ws-colheaders,
+#dash-ws-table .dash-row-main {
+  --dash-grid: 72px 120px 90px 1fr 60px 48px;
+}
+
+/* Dashboard footer — the bar styling now lives in /shared/base.css; the
+   server keeps its own bottom margin to space the footer from the saved-
+   workstreams section below. */
+.dash-footer {
+  margin-bottom: 24px;
+}
+.dash-footer-nodes {
+  color: var(--fg-dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dash-footer-node-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  display: inline-block;
+  flex-shrink: 0;
+  box-shadow: 0 0 4px var(--green-glow);
+}
+.dash-footer-stats {
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Dashboard responsive */
+@media (max-width: 700px) {
+  :root {
+    --dash-grid: 68px 110px 1fr 56px 44px;
+  }
+  .dash-col-model,
+  .dash-cell-model,
+  .dash-col-node,
+  .dash-cell-node {
+    display: none;
+  }
+  .dash-row-sub {
+    padding-left: 76px;
+  }
+}
+@media (max-width: 600px) {
+  /* Drop the row constraint and let composer children flow vertically so
+     Send can naturally come after chips + options instead of breaking the
+     reading order with a giant button mid-card. */
+  .dashboard-composer-row {
+    display: contents;
+  }
+  .dashboard-composer-actions {
+    order: 2;
+    justify-content: flex-start;
+  }
+  .dashboard-composer #dashboard-error {
+    order: 3;
+  }
+  .dashboard-composer #dashboard-attach-chips {
+    order: 4;
+  }
+  .dashboard-composer .dashboard-options {
+    order: 5;
+  }
+  .dashboard-composer .dashboard-new-btn {
+    order: 6;
+    width: 100%;
+  }
+}
+@media (max-width: 480px) {
+  .dashboard-content {
+    padding: 24px 12px 16px;
+  }
+  :root {
+    --dash-grid: 50px 1fr 50px;
+  }
+  .dash-col-model,
+  .dash-cell-model,
+  .dash-col-node,
+  .dash-cell-node,
+  .dash-col-task,
+  .dash-cell-task,
+  .dash-col-ctx,
+  .dash-cell-ctx {
+    display: none;
+  }
+  .dash-row-sub {
+    padding-left: 66px;
+  }
+  .tool-output,
+  .tool-output-stream {
+    max-height: 200px;
+  }
+}
+
+/* Verdict-badge styling lives in the color-mix block further down
+   in this file (.verdict-badge.verdict-{low,medium,high,critical}).
+   The earlier flat-palette duplicate that lived here was removed —
+   two competing .verdict-badge rule sets caused subtle cascade drift
+   (the color-mix block won for backgrounds, the flat one won for the
+   bare .verdict-low/medium/high/critical class names) which made
+   tweaks fragile. Single source of truth now. */
+
+.verdict-detail {
+  padding: 6px 12px;
+  font-size: 11px;
+  border-top: 1px solid var(--border);
+  line-height: 1.5;
+}
+.verdict-detail .verdict-summary {
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.verdict-detail .verdict-reasoning {
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+}
+.verdict-detail .verdict-evidence {
+  color: var(--fg-dim);
+  font-style: italic;
+  margin-bottom: 4px;
+}
+.verdict-detail .verdict-tier {
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+
+.verdict-expand {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 10px;
+  text-decoration: underline;
+  padding: 0;
+}
+.verdict-expand:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@keyframes judge-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ==========================================================================
+   Reduced motion — page-specific
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .tool-output-stream {
+    animation: none;
+    border-left-color: var(--accent);
+  }
+  .ts-approval-btn,
+  .ts-approval-feedback,
+  .composer button,
+  .dashboard-new-btn,
+  .dashboard-input,
+  #health-indicator,
+  #theme-toggle,
+  #mcp-status,
+  .msg.assistant tbody tr,
+  .msg.assistant .img-placeholder,
+  .media-play-btn {
+    transition: none;
+  }
+}
+
+/* ==========================================================================
+   Tool call + approval block — page-specific styling for the inline
+   approval card and its inner verdict + tool-output children.  Lives
+   here (not chat.css) because these classes only render on the
+   per-node UI surface; coord uses the .approval-dock pattern instead.
+
+   DOM shape rendered by buildToolDiv() + buildConvVerdict():
+     .msg.ts-approval.ts-approval--inline[.approved]  ← outer card
+       .ts-approval-tool
+         .tool-name                   ← tool function name
+         .tool-cmd                    ← header / command
+         .tool-diff .diff-[del|add|warn]
+         (.tool-output appended dynamically by appendToolOutput)
+       .verdict-badge.verdict-[low|medium|high|critical]
+         .verdict-risk, .verdict-rec, .verdict-conf
+         button.verdict-expand
+       .verdict-detail (hidden until expand)
+       .ts-approval-badge[--approved|--denied]          ← auto-approved pill
+
+   The block uses the unified token palette (--cyan / --ink / --panel /
+   --ok / --err / --warn) rather than the older --yellow / --green /
+   --red literals.
+   ========================================================================== */
+
+.msg.ts-approval--inline {
+  /* Cyan for tool-role surfaces — matches .msg.tool border + the
+     .ts-approval container in the chat-css approval theme.  Selector
+     keeps the .msg qualifier so its (0,2,0) specificity ties with
+     .ts-approval.approved/.denied/.error and the later-cascade rule
+     here wins, holding the inline card cyan regardless of state.
+     width: 100% forces consistent card width across tool calls; without
+     it, cards shrink to content width (short-output cards read narrow,
+     long-output cards read full-width → jagged column). */
+  border-left-color: var(--cyan);
+  background: var(--panel-2);
+  width: 100%;
+  box-sizing: border-box;
+  align-self: stretch;
+}
+
+.ts-approval-tool .tool-cmd .dollar {
+  color: var(--ok);
+}
+/* ts-pulse keyframe is defined in shared_static/ui-base.css; no
+   local duplicate needed. */
+
+.verdict-expand {
+  background: transparent;
+  border: none;
+  padding: 0 4px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.verdict-expand:hover {
+  color: var(--ink);
+}
+.verdict-expand:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.verdict-detail {
+  margin-top: 6px;
+  padding: 8px 12px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--ink-3);
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+}
+.verdict-detail .verdict-summary {
+  color: var(--ink-2);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.verdict-detail .verdict-reasoning {
+  color: var(--ink-3);
+  margin-bottom: 4px;
+}
+.verdict-detail .verdict-evidence {
+  color: var(--ink-4);
+  font-style: italic;
+  margin-bottom: 4px;
+}
+.verdict-detail .verdict-tier {
+  color: var(--ink-4);
+  font-size: 10px;
+}
+
+/* Tool output (streamed command/fetch result) — uses the panel / ink
+   tokens for surface + text colour. */
+.tool-output {
+  background: var(--panel);
+  color: var(--ink-2);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hair);
+}
+.tool-output-error {
+  color: var(--err);
+}
+.tool-output-stream {
+  border-left: 2px solid var(--accent);
+}
+
+.tool-output.collapsed::after {
+  background: linear-gradient(transparent, var(--panel) 70%);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding-top: 14px;
+}
+
+/* ==========================================================================
+   MCP error embed (consent / scope / forbidden / operator)
+   ========================================================================== */
+.mcp-error-card {
+  border-top: 1px solid var(--border);
+  background: var(--code-bg);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: start;
+  font-family: var(--font-ui);
+  font-size: 13px;
+}
+.mcp-error-icon {
+  font-size: 20px;
+  line-height: 1;
+  color: var(--accent);
+}
+.mcp-error-card.mcp-error-forbidden .mcp-error-icon,
+.mcp-error-card.mcp-error-operator .mcp-error-icon {
+  color: var(--red);
+}
+.mcp-error-card.mcp-error-transient .mcp-error-icon {
+  color: var(--yellow);
+}
+.mcp-error-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mcp-error-title {
+  font-weight: 600;
+  color: var(--fg);
+}
+.mcp-error-detail {
+  color: var(--fg-dim);
+}
+.mcp-error-server,
+.mcp-error-scopes {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.mcp-error-server code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg);
+}
+.mcp-scope-pill {
+  display: inline-block;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 8px;
+  margin-right: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg);
+}
+.mcp-error-action-btn {
+  margin-top: 6px;
+  padding: 6px 12px;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  align-self: start;
+}
+.mcp-error-action-btn:hover {
+  filter: brightness(1.1);
+}
+.mcp-error-card details {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+}
+.mcp-error-card details summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 4px 0;
+}
+.mcp-error-card details pre {
+  margin: 4px 0 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ==========================================================================
+   Settings: MCP server connections
+   ========================================================================== */
+/* (#settings-overlay — the old settings MODAL backdrop — retired: MCP connections
+   moved to the Manage > Connections pane, which provides its own container; the
+   #settings-mcp-* content rules below are reused live in that pane.) */
+#settings-mcp-loading,
+#settings-mcp-empty {
+  color: var(--fg-dim);
+  font-size: 13px;
+  padding: 12px 0;
+}
+#settings-mcp-error {
+  color: var(--red);
+  font-size: 13px;
+  padding: 12px 0;
+}
+#settings-mcp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+#settings-mcp-table th {
+  text-align: left;
+  padding: 6px 8px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#settings-mcp-table td {
+  padding: 8px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  vertical-align: middle;
+}
+.settings-revoke-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--red);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  cursor: pointer;
+}
+.settings-revoke-btn:hover {
+  background: rgba(255, 0, 0, 0.05);
+}

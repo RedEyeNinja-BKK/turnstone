@@ -1,0 +1,991 @@
+"""Discord bot adapter — connects Discord threads to turnstone workstreams.
+
+:class:`TurnstoneBot` extends ``discord.ext.commands.Bot`` and manages the
+lifecycle of SSE event subscriptions, streaming message edits, and interactive
+approval views.
+
+Events are consumed from the server's per-workstream SSE endpoint
+(``GET /v1/api/workstreams/{ws_id}/events``) using httpx-sse.  Inbound
+messages are sent directly to server nodes via HTTP
+(``POST /v1/api/workstreams/{ws_id}/send``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from turnstone.channels._config import MAX_NOTIFY_TRACKING
+from turnstone.channels._formatter import chunk_message
+from turnstone.channels._routing import ChannelRouter, pop_cycle_entry, pop_ws_entries
+from turnstone.channels._sse import run_sse_stream
+from turnstone.core.log import get_logger
+from turnstone.sdk.events import (
+    ApprovalResolvedEvent,
+    ApproveRequestEvent,
+    ContentEvent,
+    ErrorEvent,
+    IntentVerdictEvent,
+    ServerEvent,
+    StreamEndEvent,
+    ThinkingStartEvent,
+    ThinkingStopEvent,
+    ToolInfoEvent,
+    ToolResultEvent,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import discord
+    from discord.ext import commands
+
+    from turnstone.channels.discord.config import DiscordConfig
+    from turnstone.core.storage._protocol import StorageBackend
+
+log = get_logger(__name__)
+
+
+def _thread_owner_id(thread: discord.abc.Messageable) -> str:
+    """Return the Discord user ID who owns the thread / DM target.
+
+    Used to gate approval button clicks to the session
+    owner.  For Discord threads this is the thread creator
+    (``thread.owner_id``).  For DM channels we use ``recipient.id``.
+    Returns ``""`` when the owner cannot be determined — the views
+    then refuse the interaction.
+    """
+    owner = getattr(thread, "owner_id", None)
+    if owner:
+        return str(owner)
+    recipient = getattr(thread, "recipient", None)
+    if recipient is not None and getattr(recipient, "id", None):
+        return str(recipient.id)
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# StreamingMessage helper
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StreamingMessage:
+    """Accumulates streamed content and periodically edits a Discord message.
+
+    Discord rate-limits message edits, so we batch content updates and flush
+    at a configurable interval.  On finalize we send any remaining content
+    and chunk if the total exceeds the platform limit.
+    """
+
+    channel: discord.abc.Messageable
+    max_length: int = 2000
+    edit_interval: float = 1.5
+    _message: discord.Message | None = field(default=None, init=False, repr=False)
+    _buffer: list[str] = field(default_factory=list, init=False, repr=False)
+    # Rolling truncated in-progress display string; stops growing at
+    # max_length so per-flush cost is O(max_length) instead of
+    # O(total_streamed_chars).
+    _display: str = field(default="", init=False, repr=False)
+    _last_edit: float = field(default=0.0, init=False, repr=False)
+    _finalized_text: str | None = field(default=None, init=False, repr=False)
+
+    @property
+    def message(self) -> discord.Message | None:
+        """The underlying Discord message, once posted."""
+        return self._message
+
+    @message.setter
+    def message(self, value: discord.Message | None) -> None:
+        self._message = value
+
+    @property
+    def accumulated_text(self) -> str:
+        """The joined text of everything appended so far.
+
+        Cached after ``finalize()`` so the StreamEnd DM-forward path
+        (``discord/bot.py::_handle_stream_end``) doesn't re-join a
+        multi-MB buffer a second time.
+        """
+        if self._finalized_text is not None:
+            return self._finalized_text
+        return "".join(self._buffer)
+
+    async def append(self, text: str) -> None:
+        """Add *text* to the buffer and edit the message if the interval has elapsed."""
+        self._buffer.append(text)
+        if len(self._display) < self.max_length:
+            self._display = (self._display + text)[: self.max_length]
+        now = time.monotonic()
+        if now - self._last_edit >= self.edit_interval:
+            await self._flush()
+
+    async def finalize(self) -> None:
+        """Flush any remaining buffered content, chunking if necessary."""
+        content = "".join(self._buffer)
+        self._finalized_text = content
+        if not content:
+            return
+
+        if self._message is not None:
+            # Final edit — may need chunking if content grew beyond the limit.
+            chunks = chunk_message(content, self.max_length)
+            try:
+                await self._message.edit(content=chunks[0])
+            except Exception:
+                log.debug("streaming_message.edit_failed_on_finalize")
+            # Any overflow chunks are sent as new messages.
+            for chunk in chunks[1:]:
+                await self.channel.send(chunk)
+        else:
+            # Never sent an initial message — send all chunks now.
+            for chunk in chunk_message(content, self.max_length):
+                await self.channel.send(chunk)
+
+    async def _flush(self) -> None:
+        """Edit or create the message with the current display slice."""
+        display = self._display
+        if not display:
+            return
+
+        try:
+            if self._message is None:
+                self._message = await self.channel.send(display)
+            else:
+                await self._message.edit(content=display)
+        except Exception:
+            log.debug("streaming_message.flush_failed")
+        self._last_edit = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# TurnstoneBot
+# ---------------------------------------------------------------------------
+
+
+class TurnstoneBot:
+    """Discord bot that bridges Discord threads to turnstone workstreams.
+
+    Parameters
+    ----------
+    config:
+        Discord-specific configuration.
+    server_url:
+        Base URL of the turnstone server API (e.g. ``http://localhost:8080/v1``).
+    storage:
+        Storage backend for persistent route / user lookups.
+    api_token:
+        Optional bearer token for authenticating with the server API.
+    """
+
+    channel_type: str = "discord"
+    _MAX_NOTIFY_TRACKING: int = MAX_NOTIFY_TRACKING
+
+    def __init__(
+        self,
+        config: DiscordConfig,
+        server_url: str,
+        storage: StorageBackend,
+        *,
+        api_token: str = "",
+        console_url: str = "",
+        console_token_factory: Callable[[], str] | None = None,
+        server_token_factory: Callable[[], str] | None = None,
+    ) -> None:
+        import discord
+        from discord.ext import commands
+
+        self.config = config
+        self._server_url = server_url.rstrip("/")
+        self._console_url = console_url.rstrip("/") if console_url else ""
+        self._api_token = api_token
+        # Server factory for direct SSE connections to server nodes
+        self._token_factory = server_token_factory
+        self.storage = storage
+        # Router gets the appropriate factory based on mode:
+        # console mode → console factory; direct mode → server factory
+        self.router = ChannelRouter(
+            server_url,
+            storage,
+            auto_approve=config.auto_approve,
+            auto_approve_tools=list(config.auto_approve_tools),
+            skill=config.skill,
+            api_token=api_token,
+            console_url=console_url,
+            console_token_factory=console_token_factory,
+            server_token_factory=server_token_factory,
+        )
+
+        self._commands_synced: bool = False
+        self._recovering_routes = False
+        self._subscribed_ws: set[str] = set()
+        self._sse_tasks: dict[str, asyncio.Task[None]] = {}
+        self._streaming: dict[str, StreamingMessage] = {}
+        # Transient "Thinking..." status messages, deleted when content starts.
+        self._thinking_msgs: dict[str, discord.Message] = {}
+        # Per-tool "running" embeds, edited in-place when the result arrives.
+        # List preserves call order for FIFO matching when the same tool name
+        # appears more than once in a single turn.
+        self._tool_info_msgs: dict[str, list[tuple[str, str, str, discord.Message]]] = {}
+        # Track the Discord message containing each pending approval embed,
+        # keyed by (ws_id, cycle_id) — parallel task agents make several
+        # approval cycles live per workstream at once, each its own embed.
+        # The value carries the cycle's member call_ids so
+        # IntentVerdictEvent (keyed by call_id) updates the RIGHT embed
+        # with LLM judge results.
+        self._pending_approval_msgs: dict[
+            tuple[str, str], tuple[discord.Message, frozenset[str]]
+        ] = {}
+        # Notification reply tracking: maps Discord message ID ->
+        # (ws_id, target_discord_user_id) so that DM replies can be routed
+        # back to the originating workstream.  The target user ID is checked
+        # on reply to prevent cross-user message injection.
+        self._notify_ws_map: dict[int, tuple[str, str]] = {}
+        # Temporary DM forwarding: maps ws_id -> (DM channel, target_user_id)
+        # for forwarding the workstream's next response back to the
+        # notification reply DM.  The target_user_id is carried so the
+        # response message can be re-tracked for multi-turn DM conversations.
+        self._notify_reply_channels: dict[str, tuple[discord.abc.Messageable, str]] = {}
+        # Shared HTTP client for SSE connections.
+        # Read timeout detects half-open connections (server sends ping=5s
+        # keepalives, so 90s is very conservative).
+        # Token factory provides auto-rotating JWTs; static token is fallback.
+        headers: dict[str, str] = {}
+        if api_token and not server_token_factory:
+            headers["Authorization"] = f"Bearer {api_token}"
+        self._http_client = httpx.AsyncClient(
+            headers=headers,
+            timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
+        )
+
+        intents = discord.Intents.default()
+        intents.message_content = True
+
+        self._bot: commands.Bot = commands.Bot(
+            command_prefix="!ts ",
+            intents=intents,
+            help_command=None,
+            # Let Discord's permissions govern which mentions can ping.
+            allowed_mentions=discord.AllowedMentions.all(),
+        )
+
+        # Attach ourselves so cogs can access the TurnstoneBot instance.
+        self._bot.turnstone = self  # type: ignore[attr-defined]
+
+        # Register lifecycle hooks.
+        self._bot.setup_hook = self._setup_hook  # type: ignore[method-assign]
+
+        @self._bot.event
+        async def on_ready() -> None:
+            await self._on_ready()
+
+        @self._bot.event
+        async def on_resumed() -> None:
+            await self._on_resumed()
+
+    # -- lifecycle -----------------------------------------------------------
+
+    async def _setup_hook(self) -> None:
+        """Called by discord.py after login but before connecting to the gateway."""
+        from turnstone.channels.discord.cog import MessageCog
+        from turnstone.channels.discord.views import ApprovalView
+
+        msg_cog = MessageCog(self._bot)
+        await self._bot.add_cog(msg_cog._cog)
+
+        # Register persistent views so button callbacks survive restarts.
+        self._bot.add_view(ApprovalView(self)._view)
+
+        log.info("discord.setup_hook_complete")
+
+    async def _on_ready(self) -> None:
+        """Sync slash commands (once) and recover existing routes."""
+        import discord
+
+        bot = self._bot
+        log.info("discord.ready", user=str(bot.user), guild_count=len(bot.guilds))
+
+        if not self._commands_synced:
+            if self.config.guild_id:
+                guild = discord.Object(id=self.config.guild_id)
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+                log.info("discord.commands_synced", guild_id=self.config.guild_id)
+            else:
+                await bot.tree.sync()
+                log.info("discord.commands_synced_global")
+            self._commands_synced = True
+
+        self._purge_dead_sse_tasks("ready")
+        await self._recover_routes()
+
+    async def _on_resumed(self) -> None:
+        """Recover dead SSE tasks after a gateway session resume.
+
+        Unlike ``on_ready``, ``on_resumed`` fires when discord.py resumes
+        an existing session after a brief disconnect — ``on_ready`` is NOT
+        called in that case.  Any SSE listener tasks that died during the
+        blip need to be cleaned up and re-subscribed.
+        """
+        self._purge_dead_sse_tasks("resumed")
+        await self._recover_routes()
+
+    def _purge_dead_sse_tasks(self, trigger: str) -> None:
+        """Remove completed/failed SSE tasks so they can be re-subscribed."""
+        dead = [ws_id for ws_id, task in self._sse_tasks.items() if task.done()]
+        for ws_id in dead:
+            task = self._sse_tasks.pop(ws_id)
+            self._subscribed_ws.discard(ws_id)
+            # Retrieve exception to suppress "Task exception was never
+            # retrieved" warnings and log the underlying failure.
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    log.warning(
+                        "discord.sse_task_failed",
+                        trigger=trigger,
+                        ws_id=ws_id,
+                        error=str(exc),
+                    )
+        if dead:
+            log.info("discord.purged_dead_tasks", trigger=trigger, count=len(dead), ws_ids=dead)
+
+    async def _recover_routes(self) -> None:
+        """Coalesce overlapping gateway lifecycle events into one recovery pass."""
+        if self._recovering_routes:
+            return
+        self._recovering_routes = True
+        try:
+            await self._restore_saved_routes()
+        finally:
+            self._recovering_routes = False
+
+    async def _restore_saved_routes(self) -> None:
+        """Re-subscribe to event channels for existing discord routes.
+
+        Queries the storage backend for all channel routes of type ``discord``
+        and opens SSE connections only for workstreams that are already live.
+        """
+        import aiohttp
+        import discord
+
+        routes = await asyncio.to_thread(self.storage.list_channel_routes_by_type, "discord")
+        # Restore cached threads before any platform lookup can block on I/O.
+        routes.sort(key=lambda route: self._bot.get_channel(int(route["channel_id"])) is None)
+        live_ids = await self.router.get_live_workstream_ids(
+            route["ws_id"]
+            for route in routes
+            if route["ws_id"] not in self._sse_tasks or self._sse_tasks[route["ws_id"]].done()
+        )
+        for route in routes:
+            ws_id = route["ws_id"]
+            if ws_id not in live_ids:
+                continue
+            task = self._sse_tasks.get(ws_id)
+            if task is not None and not task.done():
+                continue
+            channel_id = int(route["channel_id"])
+            channel = self._bot.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await self._bot.fetch_channel(channel_id)
+                except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
+                    # Missing/inaccessible threads and platform outages do not
+                    # revoke the durable association or its owner metadata.
+                    log.warning(
+                        "discord.route_recovery_fetch_failed", channel_id=channel_id, exc_info=True
+                    )
+                    continue
+            if isinstance(channel, discord.Thread) and self._is_allowed_channel(
+                channel.parent_id or 0
+            ):
+                await self.subscribe_ws(ws_id, channel)
+                log.info("discord.route_recovered", ws_id=ws_id, channel_id=channel_id)
+            else:
+                log.warning(
+                    "discord.route_recovery_channel_missing",
+                    ws_id=ws_id,
+                    channel_id=channel_id,
+                )
+
+    # -- subscription management ---------------------------------------------
+
+    async def subscribe_ws(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+    ) -> None:
+        """Subscribe to workstream events via SSE and dispatch them to *thread*."""
+        prior = self._sse_tasks.get(ws_id)
+        if prior is not None and prior.done():
+            self._purge_dead_sse_tasks("subscribe")
+        if ws_id in self._subscribed_ws:
+            return
+
+        task = asyncio.create_task(
+            self._sse_listener(ws_id, thread),
+            name=f"sse:{ws_id}",
+        )
+        self._sse_tasks[ws_id] = task
+        self._subscribed_ws.add(ws_id)
+        log.info("discord.subscribed", ws_id=ws_id)
+
+    async def _clear_ws_state(self, ws_id: str) -> None:
+        """Drop all in-memory state keyed by *ws_id*.
+
+        Does not cancel or await the SSE task — callers handle task
+        lifecycle differently (``unsubscribe_ws`` cancels and awaits;
+        ``_stop_unavailable_stream`` is itself invoked from inside the task).
+        """
+        self._subscribed_ws.discard(ws_id)
+        self._streaming.pop(ws_id, None)
+        thinking_msg = self._thinking_msgs.pop(ws_id, None)
+        self._tool_info_msgs.pop(ws_id, None)
+        self._pop_ws_approvals(ws_id)
+        self._notify_reply_channels.pop(ws_id, None)
+        # Purge stale notification tracking entries for this workstream.
+        stale = [mid for mid, entry in self._notify_ws_map.items() if entry[0] == ws_id]
+        for mid in stale:
+            del self._notify_ws_map[mid]
+        if thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
+
+    def _pop_ws_approvals(self, ws_id: str) -> None:
+        """Drop every tracked approval embed for *ws_id* (all cycles)."""
+        pop_ws_entries(self._pending_approval_msgs, ws_id)
+
+    async def unsubscribe_ws(self, ws_id: str) -> None:
+        """Cancel the SSE listener for *ws_id* and clean up streaming state."""
+        task = self._sse_tasks.pop(ws_id, None)
+        if task is not None:
+            task.cancel()
+            # Await the cancelled task so CancelledError propagates out of
+            # the SSE loop before we clear the per-ws state below.
+            # CancelledError is expected; other exceptions from the SSE
+            # loop are already logged there and must not block shutdown.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        await self._clear_ws_state(ws_id)
+        log.info("discord.unsubscribed", ws_id=ws_id)
+
+    async def _stop_unavailable_stream(self, ws_id: str) -> None:
+        """Retire this listener while retaining the route for inbound recovery."""
+        task = self._sse_tasks.get(ws_id)
+        if task is not None and task is not asyncio.current_task():
+            return
+        self._sse_tasks.pop(ws_id, None)
+        await self._clear_ws_state(ws_id)
+
+    # -- SSE listener --------------------------------------------------------
+
+    async def _sse_listener(self, ws_id: str, thread: discord.abc.Messageable) -> None:
+        """SSE listener task for a workstream.
+
+        Delegates the reconnect/backoff loop to :func:`run_sse_stream`;
+        this wrapper just translates events to ``_on_ws_event`` calls and
+        stops an unavailable subscription without deleting its route.
+        """
+
+        async def _on_event(event: ServerEvent) -> None:
+            await self._on_ws_event(ws_id, thread, event)
+
+        async def _on_unavailable() -> None:
+            await self._stop_unavailable_stream(ws_id)
+
+        await run_sse_stream(
+            http_client=self._http_client,
+            log_prefix="discord",
+            ws_id=ws_id,
+            node_url_fn=self.router.get_node_url,
+            token_factory=self._token_factory,
+            on_event=_on_event,
+            on_unavailable=_on_unavailable,
+        )
+
+    # -- event dispatch ------------------------------------------------------
+
+    async def _on_ws_event(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        event: ServerEvent,
+    ) -> None:
+        """Dispatch a typed server event to its per-event handler."""
+        if isinstance(event, ThinkingStartEvent):
+            await self._handle_thinking_start(ws_id, thread)
+        elif isinstance(event, ThinkingStopEvent):
+            # Leave the thinking message in place — the next visible event
+            # (ContentEvent, ToolInfoEvent, StreamEndEvent) will edit or
+            # clean it up, avoiding a delete→gap→new-message flicker.
+            pass
+        elif isinstance(event, ContentEvent):
+            await self._handle_content(ws_id, thread, event)
+        elif isinstance(event, ToolInfoEvent):
+            await self._handle_tool_info(ws_id, thread, event)
+        elif isinstance(event, ToolResultEvent):
+            await self._handle_tool_result(ws_id, thread, event)
+        elif isinstance(event, ApproveRequestEvent):
+            await self._handle_approve_request(ws_id, thread, event)
+        elif isinstance(event, IntentVerdictEvent):
+            await self._handle_intent_verdict(ws_id, event)
+        elif isinstance(event, ApprovalResolvedEvent):
+            await self._handle_approval_resolved(ws_id, event)
+        elif isinstance(event, StreamEndEvent):
+            await self._handle_stream_end(ws_id)
+        elif isinstance(event, ErrorEvent):
+            safe_msg = event.message[:500] if event.message else "An error occurred"
+            await thread.send(f"**Error:** {safe_msg}")
+
+    async def _handle_thinking_start(self, ws_id: str, thread: discord.abc.Messageable) -> None:
+        # Clean up any prior thinking message (consecutive starts without stop).
+        prev = self._thinking_msgs.pop(ws_id, None)
+        if prev is not None:
+            with contextlib.suppress(Exception):
+                await prev.delete()
+        try:
+            msg = await thread.send("*Thinking...*")
+            self._thinking_msgs[ws_id] = msg
+        except Exception:
+            log.debug("discord.thinking_start_send_failed", ws_id=ws_id)
+
+    async def _handle_content(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        event: ContentEvent,
+    ) -> None:
+        # Reuse thinking message as the initial streaming message so the
+        # first flush edits it in-place (no delete→gap→send flicker).
+        thinking_msg = self._thinking_msgs.pop(ws_id, None)
+        sm = self._streaming.get(ws_id)
+        if sm is None:
+            sm = StreamingMessage(
+                channel=thread,
+                max_length=self.config.max_message_length,
+                edit_interval=self.config.streaming_edit_interval,
+            )
+            if thinking_msg is not None:
+                sm.message = thinking_msg
+            self._streaming[ws_id] = sm
+        elif thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
+        await sm.append(event.text)
+
+    async def _handle_tool_info(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        event: ToolInfoEvent,
+    ) -> None:
+        import discord
+
+        from turnstone.channels._formatter import truncate
+
+        # Reuse the thinking message for the first tool embed.
+        thinking_msg = self._thinking_msgs.pop(ws_id, None)
+
+        # Show a "running" embed for every tool.  The approval dialog
+        # (ApproveRequestEvent) is a separate concern — it asks "do you
+        # authorize this?" while the running embed says "this tool is
+        # executing."  Both can coexist in the thread.
+        for it in event.items:
+            raw_name = it.get("func_name") or it.get("approval_label") or "tool"
+            display_name = discord.utils.escape_markdown(raw_name)
+            raw_preview = it.get("preview", "")
+            # Escape backticks to prevent markdown breakout.
+            raw_preview = raw_preview.replace("`", "\\`")
+            preview = truncate(raw_preview, max_length=120) or None
+            embed = discord.Embed(
+                title=display_name,
+                description=preview,
+                color=discord.Color.light_grey(),
+            )
+            # Edit thinking message into first tool embed to avoid flicker.
+            if thinking_msg is not None:
+                try:
+                    await thinking_msg.edit(content=None, embed=embed)
+                    msg = thinking_msg
+                except Exception:
+                    msg = await thread.send(embed=embed)
+                thinking_msg = None
+            else:
+                msg = await thread.send(embed=embed)
+            call_id = it.get("call_id", "")
+            # Store raw (unescaped) name for matching against ToolResultEvent.name
+            self._tool_info_msgs.setdefault(ws_id, []).append(
+                (call_id, raw_name, preview or "", msg)
+            )
+
+        # If no items consumed the thinking message (empty event), clean up.
+        if thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
+
+    async def _handle_tool_result(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        event: ToolResultEvent,
+    ) -> None:
+        import discord
+
+        from turnstone.channels._formatter import format_tool_result
+
+        # Mark the matching "running" embed as complete/errored.
+        # Prefer call_id match (deterministic); fall back to name (FIFO).
+        info_list = self._tool_info_msgs.get(ws_id, [])
+        matched_preview = ""
+        matched_msg: discord.Message | None = None
+        if event.call_id:
+            for i, (cid, _tname, _prev, _tmsg) in enumerate(info_list):
+                if cid == event.call_id:
+                    entry = info_list.pop(i)
+                    matched_preview, matched_msg = entry[2], entry[3]
+                    break
+        if matched_msg is None:
+            for i, (_cid, tname, _prev, _tmsg) in enumerate(info_list):
+                if tname == event.name:
+                    entry = info_list.pop(i)
+                    matched_preview, matched_msg = entry[2], entry[3]
+                    break
+        if matched_msg is not None:
+            status = "Error" if event.is_error else "Done"
+            status_color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
+            status_embed = discord.Embed(
+                title=f"{discord.utils.escape_markdown(event.name)} \u2014 {status}",
+                description=matched_preview or None,
+                color=status_color,
+            )
+            try:
+                await matched_msg.edit(content=None, embed=status_embed)
+            except Exception:
+                log.debug("discord.tool_info_status_edit_failed", ws_id=ws_id)
+
+        # Send the result as a separate message.
+        if not event.is_error:
+            from turnstone.channels._formatter import try_build_media_embed
+
+            media_result = None
+            try:
+                media_result = await try_build_media_embed(
+                    event.name,
+                    event.output,
+                    http=self._http_client,
+                )
+            except Exception:
+                log.debug("discord.media_embed_failed", ws_id=ws_id, tool=event.name)
+            if media_result is not None:
+                embed, file = media_result
+                kwargs: dict[str, Any] = {"embed": embed}
+                if file is not None:
+                    kwargs["file"] = file
+                await thread.send(**kwargs)
+            else:
+                desc = format_tool_result(event.output)
+                result_embed = discord.Embed(
+                    title=event.name,
+                    description=desc,
+                    color=discord.Color.dark_grey(),
+                )
+                await thread.send(embed=result_embed)
+        else:
+            desc = format_tool_result(event.output)
+            result_embed = discord.Embed(
+                title=event.name,
+                description=desc,
+                color=discord.Color.red(),
+            )
+            await thread.send(embed=result_embed)
+
+    async def _handle_approve_request(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        event: ApproveRequestEvent,
+    ) -> None:
+        import discord
+
+        from turnstone.channels._formatter import format_approval_request, format_verdict
+        from turnstone.channels.discord.views import ApprovalView
+
+        # Every decision below is about THIS event's cycle — forward its
+        # cycle_id so the resolution can't land on a sibling round
+        # (parallel task agents can have several prompts outstanding).
+        cycle_id = event.cycle_id
+        # Evaluate admin tool policies before auto-approve.
+        policy_verdict = await self.router.evaluate_tool_policies(event.items)
+        policy_handled = False
+        if policy_verdict.kind == "deny":
+            denied = ", ".join(policy_verdict.denied_tools)
+            await self.router.send_approval(
+                ws_id,
+                cycle_id,
+                approved=False,
+                feedback=f"Blocked by tool policy: {denied}",
+            )
+            await thread.send(f"*Tool blocked by admin policy: {denied}*")
+            policy_handled = True
+        elif policy_verdict.kind == "allow":
+            await self.router.send_approval(ws_id, cycle_id, approved=True)
+            await thread.send("*Tool approved by policy.*")
+            policy_handled = True
+
+        if not policy_handled and (self.config.auto_approve or self._should_auto_approve(event)):
+            await self.router.send_approval(ws_id, cycle_id, approved=True)
+            await thread.send("*Tool auto-approved.*")
+        elif not policy_handled:
+            text = format_approval_request(event.items)
+            embed = discord.Embed(
+                title="Tool Approval Required",
+                description=text,
+                color=discord.Color.orange(),
+            )
+            # Include heuristic verdicts from approval items.
+            for item in event.items:
+                verdict = item.get("verdict")
+                if verdict:
+                    name = item.get("func_name") or item.get("approval_label") or "tool"
+                    embed.add_field(
+                        name=f"Verdict: {name}",
+                        value=format_verdict(verdict),
+                        inline=False,
+                    )
+            # Footer format ws_id|cycle_id|owner — the persistent view
+            # parses it back on click and routes the decision to exactly
+            # this cycle.
+            route = await asyncio.to_thread(self.storage.get_channel_route_by_ws, ws_id)
+            owner_id = (
+                route.get("channel_user_id", "") if route is not None else _thread_owner_id(thread)
+            )
+            embed.set_footer(text=f"{ws_id}|{cycle_id}|{owner_id}")
+            msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
+            call_ids = frozenset(
+                str(it.get("call_id", "")) for it in event.items if it.get("call_id")
+            )
+            self._pending_approval_msgs[(ws_id, cycle_id)] = (msg, call_ids)
+
+    async def _handle_intent_verdict(
+        self,
+        ws_id: str,
+        event: IntentVerdictEvent,
+    ) -> None:
+        import discord
+
+        from turnstone.channels._formatter import format_verdict
+
+        # LLM judge verdict arrived — update the pending approval embed
+        # whose cycle contains this call_id (several can be live at once
+        # under parallel task agents).  Legacy entries (empty call_ids)
+        # accept any verdict for the ws, as before.
+        approval_msg = next(
+            (
+                msg
+                for (wid, _), (msg, call_ids) in self._pending_approval_msgs.items()
+                if wid == ws_id and (not call_ids or event.call_id in call_ids)
+            ),
+            None,
+        )
+        if approval_msg and approval_msg.embeds:
+            embed = approval_msg.embeds[0]
+            verdict_data = {
+                "risk_level": event.risk_level,
+                "recommendation": event.recommendation,
+                "confidence": event.confidence,
+                "intent_summary": event.intent_summary,
+                "tier": event.tier,
+            }
+            name = event.func_name or "tool"
+            # Update embed color based on LLM judge risk level.
+            risk = (event.risk_level or "medium").upper()
+            color_map = {
+                "LOW": discord.Color.green(),
+                "MEDIUM": discord.Color.orange(),
+                "HIGH": discord.Color.red(),
+                "CRITICAL": discord.Color.dark_red(),
+            }
+            embed.color = color_map.get(risk, discord.Color.orange())
+            embed.add_field(
+                name=f"Judge Verdict: {name}",
+                value=format_verdict(verdict_data),
+                inline=False,
+            )
+            try:
+                await approval_msg.edit(embed=embed)
+            except Exception:
+                log.debug("discord.verdict_embed_edit_failed", ws_id=ws_id)
+
+    async def _handle_approval_resolved(
+        self,
+        ws_id: str,
+        event: ApprovalResolvedEvent,
+    ) -> None:
+        # Server resolved the approval (timeout, external approve/reject).
+        # Disable the buttons so they can't be clicked stale.  Route by
+        # the event's cycle_id; a pre-multi-cycle server (no cycle_id)
+        # clears the ws's single tracked entry, as before.
+        entry = pop_cycle_entry(self._pending_approval_msgs, ws_id, event.cycle_id)
+        if entry is not None:
+            approval_msg = entry[0]
+            from turnstone.channels.discord.views import disable_message_buttons
+
+            label = "Approved" if event.approved else "Denied"
+            try:
+                await disable_message_buttons(approval_msg, label)
+            except Exception:
+                log.debug("discord.approval_resolved_edit_failed", ws_id=ws_id)
+
+    async def _handle_stream_end(self, ws_id: str) -> None:
+        # Edge-case cleanup: clear any lingering thinking indicator.
+        thinking_msg = self._thinking_msgs.pop(ws_id, None)
+        if thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
+        self._tool_info_msgs.pop(ws_id, None)
+        sm = self._streaming.pop(ws_id, None)
+        if sm is not None:
+            await sm.finalize()
+        # Forward accumulated response to notification reply DM if active.
+        dm_entry = self._notify_reply_channels.pop(ws_id, None)
+        if dm_entry is not None and sm is not None:
+            content = sm.accumulated_text
+            if content:
+                dm_channel, target_user_id = dm_entry
+                last_msg: discord.Message | None = None
+                for dm_chunk in chunk_message(content, self.config.max_message_length):
+                    try:
+                        last_msg = await dm_channel.send(dm_chunk)
+                    except Exception:
+                        log.debug("discord.notify_reply_dm_failed", ws_id=ws_id)
+                        break
+                # Track the response message so the user can reply again
+                # for multi-turn DM conversations.
+                if last_msg is not None:
+                    self._track_notification(last_msg.id, ws_id, target_user_id)
+        # Clean up pending approval message tracking (all cycles).
+        self._pop_ws_approvals(ws_id)
+
+    # -- helpers -------------------------------------------------------------
+
+    def _should_auto_approve(self, event: ApproveRequestEvent) -> bool:
+        """Return True if all tools in *event.items* are in the auto-approve list."""
+        allowed = self.config.auto_approve_tools
+        if not allowed or not event.items:
+            return False
+        for item in event.items:
+            # Support both server SSE format (func_name) and OpenAI format (function.name).
+            name = (
+                item.get("func_name")
+                or item.get("approval_label")
+                or item.get("function", {}).get("name", "")
+            )
+            if name not in allowed:
+                return False
+        return True
+
+    def _track_notification(self, message_id: int, ws_id: str, target_user_id: str) -> None:
+        """Record a notification message for reply routing.
+
+        Evicts the oldest entry when the map exceeds
+        ``_MAX_NOTIFY_TRACKING``.  Relies on dict insertion order
+        (Python 3.7+).
+        """
+        while len(self._notify_ws_map) >= self._MAX_NOTIFY_TRACKING:
+            oldest = next(iter(self._notify_ws_map))
+            del self._notify_ws_map[oldest]
+        self._notify_ws_map[message_id] = (ws_id, target_user_id)
+
+    def _is_allowed_channel(self, channel_id: int) -> bool:
+        """Return True if *channel_id* is in the allowed list (or list is empty)."""
+        if not self.config.allowed_channels:
+            return True
+        return channel_id in self.config.allowed_channels
+
+    def run(self, **kwargs: object) -> None:
+        """Start the bot (blocking). Pass-through to ``commands.Bot.run``."""
+        self._bot.run(self.config.bot_token, log_handler=None, **kwargs)  # type: ignore[arg-type]
+
+    async def start(self) -> None:
+        """Start the bot (async). Use this for multi-adapter ``asyncio.gather``."""
+        await self._bot.start(self.config.bot_token, reconnect=True)
+
+    async def send(self, channel_id: str, content: str) -> str:
+        """Send a message to a Discord channel or user DM.
+
+        Implements the :class:`ChannelAdapter` protocol.  Tries the ID as a
+        channel first; if not found, attempts a user DM.  Long messages are
+        chunked via :func:`chunk_message`. Mentions are allowed, subject
+        to Discord's permissions and the recipient's notification settings.
+        """
+        import discord
+
+        int_id = int(channel_id)
+        target: discord.abc.Messageable | None = self._bot.get_channel(int_id)  # type: ignore[assignment]
+        if target is None:
+            try:
+                user = await self._bot.fetch_user(int_id)
+                target = await user.create_dm()
+            except discord.NotFound as exc:
+                raise ValueError(f"Discord channel/user {channel_id} not found") from exc
+
+        chunks = chunk_message(content, self.config.max_message_length)
+        msg: discord.Message | None = None
+        for chunk in chunks:
+            msg = await target.send(chunk)  # type: ignore[union-attr]
+
+        return str(msg.id) if msg else ""
+
+    async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str:
+        """Send a notification and track the message for reply routing (DMs only).
+
+        Like :meth:`send`, allows mentions and, when the target resolves to a DM channel, records a
+        mapping from the outgoing Discord message ID to ``(ws_id, user_id)`` so that the user's reply
+        can be routed back to the originating workstream. Notifications delivered to guild channels
+        are NOT tracked — the reply-channel_id check would treat the channel ID as a user ID and
+        reject every legitimate reply.
+        """
+        import discord
+
+        int_id = int(channel_id)
+        target: discord.abc.Messageable | None = self._bot.get_channel(int_id)  # type: ignore[assignment]
+        target_user_id: str = ""
+        if target is None:
+            try:
+                user = await self._bot.fetch_user(int_id)
+                target = await user.create_dm()
+                target_user_id = str(user.id)
+            except discord.NotFound as exc:
+                raise ValueError(f"Discord channel/user {channel_id} not found") from exc
+
+        chunks = chunk_message(content, self.config.max_message_length)
+        msg: discord.Message | None = None
+        for chunk in chunks:
+            msg = await target.send(chunk)  # type: ignore[union-attr]
+
+        if msg is None:
+            return ""
+
+        msg_id_str = str(msg.id)
+        if ws_id and target_user_id:
+            self._track_notification(int(msg_id_str), ws_id, target_user_id)
+            log.debug(
+                "discord.notification_tracked",
+                message_id=msg_id_str,
+                ws_id=ws_id,
+                target_user=target_user_id,
+            )
+        return msg_id_str
+
+    async def stop(self) -> None:
+        """Disconnect the bot, cancel SSE tasks, and clean up."""
+        for ws_id in list(self._subscribed_ws):
+            await self.unsubscribe_ws(ws_id)
+        await self.router.aclose()
+        await self._http_client.aclose()
+        await self._bot.close()

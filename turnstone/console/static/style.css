@@ -1,0 +1,3770 @@
+/* ==========================================================================
+   turnstone console — page-specific styles
+   Extends shared base.css with console-only layout and components
+   ========================================================================== */
+
+/* ==========================================================================
+   Header overrides — wider padding for console layout
+   ========================================================================== */
+#header {
+  padding: 10px 20px;
+  gap: 16px;
+}
+#header-home-link {
+  color: inherit;
+  text-decoration: none;
+  letter-spacing: inherit;
+}
+#header-home-link:hover {
+  color: var(--accent);
+}
+#header-home-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+#status-bar {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-left: auto;
+}
+#status-bar.disconnected {
+  color: var(--red);
+}
+.header-dim {
+  color: var(--fg-dim);
+  font-weight: 400;
+}
+#theme-toggle {
+  color: var(--fg);
+}
+
+/* ==========================================================================
+   Main content
+   ========================================================================== */
+#main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px;
+  padding-bottom: 60px;
+  max-width: 1140px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* ==========================================================================
+   Home landing — coordinator-first view
+   Stacked panels: composer → active coordinators → cluster summary.
+   ========================================================================== */
+#view-home {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* Composer wrapper — layout-only.  The inner Composer (mounted by
+   shared_static/composer.js) carries its own background + border + radius;
+   double-framing made the section look chunky vs the node-detail composer
+   in ui/static, so this wrapper now only stacks the 503 banner + composer
+   + error row vertically. */
+.home-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Typography overlaps .ui-section-heading but renders flow-layout
+   without the sidebar-row background / border / padding that
+   .ui-section-heading adds — so it's a separate rule.  If more
+   flow-layout headings appear, consider a .ui-section-heading--flow
+   variant. */
+.home-panel-title {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.home-composer-error {
+  /* Always rendered (no display toggle in JS) so toggling validation
+     messages doesn't reflow the saved-sessions list below.  The
+     min-height holds a single 12px line + padding so an empty state
+     reserves the same space the rendered error will occupy. */
+  min-height: 20px;
+  color: var(--red);
+  font-size: 12px;
+  padding: 4px 2px 0;
+}
+
+/* Scheduled kind: the When builder between the kind toggle and the
+   composer.  Required input for this kind, so it is NOT the options tier
+   (--bg-highlight): it sits on the surface tier and wears the kind's blue
+   (the system-operation hue; magenta is the MCP surface's) — border and left
+   rule here, and the pressed segments / chips / read-out inside follow
+   through --hatch-accent (hatch.css).  The builder's
+   labels and fields take the shelf cadence from hatch.css (.when-builder);
+   only the panel and its heading live here. */
+.launcher-when {
+  --hatch-accent: var(--blue);
+  padding: 10px 12px 12px;
+  background: var(--bg-surface);
+  border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--border-strong));
+  border-left: 2px solid var(--blue);
+  border-radius: var(--r-sm);
+}
+/* A heading, not another field label: the shelf's .sh-section treatment
+   (hairline rule) at the panel's own ink. */
+.launcher-when-title {
+  margin: 0 0 4px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--hair);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+/* The message row doubles as the Scheduled kind's post-submit confirmation
+   (app.js _homeShowMessage toggles the class). */
+.home-composer-error.is-ok {
+  color: var(--green);
+}
+
+/* Drag-over feedback for the home coord composer — wired by Composer's
+   dragDrop option (dropClass: home-coord-drop) on the composer mount.
+   Mirrors the dashed-outline affordance on coord-main so users see the
+   same drop visual the in-coord composer uses. */
+#home-coord-composer-mount {
+  position: relative;
+}
+#home-coord-composer-mount.home-coord-drop {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+  border-radius: var(--radius);
+}
+
+/* Cap chip filename width inside the home composer so a long-name
+   attachment doesn't push the strip wider than the textarea or wrap
+   unpredictably across multiple rows.  shared_static/chat.css defines
+   .composer-chip / .composer-chip-size / .composer-chip-remove but
+   leaves .composer-chip-name unstyled — the span just inherits the
+   .composer-chip font with no width cap, fine for chat-pane width but
+   too loose for the narrower home column.  Apply the same ellipsis
+   cap the .msg-user-attach-pill rule uses on the user bubble. */
+#home-coord-composer-mount .composer-chip-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Sub-700px: collapse the composer row and tighten padding.  The
+   phase-4 designer-review "composer wrap 340-699px" observation is
+   fully covered by this full-stack rule — the flex math at ≥701px
+   (name 1 1 220/160min + skill 0 0 180 + submit 0 0 auto/90min +
+   2×8px gap ≈ 500-540px preferred) fits comfortably in every
+   desktop viewport, so a mid-zone break rule is unnecessary. */
+@media (max-width: 700px) {
+  #main {
+    padding: 14px 12px 48px;
+  }
+  #view-home {
+    gap: 16px;
+  }
+}
+
+/* ==========================================================================
+   Breadcrumb
+   ========================================================================== */
+.breadcrumb {
+  padding: 8px 20px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-ui);
+  letter-spacing: 0.02em;
+}
+.breadcrumb a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+.breadcrumb a:hover {
+  text-decoration: underline;
+}
+.breadcrumb-sep {
+  margin: 0 8px;
+  color: var(--fg-dim);
+  opacity: 0.5;
+}
+
+/* ==========================================================================
+   Section headers
+   ========================================================================== */
+.section-header {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.1em;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+}
+
+/* ==========================================================================
+   Dashboard table — console overrides
+   ========================================================================== */
+.dash-row.has-link {
+  cursor: pointer;
+}
+.dash-row.has-link::after {
+  content: "\2197";
+  position: absolute;
+  right: 12px;
+  top: 10px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.dash-row.has-link:hover::after,
+.dash-row.has-link:focus-visible::after {
+  opacity: 0.6;
+}
+
+.dash-cell-node {
+  color: var(--accent);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.1s;
+}
+.dash-cell-node:hover {
+  text-decoration: underline;
+  color: var(--fg-bright);
+}
+
+/* Coordinator / child / orphan tree grouping ---------------------------- */
+.dash-caret,
+.dash-caret-placeholder {
+  display: inline-block;
+  width: 1.25rem;
+  flex-shrink: 0;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--fg-dim);
+  line-height: 1;
+}
+.dash-caret {
+  background: transparent;
+  border: none;
+  padding: 0 0.15rem;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.dash-caret:hover {
+  background: var(--bg-elevated);
+  color: var(--fg);
+}
+.dash-caret:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.dash-caret-placeholder {
+  visibility: hidden;
+}
+.dash-row--coordinator .dash-cell-name {
+  font-weight: 600;
+}
+.dash-row--child {
+  padding-left: 1.75rem;
+  opacity: 0.95;
+}
+.dash-row--child .dash-row-main {
+  border-left: 2px solid var(--border);
+  padding-left: 0.5rem;
+}
+/* Caret-driven collapse: child rows render in the DOM always; the
+   caret toggles this class on the matching [data-parent-ws-id].  No
+   table rebuild, so focus and screen-reader position survive. */
+.dash-row--child.dash-row--collapsed {
+  display: none;
+}
+.dash-child-count {
+  color: var(--fg-dim);
+  font-weight: 400;
+  font-size: 0.85em;
+}
+/* Hide the "(N children)" summary when the caret is expanded — the
+   indented child rows make the count self-evident. */
+.dash-row--coordinator[data-expanded="true"] .dash-child-count {
+  display: none;
+}
+.dash-orphan-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.02rem 0.35rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  background: var(--bg-elevated);
+  border-radius: 2px;
+}
+
+/* The ``.pagination`` control (Saved Coordinators + the filtered admin
+   lists, and the server UI's Saved Workstreams) lives in /shared/cards.css
+   so the two dashboards share one source of truth. */
+
+/* ==========================================================================
+   Toast override — sit above the cluster status bar.  Stacking against the
+   hatch dialogs needs no z-index at all: a document-modal <dialog> owns the
+   top layer, and toast.js promotes the toast to a manual popover (also top
+   layer, later = higher) while one is open.
+   ========================================================================== */
+#toast {
+  bottom: 56px;
+  z-index: 700;
+  color: var(--fg-bright);
+  border-color: var(--border-strong);
+}
+
+/* Admin button — top accent line + active state */
+#admin-btn {
+  position: relative;
+  overflow: visible;
+}
+#admin-btn::before {
+  content: "";
+  position: absolute;
+  top: -2px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 0 0 1px 1px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+#admin-btn.active::before {
+  opacity: 1;
+}
+#admin-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+/* ==========================================================================
+   Responsive
+   ========================================================================== */
+@media (max-width: 700px) {
+  :root {
+    --dash-grid: 68px 110px 1fr 56px 44px;
+  }
+  .dash-col-model,
+  .dash-cell-model,
+  .dash-col-node,
+  .dash-cell-node {
+    display: none;
+  }
+  #main {
+    padding: 16px;
+    padding-bottom: 60px;
+  }
+}
+@media (max-width: 480px) {
+  :root {
+    --dash-grid: 50px 1fr 50px;
+  }
+  .dash-col-model,
+  .dash-cell-model,
+  .dash-col-node,
+  .dash-cell-node,
+  .dash-col-task,
+  .dash-cell-task,
+  .dash-col-ctx,
+  .dash-cell-ctx {
+    display: none;
+  }
+  #cluster-status-bar {
+    height: auto;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    gap: 6px;
+  }
+  .csb-states {
+    flex-wrap: wrap;
+    gap: 2px;
+  }
+  .csb-state {
+    padding: 4px 6px;
+    font-size: 11px;
+  }
+  .csb-divider {
+    display: none;
+  }
+  .csb-metrics {
+    width: 100%;
+    justify-content: center;
+  }
+  #main {
+    padding-bottom: 80px;
+  }
+  #header h1 {
+    font-size: 13px;
+  }
+}
+
+/* ==========================================================================
+   Admin panel — sidebar layout
+   ========================================================================== */
+
+#view-admin {
+  animation: admin-fadein 0.15s ease-out;
+}
+@keyframes admin-fadein {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.admin-layout {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+}
+
+/* Content area — the manage pane's interior scroller.  The chain above it
+   (#view-admin → .admin-layout) is height-pinned by the L-shell pane and the
+   .hatch-host clips, so this is the last box that can own tab overflow.  It
+   scrolls so the docked shelf — positioned against .admin-layout, OUTSIDE
+   this scroller — stays put while tab content moves beneath it; the same
+   division of labor as #main inside the dashboard pane. */
+.admin-content {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding-right: 20px;
+  /* scroll tail — the last row must not hug the pane edge (#main keeps 60px;
+     the admin tables are denser, so less) */
+  padding-bottom: 24px;
+}
+
+.admin-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.admin-action-btn {
+  margin-left: auto;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 14px;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+  transition: filter 0.15s;
+}
+.admin-action-btn:hover {
+  filter: brightness(1.1);
+}
+.admin-action-btn:focus-visible {
+  outline: 2px solid var(--fg-bright);
+  outline-offset: 2px;
+}
+.admin-action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.admin-toolbar select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 30px 5px 10px;
+  min-width: 180px;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238a93ad' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.admin-toolbar select:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* Project-members shelf: the add-member row pairs the user picker with its Add
+   button on one line (the select flexes, the button stays its content width). */
+.pm-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.pm-add-row select {
+  flex: 1;
+  min-width: 0;
+}
+.pm-add-row .sh-btn {
+  flex: none;
+}
+
+/* Admin table grid */
+.admin-colheaders {
+  display: grid;
+  padding: 0 12px;
+  margin-bottom: 4px;
+}
+.admin-colheaders .admin-col {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+.admin-row {
+  display: grid;
+  padding: 8px 12px;
+  align-items: start;
+  border-radius: var(--radius-sm);
+  transition: background 0.1s;
+}
+.admin-row:nth-child(even) {
+  background: var(--row-alt, rgba(255, 255, 255, 0.015));
+}
+.admin-row:hover {
+  background: var(--bg-highlight);
+}
+
+.admin-col {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.admin-col code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.admin-col-subtitle {
+  display: block;
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-weight: 400;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Users grid: USERNAME | NAME | CREATED | ACTIONS */
+#admin-users .admin-colheaders,
+#admin-users .admin-row {
+  grid-template-columns: 140px 1fr 100px 80px;
+}
+
+/* Tokens grid: PREFIX | NAME | SCOPES | CREATED | EXPIRES | ACTIONS */
+#admin-tokens .admin-colheaders,
+#admin-tokens .admin-row {
+  grid-template-columns: 100px 1fr 160px 100px 100px 80px;
+}
+
+/* Channels grid: CHANNEL | EXTERNAL ID | LINKED | ACTIONS */
+#admin-channels .admin-colheaders,
+#admin-channels .admin-row {
+  grid-template-columns: 100px 1fr 100px 80px;
+}
+
+/* TLS grid: DOMAIN | SANS | ISSUED | EXPIRES | ACTIONS */
+#admin-tls .admin-colheaders,
+#admin-tls .admin-row {
+  grid-template-columns: 160px 1fr 130px 150px 120px;
+}
+/* Projects: NAME | VISIBILITY | STATE | ACTIONS.  ``.admin-row`` is display:grid
+   with no template in the base rule — every tab supplies its own, or the columns
+   stack one per implicit row. */
+#admin-projects .admin-colheaders,
+#admin-projects .admin-row {
+  grid-template-columns: 1fr 110px 100px 80px;
+}
+/* Personas: NAME | KINDS | ENVELOPE | STATE | ACTIONS.  ENVELOPE carries the
+   levers summary, so it gets the extra flexible track. */
+#admin-personas .admin-colheaders,
+#admin-personas .admin-row {
+  grid-template-columns: 1fr 110px 1.6fr 100px 80px;
+}
+/* Members list inside the project-members shelf: USER | ACTIONS. */
+#pm-members-container .admin-row {
+  grid-template-columns: 1fr auto;
+}
+.tls-ca-bar {
+  display: flex;
+  gap: 2rem;
+  margin-bottom: 0.75rem;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+/* Scope badges */
+.scope-badge {
+  display: inline-block;
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 2px;
+  margin-right: 3px;
+  background: var(--bg-highlight);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+}
+.scope-write {
+  color: var(--cyan);
+  border-color: rgba(103, 232, 249, 0.2);
+}
+.scope-approve {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+/* Per-platform channel badges first — a row uses scope-discord OR
+   scope-slack OR (for unknown platforms) the generic scope-channel
+   fallback below.  Source order matters less now that the per-platform
+   classes are exclusive of scope-channel; keeping it tidy regardless. */
+.scope-discord {
+  color: var(--discord);
+  border-color: var(--discord-glow);
+}
+.scope-slack {
+  color: var(--slack);
+  border-color: var(--slack-glow);
+}
+.scope-channel {
+  color: var(--magenta);
+  border-color: var(--magenta-glow);
+}
+.scope-mcp {
+  color: var(--magenta);
+  border-color: rgba(192, 132, 252, 0.25);
+}
+.scope-deny {
+  color: var(--red);
+  border-color: rgba(255, 80, 80, 0.25);
+}
+.scope-scan-safe {
+  color: var(--green);
+  border-color: var(--green-glow);
+}
+.scope-scan-low {
+  color: var(--fg-dim);
+  border-color: var(--border);
+}
+.scope-scan-medium {
+  color: var(--yellow);
+  border-color: var(--yellow-glow);
+}
+.scope-scan-high {
+  color: var(--red);
+  border-color: var(--red-glow);
+}
+.scope-scan-critical {
+  color: var(--red);
+  border-color: var(--red-glow);
+  background: rgba(248, 113, 113, 0.08);
+}
+
+.admin-field {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.admin-field-heading {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+  display: block;
+}
+
+.scan-composite {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-left: 6px;
+}
+.scan-version {
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin-left: 6px;
+}
+.scan-axis {
+  font-size: 11px;
+  padding: 2px 0;
+  color: var(--fg-dim);
+}
+.scan-axis-name {
+  text-transform: capitalize;
+  display: inline-block;
+  min-width: 100px;
+}
+.scan-axis-score {
+  font-family: var(--font-mono);
+}
+.scan-axis-flags {
+  color: var(--yellow);
+  font-size: 10px;
+}
+
+/* Action buttons */
+.admin-btn-danger {
+  background: none;
+  border: 1px solid var(--red);
+  color: var(--red);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0.8;
+  transition:
+    opacity 0.15s,
+    background 0.15s;
+}
+.admin-btn-danger:hover {
+  opacity: 1;
+  background: rgba(248, 113, 113, 0.1);
+}
+.admin-btn-danger:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+}
+
+.admin-btn-caution {
+  background: none;
+  border: 1px solid var(--yellow);
+  color: var(--yellow);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0.8;
+  transition:
+    opacity 0.15s,
+    background 0.15s;
+}
+.admin-btn-caution:hover {
+  opacity: 1;
+  background: rgba(251, 191, 36, 0.1);
+}
+.admin-btn-caution:focus-visible {
+  outline: 2px solid var(--yellow);
+  outline-offset: 2px;
+}
+
+.admin-btn-action {
+  background: none;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-dim);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0.8;
+  transition:
+    opacity 0.15s,
+    background 0.15s;
+  margin-right: 4px;
+}
+.admin-btn-action:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+}
+.admin-btn-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Row action overflow menu (kebab) — shared affordance for every admin
+   table's ACTIONS column.  Replaces the inline button strips that
+   overflowed narrow action tracks and rendered a misleading
+   text-overflow "…".  The actions cell inherits `.admin-col`'s
+   `overflow: hidden`, which would re-clip a dropdown, so we override it
+   to `visible` and anchor an absolutely-positioned menu to the kebab
+   container.  The menu lives inside the `.admin-content` scroller and
+   rides with its row; the viewport-aware flip-up in _initKebabMenus
+   keeps bottom rows' menus inside the visible box, and scrolling
+   dismisses an open menu before the scroller's edge could clip it. */
+.admin-col-actions,
+.admin-col-mactions {
+  overflow: visible;
+  /* Pin the trigger to the right of its (over-wide) track so it shares an
+     edge with the right-anchored menu — and right-align the "ACTIONS"
+     header label to match. */
+  text-align: right;
+}
+
+.admin-kebab {
+  position: relative;
+  display: inline-block;
+}
+.admin-kebab.is-open {
+  z-index: 60;
+}
+
+.admin-kebab-btn {
+  background: none;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-dim);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0.8;
+  transition:
+    opacity 0.15s,
+    background 0.15s,
+    color 0.15s;
+}
+.admin-kebab-btn:hover,
+.admin-kebab.is-open .admin-kebab-btn {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+}
+.admin-kebab-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.admin-kebab-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 1;
+  min-width: 148px;
+  /* Never exceed the viewport on either axis (narrow screens / tall menus);
+     _openKebab() flips side/up when an edge would be crossed. */
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  padding: 4px;
+  display: none;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.admin-kebab.is-open .admin-kebab-menu {
+  display: flex;
+}
+.admin-kebab-menu.flip-up {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+.admin-kebab-menu.flip-left {
+  right: auto;
+  left: 0;
+}
+
+.admin-kebab-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s;
+}
+.admin-kebab-item:hover {
+  background: var(--bg-highlight);
+}
+.admin-kebab-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.admin-kebab-item--danger {
+  color: var(--red);
+}
+/* Pair the colour with a glyph so destructive/caution items don't rely on
+   hue alone.  \FE0E forces the text (non-emoji) presentation of the sign. */
+.admin-kebab-item--danger::before {
+  content: "⚠\FE0E";
+  margin-right: 7px;
+  opacity: 0.9;
+}
+.admin-kebab-item--danger:hover {
+  background: var(--red-glow);
+}
+.admin-kebab-item--caution {
+  color: var(--yellow);
+}
+.admin-kebab-item--caution::before {
+  content: "△";
+  margin-right: 7px;
+  opacity: 0.9;
+}
+.admin-kebab-item--caution:hover {
+  background: var(--yellow-glow);
+}
+
+/* Schedules grid: NAME | TYPE | SCHEDULE | TARGET | NEXT RUN | STATUS | ACTIONS */
+#admin-schedules .admin-colheaders,
+#admin-schedules .admin-row {
+  grid-template-columns: 1.5fr 60px 1.2fr 80px 130px 70px 170px;
+}
+
+/* Schedule runs grid: STARTED | NODE | STATUS | ERROR */
+.sched-runs-grid {
+  grid-template-columns: 2fr 1fr 1fr 2fr;
+}
+
+/* Schedule status indicators */
+.sched-active {
+  color: var(--green);
+  font-weight: 500;
+}
+.sched-disabled {
+  color: var(--fg-dim);
+}
+.sched-expired {
+  color: var(--accent);
+}
+
+/* Watches grid: NAME | NODE | COMMAND | INTERVAL | POLL | CONDITION | STATUS | ACTIONS */
+#admin-watches .admin-colheaders,
+#admin-watches .admin-row {
+  grid-template-columns: 1.2fr 80px 1.5fr 60px 70px 1fr 70px 70px;
+}
+
+/* Watch status indicators */
+.watch-active {
+  color: var(--green);
+  font-weight: 500;
+}
+.watch-completed {
+  color: var(--accent);
+}
+
+/* Two-column read-out grid — survives for the MCP-detail inspect shelf
+   (admin.js _openMcpDetail builds .modal-columns/.modal-col). */
+.modal-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+}
+.modal-col > label:first-child {
+  margin-top: 0;
+}
+.modal-columns > .modal-col:first-child {
+  border-right: 1px solid var(--border);
+  padding-right: 12px;
+}
+.modal-columns > .modal-col:last-child {
+  padding-left: 12px;
+}
+
+/* Toggle switch — modern replacement for boolean checkboxes inside
+ * admin modals.  The native <input type="checkbox"> stays in the
+ * markup (visually hidden but keyboard-focusable) so existing JS
+ * that reads `.checked` keeps working; the .toggle-track + ::before
+ * pseudo render the slider, .toggle-label carries the caption.
+ *
+ * Usage:
+ *   <label class="toggle-switch">
+ *     <input type="checkbox" id="..." />
+ *     <span class="toggle-track" aria-hidden="true"></span>
+ *     <span class="toggle-label">Enabled</span>
+ *   </label>
+ */
+/* Default margin-top: 14px matches the shelf form cadence for toggles
+ * that sit directly between regular labelled rows.  When a toggle is
+ * inside an explicit ``.toggle-stack`` flex container, the stack resets
+ * the margin so the parent's gap controls spacing on its own.  (Inside
+ * a hatch body, hatch.css restates this layout at higher specificity —
+ * the .sh-body label.toggle-switch exception.) */
+label.toggle-switch {
+  /* The containing block for the visually-hidden abspos input below: without
+     it the input sits at its static position outside whatever scroller the
+     toggle lives in (.sh-body, .admin-content) and focus-scrolls the wrong
+     ancestor — inside a shelf that shoved the whole hatch off its dock. */
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  margin: 14px 0 0 0;
+  padding: 0;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.toggle-stack > label.toggle-switch {
+  margin: 0;
+}
+/* Modifier for toggles that should sit flush against the surrounding
+ * rhythm rather than carry the default 14px top margin — used when a
+ * toggle is the first row of a modal (under the h2) or when it lives
+ * in a dynamically-rendered row that already supplies its own
+ * spacing (e.g. judge bool settings). */
+label.toggle-switch.toggle--flush {
+  margin-top: 0;
+}
+.toggle-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+.toggle-switch input[type="checkbox"] {
+  /* Visually hidden but still focusable + click-targetable via the
+   * <label> wrap.  Avoids display:none, which would strip the input
+   * from the keyboard tab order. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.toggle-switch .toggle-track {
+  position: relative;
+  flex: 0 0 auto;
+  /* 40×22 meets WCAG 2.5.5 (Level AAA) target size when combined with
+   * the label's hit area, and reads as a deliberate switch on touch
+   * targets without dominating the form rhythm. */
+  width: 40px;
+  height: 22px;
+  /* Off state: depressed inset on the modal background so the track
+   * silhouette stays visible at 1.5+ contrast ratio.  The earlier
+   * ``var(--border-strong)`` solid fill was ~1.18:1 against the modal
+   * surface — visible to most readers, invisible to anyone on a
+   * glare-y screen or at ``prefers-contrast: more``. */
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  border-radius: 11px;
+  transition:
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+.toggle-switch .toggle-track::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  background: var(--fg);
+  border-radius: 50%;
+  transition: transform 0.18s ease;
+}
+.toggle-switch input:checked + .toggle-track {
+  background: var(--accent);
+  box-shadow: none;
+}
+.toggle-switch input:checked + .toggle-track::before {
+  transform: translateX(18px);
+  background: var(--bg);
+}
+.toggle-switch input:focus-visible + .toggle-track {
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.toggle-switch input:disabled + .toggle-track {
+  opacity: 0.4;
+}
+.toggle-switch:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.toggle-switch .toggle-label {
+  display: inline-block;
+  /* The label text rides at the modal's normal label cadence — caps
+   * + letter-spacing so it sits next to the surrounding form rows
+   * without shifting the visual rhythm. */
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+
+/* Segmented option list — vertical card group for radio choices that
+ * benefit from a strong selected-state highlight.  The native
+ * ``<input type="radio">`` is visually hidden but stays focusable;
+ * the ``.segmented-indicator`` pseudo-circle and the row's
+ * background carry the selected state.
+ *
+ * Usage:
+ *   <div class="segmented-control" role="radiogroup">
+ *     <label class="segmented-option">
+ *       <input type="radio" name="..." value="..." />
+ *       <span class="segmented-indicator" aria-hidden="true"></span>
+ *       <span class="segmented-text">Label
+ *         <span class="segmented-hint">(hint)</span>
+ *       </span>
+ *     </label>
+ *     ...
+ *   </div>
+ */
+.segmented-control {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg);
+  margin-top: 8px;
+}
+/* Doubled with .sh-body so the cards survive the label micro-cadence
+   (.sh-body label in the later-loaded hatch.css ties bare .segmented-option
+   at 0,1,1 and strips the flex layout — the indicator collapses onto the
+   first letters and unselected rows lose their dot entirely). */
+.sh-body label.segmented-option,
+.segmented-option {
+  /* The containing block for the visually-hidden abspos radio below — same
+     anchor label.toggle-switch and .sh-body label.cap carry: an unanchored
+     input sits at its static position outside the .sh-body scroller and
+     focus-scrolls the wrong ancestor when the radiogroup is below the fold. */
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  cursor: pointer;
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--fg-dim);
+  border-top: 1px solid var(--border);
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+.segmented-option:first-of-type {
+  border-top: none;
+}
+.segmented-option input[type="radio"] {
+  /* Visually hidden but focusable + click-targetable via the label
+   * wrap.  Keyboard arrows still cycle within the radiogroup. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+.segmented-option .segmented-indicator {
+  position: relative;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+.segmented-option .segmented-indicator::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+.segmented-option:hover {
+  background: var(--bg-highlight);
+  color: var(--fg);
+}
+.segmented-option:has(input:checked) {
+  background: var(--accent-dim);
+  color: var(--fg);
+}
+.segmented-option:has(input:checked) .segmented-indicator {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.segmented-option:has(input:checked) .segmented-indicator::after {
+  background: var(--accent);
+}
+.segmented-option:has(input:focus-visible) {
+  /* Bright accent (not --accent-dim) so the ring stays visible even
+   * on the currently-selected row, which already paints --accent-dim
+   * as its background. */
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.segmented-option .segmented-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.segmented-option .segmented-hint {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--fg-dim);
+  margin-left: 4px;
+}
+.segmented-option:has(input:checked) .segmented-hint {
+  color: var(--accent);
+}
+
+/* Narrow PANE: the MCP-detail two-column read-out stacks (container query —
+   a tight split is narrow on a wide viewport, same rule as the shelf's
+   sheet mode). */
+@container pane (max-width: 700px) {
+  .modal-columns {
+    grid-template-columns: 1fr;
+    gap: 20px 0;
+  }
+  .modal-columns > .modal-col:first-child {
+    border-right: none;
+    padding-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+  }
+  .modal-columns > .modal-col:last-child {
+    padding-left: 0;
+  }
+}
+
+.admin-inline-add {
+  background: none;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: pointer;
+  width: 100%;
+  margin-top: 6px;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+.admin-inline-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.admin-inline-add:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.notify-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.notify-row select,
+.notify-row input {
+  padding: 7px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+}
+/* Tighter platform select — labels are short ("Discord"/"Slack") */
+.notify-row-ct {
+  width: 76px;
+  flex-shrink: 0;
+}
+.notify-row-target {
+  width: 90px;
+  flex-shrink: 0;
+}
+.notify-row-id {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+/* Older rows that didn't get the per-element classes still need to size */
+.notify-row select:not([class*="notify-row-"]) {
+  width: 90px;
+  flex-shrink: 0;
+}
+.notify-row input:not([class*="notify-row-"]) {
+  flex: 1;
+  min-width: 0;
+}
+.notify-row-remove {
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 4px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.notify-row-remove:hover {
+  color: var(--red);
+}
+.notify-row-remove:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+}
+/* Narrow viewports — drop the ID input to its own line so snowflakes
+   and Slack ids aren't truncated to ~80px on phones. */
+@media (max-width: 700px) {
+  .notify-row-id {
+    flex-basis: 100%;
+    order: 3;
+  }
+  .notify-row-remove {
+    order: 2;
+    margin-left: auto;
+  }
+}
+
+/* ==========================================================================
+   Skill shelf — two-column spec body
+   Left: Identity / Manifest / Deployment  |  Right: Skill Content
+   ========================================================================== */
+.skill-spec-body {
+  display: grid;
+  grid-template-columns: 1fr 1.55fr;
+  gap: 0;
+  margin-bottom: 12px;
+}
+
+.skill-spec-col-meta {
+  border-right: 1px solid var(--border);
+  padding-right: 22px;
+}
+
+.skill-spec-col-content {
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  /* The body is the scroll container; pinning the content column keeps the
+     SKILL.md pane visible while the (taller) meta column scrolls — the whole
+     point of the two-column split. */
+  position: sticky;
+  top: 0;
+  align-self: start;
+  max-height: 100%;
+}
+
+.skill-spec-section {
+  margin-bottom: 14px;
+}
+.skill-spec-section:last-child {
+  margin-bottom: 0;
+}
+
+/* h3 used for screen-reader heading structure; reset UA defaults.  We only
+   reset margin-block (the `margin` shorthand on .skill-spec-heading sets
+   physical margins but UA h3 uses logical margin-block-start/end); font-size
+   is left alone — .skill-spec-heading's font-size: 10px already beats the UA
+   h3 default on specificity, and an `inherit` here at (0,1,1) would silently
+   outrank the bare class at (0,1,0). */
+h3.skill-spec-heading {
+  margin-block: 0;
+}
+.skill-spec-heading {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  padding-bottom: 5px;
+  margin: 14px 0 6px;
+  border-bottom: 1px solid var(--accent-dim);
+}
+.skill-spec-section:first-child .skill-spec-heading {
+  margin-top: 0;
+}
+.skill-spec-heading .label-hint {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+  font-size: 10px;
+  opacity: 1;
+}
+
+/* Tip line above the Skill Content textarea announcing the paste-to-fill
+   affordance.  Sized to match the dim hint on the heading rather than the
+   default body text, so it doesn't out-shout the rest of the modal. */
+.skill-paste-hint {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin: -2px 0 6px;
+  line-height: 1.5;
+}
+.skill-paste-hint code {
+  font-size: 10.5px;
+  padding: 0 4px;
+  background: var(--code-bg);
+  border-radius: 2px;
+  color: var(--fg);
+}
+
+.skill-spec-section-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Scoped under `.sh-body` so the rule beats hatch.css's `.sh-body textarea`
+   (0,1,1, later in source) — without that bump, the shelf's `font: inherit`
+   + min-height: 64px would flatten the mono face and the 220px floor. */
+.sh-body textarea.skill-content-area {
+  flex: 1;
+  min-height: 220px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.skill-config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px 14px;
+  margin: 4px 0 2px;
+}
+.skill-config-grid > div {
+  min-width: 0;
+}
+
+/* Light theme: the off-state track's --bg fill is the same near-white as
+   the panel (~1.2:1) — give it real ink so on/off reads without hunting the
+   thumb. Dark keeps the recessed --bg + inset ring (visible there). */
+[data-theme="light"] .toggle-switch .toggle-track {
+  background: color-mix(in srgb, var(--ink) 18%, transparent);
+  box-shadow: none;
+}
+[data-theme="light"] .toggle-switch input:checked + .toggle-track {
+  background: var(--accent);
+}
+
+/* Origin badge — provenance chip in the skill shelf's foot meta lane
+   (installed/customized skills). Sized to the 11px foot strip. */
+.skill-origin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--cyan) 35%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 2px 7px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skill-origin-badge::before {
+  content: "\2193";
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+/* Head lock affordance on the skill shelf — the sh-x ghost recipe minus its
+   right-edge margin compensation (the lock sits mid-strip, left of the
+   designation plate). Text-variant keeps the glyph monochrome. */
+#skill-shelf .skl-lock {
+  margin: -4px 0;
+  font-variant-emoji: text;
+}
+
+/* Destructive variant of the hatch quiet button — text-weight danger for
+   foot actions that destroy (memory-detail Delete), keeping the filled
+   err treatment reserved for confirm-dialog primaries. Doubled class so
+   the rule beats the later-loaded hatch.css `.sh-btn--quiet` color. */
+.sh-btn.sh-btn--quiet-danger {
+  color: var(--err);
+}
+.sh-btn.sh-btn--quiet-danger:hover {
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  color: var(--err);
+}
+
+/* Narrow pane (mobile OR a tight split): single column, matching the
+   shelf's own bottom-sheet container breakpoint in hatch.css. */
+@container pane (max-width: 700px) {
+  .skill-spec-body {
+    grid-template-columns: 1fr;
+  }
+  .skill-spec-col-meta {
+    border-right: none;
+    padding-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+    margin-bottom: 16px;
+  }
+  .skill-spec-col-content {
+    padding-left: 0;
+  }
+  .skill-config-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* Token display (show-once) */
+.token-created-warning {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--yellow);
+  margin-bottom: 12px;
+}
+.token-display {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-bright);
+  background: var(--bg);
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  word-break: break-all;
+  user-select: all;
+}
+
+@media (max-width: 700px) {
+  #admin-users .admin-colheaders,
+  #admin-users .admin-row {
+    grid-template-columns: 100px 1fr 80px;
+  }
+  .admin-col-created {
+    display: none;
+  }
+  #admin-tokens .admin-colheaders,
+  #admin-tokens .admin-row {
+    grid-template-columns: 80px 1fr 100px 80px;
+  }
+  .admin-col-created,
+  .admin-col-expires {
+    display: none;
+  }
+  #admin-channels .admin-colheaders,
+  #admin-channels .admin-row {
+    grid-template-columns: 80px 1fr 80px;
+  }
+  #admin-channels .admin-col-created {
+    display: none;
+  }
+  #admin-schedules .admin-colheaders,
+  #admin-schedules .admin-row {
+    grid-template-columns: 1fr 60px 80px 130px;
+  }
+  .admin-col-sschedule,
+  .admin-col-starget,
+  .admin-col-snext {
+    display: none;
+  }
+  #admin-watches .admin-colheaders,
+  #admin-watches .admin-row {
+    grid-template-columns: 1.2fr 80px 70px 70px 70px;
+  }
+  .admin-col-wcmd,
+  .admin-col-wcond,
+  .admin-col-winterval {
+    display: none;
+  }
+
+  /* Judge: Heuristic Rules - hide Tier, Risk, Rec on mobile */
+  #judge-heuristic-section .admin-colheaders,
+  #judge-heuristic-section .admin-row {
+    grid-template-columns: 1fr 100px 90px 60px 160px;
+  }
+  .admin-col-htier,
+  .admin-col-hrisk,
+  .admin-col-hrec {
+    display: none;
+  }
+
+  /* Judge: Output Guard - hide Risk, Flag on mobile */
+  #judge-output-guard-section .admin-colheaders,
+  #judge-output-guard-section .admin-row {
+    grid-template-columns: 1fr 120px 90px 60px 160px;
+  }
+  .admin-col-ogrisk,
+  .admin-col-ogflag {
+    display: none;
+  }
+}
+
+/* ==========================================================================
+   Governance: Roles grid
+   ========================================================================== */
+#admin-roles .admin-colheaders,
+#admin-roles .admin-row {
+  grid-template-columns: 240px 1fr 140px;
+}
+
+/* Row-level chevron — opens the inspect drawer.  Square-bracketed
+   ascii triangle keeps with the "instrument panel" typographic
+   palette already used by the rest of the admin UX (no SVG icons). */
+.role-expand-btn {
+  display: inline-block;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--fg-dim);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  line-height: 1;
+  padding: 1px 4px;
+  margin-right: 6px;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.role-expand-btn:hover {
+  color: var(--accent);
+  border-color: var(--border);
+}
+.role-expand-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.admin-role-row[data-expanded="true"] .role-expand-btn {
+  color: var(--accent);
+}
+
+/* Collapsed-row permission summary — replaces the chip stack that
+   used to overflow with a "…" the moment a role accrued more than a
+   handful of permissions.  Drawer carries the real inventory. */
+.perm-count-chip {
+  display: inline-block;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--fg-dim);
+  letter-spacing: 0.02em;
+}
+
+/* Inspect drawer — slot directly under its row, full-width.  No
+   sub-grid (the parent table is a column of rows, not a grid), so a
+   plain block container with bordered padding is sufficient. */
+.admin-role-drawer {
+  padding: 12px 16px 14px 24px;
+  /* Pull contrast from the page background, not from --bg-highlight,
+     so the drawer reads as a recessed surface in both themes.  Light
+     theme: a slight darken via rgba black layered over the page bg
+     instead of --bg-highlight (which is barely distinguishable from
+     --bg in the light palette). */
+  background: rgba(0, 0, 0, 0.04);
+  border-left: 2px solid var(--accent);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+.role-drawer-section {
+  margin-top: 6px;
+}
+.role-drawer-section:first-child {
+  margin-top: 0;
+}
+.role-drawer-section-label {
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+}
+.role-drawer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.role-drawer-actions {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+}
+
+/* Drawer chips: baseline = subdued, grant = green plus, revoke =
+   red strike-through.  The trailing "+" / "−" sigil ('.perm-delta-mark')
+   gives the same signal at a glance for screen-reader pass-through
+   and high-contrast users where the colour alone isn't enough. */
+.perm-inspect-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 2px;
+  /* Solid page bg so chips sit on top of the recessed drawer with a
+     visible step; --fg (not --fg-dim) so the label is comfortably
+     readable in both themes. */
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+.perm-inspect-chip.is-baseline {
+  /* Baseline = "shipped default."  Slightly dimmed so the override
+     variants pop, but still high-contrast enough to read. */
+  color: var(--fg-dim);
+}
+.perm-inspect-chip.is-grant {
+  /* Bumped from 0.06 → 0.16 alpha so the green wash actually reads
+     as a state.  Border step too. */
+  color: var(--green);
+  border-color: rgba(52, 211, 153, 0.55);
+  background: rgba(52, 211, 153, 0.16);
+}
+.perm-inspect-chip.is-revoke {
+  color: var(--red);
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(248, 113, 113, 0.14);
+  text-decoration: line-through;
+}
+.perm-delta-mark {
+  font-weight: 700;
+  font-size: 10px;
+}
+
+/* Toggle annotations inside the edit modal — same baseline/grant/revoke
+   palette as the drawer, but lighter so the toggle remains the primary
+   affordance.  The dot/plus/minus mark trails the label. */
+.perm-baseline-mark {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--fg-dim);
+}
+.perm-baseline-mark.is-default {
+  color: var(--fg-dim);
+  opacity: 0.6;
+}
+.perm-toggle.is-grant .perm-baseline-mark {
+  color: var(--green);
+}
+.perm-toggle.is-revoke .perm-baseline-mark {
+  color: var(--red);
+}
+.perm-toggle.is-revoke .toggle-label {
+  color: var(--red);
+}
+.perm-toggle.is-grant .toggle-label {
+  color: var(--green);
+}
+
+/* ==========================================================================
+   Governance: Tool Policies grid
+   ========================================================================== */
+#admin-policies .admin-colheaders,
+#admin-policies .admin-row {
+  grid-template-columns: 1.2fr 1fr 70px 50px 80px 140px;
+}
+
+/* Prompt Policies grid: NAME | TOOL GATE | PRI | STATUS | ACTIONS */
+#admin-prompt-policies .admin-colheaders,
+#admin-prompt-policies .admin-row {
+  grid-template-columns: 1.2fr 1fr 50px 80px 140px;
+}
+
+/* Policy action badges */
+.policy-badge {
+  display: inline-block;
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+.policy-allow {
+  color: var(--green);
+  background: var(--green-glow);
+  border: 1px solid var(--green-glow);
+}
+.policy-deny {
+  color: var(--red);
+  background: var(--red-glow);
+  border: 1px solid var(--red-glow);
+}
+.policy-ask {
+  color: var(--yellow);
+  background: var(--yellow-glow);
+  border: 1px solid var(--yellow-glow);
+}
+
+/* ==========================================================================
+   Governance: Prompt Templates grid
+   ========================================================================== */
+#admin-skills .admin-colheaders,
+#admin-skills .admin-row {
+  grid-template-columns: 80px 1.5fr 80px 120px;
+}
+/* ==========================================================================
+   Governance: Audit grid
+   ========================================================================== */
+#admin-audit .admin-colheaders,
+#admin-audit .admin-row {
+  grid-template-columns: 80px 80px 1fr 120px 1.5fr;
+}
+
+/* ==========================================================================
+   Admin sub-section tabs (used by Judge + Models tabs)
+   ========================================================================== */
+.admin-subtab-switcher {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 16px;
+  border-bottom: 1px solid var(--border-strong);
+}
+.admin-subtab-btn {
+  padding: 6px 14px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.admin-subtab-btn:hover {
+  color: var(--fg);
+}
+.admin-subtab-btn.active {
+  border-bottom-color: var(--accent);
+  color: var(--fg);
+}
+.admin-subtab-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ==========================================================================
+   Judge: Heuristic Rules grid
+   ========================================================================== */
+#judge-heuristic-section .admin-colheaders,
+#judge-heuristic-section .admin-row {
+  grid-template-columns: 1.2fr 70px 70px 100px 70px 90px 60px 170px;
+}
+/* Judge: Output Guard Patterns grid */
+#judge-output-guard-section .admin-colheaders,
+#judge-output-guard-section .admin-row {
+  grid-template-columns: 1.2fr 120px 60px 100px 90px 60px 170px;
+}
+
+/* Audit action badges */
+.audit-badge {
+  display: inline-block;
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: var(--bg-highlight);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+}
+.audit-danger {
+  color: var(--red);
+  border-color: var(--red-glow);
+}
+.audit-success {
+  color: var(--green);
+  border-color: var(--green-glow);
+}
+
+/* ==========================================================================
+   Memories tab
+   ========================================================================== */
+#admin-memories .admin-colheaders,
+#admin-memories .admin-row {
+  grid-template-columns: 1.5fr 80px 140px 1fr 100px 80px;
+}
+/* Scope cell: a fixed scope pill + the resolved target name, which truncates
+   within the cell so a long project/ws/user name can't spill into the preview. */
+.admin-col-mscope {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.admin-col-mscope .scope-badge {
+  flex: none;
+}
+.mem-scope-target {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+/* Filter toolbar */
+.admin-toolbar-filters {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  align-items: center;
+}
+.admin-toolbar-filters select,
+.admin-toolbar-filters input[type="search"] {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.admin-toolbar-filters select {
+  min-width: 0;
+}
+.admin-toolbar-filters input[type="search"] {
+  width: 180px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.admin-toolbar-filters input[type="search"]::placeholder {
+  color: var(--fg-dim);
+}
+
+/* Memory type badges */
+.mem-type-general {
+  background: var(--bg-highlight);
+  color: var(--cyan);
+  border-color: var(--cyan-glow, var(--border));
+}
+.mem-type-user {
+  background: var(--bg-highlight);
+  color: var(--green);
+  border-color: var(--green-glow, var(--border));
+}
+.mem-type-feedback {
+  background: var(--bg-highlight);
+  color: var(--yellow);
+  border-color: var(--yellow-glow, var(--border));
+}
+.mem-type-reference {
+  background: var(--bg-highlight);
+  color: var(--magenta);
+  border-color: var(--magenta-glow, var(--border));
+}
+
+/* Memory scope badges */
+.mem-scope-global {
+  background: var(--bg-highlight);
+  color: var(--fg-dim);
+}
+.mem-scope-workstream {
+  background: var(--bg-highlight);
+  color: var(--cyan);
+  border-color: var(--cyan-glow, var(--border));
+}
+.mem-scope-user {
+  background: var(--bg-highlight);
+  color: var(--green);
+  border-color: var(--green-glow, var(--border));
+}
+.mem-scope-coordinator {
+  background: var(--bg-highlight);
+  color: var(--magenta);
+  border-color: var(--magenta-glow, var(--border));
+}
+/* Project scope = the amber project vocabulary (▣ chip / rail group / pill). */
+.mem-scope-project {
+  background: var(--bg-highlight);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Memory detail modal */
+.mem-detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px 16px;
+}
+.mem-detail-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mem-detail-label {
+  font-size: 10px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+.mem-detail-desc {
+  color: var(--fg);
+  font-size: 13px;
+  padding: 4px 0;
+}
+.memory-content-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px;
+  max-height: 400px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--fg);
+  margin: 4px 0 0;
+}
+
+/* ==========================================================================
+   Governance: Usage dashboard
+   ========================================================================== */
+.usage-summary {
+  display: flex;
+  gap: 24px;
+  padding: 16px 0 20px;
+  flex-wrap: wrap;
+}
+.usage-readout {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.usage-readout-value {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--fg-bright);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  letter-spacing: -0.02em;
+}
+.usage-readout-label {
+  font-size: 10px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+/* Secondary readouts (cache stats) — smaller to denote supplementary metrics */
+.usage-readout-secondary .usage-readout-value {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+.usage-readout-secondary .usage-readout-label {
+  font-size: 9px;
+}
+/* Dim zero-value secondary readouts to reduce noise */
+.usage-readout-zero {
+  opacity: 0.35;
+}
+/* Vertical divider between primary and secondary readout groups */
+.usage-summary-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 2px 0;
+}
+
+/* Usage bar chart */
+.usage-chart {
+  padding-top: 4px;
+}
+.usage-bar-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 60px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+}
+.usage-bar-label {
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-bar-track {
+  height: 16px;
+  background: var(--bg-highlight);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.usage-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  min-width: 2px;
+  transition: width 0.3s ease;
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.usage-bar-value {
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Usage range/group buttons */
+.usage-range-group {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.usage-range-btn,
+.usage-group-btn {
+  background: var(--bg);
+  color: var(--fg-dim);
+  border: none;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.usage-range-btn:hover,
+.usage-group-btn:hover {
+  background: var(--bg-highlight);
+  color: var(--fg);
+}
+.usage-range-btn.active,
+.usage-group-btn.active {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+.usage-range-btn:focus-visible,
+.usage-group-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ==========================================================================
+   Governance: Permission grid (modal checkboxes)
+   ========================================================================== */
+.perm-fieldset {
+  border: none;
+  padding: 0;
+  margin: 12px 0 0;
+}
+.perm-fieldset legend {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  padding: 0;
+  margin-bottom: 4px;
+}
+/* Permission section grouping — keeps each namespace contiguous so
+ * the row-flow grid below doesn't slice ``admin.*`` mid-column.  The
+ * caps-styled ``.perm-section-label`` re-anchors the toggles to the
+ * shelf's typographic system (matches ``.sh-body label``: 10px caps,
+ * 0.08em letter-spacing, fg-dim). */
+.perm-section {
+  margin-top: 12px;
+}
+.perm-section:first-of-type {
+  margin-top: 0;
+}
+.perm-section-label {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+}
+.perm-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 16px;
+  padding: 4px 0 0;
+}
+/* Permission rows inherit the toggle-switch component but render the
+ * permission name in monospace + lower case (it's an identifier, not
+ * a heading) — overrides the .toggle-label's caps/letter-spacing
+ * cadence used elsewhere in admin modals. */
+.perm-grid label.toggle-switch.perm-toggle {
+  margin: 0;
+}
+.perm-grid .toggle-switch.perm-toggle .toggle-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--fg);
+}
+
+/* User-role assignment list (Users tab → Manage roles modal).  Same
+ * toggle-switch component as elsewhere, but the labels are
+ * human-readable role display names so we keep ui-font + caps-on so
+ * the stack reads like a settings list.  Only override the layout
+ * margin (the modal already provides outer padding). */
+.user-roles-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.user-roles-list label.toggle-switch.user-role-toggle {
+  margin: 0;
+}
+
+/* ==========================================================================
+   Governance: Responsive
+   ========================================================================== */
+@media (max-width: 700px) {
+  #admin-roles .admin-colheaders,
+  #admin-roles .admin-row {
+    grid-template-columns: 1fr 100px;
+  }
+  .admin-col-rperms {
+    display: none;
+  }
+  #admin-policies .admin-colheaders,
+  #admin-policies .admin-row {
+    grid-template-columns: 1fr 70px 50px 100px;
+  }
+  .admin-col-pstatus,
+  .admin-col-ppriority {
+    display: none;
+  }
+  #admin-prompt-policies .admin-colheaders,
+  #admin-prompt-policies .admin-row {
+    grid-template-columns: 1fr 70px 100px;
+  }
+  #admin-skills .admin-colheaders,
+  #admin-skills .admin-row {
+    grid-template-columns: 1fr 100px;
+  }
+  .admin-col-tmcat,
+  .admin-col-tmrisk {
+    display: none;
+  }
+  #admin-audit .admin-colheaders,
+  #admin-audit .admin-row {
+    grid-template-columns: 60px 1fr 100px;
+  }
+  .admin-col-auser,
+  .admin-col-adetail {
+    display: none;
+  }
+  #admin-memories .admin-colheaders,
+  #admin-memories .admin-row {
+    grid-template-columns: 1fr 70px 90px 80px;
+  }
+  .admin-col-mdesc,
+  .admin-col-mupdated {
+    display: none;
+  }
+  .admin-toolbar-filters {
+    flex-wrap: wrap;
+  }
+  .admin-toolbar-filters input[type="search"] {
+    width: 120px;
+  }
+  .mem-detail-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .usage-summary {
+    gap: 14px;
+  }
+  .usage-readout-value {
+    font-size: 18px;
+  }
+  .usage-readout-secondary .usage-readout-value {
+    font-size: 14px;
+  }
+  .usage-bar-row {
+    grid-template-columns: 70px 1fr 50px;
+  }
+  .perm-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ==========================================================================
+   Settings tab — form editor
+   ========================================================================== */
+.settings-section {
+  margin-bottom: 12px;
+}
+.settings-section-header {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+}
+.settings-section-header:hover {
+  color: var(--fg);
+}
+.settings-section-header::after {
+  content: "\25BE";
+  margin-left: 8px;
+  font-size: 11px;
+}
+.settings-section[data-collapsed] .settings-section-body {
+  display: none;
+}
+.settings-section[data-collapsed] .settings-section-header::after {
+  content: "\25B8";
+}
+/* Setting row — 3-column grid */
+.settings-row {
+  display: grid;
+  grid-template-columns: 200px 1fr auto;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  align-items: start;
+  border-bottom: 1px solid var(--border);
+}
+.settings-row:hover {
+  background: var(--row-alt, rgba(255, 255, 255, 0.015));
+}
+
+/* Label column */
+.settings-label-col {
+  min-width: 0;
+}
+.settings-label {
+  font-size: 12px;
+  color: var(--fg);
+  font-family: var(--font-mono);
+}
+.settings-desc {
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin-top: 2px;
+  line-height: 1.3;
+}
+
+/* Input column */
+.settings-input input[type="text"],
+.settings-input input[type="number"],
+.settings-input input[type="password"],
+.settings-input select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  width: 100%;
+  max-width: 300px;
+  box-sizing: border-box;
+}
+/* Hide number spin buttons (Firefox + WebKit) */
+.settings-input input[type="number"] {
+  -moz-appearance: textfield;
+}
+.settings-input input[type="number"]::-webkit-inner-spin-button,
+.settings-input input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.settings-input input:focus,
+.settings-input select:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.settings-input select {
+  appearance: none;
+  padding-right: 24px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+/* Bool toggle */
+.settings-input .settings-toggle {
+  margin-top: 2px;
+}
+.settings-toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+.settings-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+.settings-toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-highlight);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+.settings-toggle-slider::before {
+  content: "";
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  left: 2px;
+  bottom: 2px;
+  background: var(--fg-dim);
+  border-radius: 50%;
+  transition:
+    transform 0.2s,
+    background 0.2s;
+}
+.settings-toggle input:checked + .settings-toggle-slider {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.settings-toggle input:checked + .settings-toggle-slider::before {
+  transform: translateX(16px);
+  background: var(--accent);
+}
+.settings-toggle input:focus-visible + .settings-toggle-slider {
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* Actions column */
+.settings-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* Save button */
+.settings-save-btn {
+  visibility: hidden;
+  opacity: 0;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: none;
+  transition:
+    opacity 0.15s,
+    visibility 0s 0.15s;
+}
+.settings-save-btn.visible {
+  visibility: visible;
+  opacity: 0.8;
+  transition:
+    opacity 0.15s,
+    visibility 0s;
+}
+.settings-save-btn.visible:hover {
+  opacity: 1;
+  background: var(--accent-dim);
+}
+.settings-save-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.settings-save-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Reset button */
+.settings-reset-btn {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  background: none;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+.settings-reset-btn:hover {
+  opacity: 1;
+  color: var(--red);
+  border-color: var(--red);
+}
+.settings-reset-btn:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+}
+
+/* Badges */
+.settings-badge-default {
+  color: var(--fg-dim);
+  border-color: var(--border);
+}
+.settings-restart-badge {
+  display: none;
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--yellow);
+  padding: 1px 4px;
+  border: 1px solid var(--yellow-glow);
+  border-radius: 2px;
+}
+.settings-restart-badge.visible {
+  display: inline-block;
+}
+.settings-restart-badge.saved {
+  background: var(--yellow-glow);
+}
+
+/* Help tooltip.  Glyph painted via ``::after``; button content stays empty. */
+.settings-help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 600;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  vertical-align: middle;
+  margin-left: 4px;
+  padding: 0;
+  line-height: 1;
+  position: relative;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.settings-help-btn::after {
+  content: "?";
+  font-size: 10px;
+  line-height: 1;
+}
+/* Expand tap target to ~26px without changing visual size */
+.settings-help-btn::before {
+  content: "";
+  position: absolute;
+  inset: -5px;
+}
+.settings-help-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
+.settings-help-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings-help-popover {
+  margin-top: 4px;
+  margin-bottom: 4px;
+  padding: 6px 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+.settings-help-popover code {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 0 4px;
+  background: var(--code-bg);
+  border-radius: 2px;
+  color: var(--fg);
+}
+.settings-help-popover strong {
+  font-weight: 600;
+  color: var(--fg);
+}
+.settings-help-text {
+  color: var(--fg);
+}
+.settings-help-ref {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  font-family: var(--font-ui);
+  white-space: nowrap;
+}
+.settings-help-ref:hover {
+  text-decoration: underline;
+}
+
+/* Docs link in toolbar */
+.settings-docs-link {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  margin-left: auto;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.settings-docs-link:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.settings-docs-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Settings mobile */
+@media (max-width: 700px) {
+  .settings-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .settings-desc {
+    display: none;
+  }
+  .settings-input input[type="text"],
+  .settings-input input[type="number"],
+  .settings-input input[type="password"],
+  .settings-input select {
+    max-width: 100%;
+  }
+}
+
+/* -- MCP Servers grid ----------------------------------------------------- */
+.admin-col-mname a {
+  color: var(--fg);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+.admin-col-mname a:hover {
+  color: var(--magenta);
+}
+.admin-col-mname a:focus-visible {
+  outline: 2px solid var(--magenta);
+  outline-offset: 2px;
+}
+.mcp-grid {
+  grid-template-columns: 1.5fr 80px 55px 45px 80px 95px 120px;
+  gap: 0 6px;
+}
+@media (max-width: 700px) {
+  .mcp-grid {
+    grid-template-columns: 1fr 100px 130px;
+  }
+  .admin-col-mtransport,
+  .admin-col-mtools,
+  .admin-col-mres,
+  .admin-col-mprompts {
+    display: none;
+  }
+}
+
+.mcp-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+.mcp-status-dot.connected {
+  background: var(--magenta);
+  box-shadow: 0 0 6px var(--magenta-glow, rgba(192, 132, 252, 0.45));
+}
+.mcp-status-dot.error {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red-glow);
+  border-radius: 1px;
+}
+.mcp-status-dot.disabled {
+  background: var(--fg-dim);
+  opacity: 0.35;
+}
+.mcp-status-dot.connecting {
+  background: var(--magenta);
+  animation: mcp-pulse 1.2s ease-in-out infinite;
+}
+@keyframes mcp-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.mcp-row-connected {
+  border-left: 3px solid var(--magenta);
+}
+.mcp-row-error {
+  border-left: 3px solid var(--red);
+}
+.mcp-row-disabled {
+  border-left: 3px solid transparent;
+}
+
+.mcp-transport-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: var(--bg-highlight);
+  border: 1px solid var(--border);
+}
+.mcp-transport-stdio {
+  color: var(--cyan);
+  border-color: rgba(103, 232, 249, 0.2);
+}
+.mcp-transport-http {
+  color: var(--magenta);
+  border-color: rgba(192, 132, 252, 0.25);
+}
+
+.admin-col-mtools,
+.admin-col-mres,
+.admin-col-mprompts {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.mcp-count-dim {
+  opacity: 0.4;
+}
+
+/* Phase 9 — last-refresh pill in the MCP status cell.  Compact age +
+   outcome indicator inline with the existing status text.  Uses the
+   semantic theme tokens (--bg-highlight, --fg-dim, --warn) defined in
+   shared_static/base.css so the pill follows dark/light theme swaps. */
+.mcp-refresh-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+.mcp-refresh-pill-ok {
+  background: var(--bg-highlight);
+  color: var(--fg-dim);
+}
+.mcp-refresh-pill-err {
+  background: color-mix(in srgb, var(--warn) 15%, transparent);
+  color: var(--warn);
+}
+
+.mcp-detail-modal::before {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--magenta),
+    transparent
+  ) !important;
+}
+.mcp-detail-modal h2 {
+  color: var(--magenta) !important;
+}
+.mcp-detail-section {
+  margin-top: 16px;
+}
+.mcp-detail-section h3 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--magenta);
+  margin-bottom: 8px;
+}
+.mcp-detail-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.mcp-detail-list li {
+  font-size: 12px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-dim);
+}
+.mcp-detail-list li:last-child {
+  border-bottom: none;
+}
+
+.admin-action-btn-ghost {
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid var(--border-strong);
+}
+.admin-action-btn-ghost:hover {
+  color: var(--fg);
+  background: var(--bg-highlight);
+}
+.mcp-sync-pending,
+.model-sync-pending {
+  color: var(--yellow) !important;
+  border-color: var(--yellow) !important;
+  animation: mcp-sync-pulse 2s ease-in-out infinite;
+}
+@keyframes mcp-sync-pulse {
+  0%,
+  100% {
+    border-color: var(--yellow);
+  }
+  50% {
+    border-color: rgba(251, 191, 36, 0.3);
+  }
+}
+
+/* -- MCP sub-view toggle -------------------------------------------------- */
+.mcp-view-toggle {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.mcp-view-btn {
+  background: var(--bg);
+  color: var(--fg-dim);
+  border: none;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.mcp-view-btn:hover {
+  background: var(--bg-highlight);
+  color: var(--fg);
+}
+.mcp-view-btn.active {
+  background: rgba(192, 132, 252, 0.15);
+  color: var(--magenta);
+}
+.mcp-view-btn:focus-visible {
+  outline: 2px solid var(--magenta);
+  outline-offset: -2px;
+}
+
+/* -- MCP source badges ---------------------------------------------------- */
+.scope-config {
+  color: var(--magenta);
+  border-color: rgba(192, 132, 252, 0.25);
+}
+.scope-default {
+  color: var(--yellow);
+  border-color: rgba(251, 191, 36, 0.3);
+}
+.scope-manual {
+  color: var(--cyan);
+  border-color: rgba(103, 232, 249, 0.2);
+}
+.scope-registry {
+  color: var(--green);
+  border-color: rgba(52, 211, 153, 0.2);
+}
+
+/* -- MCP Registry notice -------------------------------------------------- */
+.mcp-registry-notice {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  background: rgba(251, 191, 36, 0.06);
+  border: 1px solid rgba(251, 191, 36, 0.15);
+  border-left: 3px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+.mcp-registry-notice-icon {
+  color: var(--yellow);
+  font-size: 13px;
+  margin-right: 6px;
+}
+.mcp-registry-notice a {
+  color: var(--yellow);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.mcp-registry-notice a:hover {
+  color: var(--fg-bright);
+}
+
+/* -- MCP Registry search -------------------------------------------------- */
+.mcp-registry-search {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.mcp-registry-search input[type="search"] {
+  flex: 1;
+  padding: 9px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.mcp-registry-search input[type="search"]:focus {
+  border-color: var(--magenta);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.15);
+}
+.mcp-registry-search input[type="search"]::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.8;
+}
+.mcp-registry-search select {
+  padding: 9px 30px 9px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  min-width: 110px;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238a93ad' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.mcp-registry-search select:focus {
+  border-color: var(--magenta);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.15);
+}
+
+/* -- MCP Registry result cards -------------------------------------------- */
+.mcp-reg-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: start;
+  padding: 14px 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 6px;
+  transition: border-color 0.15s;
+}
+.mcp-reg-card:hover {
+  border-color: var(--border-strong);
+  border-left-color: var(--magenta);
+}
+.mcp-reg-card-info {
+  min-width: 0;
+}
+.mcp-reg-card-name {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-bright);
+  margin-bottom: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcp-reg-card-repo {
+  color: var(--fg-dim);
+  text-decoration: none;
+  font-size: 11px;
+  margin-left: 4px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+.mcp-reg-card-repo:hover {
+  opacity: 1;
+  color: var(--magenta);
+}
+.mcp-reg-card-repo:focus-visible {
+  opacity: 1;
+  color: var(--magenta);
+  outline: 2px solid var(--magenta);
+  outline-offset: 2px;
+}
+.mcp-reg-card-desc {
+  font-size: 11px;
+  color: var(--fg-dim);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+.mcp-reg-card-meta {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.mcp-reg-card-meta .scope-badge {
+  font-size: 9px;
+}
+.mcp-reg-card-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.mcp-reg-card-version {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+.mcp-install-btn {
+  background: var(--magenta);
+  color: var(--bg);
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 5px 14px;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+  transition: filter 0.15s;
+  white-space: nowrap;
+}
+.mcp-install-btn:hover {
+  filter: brightness(1.15);
+}
+.mcp-install-btn:focus-visible {
+  outline: 2px solid var(--fg-bright);
+  outline-offset: 2px;
+}
+.mcp-install-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.mcp-install-btn.mcp-update-btn {
+  background: transparent;
+  color: var(--yellow);
+  border: 1px solid var(--yellow);
+}
+.mcp-install-btn.mcp-update-btn:hover {
+  background: rgba(251, 191, 36, 0.1);
+  filter: none;
+}
+.mcp-installed-badge {
+  display: inline-block;
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 3px 8px;
+  border-radius: 2px;
+  background: rgba(52, 211, 153, 0.1);
+  color: var(--green);
+  border: 1px solid rgba(52, 211, 153, 0.2);
+}
+
+#mcp-registry-pagination {
+  display: flex;
+  align-items: center;
+  padding: 12px 0;
+}
+.mcp-registry-count-label {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-left: 10px;
+}
+
+/* -- MCP Install modal ---------------------------------------------------- */
+.mcp-install-summary-name {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--magenta);
+  margin-bottom: 4px;
+}
+.mcp-install-summary-desc {
+  font-size: 12px;
+  color: var(--fg-dim);
+  margin-bottom: 12px;
+  line-height: 1.4;
+}
+.mcp-install-source-group {
+  margin-bottom: 14px;
+}
+/* Doubled with .sh-body — the fourth label-rooted shelf component (after
+   toggle-switch / cap / segmented-option) that must out-rank the hatch.css
+   label micro-cadence at 0,1,1. */
+.sh-body label.mcp-install-source-label,
+.mcp-install-source-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  margin-bottom: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+  font-size: 12px;
+  color: var(--fg);
+}
+.mcp-install-source-label:hover {
+  border-color: var(--magenta);
+}
+.mcp-install-source-label input[type="radio"] {
+  width: auto;
+  margin: 0;
+}
+.mcp-install-source-type {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+@media (max-width: 700px) {
+  .mcp-reg-card {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .mcp-reg-card-actions {
+    flex-direction: row;
+    align-items: center;
+  }
+  .mcp-registry-search {
+    flex-direction: column;
+  }
+  #admin-mcp .admin-toolbar,
+  #admin-models .admin-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  #mcp-servers-toolbar {
+    display: flex;
+    gap: 6px;
+    width: 100%;
+  }
+  #admin-skills .admin-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  #skill-installed-toolbar {
+    display: flex;
+    gap: 6px;
+    width: 100%;
+  }
+}
+
+/* ==========================================================================
+   OIDC detail panel (inline expansion below user row)
+   ========================================================================== */
+.oidc-detail-panel,
+.proj-detail-panel {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 150ms ease;
+  margin: 0 8px 0 24px;
+}
+.oidc-detail-inner,
+.proj-detail-inner {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  margin-bottom: 8px;
+  background: var(--row-alt);
+}
+.oidc-detail-header,
+.proj-detail-header {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+}
+.oidc-detail-header::before,
+.proj-detail-header::before {
+  content: "\25c6 ";
+  color: var(--accent);
+}
+/* Per-project resources panel rows: name/link left, dim meta right. */
+.proj-detail-header + .proj-detail-header,
+.proj-detail-row + .proj-detail-header {
+  margin-top: 12px;
+}
+.proj-detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  font-size: 12px;
+  align-items: baseline;
+}
+.proj-detail-row + .proj-detail-row {
+  border-top: 1px solid var(--border);
+}
+.proj-detail-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proj-detail-dim {
+  color: var(--fg-dim);
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.proj-detail-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+}
+.proj-detail-link:hover {
+  text-decoration-color: var(--accent);
+}
+.oidc-identity-row {
+  display: grid;
+  grid-template-columns: 70px 100px 1fr 60px 50px;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12px;
+  align-items: center;
+}
+.oidc-identity-row + .oidc-identity-row {
+  border-top: 1px solid var(--border);
+}
+.oidc-identity-issuer {
+  overflow: hidden;
+}
+.oidc-identity-issuer .scope-badge {
+  font-size: 10px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oidc-identity-subject {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oidc-identity-email {
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oidc-identity-time {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.oidc-identity-actions .admin-btn-danger {
+  font-size: 11px;
+}
+.oidc-detail-empty,
+.proj-detail-empty {
+  color: var(--fg-dim);
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* Expand indicator on user rows */
+.admin-row[data-expandable] {
+  cursor: pointer;
+}
+.admin-row[data-expandable]:hover {
+  background: var(--bg-highlight);
+}
+.admin-row[data-expandable]:hover .admin-expand-indicator {
+  color: var(--fg);
+}
+.admin-row[data-expandable]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.admin-expand-indicator {
+  display: inline-block;
+  width: 14px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  transition: transform 150ms ease;
+  transform-origin: center;
+}
+.admin-expand-indicator.expanded {
+  transform: rotate(90deg);
+}
+
+@media (max-width: 700px) {
+  .oidc-identity-row {
+    grid-template-columns: 70px 1fr 50px;
+  }
+  .oidc-identity-email,
+  .oidc-identity-time {
+    display: none;
+  }
+  .oidc-detail-panel,
+  .proj-detail-panel {
+    margin-left: 8px;
+  }
+}
+
+/* -- Models grid --------------------------------------------------------- */
+.models-grid {
+  grid-template-columns: 1.2fr 1.2fr 80px 90px 80px 160px;
+  gap: 0 6px;
+}
+@media (max-width: 700px) {
+  .models-grid {
+    grid-template-columns: 1fr 80px 160px;
+  }
+  .models-grid .admin-col:nth-child(2),
+  .models-grid .admin-col:nth-child(3),
+  .models-grid .admin-col:nth-child(4) {
+    display: none;
+  }
+  .models-grid .admin-col:last-child {
+    white-space: normal;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+  }
+}
+
+/* Model status indicators */
+.model-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+.model-status-dot.enabled {
+  background: var(--blue);
+  box-shadow: 0 0 6px var(--blue-glow);
+}
+.model-status-dot.disabled {
+  background: var(--fg-dim);
+  opacity: 0.35;
+}
+
+.model-row-enabled {
+  border-left: 3px solid var(--blue);
+}
+.model-row-disabled {
+  border-left: 3px solid transparent;
+}
+
+/* Provider badges */
+.model-provider-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: var(--bg-highlight);
+  border: 1px solid var(--border);
+}
+.model-provider-openai {
+  color: var(--blue);
+  border-color: rgba(56, 189, 248, 0.2);
+}
+.model-provider-anthropic {
+  color: var(--magenta);
+  border-color: rgba(192, 132, 252, 0.25);
+}
+.model-provider-google {
+  color: var(--green);
+  border-color: rgba(52, 211, 153, 0.2);
+}
+.model-provider-compat {
+  color: var(--fg-dim);
+  border-color: var(--border-strong);
+}
+
+/* Per-model override hints */
+.model-overrides-hint {
+  font-size: 10px;
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
+}
+
+/* Models → Roles sub-tab rows */
+.model-role-row {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-strong);
+}
+.model-role-row:last-child {
+  border-bottom: none;
+}
+.model-role-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.model-role-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.model-role-desc {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+}
+.model-role-controls {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(180px, auto);
+  column-gap: 16px;
+  row-gap: 8px;
+  align-items: end;
+}
+.model-role-control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.model-role-control-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+}
+.model-role-control select {
+  width: 100%;
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  color: var(--fg);
+  border-radius: 3px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+.model-role-control select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Model source badge */
+.scope-db {
+  color: var(--blue);
+  border-color: rgba(56, 189, 248, 0.2);
+}
+
+/* ==========================================================================
+   Reduced motion — console-specific
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .csb-np-caret {
+    transition: none;
+  }
+  .csb-state,
+  .csb-np-trigger,
+  .csb-np-item {
+    transition: none;
+  }
+  .dash-cell-node {
+    transition: none;
+  }
+  .dash-row.has-link::after {
+    transition: none;
+  }
+  .admin-row,
+  .admin-btn-danger,
+  .admin-btn-caution,
+  .admin-btn-action,
+  .admin-kebab-btn,
+  .admin-kebab-item,
+  .admin-subtab-btn {
+    transition: none;
+  }
+  .settings-toggle-slider,
+  .settings-toggle-slider::before {
+    transition: none;
+  }
+  .settings-save-btn,
+  .settings-reset-btn,
+  .settings-docs-link,
+  .settings-help-btn {
+    transition: none;
+  }
+  #view-admin {
+    animation: none;
+  }
+  .admin-action-btn {
+    transition: none;
+  }
+  .mcp-status-dot.connecting {
+    animation: none;
+  }
+  .oidc-detail-panel,
+  .proj-detail-panel,
+  .admin-expand-indicator {
+    transition: none;
+  }
+  .mcp-view-btn,
+  .mcp-reg-card,
+  .mcp-install-btn,
+  .mcp-install-source-label {
+    transition: none;
+  }
+  .mcp-registry-search input[type="search"] {
+    transition: none;
+  }
+  .mcp-reg-card-repo {
+    transition: none;
+  }
+  .mcp-sync-pending,
+  .model-sync-pending {
+    animation: none;
+  }
+}
+
+/* Node metadata */
+.nm-source-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.nm-source-auto {
+  background: var(--green-glow);
+  color: var(--green);
+}
+.nm-source-user {
+  background: var(--cyan-glow);
+  color: var(--cyan);
+}
+.nm-source-config {
+  background: var(--yellow-glow);
+  color: var(--yellow);
+}
+
+.nm-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.nm-table th {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  padding: 4px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.nm-table td {
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--fg);
+  border-bottom: 1px solid var(--border);
+}
+.nm-key {
+  font-family: var(--font-mono);
+  color: var(--fg-bright);
+}
+.nm-val {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nm-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+}
+.nm-add-row input[type="text"] {
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.nm-add-row input[type="text"]:first-of-type {
+  width: 120px;
+}
+.nm-add-row input[type="text"]:nth-of-type(2) {
+  flex: 1;
+}
+.nm-add-row input[type="text"]:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.nm-add-row input[type="text"]::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.6;
+}
+.nm-add-row input[type="text"]:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (max-width: 700px) {
+  .nm-add-row {
+    flex-wrap: wrap;
+  }
+  .nm-add-row input[type="text"] {
+    width: 100% !important;
+    flex: none;
+  }
+  .nm-val {
+    max-width: 150px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nm-add-row input[type="text"] {
+    transition: none;
+  }
+}
+
+/* ===== Personas shelf — the tool-visibility checklist (four-lever form).
+   Grid of toggle rows so 16+ tool names don't become a full-height column;
+   the free-text row beneath carries MCP/dynamic names. */
+#pr-tools-checklist {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 2px 14px;
+  margin: 4px 0 10px;
+}
+#pr-tools-picker {
+  margin: 2px 0 6px;
+}

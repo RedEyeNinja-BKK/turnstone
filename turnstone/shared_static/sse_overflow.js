@@ -1,0 +1,96 @@
+// Client half of the SSE overflow recovery — the storm-guard math and the
+// degraded-catchup cooldown ladder, shared by every pane that consumes a
+// per-workstream SSE stream (the interactive pane and the coordinator pane).
+//
+// The server closes a stream whose listener queue overflowed — after an
+// id-less `stream_overflow` frame — and the native EventSource reconnect
+// replays the gap from the server's ring buffer.  For a consumer that STAYS
+// too slow that cycle would churn forever (reconnect → replay burst →
+// re-saturate → re-close, stalling ~3-5 s per retry round), so after
+// OVERFLOW_TRIP_COUNT overflow closes inside a rolling OVERFLOW_TRIP_WINDOW_MS
+// the pane drops to a degraded catch-up: stop live streaming, say so plainly,
+// and re-try after a doubling cooldown — the eventual reconnect replays the
+// gap, or falls to the replay_truncated → /history floor once the gap
+// outgrows the ring.
+//
+// The two surfaces keep their OWN transport/DOM glue (interactive.js is a
+// class whose methods hang off `this` and route through disconnectSSE;
+// coordinator.js is a closure with an inline stream close) but share these two
+// pure helpers + the constants, so the trip threshold and the escalation
+// ladder — the review-hardened, drift-prone part — have a single source of
+// truth instead of two copies that silently diverge.
+export const OVERFLOW_TRIP_COUNT = 3;
+export const OVERFLOW_TRIP_WINDOW_MS = 60000;
+export const DEGRADED_COOLDOWN_BASE_MS = 15000;
+export const DEGRADED_COOLDOWN_MAX_MS = 120000;
+// Reset the cooldown ladder back to base only after this long WITHOUT a
+// degraded trip.  Deliberately larger than DEGRADED_COOLDOWN_MAX_MS: a
+// persistently-slow consumer trips again roughly one cooldown apart, so keying
+// the reset off the (shorter) trip window would let the gap between
+// top-of-ladder trips exceed the window and oscillate the cooldown back to
+// base — the escalation must survive its own backoff.
+export const DEGRADED_COOLDOWN_RESET_MS = 300000;
+// Random 0..this spread before a truncated-triggered /history resync starts.
+// The truncated envelope is herd-shaped: a node restart makes EVERY open tab
+// with a stale cursor reconnect inside the EventSource retry jitter
+// (2.5-4.5 s) and — since empty-ring reconnects now report truncated instead
+// of a silent replay_ok — each one answers with a full /history fetch.  The
+// per-tab churn limiter can't see the cross-tab herd (one resync per tab
+// never trips it), so the spread happens client-side, before the fetch.
+// During the wait the pane keeps painting live events (the gap predates the
+// resync either way), so the only cost is a delayed backfill.  If restart
+// herds ever measure hot despite the spread, the deeper complement is
+// server-side /history coalescing/rate-limiting (#884) — a node-side
+// change, not a bigger jitter: the spread lowers the peak but not the
+// total per-restart fetch count.
+export const TRUNCATED_RESYNC_JITTER_MS = 10000;
+
+// Spread for the clear_ui staleness retry, ADDITIVE over STALE_RETRY_BASE_MS
+// (`STALE_RETRY_BASE_MS + Math.random() * this`).  One clear_ui fans out to every listener
+// on the workstream, so an un-spread retry makes N tabs re-fetch /history in
+// near-lockstep — and #900 widened that arm: a render the cursor-safety gate
+// declines now leaves the latch set, so a SUCCESSFUL fetch can arm the retry
+// too, and the decline trigger (transport down) is itself herd-shaped.
+//
+// Deliberately small, and deliberately NOT TRUNCATED_RESYNC_JITTER_MS: this
+// spread works AGAINST #884's `(ws_id, limit, generation)` single-flight,
+// which coalesces a lockstep herd into one reconstruction.  Spreading past a
+// typical flight duration de-coalesces it — lower peak, higher total. 500 ms
+// keeps the window comparable to a flight while still breaking lockstep.
+// The floor is load-bearing for the e2e non-occurrence detectors (they size
+// their windows on floor + this); raising either requires widening those.
+export const STALE_RETRY_JITTER_MS = 500;
+
+// The floor the jitter is additive OVER.  Exported rather than left as a
+// literal in each client because FOUR sites must move together: both panes'
+// retry arms and both e2e non-occurrence windows, which size themselves on
+// floor + jitter and go vacuous if the retry can fire before they open.
+export const STALE_RETRY_BASE_MS = 2000;
+
+// Rolling-window trip check.  Prunes `times` in place (entries older than
+// windowMs against nowMs) and reports whether count-or-more remain.  A
+// standalone pure function so the trip logic can be lifted verbatim into a
+// bare `node` runtime probe (see tests/test_sse_overflow_js.py).
+export function overflowWindowTripped(times, nowMs, count, windowMs) {
+  while (times.length && nowMs - times[0] > windowMs) times.shift();
+  return times.length >= count;
+}
+
+// Cooldown-ladder step for degraded catch-up.  Escalates (double, capped at
+// maxMs) when a trip recurs within resetMs of the last one; resets to baseMs
+// only after a genuine quiet gap.  Pure — keyed off the last-trip TIMESTAMP,
+// never the overflow-window array (which the caller clears each trip, so
+// keying off it would reset the ladder on every storm's first overflow and
+// the doubling would never escalate).  Split out so the escalation is
+// runtime-testable without a DOM-bound pane.
+export function degradedCooldownStep(
+  prevCooldownMs,
+  lastTripAtMs,
+  nowMs,
+  baseMs,
+  maxMs,
+  resetMs,
+) {
+  const cooldown = nowMs - lastTripAtMs > resetMs ? baseMs : prevCooldownMs;
+  return { cooldown, nextCooldownMs: Math.min(cooldown * 2, maxMs) };
+}

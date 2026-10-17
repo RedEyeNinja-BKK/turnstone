@@ -1,0 +1,342 @@
+/* ==========================================================================
+   Interactive pane — console L-shell styling (step 5b)
+
+   The conversational Pane (shared_static/interactive.js) mounts its own .pane
+   div inside the L-shell's .pane-body.  This sheet provides TWO things, loaded
+   by the console (and, in step 6, the standalone shell):
+
+   1. The EMBEDDED slim-header layout, scoped to .pane--embedded so it never
+      touches the ShellPane's own .pane section (the brief's namespace-collision
+      watch-out).  The standalone split-pane chrome stays in ui/static/style.css.
+
+   2. The post-execution result subsystem — tool output (collapse / stream) +
+      media / MCP-error embeds — kept interactive-only (live-execution
+      affordances the read-only coordinator history doesn't need).  The approval
+      CARD chrome (rows / verdict / warning / actions / status) was unified into
+      shared_static/conversation.css (step 5e.2); this sheet no longer carries a
+      ts-approval / verdict copy.
+   ========================================================================== */
+
+/* ---- 1. Embedded chrome (.pane--embedded) ------------------------------- */
+
+/* Fill the pane-body; shell.css `.pane` already gives display:flex column. */
+.pane--embedded {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* No embedded pane header — name / persona / state are shown by the tab + rail
+   (Workspaces), so the conversation reclaims the full pane height.  The slim
+   header + kind-tag rules were removed here when the embedded header was
+   dropped; the standalone split-pane header (retired in step 6) styles itself
+   from ui/static. */
+
+/* Messages scroll; the per-ws status bar + composer stay pinned. */
+.pane--embedded .pane-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 13px;
+  display: flex;
+  flex-direction: column;
+  /* Trimmed from 5px: the .msg turn boxes already carry a 4px margin-bottom, so
+     a 5px flex gap stacked ~9px of dead space between segments ("too thick").
+     2px gap + the 4px element margin lands at a compact ~6px between turns. */
+  gap: 2px;
+}
+/* The message list is a SCROLLING flex column (overflow-y:auto), so its children
+   must size to content and never shrink.  Without this, an `overflow:hidden`
+   card — the .conv-batch tool block — has its flex `min-height:auto` resolve to
+   0 and gets squished to a ~2px stripe (just its border) once the column fills,
+   while plain .msg blocks (overflow visible) keep their height.  That asymmetry
+   is the "tool calls collapse to an empty stripe" regression; pinning every row
+   makes the column scroll instead. */
+.pane--embedded .pane-messages > * {
+  flex-shrink: 0;
+}
+.pane--embedded .ws-status-bar {
+  flex-shrink: 0;
+}
+
+/* ---- 2. Conversational rendering (copied from ui/static/style.css) ------- */
+
+.skip-permissions-warning {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--yellow);
+  padding: 2px 8px;
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  letter-spacing: 0.02em;
+}
+
+/* Historical-message attachment pills — beneath the user bubble */
+.msg-user-attach {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.msg-user-attach-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-surface);
+  color: var(--fg-dim, var(--fg));
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.msg-user-attach-icon {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.msg-user-attach-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-output {
+  padding: 8px 12px;
+  background: var(--code-bg);
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: var(--fg-dim);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.tool-output-error {
+  color: var(--red);
+}
+
+.tool-output-stream {
+  border-left: 2px solid var(--accent);
+  max-height: 400px;
+  animation: stream-pulse 2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tool-output-stream {
+    animation: none;
+  }
+}
+
+.tool-output.collapsed {
+  max-height: 150px;
+  position: relative;
+  overflow: hidden;
+}
+
+.tool-output.collapsed::after {
+  content: "click to expand";
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  text-align: center;
+  padding: 6px;
+  background: linear-gradient(transparent, var(--code-bg) 60%);
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  letter-spacing: 0.03em;
+}
+
+/* ==========================================================================
+   Media embed cards (MCP tool output with stream_url / results)
+   ========================================================================== */
+.media-embed {
+  border-top: 1px solid var(--border);
+  background: var(--code-bg);
+}
+
+.media-card {
+  display: flex;
+  gap: 12px;
+  padding: 10px 12px;
+  align-items: flex-start;
+}
+
+.media-card-thumb {
+  width: 80px;
+  height: 120px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+
+.media-card-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.media-card-title {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-bright);
+  margin-bottom: 2px;
+}
+
+.media-card-meta {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+
+.media-play-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.media-play-btn:hover {
+  background: rgba(229, 160, 66, 0.1);
+}
+
+.media-play-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.media-play-btn:active {
+  background: rgba(229, 160, 66, 0.2);
+}
+
+.media-play-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.media-player {
+  width: 100%;
+  max-height: 480px;
+  background: #000;
+  border-radius: 0;
+}
+
+audio.media-player {
+  max-height: 54px;
+}
+
+.media-player-error {
+  color: var(--red);
+  font-size: 12px;
+  padding: 8px 12px;
+  background: var(--code-bg);
+}
+
+.media-results-list {
+  padding: 6px 12px;
+}
+
+.media-result-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  align-items: center;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.media-result-row:last-child {
+  border-bottom: none;
+}
+
+.media-result-thumb {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+
+.media-result-title {
+  color: var(--fg-bright);
+  font-weight: 500;
+}
+
+.media-result-meta {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.media-results-count {
+  text-align: right;
+  font-size: 10px;
+  color: var(--fg-dim);
+  padding: 4px 0;
+}
+
+/* ==========================================================================
+   Empty state
+   ========================================================================== */
+.empty-state {
+  color: var(--fg-dim);
+  text-align: center;
+  padding: 48px 16px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.judge-spinner-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: judge-pulse 1.2s ease-in-out infinite;
+}
+
+/* Tool output (streamed command/fetch result) — uses the panel / ink
+   tokens for surface + text colour. */
+.tool-output {
+  background: var(--panel);
+  color: var(--ink-2);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hair);
+}
+
+.tool-output-error {
+  color: var(--err);
+}
+
+.tool-output-stream {
+  border-left: 2px solid var(--accent);
+}
+
+.tool-output.collapsed::after {
+  background: linear-gradient(transparent, var(--panel) 70%);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding-top: 14px;
+}
+
+/* MCP error embed rules live in shared_static/mcp_error.css — the sheet
+   pairs with mcp_error.js and is linked by every card host (dual-static
+   rule: shared visual rules live in shared_static, next to their JS). */

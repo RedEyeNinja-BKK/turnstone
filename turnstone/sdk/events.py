@@ -1,0 +1,613 @@
+"""Standalone SSE event dataclasses for the turnstone SDK.
+
+These types match the JSON payloads emitted by the server and console
+SSE endpoints.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+from typing import Any
+
+# Runtime import keeps the public SDK alias and dataclass annotations resolvable.
+from turnstone.core.workstream import (  # noqa: TC001
+    ConversationPersistenceState as ConversationPersistenceState,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _fields_of(cls: type[Any]) -> frozenset[str]:
+    return frozenset(f.name for f in fields(cls))
+
+
+# ---------------------------------------------------------------------------
+# Server per-workstream events  (/v1/api/workstreams/{ws_id}/events)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ServerEvent:
+    """Base class for all server SSE events."""
+
+    type: str = ""
+    ws_id: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ServerEvent:
+        """Deserialize an SSE JSON payload into a typed event."""
+        etype = data.get("type", "")
+        klass = _SERVER_REGISTRY.get(etype, ServerEvent)
+        valid = _fields_of(klass)
+        return klass(**{k: v for k, v in data.items() if k in valid})
+
+
+@dataclass
+class ConnectedEvent(ServerEvent):
+    type: str = "connected"
+    model: str = ""
+    model_alias: str = ""
+    skip_permissions: bool = False
+
+
+@dataclass
+class HistoryEvent(ServerEvent):
+    """SSE replay payload — the per-tab message backlog on connect.
+
+    Each entry in ``messages`` is a per-message dict the frontend
+    consumes directly. Notable optional keys:
+
+    * ``role`` (``"user"`` / ``"assistant"`` / ``"tool"`` / ``"system"``)
+    * ``content`` — string for text turns, list for image / document parts
+    * ``tool_calls`` — list of ``{id, name, arguments, verdict?,
+      output_assessment?}`` (assistant turns)
+    * ``tool_call_id`` — the originating call's id (tool turns)
+    * ``source`` — the operator-context kind on a ``system`` turn
+      (``output_guard`` / ``user_interjection`` / ``tool_error`` / ...),
+      or ``"system_nudge"`` on a wake-driven empty user turn
+    * ``meta`` — structured per-kind fields on an operator-context
+      ``system`` turn (e.g. ``watch_triggered``'s ``{watch_name, command,
+      poll_count, max_polls, is_final}``) so the renderer can rebuild
+      per-kind UI (the watch-result card); absent when the kind carries no
+      structured data
+    * ``attachments`` — per-attachment metadata ``{kind, filename,
+      mime_type}`` (turns that carried image / document refs)
+    * ``reasoning`` — concatenated reasoning text for assistant turns
+      that round-tripped a thinking-block lane (Anthropic-with-thinking
+      today; OpenAI Responses + Gemini in later phases). Present only
+      when the active model's ``surface_persisted_reasoning`` flag is true and
+      the underlying ``provider_data`` carries reasoning blocks.
+    """
+
+    type: str = "history"
+    messages: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class HistoryResyncEvent(ServerEvent):
+    """The rendered REST history no longer matches the live row prefix.
+
+    This is stronger than an event-ring gap.  Callers must stop using the
+    current stream, fetch ``/history`` again, render that response, and open a
+    new stream with its one-shot handoff token.  The SDK intentionally does
+    not perform that policy automatically.
+    """
+
+    type: str = "history_resync"
+    reason: str = ""
+
+
+@dataclass
+class UserTurnEvent(ServerEvent):
+    """Canonical accepted user row projected to every stream consumer.
+
+    ``client_send_ids`` correlate browser optimistic bubbles only; they are
+    not idempotency keys. ``_event_id`` is the monotonic row/event identity.
+    """
+
+    type: str = "user_turn"
+    content: str = ""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    sender: str = ""
+    source: str = ""
+    client_send_ids: list[str] = field(default_factory=list)
+    _event_id: int | None = None
+
+
+@dataclass
+class ThinkingStartEvent(ServerEvent):
+    type: str = "thinking_start"
+
+
+@dataclass
+class ThinkingStopEvent(ServerEvent):
+    type: str = "thinking_stop"
+
+
+@dataclass
+class ReasoningEvent(ServerEvent):
+    type: str = "reasoning"
+    text: str = ""
+
+
+@dataclass
+class ContentEvent(ServerEvent):
+    type: str = "content"
+    text: str = ""
+
+
+@dataclass
+class InProgressSnapshotEvent(ServerEvent):
+    """One-shot replay of the in-progress turn's content + reasoning.
+
+    Emitted by the per-workstream events SSE handler immediately after
+    the kind-specific replay phase (history / pending / state_change)
+    when a fresh subscriber connects mid-stream. Lets a refreshing
+    browser tab restore the partial assistant message without waiting
+    for the response to complete and a full page reload.
+    """
+
+    type: str = "in_progress_snapshot"
+    content: str = ""
+    reasoning: str = ""
+
+
+@dataclass
+class AgentContextEvent(ServerEvent):
+    """Latest prompt usage for one running task agent.
+
+    Live updates follow each task-agent model turn. Fresh or truncated SSE
+    connections also receive one synthetic reading per active parent call. A
+    ``ToolResultEvent`` whose ``call_id`` matches ``parent_call_id`` is the
+    terminal signal; completed readings are not retained in history.
+    """
+
+    type: str = "agent_context"
+    parent_call_id: str = ""
+    prompt_tokens: int = 0
+    context_window: int = 0
+
+
+@dataclass
+class StateChangeEvent(ServerEvent):
+    type: str = "state_change"
+    state: str = ""
+
+
+@dataclass
+class StreamEndEvent(ServerEvent):
+    type: str = "stream_end"
+
+
+@dataclass
+class ToolPendingEvent(ServerEvent):
+    """Early paint of a tool batch the model just committed to.
+
+    Emitted at the top of ``approve_tools`` — before the tool-policy
+    lookup, the Smart Approvals verdict wait, and the human approval
+    gate — so a client can render the pending call (and offer Stop)
+    the instant it appears, rather than waiting for the judge verdict.
+    The authoritative :class:`ToolInfoEvent` (auto-approved) or
+    :class:`ApproveRequestEvent` (human gate) follows with the resolved
+    state; both carry the same ``call_id`` items so a client keys the
+    construct by ``call_id`` and upgrades it in place instead of
+    duplicating.  ``items`` carry the heuristic verdict but not yet the
+    auto-approve tag or completed LLM verdict.
+    """
+
+    type: str = "tool_pending"
+    items: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ToolInfoEvent(ServerEvent):
+    type: str = "tool_info"
+    items: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ApproveRequestEvent(ServerEvent):
+    """One approval CYCLE awaiting the operator.
+
+    ``cycle_id`` names the round: echo it back on the approve POST to
+    resolve exactly this batch.  Several of these can be outstanding at
+    once — parallel task agents each gate their own tool calls — so
+    clients must key prompt UI by ``cycle_id``, not assume a singleton.
+    """
+
+    type: str = "approve_request"
+    cycle_id: str = ""
+    items: list[dict[str, Any]] = field(default_factory=list)
+    judge_pending: bool = False
+
+
+@dataclass
+class ApprovalResolvedEvent(ServerEvent):
+    """A specific approval cycle resolved (by any connected client).
+
+    ``cycle_id`` / ``call_ids`` identify WHICH prompt to dismiss —
+    with concurrent cycles a bare "something resolved" would dismiss
+    the wrong card.
+    """
+
+    type: str = "approval_resolved"
+    approved: bool = False
+    feedback: str = ""
+    always: bool = False
+    cycle_id: str = ""
+    call_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ToolResultEvent(ServerEvent):
+    type: str = "tool_result"
+    call_id: str = ""
+    name: str = ""
+    output: str = ""
+    is_error: bool = False
+    preview: dict[str, Any] | None = None
+    accepted: bool = False
+    effect_status: str = ""
+    _event_id: int | None = None
+
+
+@dataclass
+class ToolOutputChunkEvent(ServerEvent):
+    type: str = "tool_output_chunk"
+    call_id: str = ""
+    chunk: str = ""
+
+
+@dataclass
+class StatusEvent(ServerEvent):
+    type: str = "status"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    context_window: int = 0
+    pct: float = 0.0
+    effort: str = ""
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    tool_calls_this_turn: int = 0
+    turn_count: int = 0
+
+
+@dataclass
+class InfoEvent(ServerEvent):
+    type: str = "info"
+    message: str = ""
+
+
+@dataclass
+class ErrorEvent(ServerEvent):
+    type: str = "error"
+    message: str = ""
+
+
+@dataclass
+class BusyErrorEvent(ServerEvent):
+    type: str = "busy_error"
+    message: str = ""
+
+
+@dataclass
+class ClearUiEvent(ServerEvent):
+    type: str = "clear_ui"
+
+
+@dataclass
+class CancelledEvent(ServerEvent):
+    type: str = "cancelled"
+
+
+@dataclass
+class IntentVerdictEvent(ServerEvent):
+    type: str = "intent_verdict"
+    tool_name: str = ""
+    verdict: str = ""
+    reason: str = ""
+    call_id: str = ""
+    func_name: str = ""
+    intent_summary: str = ""
+    risk_level: str = ""
+    confidence: float = 0.0
+    recommendation: str = ""
+    reasoning: str = ""
+    tier: str = ""
+    judge_model: str = ""
+    verdict_id: str = ""
+    latency_ms: int = 0
+
+
+@dataclass
+class OutputWarningEvent(ServerEvent):
+    """Output-guard finding for a tool result (Facet 2 of intent validation).
+
+    The chip is a MERGE of the regex heuristic and the LLM judge (issue
+    #560, "show, annotated"): ``risk_level`` is max(heuristic, llm) and
+    ``flags`` is their union — a positive from either detector surfaces and
+    an LLM "none" never lowers a heuristic positive.  ``tier`` is ``"llm"``
+    when the judge returned a verdict (then ``judge_risk`` / ``confidence``
+    / ``reasoning`` / ``judge_model`` carry its OWN opinion, which may
+    differ from the displayed ``risk_level``), else ``"heuristic"``.
+    Mirrors ``ChatSession._evaluate_output`` and the replay projection
+    ``build_merged_output_assessment_payload`` — all three share
+    ``output_guard.merge_guard_display_payload``.
+    """
+
+    type: str = "output_warning"
+    call_id: str = ""
+    func_name: str = ""
+    risk_level: str = ""
+    flags: list[str] = field(default_factory=list)
+    annotations: list[str] = field(default_factory=list)
+    redacted: bool = False
+    output_length: int = 0
+    tier: str = "heuristic"
+    judge_risk: str = ""
+    confidence: float = 0.0
+    reasoning: str = ""
+    judge_model: str = ""
+
+
+@dataclass
+class CompactionEvent(ServerEvent):
+    """Context-compaction lifecycle (``phase`` = start / progress / end).
+
+    ``start`` carries ``trigger`` (``"manual"`` / ``"auto"``; auto adds
+    ``where`` + ``pct``); ``progress`` carries chunked-summarization
+    ``part``/``total``/``depth`` (or ``retry_in``/``error`` for a retry
+    wait); ``end`` carries ``ok`` plus either the result
+    (``before_tokens``/``after_tokens``/``summary``) or the failure
+    ``reason``/``message`` — failure ends carry ``trigger`` too.  The
+    ``target`` is ``"workstream"`` when the lifecycle owns the transcript
+    and durable marker. ``"task_agent"`` events instead carry
+    ``parent_call_id`` and are transient progress for that nested task; their
+    successful end omits ``summary``. Events without a target are workstream
+    events because that was the only compaction scope before targeted events
+    existed. The workstream successful end's summary is also
+    persisted as a compaction marker row and replays from ``/history`` as a
+    ``role="system"``, ``source="compaction"`` entry. ``compaction_id``
+    correlates every event of one attempt (0 from internal emitters). End
+    events additionally carry ``superseded``: True marks a force-abandoned
+    compaction retiring after a successor generation took over — clients
+    should skip failure notices for those (an OK end's result still
+    stands; the history swap happened). Failed ends carry ``notice``: the
+    emitter-computed display verdict. Workstream errors use their paired typed
+    error and set it false; task-agent errors have no unscoped error twin and
+    set it true for the nested card. Clients show ``message`` only when notice
+    is true instead of re-deriving policy from reason/trigger/superseded.
+    """
+
+    type: str = "compaction"
+    phase: str = ""
+    target: str = "workstream"
+    parent_call_id: str = ""
+    compaction_id: int = 0
+    superseded: bool = False
+    notice: bool = False
+    trigger: str = ""
+    where: str = ""
+    pct: int | None = None
+    part: int | None = None
+    total: int | None = None
+    depth: int | None = None
+    retry_in: float | None = None
+    error: str = ""
+    warning: str = ""
+    ok: bool | None = None
+    reason: str = ""
+    message: str = ""
+    before_tokens: int | None = None
+    after_tokens: int | None = None
+    summary: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Server global events  (/v1/api/events/global)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WsStateEvent(ServerEvent):
+    type: str = "ws_state"
+    state: str = ""
+    tokens: int = 0
+    context_ratio: float = 0.0
+    activity: str = ""
+    activity_state: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
+    content: str = ""  # populated on idle transitions only
+
+
+@dataclass
+class WsActivityEvent(ServerEvent):
+    type: str = "ws_activity"
+    activity: str = ""
+    activity_state: str = ""
+
+
+@dataclass
+class WsRenameEvent(ServerEvent):
+    type: str = "ws_rename"
+    name: str = ""
+
+
+@dataclass
+class WsClosedEvent(ServerEvent):
+    type: str = "ws_closed"
+    name: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Console cluster events  (/v1/api/cluster/events)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClusterEvent:
+    """Base class for console cluster SSE events."""
+
+    type: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClusterEvent:
+        etype = data.get("type", "")
+        klass = _CLUSTER_REGISTRY.get(etype, ClusterEvent)
+        valid = _fields_of(klass)
+        return klass(**{k: v for k, v in data.items() if k in valid})
+
+
+@dataclass
+class NodeJoinedEvent(ClusterEvent):
+    type: str = "node_joined"
+    node_id: str = ""
+
+
+@dataclass
+class NodeLostEvent(ClusterEvent):
+    type: str = "node_lost"
+    node_id: str = ""
+
+
+@dataclass
+class ClusterStateEvent(ClusterEvent):
+    type: str = "cluster_state"
+    ws_id: str = ""
+    node_id: str = ""
+    state: str = ""
+    tokens: int = 0
+    context_ratio: float = 0.0
+    activity: str = ""
+    activity_state: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
+
+
+@dataclass
+class ClusterWsCreatedEvent(ClusterEvent):
+    type: str = "ws_created"
+    ws_id: str = ""
+    node_id: str = ""
+    name: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
+
+
+@dataclass
+class ClusterWsClosedEvent(ClusterEvent):
+    type: str = "ws_closed"
+    ws_id: str = ""
+
+
+@dataclass
+class ClusterWsRenameEvent(ClusterEvent):
+    type: str = "ws_rename"
+    ws_id: str = ""
+    name: str = ""
+
+
+@dataclass
+class ClusterSnapshotEvent(ClusterEvent):
+    type: str = "snapshot"
+    nodes: list[dict[str, Any]] = field(default_factory=list)
+    overview: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = 0.0
+
+
+@dataclass
+class NodeSnapshotEvent(ClusterEvent):
+    """Full node state delivered on SSE connect to ``/v1/api/events/global``."""
+
+    type: str = "node_snapshot"
+    node_id: str = ""
+    workstreams: list[dict[str, Any]] = field(default_factory=list)
+    health: dict[str, Any] = field(default_factory=dict)
+    aggregate: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HealthChangedEvent(ClusterEvent):
+    """Backend health state transition on a server node."""
+
+    type: str = "health_changed"
+    backend_status: str = ""  # "healthy" or "degraded"
+
+
+@dataclass
+class AggregateEvent(ClusterEvent):
+    """Periodic aggregate metrics from a server node."""
+
+    type: str = "aggregate"
+    total_tokens: int = 0
+    total_tool_calls: int = 0
+    active_count: int = 0
+    total_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Type registries (built after all classes are defined)
+# ---------------------------------------------------------------------------
+
+
+def _type_default(cls: type[Any]) -> str:
+    """Return the default value of the ``type`` field for a dataclass."""
+    for f in fields(cls):
+        if f.name == "type":
+            return f.default  # type: ignore[return-value]
+    return ""
+
+
+_SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
+    _type_default(cls): cls
+    for cls in [
+        ConnectedEvent,
+        HistoryEvent,
+        HistoryResyncEvent,
+        UserTurnEvent,
+        ThinkingStartEvent,
+        ThinkingStopEvent,
+        ReasoningEvent,
+        ContentEvent,
+        InProgressSnapshotEvent,
+        AgentContextEvent,
+        StateChangeEvent,
+        StreamEndEvent,
+        ToolPendingEvent,
+        ToolInfoEvent,
+        ApproveRequestEvent,
+        ApprovalResolvedEvent,
+        ToolResultEvent,
+        ToolOutputChunkEvent,
+        StatusEvent,
+        InfoEvent,
+        ErrorEvent,
+        BusyErrorEvent,
+        ClearUiEvent,
+        CancelledEvent,
+        IntentVerdictEvent,
+        OutputWarningEvent,
+        CompactionEvent,
+        WsStateEvent,
+        WsActivityEvent,
+        WsRenameEvent,
+        WsClosedEvent,
+    ]
+}
+
+_CLUSTER_REGISTRY: dict[str, type[ClusterEvent]] = {
+    _type_default(cls): cls
+    for cls in [
+        NodeJoinedEvent,
+        NodeLostEvent,
+        ClusterStateEvent,
+        ClusterWsCreatedEvent,
+        ClusterWsClosedEvent,
+        ClusterWsRenameEvent,
+        ClusterSnapshotEvent,
+        NodeSnapshotEvent,
+        HealthChangedEvent,
+        AggregateEvent,
+    ]
+}

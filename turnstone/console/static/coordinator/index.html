@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en" data-ws-id="{{WS_ID}}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>coordinator · turnstone</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%2315211f'/%3E%3Cpath%20d='M9%2020%2016%2012%2023%2020'%20fill='none'%20stroke='%236bb7a8'%20stroke-width='2.4'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3Ccircle%20cx='16'%20cy='23.5'%20r='2.1'%20fill='%23e5a042'/%3E%3C/svg%3E"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/shared/base.css" />
+    <link rel="stylesheet" href="/shared/ui-base.css" />
+    <link rel="stylesheet" href="/shared/chat.css" />
+    <link rel="stylesheet" href="/shared/conversation.css" />
+    <link rel="stylesheet" href="/shared/mcp_error.css" />
+    <link rel="stylesheet" href="/shared/katex-0.18.4/katex.min.css" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/coordinator/coordinator.css" />
+    <link rel="stylesheet" href="/static/coordinator/coord-chrome.css" />
+    <style>
+      /* standalone page sizing; a console pane is sized by its host instead */
+      body {
+        height: 100vh;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Shared-static set matches the console dashboard
+     (console/static/index.html), two lanes: classic theme.js (FOUC) +
+     vendored katex/hljs; everything else is the deferred shared module
+     substrate (renderer.js is the single canonical markdown implementation
+     shared across the chat pages).  The coordinator module below runs after
+     the substrate by document order. -->
+    <script src="/shared/theme.js"></script>
+    <script type="module" src="/shared/utils.js"></script>
+    <script type="module" src="/shared/toast.js"></script>
+    <script type="module" src="/shared/auth.js"></script>
+    <script type="module" src="/shared/kb.js"></script>
+    <script type="module" src="/shared/composer_paste_text.js"></script>
+    <script type="module" src="/shared/composer.js"></script>
+    <script type="module" src="/shared/composer_attachments.js"></script>
+    <script type="module" src="/shared/composer_queue.js"></script>
+    <script type="module" src="/shared/status_bar.js"></script>
+    <script src="/shared/katex-0.18.4/katex.min.js"></script>
+    <script src="/shared/hljs-11.12.0/highlight.min.js"></script>
+    <script type="module" src="/shared/renderer.js"></script>
+    <script type="module">
+      // Standalone coordinator page = one coordinator pane filling the body.
+      // (The console shell instead creates panes on demand via the same imported
+      //  createCoordinatorPane factory — one per ws_id.)  A module so the import
+      //  resolves before use: a classic eager IIFE would run before the deferred
+      //  coordinator module loaded the factory.
+      import { createCoordinatorPane } from "/static/coordinator/coordinator.js";
+      const wsId = document.documentElement.dataset.wsId || "";
+      const pane = createCoordinatorPane(document.body, wsId, {
+        standalone: true,
+      });
+      if (pane) {
+        pane.connect();
+        window.onLoginSuccess = function () {
+          pane.onLogin();
+        };
+      }
+    </script>
+  </body>
+</html>

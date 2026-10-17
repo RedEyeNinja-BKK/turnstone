@@ -1,0 +1,677 @@
+/* ==========================================================================
+   Rail live sections — Cluster health + Workspaces session tree.
+
+   Step 2 of the L-shell: the rail's `Cluster` and `Workspaces` sections (step-1
+   stub labels) become live, fed by the Tier-1 `clusterState` that app.js owns
+   and exposes via a small `window.TS_APP` seam (getClusterState + onRender +
+   the nav actions).  This module never touches `clusterState` directly — it
+   reads through the seam and re-renders whenever app.js fires `onRender`.
+
+   House style: ES module, programmatic DOM (createElement / textContent /
+   append), NO innerHTML.  State = shape + colour via `ui-base.css .ui-glyph-*`.
+   ========================================================================== */
+
+import { projectName, refreshProjects, onProjectsChange } from "./projects.js";
+import {
+  personaLabel,
+  refreshPersonas,
+  onPersonasChange,
+} from "./personas.js";
+
+const GLYPH = {
+  running: "●",
+  thinking: "◐",
+  attention: "⚠",
+  error: "✗",
+  idle: "○",
+};
+const STATE_LABEL = {
+  running: "running",
+  thinking: "thinking",
+  attention: "attention",
+  error: "error",
+  idle: "idle",
+};
+
+/** A decorative shape+colour state glyph (the row/pill also carries the state
+ *  in text/aria, so the glyph itself is aria-hidden).  Exported so the shell can
+ *  paint the SAME glyph onto a conversational tab from the SAME Tier-1 source —
+ *  rail row and tab stay consistent, one writer (no Tier-2 tab-glyph race). */
+export function glyph(state) {
+  const s = GLYPH[state] ? state : "idle";
+  const el = document.createElement("span");
+  el.className = "ui-glyph ui-glyph-" + s;
+  el.textContent = GLYPH[s];
+  el.setAttribute("aria-hidden", "true");
+  return el;
+}
+
+/** A small count chip for a Manage row/group head — glyph + count (never colour
+ *  alone), DS warn vocabulary (shell.css `.rail-badge`).  The count rides the
+ *  text; the ⚠ glyph is aria-hidden because the supplied `label` already names
+ *  the condition for assistive tech.  Returns a detached span the caller mounts. */
+function badge(count, label) {
+  const el = document.createElement("span");
+  el.className = "rail-badge";
+  const g = document.createElement("span");
+  g.className = "rail-badge-glyph";
+  g.setAttribute("aria-hidden", "true");
+  g.textContent = "⚠"; // ⚠ — pairs the colour with a glyph (chip-contrast rule)
+  const n = document.createElement("b");
+  n.textContent = String(count);
+  el.append(g, n);
+  if (label) el.setAttribute("aria-label", label);
+  return el;
+}
+
+/** Derive a node's overall state glyph from its workstream mix + health. */
+function nodeState(info) {
+  if (!info.reachable) return "error";
+  if ((info.health || {}).status === "degraded") return "attention";
+  if (info.ws_running > 0) return "running";
+  if (info.ws_thinking > 0) return "thinking";
+  if (info.ws_attention > 0) return "attention";
+  return "idle";
+}
+
+function tagFor(kind) {
+  const tag = document.createElement("span");
+  const coord = kind === "coordinator";
+  tag.className = "tag" + (coord ? " coord" : "");
+  tag.textContent = coord ? "COORD" : "INT";
+  return tag;
+}
+
+// ---- Cluster section -------------------------------------------------------
+
+// Node-list collapse state — persisted across Tier-1 re-renders (the rail
+// re-renders on every snapshot).  Click the "Nodes" header to toggle.
+let _nodesCollapsed = false;
+
+function renderCluster(root, cs, TS) {
+  root.replaceChildren();
+  const card = document.createElement("div");
+  card.className = "cluster";
+
+  const overview = (cs && cs.overview) || {};
+  const states = overview.states || {};
+
+  // Health pills — always show run/think/idle; attention/error only when present.
+  const row = document.createElement("div");
+  row.className = "cluster-row";
+  const pillStates = ["running", "thinking", "idle"];
+  for (const st of ["attention", "error"]) {
+    if ((states[st] || 0) > 0) pillStates.splice(2, 0, st);
+  }
+  for (const st of pillStates) {
+    const n = states[st] || 0;
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "cpill";
+    pill.setAttribute("aria-label", n + " " + STATE_LABEL[st] + ", filter");
+    pill.title = n + " " + STATE_LABEL[st]; // names the glyph+count when the rail is collapsed
+    pill.append(glyph(st));
+    const b = document.createElement("b");
+    b.textContent = String(n);
+    // The label rides in a span so the collapsed rail can hide it and keep the
+    // glyph + count (a bare text node is not CSS-addressable).
+    const lbl = document.createElement("span");
+    lbl.className = "cpill-label";
+    lbl.textContent = " " + STATE_LABEL[st];
+    pill.append(b, lbl);
+    pill.addEventListener(
+      "click",
+      () => TS.drillDownByState && TS.drillDownByState(st),
+    );
+    row.append(pill);
+  }
+  card.append(row);
+
+  // Node list (real compute nodes only — the "console" pseudo-node hosts
+  // coordinators, which live in Workspaces, not the node list).
+  const nodeIds = cs
+    ? Object.keys(cs.nodes || {}).filter((n) => n !== "console")
+    : [];
+  if (nodeIds.length) {
+    const nodes = nodeIds.map((n) => TS.buildNodeInfo(cs.nodes[n]));
+    // The cluster's most-common version — only nodes that DIFFER from it get the
+    // amber drift treatment, so the highlight marks the outlier, not every row.
+    const verCounts = {};
+    for (const n of nodes) {
+      if (n.version) verCounts[n.version] = (verCounts[n.version] || 0) + 1;
+    }
+    const majorityVer = Object.keys(verCounts).sort(
+      (a, b) => verCounts[b] - verCounts[a],
+    )[0];
+    const wrap = document.createElement("div");
+    wrap.className = "cluster-nodes";
+
+    const label = document.createElement("button");
+    label.type = "button";
+    label.className = "nlabel";
+    label.setAttribute("aria-expanded", _nodesCollapsed ? "false" : "true");
+    const ncaret = document.createElement("span");
+    ncaret.className = "nlabel-caret";
+    ncaret.setAttribute("aria-hidden", "true");
+    ncaret.textContent = "\u25be";
+    label.append(ncaret, document.createTextNode("Nodes · " + nodes.length));
+    const driftCount = (overview.versions || []).length;
+    if (overview.version_drift && driftCount > 1) {
+      const drift = document.createElement("span");
+      drift.className = "drift";
+      drift.append(glyph("attention"), document.createTextNode(" drift"));
+      drift.title = (overview.versions || []).join(", ");
+      label.append(drift);
+    }
+    wrap.append(label);
+
+    const nodeList = document.createElement("div");
+    nodeList.className = "cluster-node-list";
+    nodeList.hidden = _nodesCollapsed;
+    label.addEventListener("click", () => {
+      _nodesCollapsed = !_nodesCollapsed;
+      nodeList.hidden = _nodesCollapsed;
+      label.setAttribute("aria-expanded", _nodesCollapsed ? "false" : "true");
+    });
+
+    for (const info of nodes) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "node-row";
+      const st = nodeState(info);
+      item.title = info.node_id; // the .nn label ellipsizes long node ids
+      item.setAttribute(
+        "aria-label",
+        info.node_id + ", " + st + ", " + info.ws_total + " workstreams",
+      );
+      item.append(glyph(st));
+      const nn = document.createElement("span");
+      nn.className = "nn";
+      nn.textContent = info.node_id;
+      const drifted =
+        overview.version_drift && info.version && info.version !== majorityVer;
+      const ver = document.createElement("span");
+      ver.className = "ver" + (drifted ? " drift" : "");
+      if (drifted) ver.title = "drift: cluster majority is " + majorityVer;
+      ver.textContent = info.version || "—";
+      const nws = document.createElement("span");
+      nws.className = "nws";
+      nws.textContent = info.ws_total ? info.ws_total + " ws" : "idle";
+      item.append(nn, ver, nws);
+      item.addEventListener("click", () => {
+        window.location.href =
+          "/node/" + encodeURIComponent(info.node_id) + "/";
+      });
+      nodeList.append(item);
+    }
+    wrap.append(nodeList);
+    card.append(wrap);
+  }
+
+  root.append(card);
+}
+
+// ---- Workspaces section ----------------------------------------------------
+
+function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
+  const li = document.createElement("li");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  // `.open` (amber left-accent) marks the row whose pane is the active tab, so
+  // the rail map and the tab bar agree on what is focused.
+  const isOpen = !!(active && active.rawId === ws.id);
+  btn.className =
+    "row" + (isChild ? " row-child" : "") + (isOpen ? " open" : "");
+  // Tier-1 always stamps `kind` (the snapshot defaults it to "interactive");
+  // the fallback just mirrors that default for a malformed row.
+  const kind = ws.kind || "interactive";
+  // The workstream wears its persona on the hover title + aria label — the
+  // 266px rail row has no room for another chip, and the saved tables carry
+  // the full PERSONA column.  personaLabel falls back to the raw slug for a
+  // since-archived persona, so the label never silently disappears.
+  const persona = personaLabel(ws.persona || "");
+  btn.setAttribute(
+    "aria-label",
+    (ws.name || ws.title || ws.id) +
+      ", " +
+      (ws.state || "idle") +
+      ", " +
+      kind +
+      (persona ? ", persona " + persona : ""),
+  );
+  // Hover name — the expanded row ellipsizes long names; the collapsed rail
+  // shows only the state glyph, so the title is the whole label there.
+  btn.title =
+    (ws.name || ws.title || ws.id || "session") +
+    (persona ? " · " + persona : "");
+  btn.append(glyph(ws.state || "idle"));
+  const nm = document.createElement("span");
+  nm.className = "nm";
+  nm.textContent = ws.name || ws.title || ws.id || "session";
+  btn.append(nm);
+  if (childCount) {
+    const c = document.createElement("span");
+    c.className = "rcount";
+    c.textContent = String(childCount);
+    btn.append(c);
+  }
+  btn.append(tagFor(kind));
+  // Both kinds open as console panes (step 5): a coordinator is console-local;
+  // an interactive session lives on a node, so its pane is node-PROXIED — pass
+  // the owning node as a hint (the shell re-derives it from Tier-1 on rehydrate).
+  // Fall back to the legacy full-page node UI only when no pane host is present.
+  btn.addEventListener("click", () => {
+    if (kind === "coordinator") {
+      if (paneManager) paneManager.openPane("coordinator", ws.id);
+    } else if (paneManager) {
+      paneManager.openPane("interactive", ws.id, { nodeId: ws.node });
+    } else if (ws.node && ws.node !== "console") {
+      window.location.href =
+        "/node/" +
+        encodeURIComponent(ws.node) +
+        "/?ws_id=" +
+        encodeURIComponent(ws.id);
+    }
+  });
+  li.append(btn);
+  return li;
+}
+
+// Project-group collapse state — persisted across Tier-1 re-renders (the rail
+// rebuilds on every snapshot), keyed by project_id.  Click a project head to
+// toggle.  Mirrors `_nodesCollapsed` for the Cluster node list.
+const _projCollapsed = new Set();
+
+// Render a flat ws list as a parent-bucketed tree (coordinators with nested
+// children, then orphans) into `nav`.  Shared by the ungrouped top level and
+// each project group so nesting reads identically inside a project.
+function renderSessionTree(nav, list, TS, paneManager, active) {
+  const groups = TS.bucketByParent(list);
+  for (const ws of groups.roots) {
+    const kids = groups.childrenMap[ws.id] || [];
+    const li = sessionRow(ws, kids.length, false, TS, paneManager, active);
+    if (kids.length) {
+      const childUl = document.createElement("ul");
+      childUl.className = "children";
+      for (const k of kids)
+        childUl.append(sessionRow(k, 0, true, TS, paneManager, active));
+      li.append(childUl);
+    }
+    nav.append(li);
+  }
+  for (const ws of groups.orphans)
+    nav.append(sessionRow(ws, 0, false, TS, paneManager, active));
+}
+
+// A collapsible project group: reuses the Manage `.grp-head` header vocabulary
+// (chevron + name + count, keyboard-operable <button>, aria-expanded) over a
+// `.proj-grp-items` body holding the project's session tree.  Returns a
+// detached `.proj-grp` the caller mounts.
+function projectGroup(pid, name, sessions, TS, paneManager, active) {
+  const collapsed = _projCollapsed.has(pid);
+  const grp = document.createElement("div");
+  grp.className = "proj-grp" + (collapsed ? "" : " open");
+
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "grp-head";
+  head.title = name; // the collapsed-width rail + ellipsis need the full name
+  head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  const chev = document.createElement("span");
+  chev.className = "chev";
+  chev.setAttribute("aria-hidden", "true");
+  chev.textContent = collapsed ? "▸" : "▾";
+  // The same ▣ mark the composer chip + dashboard use, so the eye connects the
+  // rail bucket to the badge.  In ink (not amber) — the rail's only amber is the
+  // `.row.open` active-tab accent, which this must not compete with.
+  const mark = document.createElement("span");
+  mark.className = "gmark";
+  mark.setAttribute("aria-hidden", "true");
+  mark.textContent = "▣";
+  const nm = document.createElement("span");
+  nm.className = "gname";
+  nm.textContent = name;
+  const count = document.createElement("span");
+  count.className = "gcount";
+  count.textContent = String(sessions.length);
+  head.append(chev, mark, nm, count);
+
+  const items = document.createElement("div");
+  items.className = "proj-grp-items";
+  items.id = "proj-items-" + pid; // aria-controls target for the header
+  head.setAttribute("aria-controls", items.id);
+  const treeUl = document.createElement("ul");
+  treeUl.className = "nav";
+  renderSessionTree(treeUl, sessions, TS, paneManager, active);
+  items.append(treeUl);
+
+  head.addEventListener("click", () => {
+    const nowCollapsed = !_projCollapsed.has(pid);
+    if (nowCollapsed) _projCollapsed.add(pid);
+    else _projCollapsed.delete(pid);
+    grp.classList.toggle("open", !nowCollapsed);
+    head.setAttribute("aria-expanded", nowCollapsed ? "false" : "true");
+    chev.textContent = nowCollapsed ? "▸" : "▾";
+  });
+
+  grp.append(head, items);
+  return grp;
+}
+
+function renderWorkspaces(root, cs, TS, paneManager) {
+  root.replaceChildren();
+  const nav = document.createElement("ul");
+  nav.className = "nav";
+
+  // The active pane drives the `.open` marker so the rail map mirrors the tab
+  // bar (re-rendered on every activate via paneManager.onActiveChange).
+  const active =
+    paneManager && paneManager.getActive ? paneManager.getActive() : null;
+
+  // Dashboard entry — activates the Dashboard pane (the one pane in step 2).
+  const dashLi = document.createElement("li");
+  const dash = document.createElement("button");
+  dash.type = "button";
+  dash.title = "Dashboard"; // the collapsed rail shows only the ◇ glyph
+  dash.className =
+    "row" + (active && active.type === "dashboard" ? " open" : "");
+  const g = document.createElement("span");
+  g.className = "glyph";
+  g.setAttribute("aria-hidden", "true");
+  g.textContent = "◇";
+  dash.append(g);
+  const dnm = document.createElement("span");
+  dnm.className = "nm";
+  dnm.textContent = "Dashboard";
+  dash.append(dnm);
+  dash.addEventListener(
+    "click",
+    () => paneManager && paneManager.openPane("dashboard"),
+  );
+  dashLi.append(dash);
+  nav.append(dashLi);
+
+  // Gather all workstreams (console coordinators + node interactives).
+  const all = [];
+  if (cs) {
+    for (const nid of Object.keys(cs.nodes || {})) {
+      for (const ws of cs.nodes[nid].workstreams || []) all.push(ws);
+    }
+  }
+
+  // Partition by attached project.  A ws whose project is unknown or
+  // inaccessible (projectName "" — cache not loaded yet, no access, or a
+  // since-removed project) falls back to ungrouped, so the rail never paints a
+  // headerless or bare-id group.  When NO ws carries a resolvable project the
+  // loop below is empty and the tree renders flat — identical to the
+  // pre-projects layout for deployments not using projects.
+  const ungrouped = [];
+  const byProject = new Map(); // pid -> { name, sessions: [] }
+  for (const ws of all) {
+    const pid = ws.project_id || "";
+    const pname = pid ? projectName(pid) : "";
+    if (pname) {
+      let bucket = byProject.get(pid);
+      if (!bucket) {
+        bucket = { name: pname, sessions: [] };
+        byProject.set(pid, bucket);
+      }
+      bucket.sessions.push(ws);
+    } else {
+      ungrouped.push(ws);
+    }
+  }
+
+  // Ungrouped sessions keep the top level (no header), then project groups
+  // follow, ordered by name so the rail map is stable across snapshots.
+  renderSessionTree(nav, ungrouped, TS, paneManager, active);
+  root.append(nav);
+
+  Array.from(byProject.keys())
+    .sort((a, b) => byProject.get(a).name.localeCompare(byProject.get(b).name))
+    .forEach((pid) => {
+      const grp = byProject.get(pid);
+      root.append(
+        projectGroup(pid, grp.name, grp.sessions, TS, paneManager, active),
+      );
+    });
+}
+
+// ---- Mount -----------------------------------------------------------------
+
+/**
+ * Wire the rail's live sections to the Tier-1 render signal.
+ * `sections` = { cluster?: HTMLElement, workspaces: HTMLElement, paneManager }.
+ */
+export function mountRail(sections, caps) {
+  const TS = window.TS_APP || {};
+  function render() {
+    const cs = TS.getClusterState ? TS.getClusterState() : null;
+    if (sections.cluster && caps.cluster)
+      renderCluster(sections.cluster, cs, TS);
+    if (sections.workspaces)
+      renderWorkspaces(sections.workspaces, cs, TS, sections.paneManager);
+  }
+  if (TS.onRender) TS.onRender(render);
+  // Re-render when the active pane changes so the Workspaces `.open` marker
+  // tracks the active tab (not just on the next Tier-1 snapshot).
+  if (sections.paneManager && sections.paneManager.onActiveChange)
+    sections.paneManager.onActiveChange(render);
+  // Group-by-project needs the project id→name map: load it once for the rail
+  // and re-render whenever it changes (a project renamed / created elsewhere).
+  // refreshProjects never rejects (a project.read denial leaves an empty map →
+  // the tree renders flat), so this can't break the rail.
+  onProjectsChange(render);
+  refreshProjects();
+  // Persona labels ride the same policy: load once, re-render on change,
+  // never-reject (a failed fetch leaves rows labelled by raw slug).
+  onPersonasChange(render);
+  refreshPersonas();
+  render(); // initial paint (empty until the first snapshot arrives)
+}
+
+// ---- Manage section (admin IA → collapsible discovery groups) --------------
+
+// Generic Manage-row badge state.  A subsystem (e.g. the standalone consent
+// badge) drives a count onto a tab row by KEY via `setRowBadge`; rail.js stays
+// agnostic about what the count means.  Kept module-level so a `mountManage`
+// rebuild (the IA is static, but the section re-mounts on shell init) re-applies
+// the live counts rather than dropping them.  `null` label = clear.
+const _rowBadges = new Map(); // tabKey -> { count, label }
+// Rebuilt each mount: the row <button> + owning group key for every tab.  The
+// group's head <button> (where a collapsed group surfaces its summed badge —
+// a collapsed group hides its rows, so the head must carry the signal) is
+// looked up via _groupEls, not duplicated here.
+let _rowEls = new Map(); // tabKey -> { row, group }
+let _groupEls = new Map(); // group key -> { head, tabKeys: [] }
+
+/** Paint (or clear) the badge slot inside a host button, keyed by a stable
+ *  `.rail-badge` child so repeated calls replace rather than stack. */
+function _applyBadge(host, count, label) {
+  if (!host) return;
+  const existing = host.querySelector(":scope > .rail-badge");
+  if (!count) {
+    if (existing) existing.remove();
+    return;
+  }
+  const fresh = badge(count, label);
+  if (existing) host.replaceChild(fresh, existing);
+  else host.append(fresh);
+}
+
+/** Sum the live badge counts for a group's tabs — drives the head badge so a
+ *  COLLAPSED group still shows that something inside it needs attention. */
+function _groupCount(groupKey) {
+  const grp = _groupEls.get(groupKey);
+  if (!grp) return 0;
+  let total = 0;
+  for (const tabKey of grp.tabKeys) {
+    const b = _rowBadges.get(tabKey);
+    if (b) total += b.count;
+  }
+  return total;
+}
+
+/**
+ * Generic Manage-row badge hook.  `setRowBadge(tabKey, count, label?)` stamps a
+ * count chip on that tab's row and, so the signal survives a collapsed group,
+ * mirrors the group's total onto its head.  `count` 0 (or falsy) clears the row.
+ * Drives off the refs `mountManage` registered; a no-op before the first mount
+ * (the consent subsystem re-drives it after `_refreshConsentBadge`).
+ *
+ * rail.js owns the MECHANISM only — callers own the meaning (no consent specifics
+ * here), matching the rail's seam-driven posture.
+ */
+export function setRowBadge(tabKey, count, label) {
+  const n = Number(count) || 0;
+  if (n > 0) _rowBadges.set(tabKey, { count: n, label: label || "" });
+  else _rowBadges.delete(tabKey);
+  const ref = _rowEls.get(tabKey);
+  if (!ref) return; // not mounted yet (or gated away) — state is kept for remount
+  _applyBadge(ref.row, n, label);
+  // The collapsed-group head mirrors the group's running total + its own label.
+  const total = _groupCount(ref.group);
+  const grp = _groupEls.get(ref.group);
+  _applyBadge(
+    grp && grp.head,
+    total,
+    total ? total + " in " + ref.group + " awaiting attention" : "",
+  );
+}
+
+/** Re-stamp every stored badge after a (re)mount rebuilt the row/head refs.
+ *  `setRowBadge` self-guards a missing ref and recomputes each head total, so
+ *  replaying the stored rows lands both rows and heads at their correct sums. */
+function _reapplyBadges() {
+  for (const [tabKey, b] of _rowBadges) setRowBadge(tabKey, b.count, b.label);
+}
+
+/**
+ * Build the rail's Manage groups from the admin IA seam (admin.js exposes
+ * `window.TS_ADMIN`).  Each group is a collapsible `.grp` whose head toggles
+ * its `.grp-items`; items are the admin tabs the user is permitted to see.  A
+ * row click opens/focuses the singleton Admin pane on that tab via the seam's
+ * `openTab`.  The IA is static, so this builds once; only the active-row marker
+ * re-renders, driven by the admin tab-change subscription (single writer).
+ *
+ * House style: programmatic DOM, NO innerHTML; reuses the mock's
+ * `.grp`/`.grp-head`/`.grp-items` vocabulary (shell.css).
+ */
+export function mountManage(root, paneManager) {
+  if (!root) return;
+  const TS = window.TS_ADMIN || {};
+  const ia = TS.ia || [];
+  const allowed = TS.isTabAllowed || (() => true);
+  root.replaceChildren();
+
+  // Collapsed-rail representation: the discovery groups need text, so the
+  // collapsed strip shows ONE ⚙ row that opens/focuses the singleton Admin
+  // pane at its current tab (the rail expands back to browse the full map).
+  // Always in the DOM (CSS shows it only while the rail is collapsed), but
+  // permission-gated like the groups: no visible tab, no ⚙ either.
+  if (ia.some((g) => g.tabs.some((t) => allowed(t.tab)))) {
+    const manageGlyph = document.createElement("button");
+    manageGlyph.type = "button";
+    manageGlyph.className = "row manage-glyph";
+    manageGlyph.title = "Manage";
+    manageGlyph.setAttribute("aria-label", "Manage (open admin)");
+    const mg = document.createElement("span");
+    mg.className = "glyph";
+    mg.setAttribute("aria-hidden", "true");
+    mg.textContent = "⚙";
+    manageGlyph.append(mg);
+    manageGlyph.addEventListener(
+      "click",
+      () => paneManager && paneManager.openPane("admin"),
+    );
+    root.append(manageGlyph);
+  }
+
+  // If the Admin pane is already open (e.g. restored by PaneManager.rehydrate),
+  // seed the rail to its current tab + expand the owning group; otherwise every
+  // group starts collapsed and nothing is marked until the user clicks.
+  const adminOpen =
+    paneManager && paneManager.hasPane && paneManager.hasPane("admin");
+  const activeTab = adminOpen && TS.getActiveTab ? TS.getActiveTab() : null;
+
+  const rowByTab = new Map(); // tab -> its row <button>, for active-state sync
+  // Rebuild the badge ref maps for this mount (the previous DOM is gone).
+  _rowEls = new Map();
+  _groupEls = new Map();
+
+  ia.forEach((group) => {
+    const tabs = group.tabs.filter((t) => allowed(t.tab));
+    if (!tabs.length) return; // every tab in the group is gated away, drop it
+
+    const expanded = activeTab
+      ? group.tabs.some((t) => t.tab === activeTab) // group owning the active tab
+      : false; // default: every group collapsed — Manage is a discovery map, not a wall of open links
+
+    const grp = document.createElement("div");
+    grp.className = "grp";
+    if (expanded) grp.classList.add("open");
+
+    const itemsId = "manage-grp-" + group.group.toLowerCase();
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "grp-head";
+    head.setAttribute("aria-expanded", expanded ? "true" : "false");
+    head.setAttribute("aria-controls", itemsId);
+    const chev = document.createElement("span");
+    chev.className = "chev";
+    chev.setAttribute("aria-hidden", "true");
+    chev.textContent = expanded ? "▾" : "▸";
+    const name = document.createElement("span");
+    name.className = "gname";
+    name.textContent = group.group;
+    const count = document.createElement("span");
+    count.className = "gcount";
+    count.textContent = String(tabs.length);
+    head.append(chev, name, count);
+    // Register the head so a collapsed group can carry its tabs' badge total.
+    _groupEls.set(group.group, { head, tabKeys: tabs.map((t) => t.tab) });
+
+    const items = document.createElement("div");
+    items.className = "grp-items";
+    items.id = itemsId;
+    for (const t of tabs) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "row";
+      row.dataset.tab = t.tab;
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = t.label;
+      row.append(nm);
+      row.addEventListener("click", () => {
+        if (TS.openTab) TS.openTab(t.tab);
+      });
+      rowByTab.set(t.tab, row);
+      // Register the row + its owning group for the badge hook (the group's
+      // head element is resolved through _groupEls when needed).
+      _rowEls.set(t.tab, { row, group: group.group });
+      items.append(row);
+    }
+
+    head.addEventListener("click", () => {
+      const open = grp.classList.toggle("open");
+      head.setAttribute("aria-expanded", open ? "true" : "false");
+      chev.textContent = open ? "▾" : "▸";
+    });
+
+    grp.append(head, items);
+    root.append(grp);
+  });
+
+  // Re-apply any live row badges a subsystem set before/across this (re)mount.
+  _reapplyBadges();
+
+  // Single writer for the Manage active-row: the row for the current admin tab
+  // carries `.active`.  admin.js notifies on every switchAdminTab; seed it here
+  // for an already-open (restored) Admin pane.
+  function markActive(tab) {
+    for (const [t, row] of rowByTab) row.classList.toggle("active", t === tab);
+  }
+  if (activeTab) markActive(activeTab);
+  if (TS.onTabChange) TS.onTabChange(markActive);
+}

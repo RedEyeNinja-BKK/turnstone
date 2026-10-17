@@ -1,0 +1,99 @@
+"""Turnstone Client SDK — typed HTTP clients for server and console APIs.
+
+Quick start::
+
+    from turnstone.sdk import TurnstoneServer
+
+    with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+        ws = client.create_workstream(name="demo")
+        result = client.send_and_wait("Hello!", ws.ws_id)
+        print(result.content)
+"""
+
+from __future__ import annotations
+
+from turnstone.sdk._types import AttachmentUpload, TurnResult, TurnstoneAPIError
+from turnstone.sdk.console import AsyncTurnstoneConsole, TurnstoneConsole
+from turnstone.sdk.events import (
+    AgentContextEvent,
+    ApproveRequestEvent,
+    BusyErrorEvent,
+    ClearUiEvent,
+    ClusterEvent,
+    ClusterStateEvent,
+    ClusterWsClosedEvent,
+    ClusterWsCreatedEvent,
+    ClusterWsRenameEvent,
+    ConnectedEvent,
+    ContentEvent,
+    ConversationPersistenceState,
+    ErrorEvent,
+    HistoryEvent,
+    HistoryResyncEvent,
+    InfoEvent,
+    NodeJoinedEvent,
+    NodeLostEvent,
+    ReasoningEvent,
+    ServerEvent,
+    StatusEvent,
+    StreamEndEvent,
+    ThinkingStartEvent,
+    ThinkingStopEvent,
+    ToolInfoEvent,
+    ToolOutputChunkEvent,
+    ToolPendingEvent,
+    ToolResultEvent,
+    UserTurnEvent,
+    WsActivityEvent,
+    WsClosedEvent,
+    WsRenameEvent,
+    WsStateEvent,
+)
+from turnstone.sdk.server import AsyncTurnstoneServer, TurnstoneServer
+
+__all__ = [
+    # Clients
+    "AsyncTurnstoneServer",
+    "TurnstoneServer",
+    "AsyncTurnstoneConsole",
+    "TurnstoneConsole",
+    # Result types
+    "AttachmentUpload",
+    "TurnResult",
+    "TurnstoneAPIError",
+    "ConversationPersistenceState",
+    # Server events
+    "ServerEvent",
+    "ConnectedEvent",
+    "HistoryEvent",
+    "HistoryResyncEvent",
+    "UserTurnEvent",
+    "ThinkingStartEvent",
+    "ThinkingStopEvent",
+    "ReasoningEvent",
+    "ContentEvent",
+    "AgentContextEvent",
+    "StreamEndEvent",
+    "ToolPendingEvent",
+    "ToolInfoEvent",
+    "ApproveRequestEvent",
+    "ToolResultEvent",
+    "ToolOutputChunkEvent",
+    "StatusEvent",
+    "InfoEvent",
+    "ErrorEvent",
+    "BusyErrorEvent",
+    "ClearUiEvent",
+    "WsStateEvent",
+    "WsActivityEvent",
+    "WsRenameEvent",
+    "WsClosedEvent",
+    # Cluster events
+    "ClusterEvent",
+    "NodeJoinedEvent",
+    "NodeLostEvent",
+    "ClusterStateEvent",
+    "ClusterWsCreatedEvent",
+    "ClusterWsClosedEvent",
+    "ClusterWsRenameEvent",
+]

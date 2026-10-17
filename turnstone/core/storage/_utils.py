@@ -1,0 +1,3074 @@
+"""Shared utilities for storage backends."""
+
+from __future__ import annotations
+
+import base64
+import json
+import re
+from collections import Counter
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+import sqlalchemy as sa
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
+from turnstone.core.log import get_logger
+from turnstone.core.project_access import decide_project_access, fold_role_permissions
+from turnstone.core.storage._protocol import (
+    FORK_RESERVATION_CONFIG_KEY,
+    AttachmentWrite,
+    ConversationCommitConflictError,
+    ForkCloneExpectation,
+    ForkCloneSnapshot,
+    ForkDestinationConflictError,
+    ForkSourceUnavailableError,
+)
+from turnstone.core.storage._schema import (
+    conversations,
+    memory_index_snapshots,
+    project_members,
+    projects,
+    role_permission_overrides,
+    roles,
+    structured_memories,
+    user_roles,
+    users,
+    workstream_attachments,
+    workstream_config,
+    workstream_overrides,
+    workstreams,
+)
+from turnstone.core.trajectory import (
+    PROVENANCE_META_KEY,
+    AttachmentRef,
+    ContentBlock,
+    ProviderNative,
+    Role,
+    TextBlock,
+    ToolCall,
+    Turn,
+    TurnMeta,
+    TurnProvenance,
+    dicts_from_turns,
+    resolve_attachment_parts,
+    sanitize_client_send_ids,
+    turn_to_dict,
+)
+
+log = get_logger(__name__)
+
+
+def structured_memory_exact_scope_predicate(
+    scope: str,
+    scope_id: str,
+) -> Any:
+    """Build one exact structured-memory scope predicate."""
+    return sa.and_(
+        structured_memories.c.scope == scope,
+        structured_memories.c.scope_id == scope_id,
+    )
+
+
+def structured_memory_filter_scope_predicate(
+    scope: str,
+    scope_id: str,
+) -> Any:
+    """Build a list/count filter where an omitted scope id means any id."""
+    predicate = structured_memories.c.scope == scope
+    if scope_id:
+        predicate = sa.and_(predicate, structured_memories.c.scope_id == scope_id)
+    return predicate
+
+
+def build_memory_scope_or_clause(
+    scopes: list[tuple[str, str]],
+) -> tuple[str, dict[str, str]]:
+    """Build a parameterized OR-group for exact visible memory scopes."""
+    params: dict[str, str] = {}
+    clauses: list[str] = []
+    for i, (scope, scope_id) in enumerate(scopes):
+        params[f"sc{i}"] = scope
+        params[f"sid{i}"] = scope_id
+        parts = [f"scope = :sc{i}", f"scope_id = :sid{i}"]
+        clauses.append("(" + " AND ".join(parts) + ")")
+    return " OR ".join(clauses), params
+
+
+def memory_index_health_inputs_on_connection(
+    conn: Any,
+) -> dict[str, list[dict[str, str]]]:
+    """Read live index metadata and topology from one database snapshot."""
+    entry_rows = conn.execute(
+        sa.select(
+            structured_memories.c.memory_id,
+            structured_memories.c.name,
+            structured_memories.c.description,
+            structured_memories.c.type,
+            structured_memories.c.scope,
+            structured_memories.c.scope_id,
+        ).order_by(
+            structured_memories.c.scope,
+            structured_memories.c.scope_id,
+            structured_memories.c.name,
+            structured_memories.c.memory_id,
+        )
+    ).fetchall()
+    workstream_rows = conn.execute(
+        sa.select(
+            workstreams.c.ws_id,
+            workstreams.c.kind,
+            workstreams.c.user_id,
+            workstreams.c.project_id,
+            workstreams.c.state,
+        ).where(~workstreams.c.state.in_(("creating", "deleted")))
+    ).fetchall()
+    project_rows = conn.execute(
+        sa.select(
+            projects.c.project_id,
+            projects.c.owner_id,
+            projects.c.visibility,
+            projects.c.state,
+        )
+    ).fetchall()
+    member_rows = conn.execute(
+        sa.select(project_members.c.project_id, project_members.c.user_id)
+    ).fetchall()
+    user_rows = conn.execute(sa.select(users.c.user_id)).fetchall()
+    role_rows = conn.execute(
+        sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
+    ).fetchall()
+    assignment_rows = conn.execute(sa.select(user_roles.c.user_id, user_roles.c.role_id)).fetchall()
+    override_rows = conn.execute(
+        sa.select(
+            role_permission_overrides.c.role_id,
+            role_permission_overrides.c.permission,
+            role_permission_overrides.c.action,
+        )
+    ).fetchall()
+    return {
+        "entries": [dict(row._mapping) for row in entry_rows],
+        "workstreams": [dict(row._mapping) for row in workstream_rows],
+        "projects": [dict(row._mapping) for row in project_rows],
+        "members": [dict(row._mapping) for row in member_rows],
+        "users": [dict(row._mapping) for row in user_rows],
+        "roles": [dict(row._mapping) for row in role_rows],
+        "user_roles": [dict(row._mapping) for row in assignment_rows],
+        "role_overrides": [dict(row._mapping) for row in override_rows],
+    }
+
+
+def require_active_workstream_on_connection(
+    conn: Any,
+    *,
+    ws_id: str,
+) -> None:
+    """Lock and validate the durable parent of a workstream-scoped write."""
+    if not ws_id:
+        raise ValueError("workstream scope_id is required")
+    workstream = conn.execute(
+        sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id).with_for_update()
+    ).fetchone()
+    if workstream is None or str(workstream[0] or "") in {"creating", "deleted"}:
+        raise ValueError("workstream is no longer active")
+
+
+class ProjectMemoryAuthorizationError(PermissionError):
+    """The acting principal cannot use the requested project-memory scope."""
+
+
+def _permissions_for_user_on_connection(
+    conn: Any,
+    user_id: str,
+    *,
+    lock_rows: bool = False,
+) -> set[str]:
+    """Resolve one user's effective RBAC permissions inside *conn*.
+
+    Memory-index capture must derive project visibility from the same database
+    snapshot as the indexed rows. Calling the public storage facade here would
+    open a second transaction and recreate the ACL/read TOCTOU this helper is
+    intended to close.
+    """
+    if not user_id:
+        return set()
+    role_query = (
+        sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
+        .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
+        .where(user_roles.c.user_id == user_id)
+        .order_by(roles.c.role_id)
+    )
+    if lock_rows:
+        # Override replacement and deletion serialize on the stable role row.
+        # Lock that exact table, rather than leaving PostgreSQL to lock every
+        # joined table (which would invert the universal role -> child order).
+        role_query = role_query.with_for_update(read=True, of=roles)
+    role_rows = conn.execute(role_query).fetchall()
+    builtin_ids = [str(row[0]) for row in role_rows if row[2]]
+    grants: dict[str, set[str]] = {}
+    revokes: dict[str, set[str]] = {}
+    if builtin_ids:
+        override_query = sa.select(
+            role_permission_overrides.c.role_id,
+            role_permission_overrides.c.permission,
+            role_permission_overrides.c.action,
+        ).where(role_permission_overrides.c.role_id.in_(builtin_ids))
+        overrides = conn.execute(override_query).fetchall()
+        for role_id, permission, action in overrides:
+            target = grants if action == "grant" else revokes if action == "revoke" else None
+            if target is not None:
+                target.setdefault(str(role_id), set()).add(str(permission))
+    permissions: set[str] = set()
+    for role_id, raw_permissions, builtin in role_rows:
+        role_permissions = fold_role_permissions(raw_permissions)
+        if builtin:
+            role_permissions = fold_role_permissions(
+                role_permissions,
+                grants=grants.get(str(role_id), set()),
+                revokes=revokes.get(str(role_id), set()),
+            )
+        permissions.update(role_permissions)
+    return permissions
+
+
+def require_project_memory_access_on_connection(
+    conn: Any,
+    *,
+    project_id: str,
+    principal_id: str,
+    write: bool,
+) -> None:
+    """Authorize one project-memory operation in the caller's transaction.
+
+    The project, membership, and effective RBAC rows are read through the same
+    connection as the memory operation. PostgreSQL holds shared row locks until
+    commit; SQLite callers begin the appropriate transaction before entering
+    this helper. The authorization decision therefore cannot be separated from
+    the read or mutation by a second storage transaction.
+    """
+    if not project_id or not principal_id:
+        raise ProjectMemoryAuthorizationError("project memory access denied")
+
+    project = conn.execute(
+        sa.select(
+            projects.c.owner_id,
+            projects.c.visibility,
+            projects.c.state,
+        )
+        .where(projects.c.project_id == project_id)
+        .with_for_update(read=True)
+    ).fetchone()
+    if project is None or str(project[2] or "active") != "active":
+        raise ProjectMemoryAuthorizationError("project memory access denied")
+    member = conn.execute(
+        sa.select(project_members.c.project_id)
+        .where(
+            project_members.c.project_id == project_id,
+            project_members.c.user_id == principal_id,
+        )
+        .with_for_update(read=True)
+    ).fetchone()
+    permissions = _permissions_for_user_on_connection(
+        conn,
+        principal_id,
+        lock_rows=True,
+    )
+    decision = decide_project_access(
+        principal_id=principal_id,
+        owner_id=str(project[0] or ""),
+        visibility=str(project[1] or "private"),
+        state=str(project[2] or "active"),
+        is_member=member is not None,
+        permissions=permissions,
+    )
+    allowed = decision.can_write if write else decision.can_read
+    if not allowed:
+        raise ProjectMemoryAuthorizationError("project memory access denied")
+
+
+def require_project_memory_scopes_on_connection(
+    conn: Any,
+    *,
+    scopes: list[tuple[str, str]],
+    principal_id: str,
+    write: bool,
+) -> None:
+    """Authorize every distinct project scope in a visible-scope query."""
+    for project_id in sorted({scope_id for scope, scope_id in scopes if scope == "project"}):
+        require_project_memory_access_on_connection(
+            conn,
+            project_id=project_id,
+            principal_id=principal_id,
+            write=write,
+        )
+
+
+def _memory_index_project_on_connection(
+    conn: Any,
+    principal_id: str,
+    attached_project_id: str,
+    *,
+    permissions: set[str] | None = None,
+) -> tuple[str, str]:
+    """Return the active project id/name readable in this transaction."""
+    if not principal_id or not attached_project_id:
+        return "", ""
+    project = conn.execute(
+        sa.select(
+            projects.c.project_id,
+            projects.c.name,
+            projects.c.owner_id,
+            projects.c.visibility,
+            projects.c.state,
+        )
+        .where(projects.c.project_id == attached_project_id)
+        .with_for_update(read=True)
+    ).fetchone()
+    if project is None or str(project[4] or "active") != "active":
+        return "", ""
+    member = conn.execute(
+        sa.select(project_members.c.project_id)
+        .where(
+            project_members.c.project_id == attached_project_id,
+            project_members.c.user_id == principal_id,
+        )
+        .with_for_update(read=True)
+    ).fetchone()
+    decision = decide_project_access(
+        principal_id=principal_id,
+        owner_id=str(project[2] or ""),
+        visibility=str(project[3] or "private"),
+        state=str(project[4] or "active"),
+        is_member=member is not None,
+        permissions=(
+            permissions
+            if permissions is not None
+            else _permissions_for_user_on_connection(conn, principal_id, lock_rows=True)
+        ),
+    )
+    if decision.can_read:
+        return str(project[0]), str(project[1] or "")
+    return "", ""
+
+
+def acquire_memory_index_snapshot_on_connection(
+    conn: Any,
+    *,
+    ws_id: str,
+    principal_id: str,
+) -> dict[str, Any] | None:
+    """Capture or load one immutable index under one database snapshot.
+
+    The caller must begin a write transaction before invoking this helper
+    (``BEGIN IMMEDIATE`` on SQLite; a row-locking transaction on PostgreSQL).
+    Workstream identity, project ACL, visible memory metadata, rendering, and
+    the first-writer insert therefore describe one coherent state. The
+    snapshot belongs to the current durable row; transactional hard-delete and
+    registration cleanup prevent a later same-ID row from inheriting it.
+    """
+    from turnstone.core.memory_index import (
+        MEMORY_INDEX_FORMAT_VERSION,
+        memory_visibility_key,
+        render_memory_index,
+    )
+
+    # PostgreSQL captures under REPEATABLE READ.  Make the role/override read
+    # the transaction's first snapshot operation and hold shared locks on the
+    # concrete role rows: a concurrent override replacement is then either
+    # wholly before this snapshot or waits until the capture commits.  Loading
+    # the workstream first would fix the MVCC snapshot before the stable role
+    # lock and could observe pre-revoke override children after the replacer
+    # had already committed.
+    permissions = _permissions_for_user_on_connection(
+        conn,
+        principal_id,
+        lock_rows=True,
+    )
+    workstream = conn.execute(
+        sa.select(
+            workstreams.c.ws_id,
+            workstreams.c.kind,
+            workstreams.c.project_id,
+            workstreams.c.state,
+        )
+        .where(workstreams.c.ws_id == ws_id)
+        .with_for_update()
+    ).fetchone()
+    if workstream is None or str(workstream[3] or "") in {"creating", "deleted"}:
+        return None
+
+    existing = conn.execute(
+        sa.select(memory_index_snapshots).where(
+            memory_index_snapshots.c.ws_id == ws_id,
+        )
+    ).fetchone()
+    if existing is not None:
+        return dict(existing._mapping)
+
+    kind = str(workstream[1] or "interactive")
+    project_id, project_name = _memory_index_project_on_connection(
+        conn,
+        principal_id,
+        str(workstream[2] or ""),
+        permissions=permissions,
+    )
+    if kind == "coordinator":
+        scopes = [("coordinator", principal_id)] if principal_id else []
+    else:
+        scopes = [("global", ""), ("workstream", ws_id)]
+        if principal_id:
+            scopes.append(("user", principal_id))
+    if project_id:
+        scopes.append(("project", project_id))
+
+    predicates = [
+        structured_memory_exact_scope_predicate(scope, scope_id) for scope, scope_id in scopes
+    ]
+    rows: list[dict[str, Any]] = []
+    if predicates:
+        result = conn.execute(
+            sa.select(
+                structured_memories.c.memory_id,
+                structured_memories.c.name,
+                structured_memories.c.description,
+                structured_memories.c.type,
+                structured_memories.c.scope,
+                structured_memories.c.scope_id,
+            ).where(sa.or_(*predicates))
+        ).fetchall()
+        rows = [dict(row._mapping) for row in result]
+    rendered = render_memory_index(rows, project_id=project_id)
+    captured_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    values = {
+        "ws_id": ws_id,
+        "principal_id": principal_id,
+        "project_id": project_id,
+        "project_name": project_name,
+        "visibility_key": memory_visibility_key(scopes),
+        "content": rendered.content,
+        "format_version": MEMORY_INDEX_FORMAT_VERSION,
+        "entry_count": rendered.entry_count,
+        "char_count": rendered.char_count,
+        "invalid_description_count": rendered.invalid_description_count,
+        "captured_at": captured_at,
+    }
+    conn.execute(sa.insert(memory_index_snapshots), values)
+    return values
+
+
+# Client tool-call block types across providers, used to enforce the
+# native↔tool_calls mirror (see ``normalize_native_for_save``).  Anthropic emits
+# ``tool_use``; OpenAI Responses ``function_call``; Google's OpenAI-compat lane
+# ``function``.  Server-side tool blocks (``server_tool_use`` /
+# ``web_search_tool_result`` / ``web_search_call`` / ``*_call`` results) and
+# reasoning blocks are deliberately absent: they carry no client ``tool_result`` to
+# orphan and must round-trip verbatim.
+_CLIENT_TOOL_CALL_BLOCK_TYPES: frozenset[str] = frozenset({"tool_use", "function_call", "function"})
+
+
+def strip_orphan_client_tool_blocks(blocks: list[Any]) -> list[Any]:
+    """Drop client tool-call blocks from a provider-native block list.
+
+    Used when an assistant turn carries no ``tool_calls``: a client tool-call block
+    left in the native lane would replay as an orphan ``tool_use`` / ``function_call``
+    with no matching ``tool_result`` and be rejected by the API on a same-provider
+    resume.  Reasoning / server-tool / web-search blocks are preserved.  Returns a new
+    list; the input is not mutated.
+    """
+    return [
+        b
+        for b in blocks
+        if not (isinstance(b, dict) and b.get("type") in _CLIENT_TOOL_CALL_BLOCK_TYPES)
+    ]
+
+
+def _has_tool_calls(tool_calls_json: str | None) -> bool:
+    """True when the stored ``tool_calls`` JSON encodes a non-empty list."""
+    if not tool_calls_json:
+        return False
+    try:
+        parsed = json.loads(tool_calls_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, list) and len(parsed) > 0
+
+
+def normalize_native_for_save(
+    role: str | None, provider_data: str | None, tool_calls_json: str | None
+) -> str | None:
+    """Enforce the native↔tool_calls mirror at the persistence boundary.
+
+    A persisted ``assistant`` row must never carry a *client* tool-call block in its
+    verbatim native lane (``provider_data``) without a matching entry in ``tool_calls``;
+    otherwise a same-provider resume replays an orphan ``tool_use`` / ``function_call``
+    with no ``tool_result`` and the provider API rejects the turn (the
+    truncated-mid-tool_use hole).  Enforcing the mirror here — once, for every save path
+    and both backends — is what lets the orphan-repair pass read ``tool_calls`` alone
+    (and lets the Anthropic ``pc_tool_ids`` fallback be retired).
+
+    When ``tool_calls`` is empty, client tool-call blocks in ``provider_data`` are
+    orphaned and dropped (reasoning / server-tool / web-search blocks kept).  Returns the
+    (possibly rewritten) ``provider_data`` JSON, ``None`` if nothing survives, or the input
+    unchanged for non-assistant / well-formed rows.
+    """
+    if role != "assistant" or not provider_data or _has_tool_calls(tool_calls_json):
+        return provider_data
+    try:
+        blocks = json.loads(provider_data)
+    except (json.JSONDecodeError, TypeError):
+        return provider_data
+    if not isinstance(blocks, list):
+        return provider_data
+    kept = strip_orphan_client_tool_blocks(blocks)
+    if len(kept) == len(blocks):
+        return provider_data
+    return json.dumps(kept) if kept else None
+
+
+def wrap_provider_data(provider_data: str | None, producer: str | None) -> str | None:
+    """Wrap a bare native-block list in the storage envelope ``{producer, blocks}``.
+
+    ``producer`` (the provider that generated the turn) lets the lowering layer replay the
+    native lane verbatim only to its producing provider.  Storage-only: the envelope is
+    unwrapped back to a bare block list by :func:`reconstruct_messages`, so every
+    ``_provider_content`` consumer still sees a plain list.  Input that is empty, already
+    wrapped, unparseable, or has no ``producer`` is returned unchanged (the last keeps the
+    legacy bare-list shape, which reconstruct dual-reads).
+    """
+    if not provider_data or not producer:
+        return provider_data
+    try:
+        blocks = json.loads(provider_data)
+    except (json.JSONDecodeError, TypeError):
+        return provider_data
+    if isinstance(blocks, dict) and "blocks" in blocks:
+        return provider_data
+    return json.dumps({"producer": producer, "blocks": blocks})
+
+
+def prepare_provider_data_for_save(
+    role: str | None,
+    provider_data: str | None,
+    tool_calls_json: str | None,
+    producer: str | None,
+) -> str | None:
+    """Save-boundary preparation of the native lane: enforce the mirror, then wrap.
+
+    The single entry point both backends' save paths call:
+    :func:`normalize_native_for_save` (the native↔tool_calls mirror, on the bare block
+    list) followed by :func:`wrap_provider_data` (the ``{producer, blocks}`` envelope).
+    """
+    return wrap_provider_data(
+        normalize_native_for_save(role, provider_data, tool_calls_json), producer
+    )
+
+
+def prepare_attachment_writes(
+    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+) -> tuple[list[str], dict[str, AttachmentWrite]]:
+    """Validate an atomic write and retain one blob payload per distinct id.
+
+    The returned list preserves every reference (including duplicates).  The
+    mapping is only for inserting/validating the globally deduplicated blob.
+    Filenames are intentionally not part of duplicate compatibility: the blob
+    store historically keeps the filename of the first global reference, while
+    identity and rendering semantics are carried by content, MIME, and kind.
+    """
+    if not attachments:
+        raise ValueError("atomic attachment commit requires at least one attachment")
+
+    ordered_ids: list[str] = []
+    unique: dict[str, AttachmentWrite] = {}
+    for attachment in attachments:
+        if not attachment.attachment_id:
+            raise ValueError("attachment_id must be non-empty")
+        if not isinstance(attachment.content, bytes):
+            raise TypeError("attachment content must be bytes")
+        if attachment.size_bytes != len(attachment.content):
+            raise ValueError(
+                f"attachment {attachment.attachment_id!r} size does not match its content"
+            )
+        if not attachment.mime_type or not attachment.kind:
+            raise ValueError("attachment MIME type and kind must be non-empty")
+
+        prior = unique.get(attachment.attachment_id)
+        if prior is not None and (
+            prior.content != attachment.content
+            or prior.size_bytes != attachment.size_bytes
+            or prior.mime_type != attachment.mime_type
+            or prior.kind != attachment.kind
+        ):
+            raise ConversationCommitConflictError(
+                f"attachment {attachment.attachment_id!r} has conflicting blob payloads"
+            )
+        unique.setdefault(attachment.attachment_id, attachment)
+        ordered_ids.append(attachment.attachment_id)
+    return ordered_ids, unique
+
+
+# The immutable identity of a keyed conversation commit: every column the
+# conflict re-read projects and :func:`assert_conversation_commit_matches`
+# compares.  ``id`` rides along as the row the retry is acknowledged with;
+# ``timestamp`` is database-generated and deliberately absent.
+_COMMIT_IDENTITY_COLUMNS = (
+    conversations.c.id,
+    conversations.c.role,
+    conversations.c.content,
+    conversations.c.tool_name,
+    conversations.c.tool_call_id,
+    conversations.c.provider_data,
+    conversations.c.tool_calls,
+    conversations.c._source,
+    conversations.c.event_id,
+    conversations.c.is_error,
+    conversations.c.attachments,
+    conversations.c.meta,
+    conversations.c.commit_key,
+)
+
+
+def select_conversation_commit_row(conn: Any, ws_id: str, commit_key: str) -> Any:
+    """Re-read the row a keyed insert conflicted with, or ``None`` if it vanished.
+
+    Every keyed save path — plain and attachment-bearing, on both dialects —
+    reads the conflicting row through here, so the identity column list exists
+    once.  A vanished row is the caller's signal never to re-insert: a
+    concurrent hard delete may have removed it.
+    """
+    return conn.execute(
+        sa.select(*_COMMIT_IDENTITY_COLUMNS).where(
+            conversations.c.ws_id == ws_id,
+            conversations.c.commit_key == commit_key,
+        )
+    ).fetchone()
+
+
+def assert_conversation_commit_matches(
+    row: Any,
+    *,
+    role: str,
+    content: str | None,
+    tool_name: str | None,
+    tool_call_id: str | None,
+    source: str | None,
+    event_id: int | None,
+    is_error: bool,
+    meta: str | None,
+    commit_key: str,
+    provider_data: str | None = None,
+    tool_calls: str | None = None,
+    attachment_ids: list[str] | None = None,
+) -> int:
+    """Validate an existing row against one normalized keyed commit.
+
+    ``id`` and ``timestamp`` are database-generated and intentionally excluded.
+    A plain commit (``attachment_ids`` omitted) requires a NULL ``attachments``
+    column, because attachment-bearing USER/TOOL writes use the dedicated atomic
+    seams; those pass their ordered reference list, which is compared decoded so
+    a re-ordered retry conflicts while an equivalent encoding does not.
+
+    Every other column compares byte-identically on purpose: the durability
+    journal reads a mismatch as a permanent conflict, so normalization added
+    here would turn benign retries into spurious failures.
+    """
+    values = row._mapping
+    expected = {
+        "role": role,
+        "content": content,
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "provider_data": provider_data,
+        "tool_calls": tool_calls,
+        "_source": source,
+        "event_id": event_id,
+        "is_error": is_error,
+        **({} if attachment_ids is not None else {"attachments": None}),
+        "meta": meta,
+        "commit_key": commit_key,
+    }
+    mismatched = [
+        field
+        for field, expected_value in expected.items()
+        if values[field] != expected_value
+        and not (field == "is_error" and bool(values[field]) is expected_value)
+    ]
+    if (
+        attachment_ids is not None
+        and parse_attachment_refs(values["attachments"]) != attachment_ids
+    ):
+        mismatched.append("attachments")
+    if mismatched:
+        kind = "attachment" if attachment_ids is not None else "conversation"
+        raise ConversationCommitConflictError(
+            f"commit_key already identifies a different {kind} commit "
+            f"(mismatched fields: {', '.join(mismatched)})"
+        )
+    return int(values["id"])
+
+
+class KeyedAttachmentSaveWrappers:
+    """Public keyed attachment-save wrappers shared by both dialects.
+
+    Each dialect implements ``_save_message_with_attachments`` (its lock
+    prologue, insert constructor, and FTS hook differ); these wrappers own
+    only the role-shaped public signatures, so the storage API cannot drift
+    between backends.
+    """
+
+    def _save_message_with_attachments(self, *args: Any, **kwargs: Any) -> int:
+        raise NotImplementedError
+
+    def save_user_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        source: str | None = None,
+        event_id: int | None = None,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Commit a keyed USER row and all attachment ownership atomically."""
+        return self._save_message_with_attachments(
+            ws_id,
+            "user",
+            content,
+            attachments,
+            source=source,
+            event_id=event_id,
+            meta=meta,
+            commit_key=commit_key,
+            origin="upload",
+            exact_blob_metadata=False,
+        )
+
+    def save_tool_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        tool_name: str,
+        tool_call_id: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        event_id: int | None = None,
+        is_error: bool = False,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Commit a keyed TOOL row and all attachment ownership atomically."""
+        return self._save_message_with_attachments(
+            ws_id,
+            "tool",
+            content,
+            attachments,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            event_id=event_id,
+            is_error=is_error,
+            meta=meta,
+            commit_key=commit_key,
+            origin="tool",
+            exact_blob_metadata=True,
+        )
+
+
+def resolve_keyed_commit_conflict(
+    conn: Any,
+    ws_id: str,
+    values: dict[str, Any],
+    *,
+    attachment_ids: list[str] | None = None,
+    vanished_message: str = "save_message: conflicting commit_key row vanished",
+) -> int:
+    """Recover a keyed insert whose ``ON CONFLICT DO NOTHING`` matched a row.
+
+    Re-selects by commit key and validates byte-identity, driven from the
+    SAME ``values`` dict the insert used — a column added to the commit
+    identity is threaded once, so every idempotent-retry validation (both
+    dialects' plain saves AND the shared attachment-commit body) compares
+    every field or none. A conflicting row that vanished must not be
+    silently re-created (that could resurrect a hard-deleted workstream):
+    raise instead.
+    """
+    commit_key = values["commit_key"]
+    row = select_conversation_commit_row(conn, ws_id, commit_key)
+    if row is None:
+        raise RuntimeError(vanished_message)
+    return assert_conversation_commit_matches(
+        row,
+        role=values["role"],
+        content=values["content"],
+        tool_name=values["tool_name"],
+        tool_call_id=values["tool_call_id"],
+        provider_data=values.get("provider_data"),
+        tool_calls=values.get("tool_calls"),
+        source=values["_source"],
+        event_id=values["event_id"],
+        is_error=values["is_error"],
+        meta=values["meta"],
+        commit_key=commit_key,
+        attachment_ids=attachment_ids,
+    )
+
+
+def assert_attachment_blobs_match(
+    conn: Any,
+    attachments: dict[str, AttachmentWrite],
+    *,
+    exact_metadata: bool = False,
+) -> None:
+    """Require every referenced CAS row to contain the requested bytes.
+
+    The USER path preserves the global store's historical first-writer MIME and
+    kind behavior. The TOOL path passes ``exact_metadata=True`` because its
+    replay contract requires bytes, length, MIME, and kind to match exactly.
+    Filename and origin remain first-writer metadata for both paths.
+    """
+    ids = list(attachments)
+    rows = conn.execute(
+        sa.select(
+            workstream_attachments.c.attachment_id,
+            workstream_attachments.c.mime_type,
+            workstream_attachments.c.size_bytes,
+            workstream_attachments.c.kind,
+            workstream_attachments.c.content,
+        ).where(workstream_attachments.c.attachment_id.in_(ids))
+    ).fetchall()
+    stored = {str(row._mapping["attachment_id"]): row._mapping for row in rows}
+    missing = set(ids) - set(stored)
+    if missing:
+        raise RuntimeError(f"atomic attachment insert lost blobs: {sorted(missing)!r}")
+
+    for attachment_id, requested in attachments.items():
+        row = stored[attachment_id]
+        raw_content = row["content"]
+        content = bytes(raw_content) if not isinstance(raw_content, bytes) else raw_content
+        if (
+            content != requested.content
+            or int(row["size_bytes"]) != requested.size_bytes
+            or (
+                exact_metadata
+                and (
+                    str(row["mime_type"]) != requested.mime_type
+                    or str(row["kind"]) != requested.kind
+                )
+            )
+        ):
+            raise ConversationCommitConflictError(
+                f"attachment {attachment_id!r} conflicts with its content-addressed blob"
+            )
+
+
+def retain_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
+    """Increment existing blobs for a newly inserted batch of references.
+
+    Fork persistence writes copied conversation rows and their attachment links
+    in one transaction. Retaining the referenced blobs in that same transaction
+    keeps the links and global refcounts atomic: either every copied row and
+    increment commits, or none of them does.
+
+    Counts duplicate ids because the release side does too: two copied turns may
+    legitimately reference the same content-addressed blob. Missing blobs are a
+    hard failure; a dangling link would make a fork appear durable while its
+    attachment route already returns 404.
+    """
+    if not attachment_ids:
+        return
+    counts = Counter(attachment_ids)
+    ids = list(counts)
+    increment = sa.case(
+        *((workstream_attachments.c.attachment_id == aid, n) for aid, n in counts.items()),
+        else_=0,
+    )
+    retained = set(
+        conn.execute(
+            sa.update(workstream_attachments)
+            .where(workstream_attachments.c.attachment_id.in_(ids))
+            .values(refcount=workstream_attachments.c.refcount + increment)
+            .returning(workstream_attachments.c.attachment_id)
+        ).scalars()
+    )
+    missing = set(ids) - retained
+    if missing:
+        raise ValueError(f"cannot retain missing attachment blobs: {sorted(missing)!r}")
+
+
+def release_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
+    """Decrement each referenced blob's refcount, prune any that reach 0.
+
+    The single dialect-agnostic owner of the content-addressed GC decrement —
+    both backends call this on rewind/retry (``delete_messages_after``) and on
+    workstream delete; the increment twin is each backend's ``save_attachment``
+    (INSERT-OR-IGNORE + unconditional ``+1``).  Counts duplicate ids in the
+    input — a turn references an id once, but a batch may span several turns that
+    each reference the same deduped blob — so the decrement matches the
+    references actually removed.  One UPDATE (a searched CASE maps each id to its
+    decrement; portable across SQLite/Postgres, unlike a VALUES join) plus one
+    prune DELETE, rather than a query per distinct id.  Caller holds the
+    connection / transaction.
+    """
+    if not attachment_ids:
+        return
+    counts = Counter(attachment_ids)
+    ids = list(counts)
+    decrement = sa.case(
+        *((workstream_attachments.c.attachment_id == aid, n) for aid, n in counts.items()),
+        else_=0,
+    )
+    conn.execute(
+        sa.update(workstream_attachments)
+        .where(workstream_attachments.c.attachment_id.in_(ids))
+        .values(refcount=workstream_attachments.c.refcount - decrement)
+    )
+    conn.execute(
+        sa.delete(workstream_attachments).where(
+            sa.and_(
+                workstream_attachments.c.attachment_id.in_(ids),
+                workstream_attachments.c.refcount <= 0,
+            )
+        )
+    )
+
+
+def prepare_attachment_commit(
+    ws_id: str,
+    role: str,
+    content: str,
+    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+    *,
+    tool_name: str | None,
+    tool_call_id: str | None,
+    source: str | None,
+    event_id: int | None,
+    is_error: bool,
+    meta: str | None,
+    commit_key: str,
+    now: str,
+) -> tuple[list[str], dict[str, AttachmentWrite], dict[str, Any]]:
+    """Validate one keyed attachment commit and build its conversation row.
+
+    Pure by design: a malformed write is refused before either backend opens
+    its writer transaction, so an invalid payload never holds SQLite's
+    database-wide writer slot or a PostgreSQL parent row lock.  Returns the
+    ordered reference list, the deduplicated blob payloads, and the row values
+    both dialects insert.
+    """
+    if not commit_key:
+        raise ValueError("atomic attachment commit requires a commit_key")
+    attachment_ids, blobs = prepare_attachment_writes(attachments)
+    if sanitize_text(content) is None:  # ``content`` is typed str; defensive at the boundary.
+        raise TypeError("atomic attachment content must be text")
+    # The commit-identity dict comes from the ONE builder both commit lanes
+    # share — a column added to the commit identity reaches the plain and
+    # attachment lanes' inserts AND their conflict rechecks together (a
+    # hand-synced sibling here would let attachment retries validate
+    # against a stale field set on both dialects).  The attachment lane's
+    # only additions: the native lane is structurally empty (attachments
+    # never carry provider blocks) and the ordered reference list rides
+    # the ``attachments`` column.
+    values = prepare_conversation_row_values(
+        ws_id,
+        role,
+        content,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        provider_data=None,
+        tool_calls=None,
+        source=source,
+        event_id=event_id,
+        is_error=is_error,
+        producer=None,
+        meta=meta,
+        commit_key=commit_key,
+        now=now,
+    )
+    values["attachments"] = json.dumps(attachment_ids)
+    return attachment_ids, blobs, values
+
+
+def prepare_conversation_row_values(
+    ws_id: str,
+    role: str,
+    content: str | None,
+    *,
+    tool_name: str | None,
+    tool_call_id: str | None,
+    provider_data: str | None,
+    tool_calls: str | None,
+    source: str | None,
+    event_id: int | None,
+    is_error: bool,
+    producer: str | None,
+    meta: str | None,
+    commit_key: str | None,
+    now: str,
+) -> dict[str, Any]:
+    """Build the ``save_message`` row values both dialects insert.
+
+    This dict IS the commit identity that ``resolve_keyed_commit_conflict``
+    re-reads and compares on an idempotent retry, so a column added to the
+    commit identity must thread through here exactly once and reach both
+    dialects' insert AND both rechecks together.  A per-dialect copy lets
+    one backend's retry validation compare a stale field set — every
+    legitimate retry false-conflicts (journal latched at "conflict"), or a
+    genuinely different commit is silently acknowledged — on one backend
+    only, invisible to single-backend tests.
+    """
+    if commit_key == "":
+        raise ValueError("conversation commit_key must be non-empty")
+    return {
+        "ws_id": ws_id,
+        "timestamp": now,
+        "role": role,
+        "content": sanitize_text(content),
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "provider_data": prepare_provider_data_for_save(
+            role, sanitize_text(provider_data), tool_calls, producer
+        ),
+        "tool_calls": tool_calls,
+        "_source": sanitize_text(source),
+        "event_id": event_id,
+        "is_error": is_error,
+        "meta": meta,
+        "commit_key": commit_key,
+    }
+
+
+def save_attachment_commit_transaction(
+    conn: Any,
+    dialect_insert: Callable[[Any], Any],
+    *,
+    values: dict[str, Any],
+    attachment_ids: list[str],
+    blobs: dict[str, AttachmentWrite],
+    now: str,
+    origin: str,
+    exact_blob_metadata: bool,
+    index_content: Callable[[int], None] | None = None,
+) -> int:
+    """Execute the backend-neutral body of a keyed USER/TOOL attachment commit.
+
+    The caller owns the connection, the transaction, and its dialect-specific
+    locking prologue: SQLite enters under ``BEGIN IMMEDIATE``, PostgreSQL under
+    the parent row's ``FOR UPDATE``, and both refuse a missing parent before
+    calling.  ``dialect_insert`` is that dialect's INSERT constructor —
+    ``ON CONFLICT DO NOTHING`` only exists on the dialect-specific construct.
+    ``index_content`` is SQLite's external-content FTS refresh, run where the
+    row id first exists; PostgreSQL passes nothing.
+    """
+    ws_id = values["ws_id"]
+    inserted = conn.execute(
+        dialect_insert(conversations)
+        .values(**values)
+        .on_conflict_do_nothing(
+            index_elements=[conversations.c.ws_id, conversations.c.commit_key],
+            index_where=conversations.c.commit_key.is_not(None),
+        )
+        .returning(conversations.c.id)
+    ).scalar_one_or_none()
+    if inserted is None:
+        row_id = resolve_keyed_commit_conflict(
+            conn,
+            ws_id,
+            values,
+            attachment_ids=attachment_ids,
+            vanished_message="atomic attachment commit conflict row vanished",
+        )
+        # A matching row is the transaction's durable witness.  Also reject
+        # latent CAS corruption instead of acknowledging a history row whose
+        # blob materialization will fail later.
+        assert_attachment_blobs_match(conn, blobs, exact_metadata=exact_blob_metadata)
+        return row_id
+
+    row_id = int(inserted)
+    written = set(
+        conn.execute(
+            dialect_insert(workstream_attachments)
+            .values(
+                [
+                    {
+                        "attachment_id": attachment.attachment_id,
+                        "filename": attachment.filename,
+                        "mime_type": attachment.mime_type,
+                        "size_bytes": attachment.size_bytes,
+                        "kind": attachment.kind,
+                        "content": attachment.content,
+                        "created": now,
+                        "refcount": 0,
+                        "origin": origin,
+                    }
+                    for attachment in blobs.values()
+                ]
+            )
+            .on_conflict_do_nothing(index_elements=["attachment_id"])
+            .returning(workstream_attachments.c.attachment_id)
+        ).scalars()
+    )
+    # Only ids this statement did NOT write can disagree with the request; the
+    # rest are the bytes we just supplied.  Re-reading those too would pull the
+    # whole upload back out of the database inside the write transaction,
+    # doubling its I/O and extending the parent row's lock hold.
+    conflicted = {aid: blob for aid, blob in blobs.items() if aid not in written}
+    if conflicted:
+        assert_attachment_blobs_match(conn, conflicted, exact_metadata=exact_blob_metadata)
+    retain_attachment_refs(conn, attachment_ids)
+    if index_content is not None:
+        index_content(row_id)
+    conn.execute(sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now))
+    return row_id
+
+
+def find_orphan_conversations(conn: Any) -> list[dict[str, Any]]:
+    """Conversation ws_ids that have no ``workstreams`` row, with row stats.
+
+    Orphans come from writers that persisted without a registered workstream:
+    historically the pre-unification CLI/server paths, and the
+    delete-during-inflight race (a late tool-result save re-creating rows
+    after ``delete_workstream``).  Read-only; ordered oldest-first.  Each
+    entry carries the attachment-ref count so a purge's refcount release is
+    visible before it happens.
+    """
+    anti_join = conversations.outerjoin(workstreams, conversations.c.ws_id == workstreams.c.ws_id)
+    rows = conn.execute(
+        sa.select(
+            conversations.c.ws_id,
+            sa.func.count().label("row_count"),
+            sa.func.min(conversations.c.timestamp).label("first"),
+            sa.func.max(conversations.c.timestamp).label("last"),
+        )
+        .select_from(anti_join)
+        .where(workstreams.c.ws_id.is_(None))
+        .group_by(conversations.c.ws_id)
+        .order_by(sa.func.min(conversations.c.timestamp))
+    ).fetchall()
+    # Ref counts in ONE pass over the orphan rows that carry attachments —
+    # not a query per orphan workstream, so the scan stays proportional to
+    # orphan ROW count.
+    ref_counts: dict[str, int] = {}
+    ref_rows = conn.execute(
+        sa.select(conversations.c.ws_id, conversations.c.attachments)
+        .select_from(anti_join)
+        .where(
+            sa.and_(
+                workstreams.c.ws_id.is_(None),
+                conversations.c.attachments.is_not(None),
+            )
+        )
+    ).fetchall()
+    for ws_id, refs in ref_rows:
+        ref_counts[ws_id] = ref_counts.get(ws_id, 0) + len(parse_attachment_refs(refs))
+    return [
+        {
+            "ws_id": ws_id,
+            "rows": int(row_count),
+            "first": first,
+            "last": last,
+            "attachment_refs": ref_counts.get(ws_id, 0),
+        }
+        for ws_id, row_count, first, last in rows
+    ]
+
+
+# IN-list chunk size for the purge statements — mirrors the storage layer's
+# existing bulk chunking (SQLite bind-parameter limits).
+_PURGE_CHUNK = 500
+
+
+def purge_orphan_conversations(conn: Any, ws_ids: list[str]) -> dict[str, int]:
+    """Delete conversation rows for the *ws_ids* that are STILL orphans.
+
+    Orphan-ness is enforced INSIDE the DELETE itself (a correlated
+    ``NOT EXISTS`` against ``workstreams``), and the refcounts to release
+    come from the DELETE's ``RETURNING`` — so refs are released for exactly
+    the rows that were deleted.  A ws_id registered at any point before the
+    DELETE statement keeps both its rows AND its refcounts; there is no
+    pre-count/delete window to underflow.  (Needs ``DELETE .. RETURNING``:
+    PostgreSQL, or SQLite ≥ 3.35.)
+
+    Input is de-duplicated and all IN-lists are chunked.  ``skipped`` =
+    distinct input ws_ids not purged (registered before/during the purge, or
+    no rows).  The purged ws_ids' ``workstream_config`` /
+    ``workstream_overrides`` rows are swept.  Caller owns commit.
+    """
+    distinct = list(dict.fromkeys(ws_ids))
+    if not distinct:
+        return {"workstreams": 0, "rows": 0, "released_refs": 0, "skipped": 0}
+    ref_ids: list[str] = []
+    purged_ws: set[str] = set()
+    rows_deleted = 0
+    for i in range(0, len(distinct), _PURGE_CHUNK):
+        chunk = distinct[i : i + _PURGE_CHUNK]
+        returned = conn.execute(
+            sa.delete(conversations)
+            .where(
+                sa.and_(
+                    conversations.c.ws_id.in_(chunk),
+                    ~sa.exists(
+                        sa.select(workstreams.c.ws_id).where(
+                            workstreams.c.ws_id == conversations.c.ws_id
+                        )
+                    ),
+                )
+            )
+            .returning(conversations.c.ws_id, conversations.c.attachments)
+        ).fetchall()
+        for ws_id, refs in returned:
+            purged_ws.add(ws_id)
+            rows_deleted += 1
+            if refs:
+                ref_ids.extend(parse_attachment_refs(refs))
+    release_attachment_refs(conn, ref_ids)
+    swept = sorted(purged_ws)
+    for i in range(0, len(swept), _PURGE_CHUNK):
+        chunk = swept[i : i + _PURGE_CHUNK]
+        conn.execute(
+            sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id.in_(chunk))
+        )
+        conn.execute(
+            sa.delete(structured_memories).where(
+                structured_memories.c.scope == "workstream",
+                structured_memories.c.scope_id.in_(chunk),
+            )
+        )
+        conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk)))
+        conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id.in_(chunk)))
+    return {
+        "workstreams": len(purged_ws),
+        "rows": rows_deleted,
+        "released_refs": len(ref_ids),
+        "skipped": len(distinct) - len(purged_ws),
+    }
+
+
+def attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a stored attachment row into an OpenAI-style content part.
+
+    Returns ``None`` if the attachment's ``kind`` / ``content`` cannot be
+    turned into a content part (logged but non-fatal so history still renders).
+    """
+    kind = att.get("kind")
+    raw = att.get("content")
+    mime = att.get("mime_type") or "application/octet-stream"
+    if kind == "image" and isinstance(raw, bytes):
+        from turnstone.core.images import normalize_image_orientation
+
+        # Bake EXIF orientation into the pixels — the model's image decoder, like
+        # Pillow, ignores the orientation tag, so a phone photo would otherwise be
+        # perceived sideways.  Unrotated images pass through untouched.
+        b64 = base64.b64encode(normalize_image_orientation(raw)).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        }
+    if kind == "text" and isinstance(raw, bytes):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            log.warning(
+                "attachment id=%s stored as text but not valid UTF-8",
+                att.get("attachment_id"),
+            )
+            return unreadable_placeholder(att.get("filename") or "")
+        return {
+            "type": "document",
+            "document": {
+                "name": att.get("filename") or "",
+                "media_type": mime,
+                "data": text,
+            },
+        }
+    if kind == "pdf" and isinstance(raw, bytes):
+        # PDF rides as a ``document`` part discriminated by media_type:
+        # base64 bytes (vs. a text doc's utf-8 ``data``).  Per-provider
+        # translators branch on ``application/pdf`` (Phase 2); the client-side
+        # fallback for non-PDF models lands in Phase 3.
+        from turnstone.core.media_materialization import native_pdf_part
+
+        return native_pdf_part(raw, att.get("filename") or "")
+    if kind == "audio" and isinstance(raw, bytes):
+        # OpenAI-style ``input_audio`` part — passes through the openai-compat
+        # lane untouched (omni models); other lanes translate / fall back in
+        # Phase 2/3.  ``format`` is the bare codec token derived from the MIME.
+        b64 = base64.b64encode(raw).decode("ascii")
+        fmt = AUDIO_MIME_TO_FORMAT.get(mime) or (mime.split("/", 1)[-1] if "/" in mime else "wav")
+        return {
+            "type": "input_audio",
+            "input_audio": {"data": b64, "format": fmt},
+        }
+    return None
+
+
+def parse_attachment_refs(raw: str | None) -> list[str]:
+    """Decode a ``conversations.attachments`` ref-list column into id strings.
+
+    The column stores a JSON array of content-addressed ``attachment_id``s in
+    turn order (NULL / empty for turns with no attachments).  Malformed or
+    non-list JSON decodes to an empty list (defensive — a corrupt column must
+    never crash a history load); non-string elements are dropped.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(x) for x in parsed if isinstance(x, str) and x]
+
+
+def build_attachments_by_msg(
+    attachment_refs: dict[int, list[str]],
+    rows_by_id: dict[str, dict[str, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    """Assemble the ``reconstruct_messages`` attachment map from ref-lists.
+
+    ``attachment_refs`` maps a conversations row id to its ordered list of
+    content-addressed ids (from :func:`parse_attachment_refs`); ``rows_by_id``
+    maps an attachment id to its resolved blob row (incl. ``content`` bytes).
+    Returns ``{row_id: [att_row, ...]}`` preserving ref-list order, skipping
+    ids whose blob is missing (pruned / never written).  Empty lists are
+    omitted so the caller can pass ``result or None`` unchanged.
+    """
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for mid, ids in attachment_refs.items():
+        resolved = [rows_by_id[aid] for aid in ids if aid in rows_by_id]
+        if resolved:
+            grouped[mid] = resolved
+    return grouped
+
+
+def _reconstruct_attachment_refs(
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None,
+    row_id: int | None,
+) -> tuple[list[AttachmentRef], list[dict[str, Any]]]:
+    """Build ``(attachment_refs, attachments_meta)`` for a row from its ref-list.
+
+    ``attachments_by_msg`` maps a conversations row id to the ordered list of
+    content-addressed attachment rows referenced by that row's ``attachments``
+    column.  Returns the by-reference content blocks (:class:`AttachmentRef`, in
+    ref-list order — bytes resolve at the consumer, never carried in the Turn)
+    and the display-oriented ``_attachments_meta`` siblings (kind / filename /
+    mime_type) so history replay keeps filenames available (e.g. image pills).
+    Shared by the user- and tool-row reconstruction.
+    """
+    refs: list[AttachmentRef] = []
+    meta: list[dict[str, Any]] = []
+    if not attachments_by_msg or row_id is None:
+        return refs, meta
+    for att in attachments_by_msg.get(row_id, []):
+        # AttachmentRef.kind is the by-reference placeholder kind: the stored
+        # blob kind verbatim for image / pdf / audio, else 'document' for a
+        # stored 'text' blob (so the placeholder type can't collide with a real
+        # text content part on the dict round-trip).  The blob kind drives the
+        # actual resolution; preserving pdf / audio here keeps the reloaded
+        # placeholder type ({type:pdf} / {type:audio}) consistent with the live
+        # injection path, which already emits those.
+        kind_str = str(att.get("kind") or "")
+        if kind_str == "preview":
+            # Preview-pane blobs ride the ref-list ONLY for refcount GC and
+            # the serving-route ownership gate — they are frontend content,
+            # addressed by the tool turn's meta descriptor, and must never
+            # become a content block a wire materialization could inline.
+            continue
+        ref_kind = kind_str if kind_str in ("image", "pdf", "audio") else "document"
+        refs.append(
+            AttachmentRef(
+                attachment_id=str(att.get("attachment_id") or ""),
+                kind=ref_kind,
+            )
+        )
+        meta.append(
+            {
+                "attachment_id": str(att.get("attachment_id") or ""),
+                "kind": str(att.get("kind") or ""),
+                "filename": str(att.get("filename") or ""),
+                "mime_type": str(att.get("mime_type") or ""),
+                # Doc-budget proxy for the by-reference placeholder (which carries
+                # no inline bytes): the token estimator reads this so a reloaded
+                # document turn isn't counted as ~free.  See ``_msg_text_chars``.
+                "size_bytes": int(att.get("size_bytes") or 0),
+            }
+        )
+    return refs, meta
+
+
+# ---------------------------------------------------------------------------
+# Search-term normalization
+# ---------------------------------------------------------------------------
+
+# Composition can hand a multi-KB pasted user message to ILIKE-based search;
+# without a cap, every distinct token would emit one unindexable predicate
+# per scope-fanned query, producing hundreds of seq-scan clauses on a single
+# rebuild.  Cap + dedupe + length filter keeps the SQL bounded.
+_MAX_SEARCH_TERMS = 16
+_MIN_TERM_LEN = 2
+
+# Streaming tokenizer — finditer doesn't allocate a full list up front,
+# so a multi-KB pasted query stops being scanned the moment the cap is
+# hit instead of after splitting every token.
+_TOKEN_RE = re.compile(r"\S+")
+
+
+def normalize_search_terms(query: str) -> list[str]:
+    """De-dupe (case-insensitive), drop short tokens, and cap at MAX terms."""
+    seen: set[str] = set()
+    terms: list[str] = []
+    for match in _TOKEN_RE.finditer(query):
+        raw = match.group()
+        lowered = raw.lower()
+        if len(lowered) < _MIN_TERM_LEN or lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(raw)
+        if len(terms) >= _MAX_SEARCH_TERMS:
+            break
+    return terms
+
+
+# ---------------------------------------------------------------------------
+# Text sanitization
+# ---------------------------------------------------------------------------
+
+
+def sanitize_text(value: str | None) -> str | None:
+    """Strip NUL bytes that PostgreSQL text fields cannot store.
+
+    SQLite tolerates NUL in TEXT but they cause downstream issues (API
+    payloads, web UI rendering), so both backends use this.
+    """
+    if value and "\x00" in value:
+        return value.replace("\x00", "")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# SQL LIKE escaping
+# ---------------------------------------------------------------------------
+
+# The escape character paired with :func:`escape_like`.  Callers MUST
+# pass ``escape=LIKE_ESCAPE`` to SQLAlchemy's ``.like()`` — without
+# that kwarg, ``.like()`` uses no escape character at all and the
+# ``\%`` / ``\_`` sequences produced by :func:`escape_like` would be
+# interpreted as a literal backslash followed by a wildcard.  ``\``
+# is the SQL standard escape character and works identically on SQLite
+# and PostgreSQL when passed explicitly.
+LIKE_ESCAPE = "\\"
+
+
+def escape_like(value: str) -> str:
+    """Escape ``%`` and ``_`` (and the escape character itself) so the
+    string can be safely embedded in a SQL ``LIKE`` pattern.
+
+    Pair with ``column.like(escape_like(prefix) + "%", escape=LIKE_ESCAPE)``
+    to do a true prefix match against caller-supplied input.  Without
+    this, untrusted text containing ``%`` or ``_`` is interpreted as a
+    wildcard — e.g. a model-supplied watch name of ``"%"`` would match
+    every row in the queried partition.
+    """
+    return (
+        value.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row helper
+# ---------------------------------------------------------------------------
+
+
+def row_to_dict(row: Any, *bool_fields: str) -> dict[str, Any]:
+    """Convert a SQLAlchemy row to a dict, casting named fields to bool."""
+    d = dict(row._mapping)
+    for key in bool_fields:
+        if key in d:
+            d[key] = bool(d[key])
+    return d
+
+
+def split_perms(value: str | None) -> set[str]:
+    """Split the comma-separated ``roles.permissions`` column into a set."""
+    if not value:
+        return set()
+    return {p.strip() for p in value.split(",") if p.strip()}
+
+
+# ---------------------------------------------------------------------------
+# Field allowlists for governance update methods
+# ---------------------------------------------------------------------------
+
+ROLE_MUTABLE = frozenset({"display_name", "permissions"})
+ORG_MUTABLE = frozenset({"display_name", "settings"})
+POLICY_MUTABLE = frozenset({"name", "tool_pattern", "action", "priority", "enabled"})
+SKILL_MUTABLE = frozenset(
+    {
+        "name",
+        "content",
+        "category",
+        "variables",
+        "is_default",
+        "description",
+        "tags",
+        "source_url",
+        "version",
+        "author",
+        "activation",
+        "token_estimate",
+        "model",
+        "auto_approve",
+        "temperature",
+        "reasoning_effort",
+        "max_tokens",
+        "token_budget",
+        "agent_max_turns",
+        "notify_on_complete",
+        "enabled",
+        "allowed_tools",
+        "license",
+        "compatibility",
+        "scan_version",
+        "risk_level",
+        "scan_report",
+        "priority",
+        "kind",
+        # SKILL.md spec uplift (migration 056)
+        "paths",
+        "hidden_from_menu",
+        "arguments",
+        "argument_hint",
+    }
+)
+# ``oauth_client_secret_ct`` is intentionally absent from this set.  It has
+# its own dedicated writer (``StorageBackend.set_mcp_oauth_client_secret_ct``)
+# so the encrypt/None-to-clear semantics — owned by
+# :class:`turnstone.core.mcp_crypto.MCPTokenStore` — live in one place and
+# the generic ``update_mcp_server`` cannot accept a raw ciphertext blob.
+MCP_SERVER_MUTABLE = frozenset(
+    {
+        "name",
+        "transport",
+        "command",
+        "args",
+        "url",
+        "headers",
+        "env",
+        "auto_approve",
+        "enabled",
+        "registry_name",
+        "registry_version",
+        "registry_meta",
+        "auth_type",
+        "oauth_client_id",
+        "oauth_scopes",
+        "oauth_audience",
+        "oauth_registration_mode",
+        "oauth_authorization_server_url",
+        "oauth_as_issuer_cached",
+    }
+)
+MODEL_DEFINITION_MUTABLE = frozenset(
+    {
+        "alias",
+        "model",
+        "provider",
+        "base_url",
+        "api_key",
+        "context_window",
+        "max_concurrency",
+        "capabilities",
+        "enabled",
+        "temperature",
+        "max_tokens",
+        "reasoning_effort",
+        "surface_persisted_reasoning",
+        "replay_reasoning_to_model",
+        "auth_mode",
+        "obo_audience",
+        "obo_scopes",
+    }
+)
+# Sentinel for ``update_model_definition``'s optional conditional-write
+# compare: distinguishes "no compare requested" (every ordinary caller)
+# from "compare against NULL". Shared by both backends so the calibrate
+# retry loop reads one contract.
+CAPS_COMPARE_UNSET: object = object()
+PROJECT_MUTABLE = frozenset({"name", "visibility", "state", "parent_project_id"})
+PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
+# ``name`` (the slug create requests reference) is deliberately immutable —
+# edit display_name instead.  Workstream snapshots are self-contained so a
+# rename wouldn't break them, but stable slugs keep audit rows and operator
+# muscle memory honest.
+PERSONA_MUTABLE = frozenset(
+    {
+        "display_name",
+        "description",
+        "base_prompt",
+        "tool_allowlist",
+        "mcp_enabled",
+        "memory_enabled",
+        "applies_to_kinds",
+        "is_default",
+        "enabled",
+    }
+)
+
+PERSONA_KINDS = frozenset({"interactive", "coordinator"})
+
+
+def persona_row_to_dict(row: Any) -> dict[str, Any]:
+    """Convert a personas row to the Python-typed dict shape the Protocol
+    documents: JSON columns parsed, 0/1 columns as bool.  ``tool_allowlist``
+    keeps its tri-state — None (unrestricted) vs [] (hard empty) vs [names].
+
+    Raises ValueError on a corrupt row: a malformed allowlist or kinds
+    column must fail loudly (mirroring ``snapshot_from_config``), never
+    decode into a garbage envelope or mask a broken invariant.
+    """
+    d = row_to_dict(row, "mcp_enabled", "memory_enabled", "is_default", "enabled")
+
+    def _load_json(column: str, raw_value: Any) -> Any:
+        # Re-raise parser errors with the persona named — a bare
+        # JSONDecodeError message doesn't say WHICH row is corrupt.
+        try:
+            return json.loads(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"corrupt {column} on persona {d.get('persona_id')!r}: {exc}") from exc
+
+    raw = d.get("tool_allowlist")
+    if raw is None:
+        d["tool_allowlist"] = None
+    else:
+        tools = _load_json("tool_allowlist", raw)
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+            raise ValueError(f"corrupt tool_allowlist on persona {d.get('persona_id')!r}")
+        d["tool_allowlist"] = tools
+    kinds_raw = d.get("applies_to_kinds")
+    kinds = _load_json("applies_to_kinds", kinds_raw) if kinds_raw else None
+    if not isinstance(kinds, list) or not kinds or not all(isinstance(k, str) for k in kinds):
+        raise ValueError(f"corrupt applies_to_kinds on persona {d.get('persona_id')!r}")
+    d["applies_to_kinds"] = kinds
+    return d
+
+
+# Storage-layer size bounds for operator-authored persona fields.  The
+# console route truncates its inputs to the same shape, but the storage
+# edge is the layer every future ingress (SDK-direct, admin CLI) inherits —
+# reject rather than silently truncate here.
+PERSONA_FIELD_CAPS: dict[str, int] = {
+    "display_name": 128,
+    "description": 1024,
+    "base_prompt": 32768,
+}
+PERSONA_ALLOWLIST_MAX_ENTRIES = 512
+PERSONA_ALLOWLIST_MAX_NAME_LEN = 256
+
+
+def serialize_persona_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Validate + serialize Python-typed persona fields to column values.
+
+    Shared by both backends so the tri-state allowlist encoding, the kinds
+    validation, and the size bounds can't drift between them.  Raises
+    ValueError on malformed or oversized input; unknown keys pass through
+    (callers filter to the mutable set first where that matters).
+    """
+    out = dict(fields)
+    for key, cap in PERSONA_FIELD_CAPS.items():
+        val = out.get(key)
+        if val is not None and key in out and len(str(val)) > cap:
+            raise ValueError(f"{key} exceeds {cap} characters")
+    # An empty inline prompt is not a source: normalise "" to NULL so the
+    # storage CHECK (base_prompt OR base_prompt_file) and the coalesce
+    # resolution (base_prompt ?? file) agree on what "unset" means.
+    bp = out.get("base_prompt")
+    if "base_prompt" in out and isinstance(bp, str) and not bp.strip():
+        out["base_prompt"] = None
+    if "applies_to_kinds" in out:
+        kinds = out["applies_to_kinds"]
+        if not isinstance(kinds, list) or not kinds or not set(kinds) <= PERSONA_KINDS:
+            raise ValueError(
+                f"applies_to_kinds must be a non-empty subset of {sorted(PERSONA_KINDS)}"
+            )
+        out["applies_to_kinds"] = json.dumps(kinds)
+    if "tool_allowlist" in out and out["tool_allowlist"] is not None:
+        tools = out["tool_allowlist"]
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+            raise ValueError("tool_allowlist must be None or a list of tool names")
+        if len(tools) > PERSONA_ALLOWLIST_MAX_ENTRIES:
+            raise ValueError(f"tool_allowlist exceeds {PERSONA_ALLOWLIST_MAX_ENTRIES} entries")
+        if any(len(t) > PERSONA_ALLOWLIST_MAX_NAME_LEN for t in tools):
+            raise ValueError(
+                f"tool_allowlist entries are capped at {PERSONA_ALLOWLIST_MAX_NAME_LEN} chars"
+            )
+        out["tool_allowlist"] = json.dumps(tools)
+    for key in ("mcp_enabled", "memory_enabled", "is_default", "enabled"):
+        if key in out:
+            out[key] = 1 if out[key] else 0
+    return out
+
+
+def validate_and_clear_default_persona(
+    conn: Any,
+    personas_table: Any,
+    *,
+    persona_id: str,
+    kinds: list[str],
+    enabled: Any,
+    now: str,
+) -> None:
+    """Enforce the default-persona invariants and demote the incumbent,
+    inside the caller's transaction.
+
+    Shared by both backends (fully dialect-neutral) so the invariants —
+    exactly one default per kind, single-kind, enabled — cannot drift.
+    A corrupt incumbent row raises rather than being skipped: silently
+    not-demoting it would commit two defaults, the exact state this
+    helper exists to prevent.  Concurrency: the PostgreSQL backend
+    serializes promotions with an advisory xact lock before calling this;
+    ``assert_single_default_persona`` runs post-promote as the backstop.
+    """
+    if not isinstance(kinds, list) or len(kinds) != 1:
+        raise ValueError("a default persona must apply to exactly one kind")
+    if not enabled:
+        raise ValueError("a disabled persona cannot be the default")
+    kind = kinds[0]
+    others = conn.execute(
+        sa.select(personas_table.c.persona_id, personas_table.c.applies_to_kinds).where(
+            sa.and_(
+                personas_table.c.is_default == 1,
+                personas_table.c.persona_id != persona_id,
+            )
+        )
+    ).fetchall()
+    for oid, okinds_raw in others:
+        okinds = json.loads(okinds_raw) if okinds_raw else None
+        if not isinstance(okinds, list):
+            raise ValueError(f"corrupt applies_to_kinds on persona {oid!r}")
+        if kind in okinds:
+            conn.execute(
+                sa.update(personas_table)
+                .where(personas_table.c.persona_id == oid)
+                .values(is_default=0, updated=now)
+            )
+
+
+def assert_single_default_persona(conn: Any, personas_table: Any, kind: str) -> None:
+    """Post-promote backstop: raise (rolling back the enclosing
+    transaction) if more than one enabled default applies to *kind* — a
+    concurrent promotion that slipped past serialization must fail loudly,
+    never commit a nondeterministic default."""
+    rows = conn.execute(
+        sa.select(personas_table.c.persona_id, personas_table.c.applies_to_kinds).where(
+            personas_table.c.is_default == 1
+        )
+    ).fetchall()
+    holders = [oid for oid, kr in rows if kind in (json.loads(kr) if kr else [])]
+    if len(holders) > 1:
+        raise ValueError(f"concurrent default-persona change detected for kind {kind!r}; retry")
+
+
+HEURISTIC_RULE_MUTABLE = frozenset(
+    {
+        "name",
+        "risk_level",
+        "confidence",
+        "recommendation",
+        "tool_pattern",
+        "arg_patterns",
+        "intent_template",
+        "reasoning_template",
+        "tier",
+        "priority",
+        "builtin",
+        "enabled",
+    }
+)
+OUTPUT_GUARD_PATTERN_MUTABLE = frozenset(
+    {
+        "name",
+        "category",
+        "risk_level",
+        "pattern",
+        "pattern_flags",
+        "flag_name",
+        "annotation",
+        "is_credential",
+        "redact_label",
+        "priority",
+        "builtin",
+        "enabled",
+    }
+)
+VERDICT_MUTABLE = frozenset(
+    {
+        "user_decision",
+        "resolver_principal_id",
+        "execution_principal_id",
+        "intent_summary",
+        "risk_level",
+        "confidence",
+        "recommendation",
+        "reasoning",
+        "evidence",
+        "tier",
+        "judge_model",
+        "latency_ms",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Skill scanning helper
+# ---------------------------------------------------------------------------
+
+
+def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]:
+    """Run the skill scanner and return ``(risk_level, scan_report_json, scanner_version)``.
+
+    Uses a lazy import to avoid circular dependencies.  Silently returns
+    empty results on import or scan errors so skill creation is never
+    blocked by a scanner bug.
+    """
+    try:
+        from turnstone.core.skill_scanner import SCANNER_VERSION, scan_skill
+
+        tools: list[str] | None = None
+        if allowed_tools and allowed_tools.strip() != "[]":
+            try:
+                parsed = json.loads(allowed_tools)
+                if isinstance(parsed, list):
+                    tools = [str(x) for x in parsed if isinstance(x, str)]
+                    if not tools:
+                        tools = None
+            except (json.JSONDecodeError, TypeError):
+                pass  # falls back to None (no tool filter)
+        result = scan_skill(content, tools)
+        return result.tier, json.dumps(result.to_dict(), ensure_ascii=False), SCANNER_VERSION
+    except Exception:
+        log.debug("skill_scanner: scan failed", exc_info=True)
+        return "", "{}", ""
+
+
+# ---------------------------------------------------------------------------
+# Message reconstruction
+# ---------------------------------------------------------------------------
+
+
+def reconstruct_messages(
+    rows: list[Any],
+    ws_id: str,
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
+    *,
+    repair: bool = True,
+    include_compaction: bool = False,
+) -> list[dict[str, Any]]:
+    """Reconstruct OpenAI message format from stored conversation rows.
+
+    Each *row* is an 8-to-13-tuple ``(id, role, content, tool_name,
+    tool_call_id, provider_data, tool_calls_json, source [, event_id [, is_error
+    [, meta [, attachments [, commit_key]]]]])``, ordered chronologically by
+    row id. ``source`` is rehydrated
+    as the ``_source`` side channel.  (The legacy ``_reminders`` column that used
+    to ride here was dropped in migration 060 — operator context lives in
+    first-class ``system`` turns now.)  The trailing optional elements —
+    ``event_id`` (migration 059, the per-ws SSE ``Last-Event-ID`` resume cursor →
+    ``_event_id``), ``is_error`` (migration 060, the persisted tool-result error
+    flag), and ``meta`` (migration 060, an operator-context turn's structured
+    ``_source_meta``), raw attachment identities, and storage idempotency
+    identity are handled by the defensive unpack so shorter legacy fixtures
+    stay valid. The last two remain internal side channels.
+
+    When ``attachments_by_msg`` is provided (keyed by row id, each value an
+    ordered list of content-addressed attachment rows resolved from the
+    ``conversations.attachments`` ref-list), any ``user`` *or* ``tool`` row
+    whose id has attachments is rebuilt with multipart list content (text +
+    image_url/document parts).  Tool rows carry persisted vision output
+    (``read_file`` on an image) this way — they would otherwise reload as the
+    flattened text alone.
+
+    When ``repair`` is True (default) the trailing ``assistant(tool_calls)``
+    turn is dropped if not all tool_call ids have a matching tool result
+    (trailing operator-context ``system`` turns are looked through and stripped
+    with it) — boot-crash recovery so a half-finished turn never replays.
+    Mid-conversation orphaned tool_calls are *not* filled here; that is the
+    send-time repair (:func:`turnstone.core.lowering.repair_wire_messages`), the
+    single place the wire path synthesizes cancellation results.  Callers that
+    consume the messages as LLM context via the session send path
+    (``session.resume``) get that repair for free; a consumer that bypasses it
+    (``export``) runs ``repair_wire_messages`` itself.  Callers reading for
+    *display* (the ``/history`` REST endpoint) should pass ``repair=False`` so
+    the user sees the actual partial state — refreshing during tool execution
+    otherwise silently drops the trailing turn from the UI.
+    """
+    # Compaction checkpoint markers are resume artifacts (the persisted summary
+    # that lets a reopened session rehydrate a bounded context, see
+    # reconstruct_turns_checkpointed), not real conversation turns — dropped by
+    # default so export and search show the true transcript without an injected
+    # summary.  ``include_compaction=True`` (the /history display path) instead
+    # re-rows each marker as a first-class ``system`` row IN PLACE: assistant
+    # rows drop ``_source``/``meta`` on reconstruction, but a system row keeps
+    # both, so the marker flows through the standard operator-context
+    # projection (``_source="compaction"`` + ``meta`` = watermark/token
+    # counts) and the frontend renders its compaction card at the point in
+    # the transcript where the compaction actually happened.
+    if include_compaction:
+        display_rows: list[Any] = []
+        for row in rows:
+            if not _is_compaction_marker(row):
+                display_rows.append(row)
+                continue
+            rewritten = list(row)
+            rewritten[1] = "system"
+            if len(rewritten) > 10:
+                marker_meta = _source_meta_from_json(rewritten[10])
+                if marker_meta is not None:
+                    # The internal checkpoint turn retains the acting
+                    # principal, but /history's display card is a public
+                    # projection and must not expose audit identity.
+                    marker_meta.pop(PROVENANCE_META_KEY, None)
+                    rewritten[10] = json.dumps(marker_meta) if marker_meta else None
+            display_rows.append(tuple(rewritten))
+        rows = display_rows
+    else:
+        rows = [r for r in rows if not _is_compaction_marker(r)]
+    turns = reconstruct_turns(rows, ws_id, attachments_by_msg)
+    if repair:
+        turns = recover_trajectory(turns)
+    # Dict consumers (display, export) want materialized content, so resolve the
+    # by-reference attachments to inline parts using the blob rows already in
+    # hand.  ``load_message_turns`` is the unresolved canonical path for resume.
+    dicts = dicts_from_turns(turns)
+    if attachments_by_msg:
+        parts_by_id = {
+            str(att.get("attachment_id") or ""): part
+            for atts in attachments_by_msg.values()
+            for att in atts
+            if (part := attachment_to_content_part(att)) is not None
+        }
+        if parts_by_id:
+            dicts = resolve_attachment_parts(dicts, parts_by_id)
+    return dicts
+
+
+def _content_blocks(text: str | None, refs: list[AttachmentRef]) -> tuple[ContentBlock, ...]:
+    """Build typed content blocks from a row's text column + attachment refs.
+
+    A row with attachments becomes a leading text block plus one
+    :class:`AttachmentRef` per attachment (``read_file`` vision output, user
+    uploads — bytes resolve at the consumer); a text-only row is a single text
+    block, or empty.
+    """
+    if refs:
+        return (TextBlock(text or ""), *refs)
+    if text:
+        return (TextBlock(text),)
+    return ()
+
+
+def _native_from_provider_data(
+    provider_data: str | None, tool_calls_json: str | None
+) -> ProviderNative | None:
+    """Decode the stored ``provider_data`` lane into a :class:`ProviderNative`.
+
+    The storage envelope is ``{producer, blocks}`` (new) or a bare block list
+    (legacy, no producer).  A decode failure or non-list/non-envelope payload
+    yields ``None`` (the lane is dropped — matching the prior best-effort decode).
+
+    Load-side mirror self-heal: when the row carries no ``tool_calls`` (empty or
+    absent column), any *client* tool-call block in the native lane is an orphan —
+    a legacy truncated-mid-``tool_use`` row predating the save-time
+    ``normalize_native_for_save`` chokepoint — that would replay on a same-provider
+    resume with no matching ``tool_result`` (Anthropic 400; Google resurrects it
+    into ``tool_calls`` via its fidelity lane).  Strip those blocks here so every
+    legacy row heals on read regardless of whether migration 060 tagged it
+    (reasoning / server-tool / web-search blocks kept).  Mirrors
+    ``normalize_native_for_save``'s gate, including its ``None`` when nothing
+    survives.  The healthy (mirror-holds) path is byte-identical to a plain decode.
+    """
+    if not provider_data:
+        return None
+    try:
+        parsed = json.loads(provider_data)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(parsed, dict) and "blocks" in parsed:
+        producer = parsed.get("producer") or ""
+        blocks = list(parsed["blocks"])
+    elif isinstance(parsed, list):
+        producer = ""
+        blocks = parsed
+    else:
+        return None
+    if not _has_tool_calls(tool_calls_json):
+        blocks = strip_orphan_client_tool_blocks(blocks)
+        if not blocks:
+            return None
+    return ProviderNative(producer=producer, blocks=tuple(blocks))
+
+
+def _source_meta_from_json(meta_json: str | None) -> dict[str, Any] | None:
+    """Decode the stored ``meta`` column into a conversation metadata object.
+
+    Role-specific routing happens in :func:`reconstruct_turns`: system rows
+    carry ``source_meta``, tool rows carry effect/preview fields plus the
+    acting principal their turn executed under, user rows carry their sender,
+    and assistant rows carry the well-known provenance envelope.  A decode
+    failure or non-object payload yields ``None``.
+    """
+    if not meta_json:
+        return None
+    try:
+        parsed = json.loads(meta_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
+def _tool_calls_from_json(tool_calls_json: str | None) -> tuple[ToolCall, ...]:
+    """Decode the stored ``tool_calls`` column into typed :class:`ToolCall`s."""
+    if not tool_calls_json:
+        return ()
+    try:
+        parsed = json.loads(tool_calls_json)
+    except (json.JSONDecodeError, TypeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(
+        ToolCall(
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in parsed
+        if isinstance(tc, dict)
+    )
+
+
+def reconstruct_turns(
+    rows: list[Any],
+    ws_id: str,
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
+) -> list[Turn]:
+    """Deserialize stored conversation rows into canonical ``Turn``s (pure).
+
+    The ``row → Turn`` boundary: one positional unpack of the row tuple, one
+    ``Turn`` per row, no wire-validity correction (the lowering layer owns that
+    — see :func:`recover_trajectory` for the load-time strip).  The legacy
+    ``tool_name`` column (position 3) is unpacked but never used.  Unknown roles
+    are dropped (the roles below are exhaustive for stored conversations);
+    ``developer`` collapses into ``Role.SYSTEM``.
+    """
+    turns: list[Turn] = []
+    for row in rows:
+        (row_id, role, content, _tool_name, tc_id, provider_data, tool_calls_json, source) = row[:8]
+        # event_id (col 9, migration 059) — the per-ws SSE Last-Event-ID cursor;
+        # is_error (col 10, migration 060); meta (col 11, also migration 060 — the
+        # operator-context per-kind ``source_meta``) rides last.  Defensive
+        # length checks keep pre-event_id / pre-is_error / pre-meta fixtures valid.
+        event_id = int(row[8]) if len(row) > 8 and row[8] is not None else None
+        is_error = bool(row[9]) if len(row) > 9 else False
+        meta = TurnMeta(event_id=event_id)
+        raw_meta = _source_meta_from_json(row[10]) if len(row) > 10 else None
+        if raw_meta is not None:
+            # The ``meta`` column is role-exclusive: a TOOL row carries the
+            # typed ``{"effect_status": ..., "preview": ...,
+            # "acting_principal": ...}`` envelope (each key optional); a SYSTEM
+            # row carries operator-context ``source_meta``. Route so a tool's
+            # disposition doesn't land under source_meta (and vice versa) —
+            # ``source_meta`` IS a public projection, so an unrouted tool key
+            # would surface as display metadata. Legacy SYSTEM rows (bare
+            # source_meta dict, no tool keys) fall through.
+            if role == "assistant":
+                assistant_meta = dict(raw_meta)
+                provenance = TurnProvenance.from_meta(assistant_meta.pop(PROVENANCE_META_KEY, None))
+                if provenance is not None:
+                    meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
+                # A compaction marker carries checkpoint metadata beside the
+                # producing model's provenance. Preserve both envelopes.
+                if assistant_meta:
+                    meta.extra["source_meta"] = assistant_meta
+            elif role == "tool" and (
+                "effect_status" in raw_meta
+                or "preview" in raw_meta
+                or "acting_principal" in raw_meta
+            ):
+                if "effect_status" in raw_meta:
+                    meta.extra["effect_status"] = raw_meta["effect_status"]
+                if "preview" in raw_meta:
+                    meta.extra["preview"] = raw_meta["preview"]
+                # The principal whose turn executed this effect — an audit
+                # identity kept OFF the dict bridge (``turn_to_dict`` projects
+                # no key for it), so it cannot reach /history, export, SSE, or
+                # a provider payload. Fork reads it from here directly.
+                acting_principal = raw_meta.get("acting_principal")
+                if isinstance(acting_principal, str) and acting_principal:
+                    meta.extra["acting_principal"] = acting_principal
+            elif role == "user":
+                # User-row metadata is its own role-exclusive envelope. Sender
+                # attribution and browser send-correlation both survive reload
+                # and fork; absent keys remain compatible with historical rows.
+                sender = raw_meta.get("sender")
+                if isinstance(sender, str) and sender:
+                    meta.extra["sender"] = sender
+                stable_client_send_ids = sanitize_client_send_ids(raw_meta.get("client_send_ids"))
+                if stable_client_send_ids:
+                    meta.extra["client_send_ids"] = stable_client_send_ids
+            else:
+                meta.extra["source_meta"] = raw_meta
+        # Canonical storage loads retain the exact ordered ref-list captured
+        # with the conversation row. Blob materialization happens on a second
+        # query and may legitimately yield less (for example, source deletion
+        # wins between the two reads); forks must still attempt to retain every
+        # captured id and fail atomically rather than silently copy text only.
+        # This is an internal persistence side channel: turn_to_dict never
+        # projects it, so it cannot reach UI or provider wire payloads.
+        if len(row) > 11 and role in ("user", "tool"):
+            # Preserve even an empty list so an exact-row "no refs" snapshot
+            # cannot fall back to a workstream-wide ownership query and borrow
+            # a blob referenced by some other row.
+            meta.extra["storage_attachment_ids"] = parse_attachment_refs(row[11])
+        if len(row) > 12 and isinstance(row[12], str) and row[12]:
+            meta.commit_key = row[12]
+        src = str(source) if source else None
+
+        if role == "user":
+            refs, am = _reconstruct_attachment_refs(attachments_by_msg, row_id)
+            if am:
+                meta.extra["attachments_meta"] = am
+            turns.append(Turn(Role.USER, _content_blocks(content, refs), source=src, meta=meta))
+        elif role == "assistant":
+            turns.append(
+                Turn(
+                    Role.ASSISTANT,
+                    _content_blocks(content, []),
+                    tool_calls=_tool_calls_from_json(tool_calls_json),
+                    native=_native_from_provider_data(provider_data, tool_calls_json),
+                    meta=meta,
+                )
+            )
+        elif role == "tool":
+            trefs, _tmeta = _reconstruct_attachment_refs(attachments_by_msg, row_id)
+            turns.append(
+                Turn(
+                    Role.TOOL,
+                    _content_blocks(content, trefs),
+                    tool_call_id=tc_id or "",
+                    is_error=is_error,
+                    meta=meta,
+                )
+            )
+        elif role in ("system", "developer"):
+            turns.append(Turn(Role.SYSTEM, _content_blocks(content, []), source=src, meta=meta))
+    return turns
+
+
+def recover_trajectory(turns: list[Turn]) -> list[Turn]:
+    """Strip a trailing incomplete tool-call turn (boot-crash recovery).
+
+    The load-time orphan policy: walk back past trailing tool results AND
+    operator-context system turns (which follow the turn they relate to) to the
+    turn's assistant head; if its tool_calls are not all answered, drop from the
+    assistant onward.  Mid-conversation orphans are left for the send-time
+    repair (``lowering.repair_wire_messages``).  Returns a new list; the input is
+    not mutated.
+    """
+    turns = list(turns)
+    while turns:
+        tail_tools = 0
+        idx = len(turns) - 1
+        while idx >= 0:
+            tail_role = turns[idx].role
+            if tail_role is Role.TOOL:
+                tail_tools += 1
+                idx -= 1
+            elif tail_role is Role.SYSTEM:
+                idx -= 1
+            else:
+                break
+        asst_idx = idx
+        if asst_idx < 0:
+            break
+        asst = turns[asst_idx]
+        if asst.role is not Role.ASSISTANT or not asst.tool_calls:
+            break
+        if tail_tools >= len(asst.tool_calls):
+            break
+        del turns[asst_idx:]
+    return turns
+
+
+# -- Compaction checkpoints ---------------------------------------------------
+#
+# When a live session compacts, it swaps its in-memory history for a summary but
+# leaves the full transcript in storage. A persisted *checkpoint marker* lets a
+# reopened session rehydrate that same bounded view instead of the full history
+# (which can exceed the model window — e.g. a long session, or one switched to a
+# smaller-context model — and deadlock the first send). The marker is one
+# ``assistant`` row tagged ``_source="compaction"`` whose content is the summary
+# and whose ``meta`` carries ``{"watermark": <id>}``: every conversation row with
+# id <= the watermark was folded into the summary; rows after it are still live.
+
+COMPACTION_SOURCE = "compaction"
+COMPACTION_SUMMARY_LABEL = "[Conversation summary]"
+
+# ---------------------------------------------------------------------------
+# History-search tenancy scope
+# ---------------------------------------------------------------------------
+# SQL mirror of ``WorkstreamProjectVisibility`` (core.auth) — THE statement of
+# who may see a workstream's rows.  A conversation row is hidden from
+# ``:scope_user`` only when its workstream links to an EXISTING project whose
+# visibility is 'private' and the user is neither the workstream creator, the
+# project owner, nor a member.  No project link, a dangling link (project row
+# deleted), and non-private projects all stay visible — the trusted-team
+# default.  ``COALESCE(w.user_id, '')`` makes a NULL creator hide (not leak):
+# plain ``<>`` would go NULL and drop the row from the hide-subquery.  Callers
+# never pass an empty ``:scope_user`` (empty scopes to None = unscoped), so
+# the COALESCE sentinel cannot collide with a real principal.  Portable across
+# SQLite and PostgreSQL; expects the conversations table aliased ``c``.
+# ``tests/test_search_history_visibility.py`` pins parity with the Python
+# predicate — change either side only in lockstep.
+
+HISTORY_VISIBILITY_SCOPE_SQL = (
+    "AND NOT EXISTS ("
+    "    SELECT 1 FROM workstreams w"
+    "    JOIN projects p ON p.project_id = w.project_id"
+    "    WHERE w.ws_id = c.ws_id"
+    "      AND p.visibility = 'private'"
+    "      AND COALESCE(w.user_id, '') <> :scope_user"
+    "      AND p.owner_id <> :scope_user"
+    "      AND NOT EXISTS ("
+    "          SELECT 1 FROM project_members pm"
+    "          WHERE pm.project_id = w.project_id AND pm.user_id = :scope_user"
+    "      )"
+    ") "
+)
+
+# Deferred creates may already contain a cloned transcript before their
+# lifecycle birth is published.  Ordinary history/recall reads must not expose
+# that provisional content.  Keep this separate from the project-tenancy
+# predicate above because it applies to every caller, including unscoped local
+# CLI reads.  ``NOT EXISTS`` deliberately preserves the historical treatment
+# of orphan conversation rows while hiding only a row that is authoritatively
+# marked ``creating``.
+HISTORY_CREATING_EXCLUSION_SQL = (
+    "AND NOT EXISTS ("
+    "    SELECT 1 FROM workstreams w_creating"
+    "    WHERE w_creating.ws_id = c.ws_id"
+    "      AND w_creating.state = 'creating'"
+    ") "
+)
+
+# Live-context exclusion for the model-facing recall tool: drop rows of ONE
+# workstream (the caller's own) above its compaction checkpoint — those rows
+# are the live segment, already in the model's context, and returning them
+# wastes result slots on duplicates.  Rows at or below the checkpoint are the
+# summarized-away past: exactly what recall exists to re-derive.
+# ``:excl_after`` = the checkpoint boundary, or ``-1`` for a never-compacted
+# workstream — the whole conversation is live then, so the whole workstream
+# is excluded.  Human-facing surfaces (the /history command) deliberately do
+# NOT apply this: a person browsing history has no "context" to duplicate.
+
+HISTORY_CONTEXT_EXCLUSION_SQL = "AND NOT (c.ws_id = :excl_ws AND c.id > :excl_after) "
+
+
+def _is_compaction_marker(row: Any) -> bool:
+    """True when a stored row is a compaction checkpoint marker (``_source`` = row index 7)."""
+    return len(row) > 7 and row[7] == COMPACTION_SOURCE
+
+
+def parse_checkpoint_watermark(meta_json: str | None) -> int | None:
+    """Parse a compaction marker's ``meta`` JSON into its watermark id.
+
+    The single decoder for the checkpoint boundary — shared by the resume
+    slice (:func:`reconstruct_turns_checkpointed` via
+    :func:`_compaction_watermark`) and the backends'
+    ``get_compaction_checkpoint``.  Returns ``None`` for a marker that
+    predates the watermark field or whose meta is malformed (callers fall
+    back to safe behavior: resume loads the full transcript, recall excludes
+    the whole workstream — never *less* safe than the honest answer)."""
+    meta = _source_meta_from_json(meta_json)
+    wm = meta.get("watermark") if meta else None
+    return wm if isinstance(wm, int) and not isinstance(wm, bool) else None
+
+
+def _compaction_watermark(row: Any) -> int | None:
+    """Read a marker row's checkpoint watermark from its ``meta`` column (row index 10)."""
+    return parse_checkpoint_watermark(row[10] if len(row) > 10 else None)
+
+
+# A workstream registered moments ago is a user mid-first-turn, not debris —
+# its first rows may still be held in a serving node's in-memory pending
+# journal, which no other node's prune can see. The grace makes youth a
+# storage-visible proxy for "possibly live"; 2 h matches the deferred-create
+# reaper's STALE_CREATE_GRACE_SECONDS precedent (session_manager.py).
+ORPHAN_PRUNE_GRACE_SECONDS = 2 * 60 * 60
+
+
+def prune_workstreams_shared(
+    retention_days: int,
+    *,
+    select_ids: Callable[[tuple[Any, ...]], list[str]],
+    delete_candidate: Callable[[str, tuple[Any, ...]], bool],
+) -> tuple[int, int]:
+    """Orchestrate both prune categories; dialects supply only the hooks.
+
+    ``select_ids`` runs one lock-free discovery SELECT over a predicate
+    tuple; ``delete_candidate`` is the dialect's
+    ``_delete_prune_candidate`` (PostgreSQL: ``FOR UPDATE SKIP LOCKED`` +
+    separate-statement recheck; SQLite: ``BEGIN IMMEDIATE`` recheck).  The
+    same predicate tuple drives discovery AND recheck, so every conjunct
+    must be a pure SQLAlchemy expression with no per-call state.
+
+    Orphan category — zero conversation rows — carries two guards beyond
+    ``state != 'creating'``:
+
+    - ``alias IS NULL``: a named workstream is explicit user intent and is
+      never auto-pruned, mirroring the stale category.  (Consequence,
+      accepted: an aliased workstream with zero rows is excluded from both
+      categories and lives until explicitly deleted.)
+    - ``updated`` older than :data:`ORPHAN_PRUNE_GRACE_SECONDS`.
+
+    Both cutoffs are formatted ONCE at discovery and ride the tuple into the
+    recheck as literals.  That is the safe direction: eligibility can only
+    shrink between discovery and recheck (an ``updated`` bump makes the row
+    ineligible under either reading), whereas recomputing ``now`` at recheck
+    would admit rows discovery never saw.  Do not "freshen" the cutoff.
+
+    A candidate whose delete raises aborts the remaining run (the caller's
+    wrapper logs and reports ``(0, 0)``) — preserved from the pre-shared
+    bodies; per-candidate continuation would need its own design pass.
+    """
+    orphans = stale = 0
+    orphan_cutoff = (datetime.now(UTC) - timedelta(seconds=ORPHAN_PRUNE_GRACE_SECONDS)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    orphan_predicate = (
+        workstreams.c.state != "creating",
+        ~sa.exists(
+            sa.select(conversations.c.id).where(conversations.c.ws_id == workstreams.c.ws_id)
+        ),
+        workstreams.c.alias.is_(None),
+        workstreams.c.updated < orphan_cutoff,
+    )
+    for ws_id in select_ids(orphan_predicate):
+        if delete_candidate(ws_id, orphan_predicate):
+            orphans += 1
+
+    # 2. Remove old unnamed workstreams.  Discover after orphan deletion so
+    # the two categories retain their established disjoint accounting.
+    if retention_days > 0:
+        stale_cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        stale_predicate = (
+            workstreams.c.state != "creating",
+            workstreams.c.alias.is_(None),
+            workstreams.c.updated < stale_cutoff,
+        )
+        for ws_id in select_ids(stale_predicate):
+            if delete_candidate(ws_id, stale_predicate):
+                stale += 1
+    return (orphans, stale)
+
+
+def get_compaction_floor_on_connection(conn: Any, ws_id: str) -> int:
+    """Latest compaction floor inside the caller's transaction.
+
+    The count of rows with ``id <= the latest marker's id`` — the summarized
+    prefix plus the marker itself — or ``0`` when the workstream never
+    compacted.  Dialect-neutral; the caller owns the surrounding
+    transaction/lock discipline.
+    """
+    marker_id = conn.execute(
+        sa.select(sa.func.max(conversations.c.id)).where(
+            sa.and_(
+                conversations.c.ws_id == ws_id,
+                conversations.c._source == COMPACTION_SOURCE,
+            )
+        )
+    ).scalar()
+    if marker_id is None:
+        return 0
+    n = conn.execute(
+        sa.select(sa.func.count())
+        .select_from(conversations)
+        .where(
+            sa.and_(
+                conversations.c.ws_id == ws_id,
+                conversations.c.id <= marker_id,
+            )
+        )
+    ).scalar()
+    return int(n or 0)
+
+
+def truncate_messages_tail_core(
+    conn: Any,
+    ws_id: str,
+    remove_count: int,
+    *,
+    delete_after: Callable[[Any, str, int], int],
+) -> int:
+    """Count → floor → keep → delete body shared by both dialects.
+
+    The caller owns the transaction and has already taken its dialect's
+    parent lock (``SELECT … FOR UPDATE`` vs ``BEGIN IMMEDIATE``) and raised
+    on a missing parent, so a keyed commit cannot inflate ``total`` between
+    the count and the delete.  ``delete_after`` is the dialect's
+    ``_delete_messages_after_on_connection`` hook.
+    """
+    total = int(
+        conn.execute(
+            sa.select(sa.func.count())
+            .select_from(conversations)
+            .where(conversations.c.ws_id == ws_id)
+        ).scalar()
+        or 0
+    )
+    floor = get_compaction_floor_on_connection(conn, ws_id)
+    keep_count = max(floor, total - remove_count)
+    return delete_after(conn, ws_id, keep_count)
+
+
+def delete_messages_after_core(
+    conn: Any,
+    ws_id: str,
+    keep_count: int,
+    *,
+    pre_delete: Callable[[Any, str, Any], None] | None = None,
+) -> int:
+    """Cutoff → dialect pre-delete hook → DELETE..RETURNING → ref release.
+
+    Shared by both dialects; the caller owns the parent lock / writer
+    transaction. ``pre_delete(conn, ws_id, cutoff_id)`` is SQLite's FTS5
+    external-content cleanup slot. GC ownership derives from the DELETE's
+    RETURNING rows, never a prior SELECT, so a row inserted between the two
+    statements cannot be released without being deleted (PostgreSQL READ
+    COMMITTED takes a new snapshot per statement; SQLite >= 3.35 RETURNING
+    is already required by orphan purging).
+    """
+    cutoff_row = conn.execute(
+        sa.select(conversations.c.id)
+        .where(conversations.c.ws_id == ws_id)
+        .order_by(conversations.c.id)
+        .limit(1)
+        .offset(keep_count)
+    ).fetchone()
+    if cutoff_row is None:
+        return 0
+    cutoff_id = cutoff_row[0]
+    if pre_delete is not None:
+        pre_delete(conn, ws_id, cutoff_id)
+    deleted = conn.execute(
+        sa.delete(conversations)
+        .where(
+            sa.and_(
+                conversations.c.ws_id == ws_id,
+                conversations.c.id >= cutoff_id,
+            )
+        )
+        .returning(conversations.c.attachments)
+    ).fetchall()
+    doomed_ids: list[str] = []
+    for (refs,) in deleted:
+        doomed_ids.extend(parse_attachment_refs(refs))
+    release_attachment_refs(conn, doomed_ids)
+    return len(deleted)
+
+
+def reconstruct_turns_checkpointed(
+    rows: list[Any],
+    ws_id: str,
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
+    *,
+    checkpoint: bool = True,
+) -> list[Turn]:
+    """Resume-path reconstruction that honors a persisted compaction checkpoint.
+
+    The full-history twin :func:`reconstruct_turns` rehydrates every row — correct
+    for a session that never compacted, but on a compacted one it reloads the
+    whole pre-compaction transcript the live session had already summarized away,
+    which can overflow the context window on reopen and deadlock the first send.
+
+    If a compaction marker is present, load only ``[summary] + [rows after its
+    watermark]`` — the in-memory view the session held when it compacted. The
+    summarized prefix and any older markers (id <= watermark) are dropped; the
+    full history stays in storage for ``/history``/export/audit. The marker
+    reconstructs as an ``assistant`` turn re-tagged ``source="compaction"``
+    (``reconstruct_turns`` drops ``_source`` for assistant rows), and a
+    synthetic ``[Conversation summary]`` user label — tagged likewise — is
+    prepended to match what ``session._compact_messages`` builds in memory
+    (and to satisfy the leading-user-turn wire contract).  The tags keep
+    provenance-testing consumers (``_find_turn_boundaries``, title gen)
+    working identically across a reopen.
+
+    Falls back to the full reconstruction when there is no marker or its watermark
+    is absent/corrupt, so every pre-checkpoint session loads exactly as before.
+
+    ``checkpoint=False`` (export/audit): return the FULL transcript as Turns —
+    every real row, no watermark slice — but still drop marker rows, since
+    :func:`reconstruct_turns` does not filter them and a leaked marker would land
+    as a stray ``assistant`` summary turn mid-history. This is the Turn-path twin
+    of the marker filter :func:`reconstruct_messages` already applies on the dict
+    (display) path; resume passes the default ``True``.
+    """
+    marker = max((r for r in rows if _is_compaction_marker(r)), key=lambda r: r[0], default=None)
+    watermark = _compaction_watermark(marker) if marker is not None else None
+    if not checkpoint or marker is None or watermark is None:
+        # Full transcript, marker rows dropped — three cases collapse here:
+        # ``checkpoint=False`` (export/audit), no marker, and a malformed/legacy
+        # watermark.  ``reconstruct_turns`` does not filter markers, so a corrupt
+        # marker would otherwise leak its summary as a stray ``assistant`` turn
+        # mid-history (and a malformed marker must NOT slice — losing real
+        # messages is worse than reloading the whole transcript).
+        return reconstruct_turns(
+            [r for r in rows if not _is_compaction_marker(r)], ws_id, attachments_by_msg
+        )
+    # Keep the marker (the summary) plus every non-marker row written after the
+    # watermark — the preserved tail and everything since. Reconstruct the two
+    # slices separately so the summary leads regardless of row-id ordering (a
+    # preserved tail kept verbatim sits at a *lower* id than the marker).
+    tail = [r for r in rows if r[0] > watermark and not _is_compaction_marker(r)]
+    label = Turn(Role.USER, _content_blocks(COMPACTION_SUMMARY_LABEL, []), source=COMPACTION_SOURCE)
+    marker_turns = reconstruct_turns([marker], ws_id, attachments_by_msg)
+    for t in marker_turns:
+        t.source = COMPACTION_SOURCE
+    return [
+        label,
+        *marker_turns,
+        *reconstruct_turns(tail, ws_id, attachments_by_msg),
+    ]
+
+
+def _fork_locked(statement: Any, *, lock_rows: bool) -> Any:
+    """Apply a PostgreSQL row lock while leaving SQLite statements unchanged."""
+    return statement.with_for_update() if lock_rows else statement
+
+
+def _fork_attachment_refs(raw: Any) -> list[str]:
+    """Strict fork-side decoder for a stored attachment ref-list.
+
+    Ordinary history reads tolerate a corrupt ref-list and show the surviving
+    text. A clone is a durability operation, so silently dropping one here
+    would commit a destination whose blob ownership no longer matches its
+    source. Refuse the whole transaction instead.
+    """
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, str):
+        raise ForkSourceUnavailableError("fork source attachment references are invalid")
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ForkSourceUnavailableError("fork source attachment references are invalid") from exc
+    if not isinstance(parsed, list) or any(
+        not isinstance(attachment_id, str) or not attachment_id for attachment_id in parsed
+    ):
+        raise ForkSourceUnavailableError("fork source attachment references are invalid")
+    return list(parsed)
+
+
+def _fork_user_permissions(conn: Any, user_id: str, *, lock_rows: bool) -> set[str]:
+    """Resolve one principal's effective RBAC set inside the clone snapshot."""
+    return _permissions_for_user_on_connection(conn, user_id, lock_rows=lock_rows)
+
+
+def _fork_turn_insert_row(
+    turn: Turn,
+    destination_ws_id: str,
+    now: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Serialize one canonical source turn for insertion under a new ws id."""
+    msg = turn_to_dict(turn)
+    tool_calls = msg.get("tool_calls")
+    tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+
+    provider_blocks = msg.get("_provider_content")
+    try:
+        provider_data = (
+            json.dumps(provider_blocks)
+            if provider_blocks and not isinstance(provider_blocks, str)
+            else provider_blocks
+        )
+    except (TypeError, ValueError):
+        provider_data = None
+
+    raw_storage_ids = turn.meta.extra.get("storage_attachment_ids")
+    if raw_storage_ids is not None:
+        if not isinstance(raw_storage_ids, list) or any(
+            not isinstance(attachment_id, str) or not attachment_id
+            for attachment_id in raw_storage_ids
+        ):
+            raise ForkSourceUnavailableError("fork source attachment references are invalid")
+        attachment_ids = list(raw_storage_ids)
+    else:
+        attachment_ids = [
+            block.attachment_id for block in turn.content if isinstance(block, AttachmentRef)
+        ]
+
+    preview = turn.meta.extra.get("preview")
+    fork_preview: dict[str, Any] | None = None
+    if turn.role is Role.TOOL and isinstance(preview, dict) and preview:
+        preview_id = preview.get("attachment_id")
+        if not isinstance(preview_id, str) or not preview_id or preview_id not in attachment_ids:
+            raise ForkSourceUnavailableError("fork source preview reference is invalid")
+        fork_preview = preview
+
+    meta_envelope: dict[str, Any] = {}
+    if turn.role is Role.ASSISTANT:
+        source_meta = turn.meta.extra.get("source_meta")
+        if isinstance(source_meta, dict) and source_meta:
+            meta_envelope.update(source_meta)
+        provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))
+        if provenance is not None:
+            meta_envelope[PROVENANCE_META_KEY] = provenance.to_meta()
+    elif turn.role is Role.TOOL:
+        if turn.effect_status is not None:
+            meta_envelope["effect_status"] = turn.effect_status.value
+        if fork_preview is not None:
+            meta_envelope["preview"] = fork_preview
+        acting_principal = turn.meta.extra.get("acting_principal")
+        if isinstance(acting_principal, str) and acting_principal:
+            meta_envelope["acting_principal"] = acting_principal
+    else:
+        source_meta = turn.meta.extra.get("source_meta")
+        sender = turn.meta.extra.get("sender")
+        if isinstance(source_meta, dict) and source_meta:
+            meta_envelope = source_meta
+        elif turn.role is Role.USER:
+            if isinstance(sender, str) and sender:
+                meta_envelope["sender"] = sender
+            client_send_ids = turn.meta.extra.get("client_send_ids")
+            if isinstance(client_send_ids, list) and client_send_ids:
+                meta_envelope["client_send_ids"] = list(client_send_ids)
+    meta_json = json.dumps(meta_envelope) if meta_envelope else None
+
+    source = msg.get("_source")
+    producer = msg.get("_producer")
+    role = turn.role.value
+    insert_row = {
+        "ws_id": destination_ws_id,
+        "timestamp": now,
+        "role": role,
+        "content": sanitize_text(turn.text),
+        "tool_name": msg.get("name"),
+        "tool_call_id": msg.get("tool_call_id"),
+        "provider_data": prepare_provider_data_for_save(
+            role,
+            sanitize_text(provider_data),
+            tool_calls_json,
+            producer if isinstance(producer, str) else None,
+        ),
+        "tool_calls": tool_calls_json,
+        "_source": source if isinstance(source, str) and source else None,
+        "event_id": None,
+        "is_error": bool(msg.get("is_error", False)),
+        "attachments": json.dumps(attachment_ids) if attachment_ids else None,
+        "meta": meta_json,
+    }
+    return insert_row, attachment_ids
+
+
+def clone_workstream_transaction(
+    conn: Any,
+    source_ws_id: str,
+    destination_ws_id: str,
+    *,
+    principal_id: str,
+    trusted_internal: bool,
+    expected_session: ForkCloneExpectation | None,
+    now: str,
+    lock_rows: bool,
+) -> ForkCloneSnapshot:
+    """Execute the backend-neutral body of an atomic workstream clone.
+
+    The caller owns transaction start, isolation, commit/rollback, dialect
+    retry policy, and SQLite's external-content FTS refresh. PostgreSQL passes
+    ``lock_rows=True`` and runs this body at SERIALIZABLE isolation; SQLite
+    enters with ``BEGIN IMMEDIATE`` and therefore already owns the writer lock.
+    """
+    if not source_ws_id:
+        raise ForkSourceUnavailableError("fork source is no longer available")
+    if not destination_ws_id or source_ws_id == destination_ws_id:
+        raise ForkDestinationConflictError("fork destination is not available")
+    if not trusted_internal and not principal_id:
+        raise ForkSourceUnavailableError("fork source is no longer available")
+
+    # PostgreSQL clones run at SERIALIZABLE isolation.  As with immutable
+    # index capture, acquire the concrete role locks in the transaction's
+    # first snapshot read so override replacement/deletion linearizes before
+    # any source facts are observed.  The loaded set is reused by both the
+    # authorization gate and the expected-session witness below.
+    fork_permissions = (
+        _fork_user_permissions(conn, principal_id, lock_rows=lock_rows)
+        if principal_id and (not trusted_internal or expected_session is not None)
+        else set()
+    )
+    workstream_stmt = (
+        sa.select(workstreams)
+        .where(workstreams.c.ws_id.in_((source_ws_id, destination_ws_id)))
+        .order_by(workstreams.c.ws_id)
+    )
+    workstream_rows = conn.execute(_fork_locked(workstream_stmt, lock_rows=lock_rows)).fetchall()
+    by_ws_id = {str(row._mapping["ws_id"]): row._mapping for row in workstream_rows}
+    source = by_ws_id.get(source_ws_id)
+    if source is None:
+        raise ForkSourceUnavailableError("fork source is no longer available")
+    if str(source.get("state") or "") == "creating":
+        # A provisional row has not crossed lifecycle publication and is
+        # deliberately hidden from every source-selection surface. Enforce the
+        # same boundary in the transaction for internal/direct callers.
+        raise ForkSourceUnavailableError("fork source is no longer available")
+
+    source_reservation_stmt = sa.select(workstream_config.c.value).where(
+        workstream_config.c.ws_id == source_ws_id,
+        workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+    )
+    source_reservation_row = conn.execute(
+        _fork_locked(source_reservation_stmt, lock_rows=lock_rows)
+    ).fetchone()
+    source_reservation_token = (
+        str(source_reservation_row[0] or "") if source_reservation_row is not None else ""
+    )
+    if expected_session is not None and (
+        not expected_session.source_reservation_token
+        or source_reservation_token != expected_session.source_reservation_token
+        or source.get("required_node_id") != expected_session.source_required_node_id
+    ):
+        # Preflight authorization was for a different durable incarnation.
+        # Treat replacement exactly like disappearance so the fork surface is
+        # not an existence/ownership oracle.
+        raise ForkSourceUnavailableError("fork source is no longer available")
+
+    raw_project_id = source.get("project_id")
+    source_project_id = (
+        raw_project_id.strip()
+        if isinstance(raw_project_id, str) and raw_project_id.strip()
+        else None
+    )
+    project = None
+    is_project_member = False
+    if source_project_id is not None:
+        project_stmt = sa.select(projects).where(projects.c.project_id == source_project_id)
+        project = conn.execute(_fork_locked(project_stmt, lock_rows=lock_rows)).fetchone()
+
+    # A dangling project link has the same trusted-team semantics as ordinary
+    # workstream visibility and is normalized to an unbound destination.
+    effective_project_id = source_project_id if project is not None else None
+    if project is not None:
+        project_map = project._mapping
+        owner_id = str(project_map.get("owner_id") or "")
+        if owner_id != principal_id and (not trusted_internal or expected_session is not None):
+            member_stmt = sa.select(project_members.c.user_id).where(
+                project_members.c.project_id == effective_project_id,
+                project_members.c.user_id == principal_id,
+            )
+            member = conn.execute(_fork_locked(member_stmt, lock_rows=lock_rows)).fetchone()
+            is_project_member = member is not None
+        if not trusted_internal:
+            decision = decide_project_access(
+                principal_id=principal_id,
+                owner_id=owner_id,
+                visibility=str(project_map.get("visibility") or "private"),
+                state=str(project_map.get("state") or "active"),
+                is_member=is_project_member,
+                permissions=fork_permissions,
+            )
+            if not decision.can_read:
+                raise ForkSourceUnavailableError("fork source is no longer available")
+
+    destination = by_ws_id.get(destination_ws_id)
+    if destination is None:
+        raise ForkDestinationConflictError("fork destination is not available")
+    if str(destination.get("state") or "") != "creating":
+        # A reservation token is retained as a durable incarnation fence for
+        # exact hard-delete. It is not a reusable clone capability once the
+        # workstream has crossed its publication CAS.
+        raise ForkDestinationConflictError("fork destination is not available")
+    if not trusted_internal and str(destination.get("user_id") or "") != principal_id:
+        raise ForkDestinationConflictError("fork destination is not available")
+    required_node_id = destination.get("required_node_id") or source.get("required_node_id")
+    if expected_session is not None:
+        from turnstone.core.node_affinity import require_execution_node
+
+        require_execution_node(required_node_id, expected_session.node_id)
+    # Preserve an existing private reservation even for compatibility callers
+    # that do not supply a construction witness. Production HTTP forks also
+    # compare it to ``expected_session`` below; preservation keeps later
+    # prepublication finalization and cancellation rollback exact.
+    reservation_stmt = sa.select(workstream_config.c.value).where(
+        workstream_config.c.ws_id == destination_ws_id,
+        workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+    )
+    reservation_row = conn.execute(_fork_locked(reservation_stmt, lock_rows=lock_rows)).fetchone()
+    destination_reservation_token = str(reservation_row[0] or "") if reservation_row else ""
+    if expected_session is not None and (
+        not expected_session.destination_reservation_token
+        or destination_reservation_token != expected_session.destination_reservation_token
+    ):
+        # The caller's in-memory Workstream owns a different durable row
+        # incarnation (or no longer owns one at all).  This closes the
+        # cross-node delete/re-register ABA that a local manager-object
+        # identity check cannot observe.
+        raise ForkDestinationConflictError("fork destination is not available")
+    raw_destination_project_id = destination.get("project_id")
+    destination_project_id = (
+        raw_destination_project_id.strip()
+        if isinstance(raw_destination_project_id, str) and raw_destination_project_id.strip()
+        else None
+    )
+    if destination_project_id != effective_project_id:
+        # The destination was constructed under the preflight project context.
+        # If the source link/project disappeared or changed since then, cloning
+        # into that already-built session would make its in-memory project
+        # context disagree with durable storage. Refuse and let create discard
+        # the destination; a retry reconstructs it under the new context.
+        raise ForkSourceUnavailableError("fork source project changed")
+
+    destination_history_stmt = (
+        sa.select(conversations.c.id).where(conversations.c.ws_id == destination_ws_id).limit(1)
+    )
+    if (
+        conn.execute(_fork_locked(destination_history_stmt, lock_rows=lock_rows)).fetchone()
+        is not None
+    ):
+        raise ForkDestinationConflictError("fork destination already has history")
+
+    config_rows = conn.execute(
+        sa.select(workstream_config.c.key, workstream_config.c.value).where(
+            workstream_config.c.ws_id == source_ws_id
+        )
+    ).fetchall()
+    source_config: dict[str, str] = {
+        str(row[0]): row[1] for row in config_rows if str(row[0]) != FORK_RESERVATION_CONFIG_KEY
+    }
+    if expected_session is not None:
+        from turnstone.core.personas import snapshot_from_config
+
+        try:
+            source_persona_snapshot = snapshot_from_config(source_config)
+        except ValueError as exc:
+            raise ForkSourceUnavailableError("fork source persona is invalid") from exc
+        source_persona = (
+            tuple(sorted(source_persona_snapshot.to_config().items()))
+            if source_persona_snapshot is not None
+            else ()
+        )
+        if source_persona != expected_session.persona_config:
+            raise ForkSourceUnavailableError("fork source persona changed")
+
+        current_project_id = ""
+        current_project_name = ""
+        current_project_writable = False
+        if project is not None and effective_project_id is not None:
+            project_map = project._mapping
+            decision = decide_project_access(
+                principal_id=principal_id,
+                owner_id=str(project_map.get("owner_id") or ""),
+                visibility=str(project_map.get("visibility") or "private"),
+                state=str(project_map.get("state") or "active"),
+                is_member=is_project_member,
+                permissions=fork_permissions,
+            )
+            if decision.can_read:
+                current_project_id = effective_project_id
+                current_project_name = str(project_map.get("name") or "")
+                current_project_writable = decision.can_write
+        if (
+            current_project_id != expected_session.project_id
+            or current_project_name != expected_session.project_name
+            or current_project_writable is not expected_session.project_writable
+        ):
+            raise ForkSourceUnavailableError("fork source project access changed")
+
+    conversation_columns = (
+        conversations.c.id,
+        conversations.c.role,
+        conversations.c.content,
+        conversations.c.tool_name,
+        conversations.c.tool_call_id,
+        conversations.c.provider_data,
+        conversations.c.tool_calls,
+        conversations.c._source,
+        conversations.c.event_id,
+        conversations.c.is_error,
+        conversations.c.meta,
+        conversations.c.attachments,
+    )
+    source_rows = [
+        tuple(row)
+        for row in conn.execute(
+            sa.select(*conversation_columns)
+            .where(conversations.c.ws_id == source_ws_id)
+            .order_by(conversations.c.id)
+        ).fetchall()
+    ]
+
+    marker = max(
+        (row for row in source_rows if _is_compaction_marker(row)),
+        key=lambda row: row[0],
+        default=None,
+    )
+    watermark = _compaction_watermark(marker) if marker is not None else None
+    has_checkpoint = marker is not None and watermark is not None
+    candidate_rows = (
+        [marker]
+        + [row for row in source_rows if row[0] > watermark and not _is_compaction_marker(row)]
+        if marker is not None and watermark is not None
+        else [row for row in source_rows if not _is_compaction_marker(row)]
+    )
+    candidate_attachment_refs: dict[int, list[str]] = {}
+    for row in candidate_rows:
+        refs = _fork_attachment_refs(row[11] if len(row) > 11 else None)
+        if refs and row[1] not in ("user", "tool"):
+            raise ForkSourceUnavailableError("fork source attachment references are invalid")
+        if refs:
+            candidate_attachment_refs[int(row[0])] = refs
+
+    preliminary_turns = recover_trajectory(
+        reconstruct_turns_checkpointed(source_rows, source_ws_id, checkpoint=True)
+    )
+    if has_checkpoint and (
+        len(preliminary_turns) < 2
+        or preliminary_turns[0].source != COMPACTION_SOURCE
+        or preliminary_turns[1].source != COMPACTION_SOURCE
+        or preliminary_turns[1].role is not Role.ASSISTANT
+        or preliminary_turns[1].tool_calls
+    ):
+        raise ForkSourceUnavailableError("fork source compaction marker is invalid")
+
+    preliminary_persisted = preliminary_turns[1:] if has_checkpoint else preliminary_turns
+    preliminary_serialized = [
+        _fork_turn_insert_row(turn, destination_ws_id, now) for turn in preliminary_persisted
+    ]
+    attachment_ids = [
+        attachment_id for _insert_row, refs in preliminary_serialized for attachment_id in refs
+    ]
+    try:
+        retain_attachment_refs(conn, attachment_ids)
+    except ValueError as exc:
+        raise ForkSourceUnavailableError("fork source attachments are no longer available") from exc
+
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None
+    if attachment_ids:
+        copied_ids = set(attachment_ids)
+        attachment_rows = conn.execute(
+            sa.select(
+                workstream_attachments.c.attachment_id,
+                workstream_attachments.c.filename,
+                workstream_attachments.c.mime_type,
+                workstream_attachments.c.size_bytes,
+                workstream_attachments.c.kind,
+            ).where(
+                workstream_attachments.c.attachment_id.in_(copied_ids),
+                workstream_attachments.c.kind != "preview",
+            )
+        ).fetchall()
+        rows_by_id = {
+            str(row._mapping["attachment_id"]): dict(row._mapping) for row in attachment_rows
+        }
+        attachments_by_msg = build_attachments_by_msg(
+            {
+                row_id: [attachment_id for attachment_id in refs if attachment_id in copied_ids]
+                for row_id, refs in candidate_attachment_refs.items()
+            },
+            rows_by_id,
+        )
+
+    final_turns = recover_trajectory(
+        reconstruct_turns_checkpointed(
+            source_rows,
+            source_ws_id,
+            attachments_by_msg,
+            checkpoint=True,
+        )
+    )
+    final_persisted = final_turns[1:] if has_checkpoint else final_turns
+    serialized = [_fork_turn_insert_row(turn, destination_ws_id, now) for turn in final_persisted]
+    final_attachment_ids = [
+        attachment_id for _insert_row, refs in serialized for attachment_id in refs
+    ]
+    if final_attachment_ids != attachment_ids:
+        raise ForkSourceUnavailableError("fork source attachment snapshot changed")
+
+    conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == destination_ws_id))
+    destination_config = dict(source_config)
+    if destination_reservation_token:
+        # Retain the private incarnation fence across clone and publication.
+        # Cancellation and later hard-delete can therefore delete A exactly
+        # without deleting a same-id replacement B.
+        destination_config[FORK_RESERVATION_CONFIG_KEY] = destination_reservation_token
+    if destination_config:
+        conn.execute(
+            sa.insert(workstream_config),
+            [
+                {"ws_id": destination_ws_id, "key": key, "value": value}
+                for key, value in destination_config.items()
+            ],
+        )
+
+    insert_rows = [insert_row for insert_row, _refs in serialized]
+    if has_checkpoint and insert_rows:
+        marker_result = conn.execute(sa.insert(conversations), insert_rows[0])
+        marker_id = marker_result.inserted_primary_key[0]
+        if marker_id is None:
+            raise RuntimeError("clone_workstream: marker primary key unavailable")
+        marker_meta_raw = insert_rows[0].get("meta")
+        try:
+            marker_meta = json.loads(marker_meta_raw) if marker_meta_raw else {}
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ForkSourceUnavailableError("fork source compaction marker is invalid") from exc
+        if not isinstance(marker_meta, dict):
+            raise ForkSourceUnavailableError("fork source compaction marker is invalid")
+        marker_meta["watermark"] = int(marker_id)
+        conn.execute(
+            sa.update(conversations)
+            .where(conversations.c.id == marker_id)
+            .values(meta=json.dumps(marker_meta))
+        )
+        if len(insert_rows) > 1:
+            conn.execute(sa.insert(conversations), insert_rows[1:])
+    elif insert_rows:
+        conn.execute(sa.insert(conversations), insert_rows)
+
+    updated = conn.execute(
+        sa.update(workstreams)
+        .where(workstreams.c.ws_id == destination_ws_id)
+        .values(project_id=effective_project_id, required_node_id=required_node_id, updated=now)
+        .returning(workstreams.c.ws_id)
+    ).fetchone()
+    if updated is None:
+        raise ForkDestinationConflictError("fork destination is no longer available")
+
+    return ForkCloneSnapshot(
+        turns=tuple(final_turns),
+        config=dict(source_config),
+        project_id=effective_project_id,
+        required_node_id=required_node_id,
+    )
+
+
+def senders_from_user_meta(metas: Iterable[str | None]) -> list[str]:
+    """Distinct, stripped sender ids from USER-row ``meta`` JSON blobs.
+
+    A user row's ``meta`` column carries only ``{"sender": ...}`` (the
+    role-exclusive routing in :func:`reconstruct_turns`); reuses
+    :func:`_source_meta_from_json` — this file's one safe-decode-tolerate-
+    garbage helper for this column — so a future change to its tolerance rules
+    (e.g. a new error type to swallow) doesn't need a second, divergent
+    implementation kept in sync here. Anything unparsable, non-dict, or
+    sender-less is skipped so one stray blob cannot poison the participant set.
+    Sorted for deterministic output across backends.
+    """
+    senders: set[str] = set()
+    for raw in metas:
+        parsed = _source_meta_from_json(raw)
+        sender = parsed.get("sender") if parsed else None
+        if isinstance(sender, str) and sender.strip():
+            senders.add(sender.strip())
+    return sorted(senders)

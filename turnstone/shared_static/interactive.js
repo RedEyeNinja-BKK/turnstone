@@ -1,0 +1,6157 @@
+// ===========================================================================
+//  turnstone interactive pane — shared module (shared_static/interactive.js)
+//
+//  The per-workstream conversational `Pane` (chat + approval cards + composer +
+//  voice), extracted from `ui/static/app.js` so BOTH deployments can mount it:
+//  the standalone `turnstone-server` UI (its split-pane shell stays in app.js
+//  and constructs panes via `new Pane(wsId, opts)`) AND the console L-shell
+//  (which proxies a node-hosted interactive session through a per-pane Tier-2
+//  stream — see `createInteractivePane`).  The one transport difference is the
+//  `opts.base` URL prefix: "" locally, "/node/{id}" when the console proxies a
+//  session living on a cluster node (the LOCALITY invariant).
+//
+//  ES module — the first legacy pane lifted into a real module (step 5a; the
+//  coordinator pane followed in 5e.0, and the shared substrate it leans on —
+//  composer/renderer/auth/etc. — became modules too, imported below).  The
+//  console shell.js imports the factory directly; the standalone loads it as
+//  `<script type="module">`.
+//
+//  House style: programmatic DOM, NO innerHTML (the renderer is the sole
+//  sanctioned exception); pane code root-scopes to its own element.
+// ===========================================================================
+
+import {
+  stripAnsi,
+  buildWatchResultCard,
+  buildCompactionCard,
+  applyCompactionEvent,
+  resetCompactionHolder,
+  buildSystemNudgeMarker,
+  buildConvBatchShell,
+  buildConvBatchDisclosure,
+  buildConvRow,
+  buildConvCmd,
+  buildConvVerdict,
+  buildConvWarning,
+  buildConvActions,
+  buildConvStatus,
+  buildAgentCardBody,
+  formatAgentContextTokens,
+  agentContextIsWarning,
+  buildPreviewChip,
+  clearConvVerdictPending,
+  convBatchSummaryText,
+  isConvVerdictCompactBlocker,
+  markConvRowResultSettled,
+  createReasoningActivity,
+  setConvBatchExpanded,
+  setToolOutputReviewState,
+  batchKicker,
+  indexLabel,
+} from "./conversation.js";
+import {
+  canAutoFoldTranscriptBatch,
+  getTranscriptPresentation,
+  preserveTranscriptBottomPin,
+  registerTranscriptScroller,
+} from "./transcript_presentation.js";
+import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
+import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
+import { authFetch } from "./auth.js";
+import { showToast } from "./toast.js";
+import { Composer } from "./composer.js";
+import {
+  createAttachmentController,
+  kindIcon,
+} from "./composer_attachments.js";
+import {
+  acceptUserTurnEvent,
+  clientSendMaySettleForViewer,
+  createQueueController,
+  mergeRejectedComposerText,
+  mintClientSendId,
+  parsePriority,
+  postAndSettleSend,
+  settleAcceptedClientSends,
+  viewerUserId,
+} from "./composer_queue.js";
+import { StatusBar } from "./status_bar.js";
+import { mountConversationScroll } from "./conversation_scroll.js";
+import { streamingRender, streamingRenderFinalize } from "./renderer.js";
+import {
+  buildMsgCopyButton,
+  buildMsgRetryButton,
+  ensureMsgActionsBar,
+  findMsgActionsBar,
+} from "./copy_actions.js";
+import { makeAnnouncer, operatorSourceLabel } from "./utils.js";
+import {
+  createHistoryHandoffDeadline,
+  createHistoryHandoffRepair,
+  HISTORY_HANDOFF_FETCH_TIMEOUT_MS,
+} from "./history_handoff.js";
+import {
+  acceptedToolEventAlreadyRendered,
+  enqueueToolOccurrence,
+  indexLatestToolRow,
+  recordAcceptedToolEvent,
+  shiftToolOccurrence,
+} from "./tool_projection.js";
+import {
+  OVERFLOW_TRIP_COUNT,
+  OVERFLOW_TRIP_WINDOW_MS,
+  DEGRADED_COOLDOWN_BASE_MS,
+  DEGRADED_COOLDOWN_MAX_MS,
+  DEGRADED_COOLDOWN_RESET_MS,
+  TRUNCATED_RESYNC_JITTER_MS,
+  STALE_RETRY_JITTER_MS,
+  STALE_RETRY_BASE_MS,
+  overflowWindowTripped,
+  degradedCooldownStep,
+} from "./sse_overflow.js";
+
+let _paneCounter = 0;
+
+// Voice-role availability comes from /v1/api/models (stt_default_alias /
+// tts_default_alias — present only when an audio-capable model role is
+// configured).  Memoized so all panes share a single fetch; affordances stay
+// hidden until it resolves.
+// Memoized per transport base — a console pane proxies a node-hosted session,
+// so its voice roles come from THAT node's /v1/api/models (base "/node/{id}"),
+// not the console's; standalone panes use base "" and share one fetch.
+const _voiceRolesPromises = {};
+
+// Max child steps held per task agent while its parent row is unpainted (see
+// InteractivePane._bufferAgentOrphan).  A real agent's whole sub-trajectory is
+// well under this; the cap only bounds a pathological never-arriving parent.
+const _AGENT_ORPHAN_CAP = 256;
+
+// Grace window before a child step whose task_agent row never paints (an id-
+// correlation mismatch, or an agent that aborted before its row painted) is
+// escaped to a top-level row so it stays VISIBLE rather than buffered forever.
+// The ordering race the buffer targets resolves within a frame, far inside it.
+const _AGENT_ORPHAN_GRACE_MS = 500;
+
+function getVoiceRoles(base) {
+  base = base || "";
+  if (!_voiceRolesPromises[base]) {
+    _voiceRolesPromises[base] = authFetch(base + "/v1/api/models")
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((d) => ({
+        stt: !!(d && d.stt_default_alias),
+        tts: !!(d && d.tts_default_alias),
+      }))
+      .catch(() => ({ stt: false, tts: false }));
+  }
+  return _voiceRolesPromises[base];
+}
+
+// Visually-hidden polite live region for voice status (recording / playback)
+// so screen-reader users perceive state changes otherwise conveyed only by
+// color/icon. Errors go through showToast (already a live region).
+const voiceAnnounce = makeAnnouncer();
+
+// Visually-hidden POLITE live region for the tool-call early paint
+// (tool_pending) so screen-reader users hear a committed call land — and that
+// they can Stop it — even though messagesEl is flipped to aria-live="off"
+// during the token streaming that immediately precedes the call.  Polite (not
+// assertive): a committed call is worth surfacing but isn't the action-required
+// human gate, which keeps its own assertive announcement.  Separate region
+// from the voice one so the two never clobber each other.
+const _toolStatus = makeAnnouncer();
+// The wrapper earns its keep with the empty-message guard —
+// _toolAnnounceText returns "" for a batch with no named tools.
+function toolAnnounce(msg) {
+  if (!msg) return;
+  _toolStatus(msg);
+}
+
+// Terse SR summary for a committed tool batch: tool name(s) (capped at 3) +
+// the fact it's being judged and can be stopped.  Empty string when there are
+// no named tools (toolAnnounce then no-ops).
+function _toolAnnounceText(items) {
+  const names = (items || []).map((it) => it && it.func_name).filter(Boolean);
+  if (!names.length) return "";
+  const n = names.length;
+  const shown = names.slice(0, 3).join(", ");
+  const list = n > 3 ? shown + ", and " + (n - 3) + " more" : shown;
+  const head =
+    n === 1 ? "Tool call pending: " + list : n + " tool calls pending: " + list;
+  // No "judge evaluating" claim — tool_pending fires unconditionally, so the
+  // intent judge may be disabled.  "Pending + you can stop it" is always true.
+  return head + ". You can stop " + (n === 1 ? "it" : "them") + ".";
+}
+
+// Default host adapter — console-safe no-ops so a bare ``new Pane(wsId)`` never
+// throws on a shell-only seam.  The standalone shell (app.js) and the console
+// factory (createInteractivePane) each pass a richer host.
+const INTERACTIVE_DEFAULT_HOST = {
+  // Is THIS pane the user's current focus?  Gates focus-stealing so a caret is
+  // never yanked into a backgrounded pane.  A lone pane is always focused.
+  isFocused() {
+    return true;
+  },
+  // EventSource-error policy.  Native auto-reconnect handles transient drops; a
+  // bare/console pane relies on it, so this is a no-op.  The standalone focused
+  // pane additionally refetches + reassigns the ws list (see app.js).
+  onStreamError() {},
+  // EventSource (re)opened — the dual of onStreamError.  The console pane host
+  // uses it to reset its terminal-failure counter (see createInteractivePane).
+  onStreamOpen() {},
+  // Where the ``--skip-permissions`` banner lands.
+  warningTarget(pane) {
+    return pane.messagesEl;
+  },
+  // An MCP server needs (re-)consent — the standalone shell drives its
+  // settings-gear badge; a bare/console pane surfaces it inline only.
+  onConsentDetected() {},
+  // A tool result carried a preview-pane descriptor — the L-shell host opens
+  // the preview pane beside this one; a bare pane keeps the transcript chip
+  // as the only affordance.
+  onPreview() {},
+};
+
+// The SSE overflow-recovery limiter (storm-guard threshold, cooldown-ladder
+// constants, and the two pure helpers overflowWindowTripped /
+// degradedCooldownStep) lives in ./sse_overflow.js — imported above and shared
+// with the coordinator pane so the trip math has a single source of truth.
+// The stateful glue (_noteStreamOverflow / _enterDegradedCatchup below) stays
+// here because it is coupled to this class's disconnectSSE/connectSSE seam.
+
+class Pane {
+  constructor(wsId, opts) {
+    opts = opts || {};
+    this.id = "p" + ++_paneCounter;
+    this.wsId = wsId || null;
+    // Transport + host seam.  ``base`` is the node-proxy URL prefix ("" for a
+    // local session, "/node/{id}" when the console proxies a session that lives
+    // on a cluster node — the LOCALITY invariant).  ``host`` supplies the few
+    // things only the surrounding shell knows (which pane is focused, the
+    // stream-error recovery policy, the warning-banner target); see
+    // createInteractivePane below.  Every pane is L-shell-hosted — the
+    // standalone split-pane chrome (focus tracking, context menu, header with
+    // split/close buttons) was retired with the step-6 fork collapse.
+    this._base = opts.base || "";
+    this._host = opts.host || INTERACTIVE_DEFAULT_HOST;
+    this._onClose = typeof opts.onClose === "function" ? opts.onClose : null;
+    this.evtSource = null;
+    this.el = null;
+    this.messagesEl = null;
+    this.inputEl = null;
+    this.sendBtn = null;
+    this.stopBtn = null;
+    this.currentAssistantEl = null;
+    this.currentReasoningEl = null;
+    this.contentBuffer = "";
+    this.busy = false;
+    // Provenance of the current busy=true (see setBusy): "server" |
+    // "optimistic" | null when idle.
+    this.busySource = null;
+    // Acting user (turn initiator) of the in-flight turn, from state_change
+    // events; drives the shared-workstream cross-user send gate. Carries the
+    // owner id even single-user (the gate just no-ops — it equals this viewer);
+    // null when idle/error or when the backend sends no acting id
+    // (unauthenticated / older backend).
+    this._actingUserId = null;
+    // Live approval cycles, cycleId → {blockEls, callIds}.  Parallel task
+    // agents gate concurrently, so several approve_request cards can be
+    // outstanding at once; each resolves independently by its cycle_id.
+    // Insertion order = arrival order — keyboard shortcuts act on the
+    // OLDEST (first) entry.  pendingApproval / approvalBlockEl are
+    // DERIVED views maintained by _syncApprovalState(): the boolean for
+    // the many "is anything pending" readers, the element pointing at
+    // the active (oldest) cycle's card for keyboard/feedback routing.
+    this.approvalCycles = new Map();
+    this.pendingApproval = false;
+    // Cross-user send gate (another participant's turn is in flight),
+    // recomputed in _reconcileSendBlock. Stored on the App because the
+    // App — not the Composer — owns sendBtn.disabled (see
+    // _reconcileSendDisabled + the composer's externalDisable option).
+    this._crossUserBlocked = false;
+    this.approvalBlockEl = null;
+    // Early-paint shells from ``tool_pending`` events, keyed by their
+    // sorted call_id set, awaiting the authoritative ``tool_info`` /
+    // ``approve_request`` upgrade.  A Map (not a single slot): with
+    // parallel task agents several announces can be in flight, and a
+    // sibling's announce must not discard ours.
+    this.announcedBlocks = new Map();
+    this.retryDelay = 1000;
+    this.model = "";
+    this.modelAlias = "";
+    this.projectName = "";
+    this._lastStatusEvt = null;
+    this._historyLoadToken = 0;
+    // One-shot REST -> SSE bootstrap token.  It names the exact live
+    // conversation revision rendered by the most recent seeded /history
+    // fetch.  connectSSE consumes it into ``?history_token=`` once; later
+    // manual/native reconnects use only their event cursor.
+    this._historyHandoffToken = null;
+    // A history_resync is stronger than an ordinary transport gap: until a
+    // new /history payload has rendered and supplied a fresh handoff token,
+    // opening a cursorless/tokenless EventSource would silently accept the
+    // stale transcript.  Keep that repair intent latched across fetch
+    // failures, hide/show, and unrelated reconnect attempts.  One capped
+    // exponential timer owns retries; terminal pane teardown cancels it.
+    // The latch, budget, backoff, and parked prompt live in the shared
+    // controller so this pane and the coordinator cannot drift on them.
+    this._historyRepair = createHistoryHandoffRepair({
+      baseDelayMs: STALE_RETRY_BASE_MS,
+      jitterMs: STALE_RETRY_JITTER_MS,
+      maxMs: DEGRADED_COOLDOWN_MAX_MS,
+      isAlive: () => !!this._visHandler,
+      load: (wsId, manualAttempt) =>
+        this._loadHistoryThenConnect(wsId, manualAttempt),
+      connect: (wsId) => this.connectSSE(wsId),
+      setStale: (stale) => {
+        this._historyStale = stale;
+      },
+      deferToShowEdge: () => {
+        this._hiddenDisconnect = true;
+      },
+      showPaused: () => {
+        this.statusBarEl.classList.add("ws-sb-disconnected");
+        this._sbTokens.textContent = "Live updates paused";
+      },
+      placePrompt: (prompt) => {
+        this.messagesEl.appendChild(prompt);
+        this.scrollToBottom();
+      },
+    });
+    // Monotonic STREAM-generation counter (#900), bumped only in
+    // evtSource.onopen.  _refetchHistory captures it at dispatch and its
+    // render-time gate requires it unchanged, so a transport that dropped
+    // and re-established across a seedless fetch's await cannot be mistaken
+    // for one that never moved — readyState reads OPEN in both cases.
+    // Must stay initialised: undefined would make every compare NaN-false
+    // and silently decline every seedless render for the life of the pane.
+    this._connectEpoch = 0;
+    // Event backlog while a clear_ui rebuild is in flight — see
+    // _beginReplayQuiesce.  {token, events[]} or null.  (The truncated
+    // resync no longer quiesces: it tears the stream down first, so no
+    // live events exist during its rebuild.)
+    //
+    // This is also why interactive needs no dispatch-seq stamp
+    // (coordinator.js's refetchSeq / refetchesInFlight — #894 r5, ruled
+    // NOT APPLICABLE here at #900): same-token /history fetches cannot
+    // overlap.  Every seedless refetch arms this queue synchronously
+    // before its await, handleEvent queues ALL events while it is armed —
+    // clear_ui included — and the backlog flushes from _endReplayQuiesce,
+    // which runs in _refetchHistory's finally AFTER the render.  So a
+    // clear_ui arriving under an in-flight heal is serialized behind it
+    // rather than racing it, and a fetch dispatched BEFORE a clear_ui
+    // cannot still be running when the latch is set (same ordering) —
+    // which is also what keeps replayHistory's latch clear honest.  The
+    // one unquiesced fetch, _loadHistoryThenConnect's, disconnects the
+    // transport first AND bumps the load token.  Coord needed the stamp
+    // precisely because it has no quiesce (see its refetchesInFlight
+    // declaration).  Ship a stamp here only if a seedless refetch ever
+    // starts without arming this queue.
+    this._replayQueue = null;
+    // One microtask-owned stale-history backstop. A replay_ok connection
+    // prepends its synthetic current-state event before the buffered ring
+    // slice. If that leading idle starts a refetch synchronously while
+    // _endReplayQuiesce is still draining, the remainder is diverted into the
+    // new queue; the refetch paints those rows from history and the diverted
+    // content then paints them a second time. Deferring to the backlog tail
+    // preserves FIFO delivery, and this latch collapses multiple idle/error
+    // edges in the same slice into one guarded attempt.
+    this._staleBackstopMicrotaskPending = false;
+    // Transcript-staleness latch (#890): TRUE = the visible transcript
+    // no longer matches the server's conversation STRUCTURE.  Set at
+    // clear_ui arrival (the server just restructured) and on a ws
+    // reassignment (near-vacuous under one-Pane-per-ws, kept
+    // defensively); cleared in exactly ONE place — replayHistory's
+    // full render, the moment the DOM matches the server again.  NOT
+    // tied to the quiesce: the quiesce tracks event buffering and
+    // releases on a FAILED fetch too, which left a window where a
+    // rewind/edit computed turn counts off the stale DOM (over-rewind).
+    // Row-level MUTATING affordances (rewind / edit / edit-and-resend)
+    // gate on this alongside ``busy``; a new mutating affordance must
+    // adopt the same gate.  Route-L reloads deliberately do NOT set
+    // it: first paint renders into an empty pane (rewind early-returns
+    // on idx < 0), the truncated resync self-heals via its armed
+    // cursor, and the onLogin re-auth reload is count-preserving for
+    // rewind purposes except a server-side advance during the outage —
+    // where a stale count UNDER-rewinds (non-destructive) rather than
+    // over-rewinds.  Accepted residual, ruled: after a DOUBLE fetch
+    // failure the latch persists and rewind/edit stay closed until the
+    // next idle-edge heal (any turn end) or reload — safe-closed
+    // strictly beats destructive-open, and a reconnect snapshot must
+    // NOT clear it (a snapshot heals only the in-flight turn, never
+    // the committed structure the latch tracks).
+    this._historyStale = false;
+    // Single bounded retry for a failed clear_ui refetch (transient
+    // 500s cluster in restart windows).  Scheduled ONCE per clear_ui
+    // from its .then when the latch survived the fetch; fire-time
+    // guards: token still current, latch still set, and TURN-FREE
+    // (never replaceChildren a live bubble — the same rule the
+    // truncated resync's deferred branch follows; a busy pane defers
+    // to the idle-edge heal instead).  Superseded by any newer load
+    // (token bump) and cancelled in replayHistory's supersession
+    // block.
+    this._staleRetryTimer = null;
+    // Hot-path caches — all invalidated by _clearAgentTracking/replayHistory.
+    // The Maps make per-event row/stream lookups O(1) instead of
+    // whole-transcript attribute-selector scans.
+    this._reasoningActivity = createReasoningActivity();
+    // Compaction lifecycle holder for the shared reducer
+    // (conversation.applyCompactionEvent); `card` is the in-progress card
+    // between start and end, nulled wherever the transcript DOM is wiped.
+    this._compaction = { card: null, cid: null };
+    // Rendered-event-id dedup for system turns and compaction markers
+    // (/history repaint vs live/replayed event — whichever renders first
+    // wins).  replayHistory assigns a FRESH Set on every transcript wipe
+    // so pre-wipe ids can't suppress re-painted rows; this is the
+    // first-load init.
+    this._renderedSystemEventIds = new Set();
+    this._renderedUserEventIds = new Set();
+    this._renderedToolEventIds = new Set();
+    this._retryHolderEl = null;
+    this._toolRowIndex = new Map();
+    this._streamElIndex = new Map();
+    // call_id -> { row, nodes }. Only result-owned siblings live here
+    // (output/media/MCP card/preview chip), so an accepted row can replace a
+    // provisional receipt without disturbing output-guard warnings.
+    this._toolResultNodes = new Map();
+    // Latest running task-agent prompt usage by parent call id. Context can
+    // arrive before its parent row during the parallel tool-pool race; the map
+    // buffers that reading until _relinkAgentCards paints the row. Repeated
+    // live/synthetic events replace one reading and update one badge.
+    this._agentContexts = new Map();
+    // parent call id -> shared-reducer holder for a task agent's transient
+    // compaction progress. Parallel task agents compact independently, so one
+    // foreground holder cannot represent them.
+    this._agentCompactions = new Map();
+    // Set when replay_truncated arrives mid-stream (refetching then would
+    // detach the live bubble); consumed on the next idle edge.  Cleared by
+    // _loadHistoryThenConnect at load start AND by replayHistory's
+    // supersession (a successful full render obsoletes the deferred
+    // resync — without that clear, a clear_ui heal left the latch armed
+    // and the next idle edge fired a phantom full resync).
+    this._pendingTruncatedResync = false;
+    // The cursor position a replay_truncated envelope was received AT —
+    // i.e. "a gap of lost events exists BELOW this cursor".  Keep-oldest:
+    // set only when null (repeated envelopes for the same unrepaired gap
+    // must not advance it), cleared by any successful full-history render
+    // (replayHistory — resync success or a clear_ui rebuild both repair
+    // the gap) or a ws switch.  Its one consumer is the connectSSE
+    // chokepoint: while set, every manual (re)connect presents THIS
+    // cursor (not the since-advanced live _lastEventId), so the server
+    // re-answers replay_truncated and the resync re-arms no matter which
+    // teardown cancelled the pending jittered timer — the gap-repair
+    // guarantee survives any interleaving of hide/show, degraded
+    // cooldowns, recover beats, and failed /history fetches.
+    this._truncatedFromCursor = null;
+    // Field instrumentation for the two distinct "output stops while the
+    // backend is healthy" causes: server-signalled overflow closes
+    // (dropped-events class) vs client dispatch/render throws (wedge
+    // class).  The console lines at each increment carry the running
+    // count, so a field report shows which class fired without a
+    // debugger attached.  ``truncatedGaps`` counts replay-window misses
+    // (truncated envelopes acted on), NOT resyncs performed — a
+    // degraded-catchup trip records the gap but skips its resync.
+    this._streamHealth = {
+      overflows: 0,
+      renderThrows: 0,
+      malformedFrames: 0,
+      truncatedGaps: 0,
+    };
+    // Rolling timestamps of heavyweight-recovery churn — stream_overflow
+    // closes AND truncated resyncs (both via _recordChurnAndMaybeTrip) —
+    // input to the degraded catch-up limiter (overflowWindowTripped).
+    this._overflowTimes = [];
+    this._degradedTimer = null;
+    // Pending jittered truncated-resync (see _scheduleTruncatedResync).
+    // Cancelled by disconnectSSE alongside _degradedTimer, so any path that
+    // tears the transport down (ws switch via _loadHistoryThenConnect,
+    // close-on-hide, degraded entry, destroy) also discards a resync
+    // scheduled for the OLD stream — the next connect's own truncated
+    // envelope reschedules if the gap still exists.  Also cancelled by
+    // replayHistory's supersession: a successful full render obsoletes a
+    // pending resync (a clear_ui heal keeps the stream live, so no
+    // teardown would otherwise catch the timer).  The heal-time cancel is
+    // safe against dropping a NEEDED repair because every clear_ui
+    // emitter is turn-free at emission — rewind/retry are busy-gated
+    // server-side, and the open post-load replay fires only on rehydrate,
+    // behind the already-loaded shortcut — so a heal render is never a
+    // cursor-trimmed snapshot of a pre-existing executing turn, and a
+    // turn STARTING mid-heal rides the replay quiesce (its events land
+    // after these clears and re-arm if truncated).  If a clear_ui emitter
+    // that can coexist with an executing turn is ever added, the heal
+    // must instead re-arm the resync when /history returns a cursor.
+    this._resyncTimer = null;
+    this._degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
+    // Timestamp of the last degraded-catchup trip; drives the cooldown
+    // ladder's escalate-vs-reset decision independently of _overflowTimes.
+    this._lastDegradedAt = 0;
+    // Close-on-hide bookkeeping.  A hidden tab's throttled event loop is
+    // the likeliest too-slow SSE consumer, so the visibilitychange
+    // handler closes the stream on hide and reconnects with the saved
+    // Last-Event-ID on show (replay_ok covers the gap).
+    // _hiddenDisconnect marks that WE closed for hide, so show never
+    // resurrects a stream that was closed deliberately elsewhere.
+    this._visHandler = null;
+    this._hiddenDisconnect = false;
+    this._cancelTimeout = null;
+    this._forceTimeout = null;
+    this._pendingEditSend = null;
+    // Voice I/O (mic STT + per-message TTS playback)
+    this._voiceRoles = { stt: false, tts: false };
+    this._micBtn = null;
+    this._micIcon = null;
+    this._micDenied = false;
+    this._recorder = null;
+    this._recordingStream = null;
+    this._isRecording = false;
+    this._discardRecording = false;
+    this._recordAborted = false;
+    this._recordTimer = null;
+    this._recordStartMs = 0;
+    this._ttsAudio = null;
+    this._ttsBtnActive = null;
+    this._ttsSeq = 0;
+    this._createDOM();
+  }
+
+  reset() {
+    this.currentAssistantEl = null;
+    this._reasoningActivity.finish();
+    this.currentReasoningEl = null;
+    this.contentBuffer = "";
+    this.setBusy(false);
+    this.approvalCycles = new Map();
+    this.pendingApproval = false;
+    this.approvalBlockEl = null;
+    this.announcedBlocks = new Map();
+    this._pendingEditSend = null;
+    this.inputEl.disabled = false;
+    // setBusy(false) above reconciled sendBtn.disabled while
+    // pendingApproval was still stale-true; re-reconcile now that the
+    // cycle state is cleared so a reset-from-pending re-enables send.
+    this._reconcileSendDisabled();
+    this.attachments.clearChips();
+    this._stopRecording(true);
+    this._stopTTS();
+  }
+
+  disconnectSSE() {
+    if (this._cancelTimeout) {
+      clearTimeout(this._cancelTimeout);
+      this._cancelTimeout = null;
+    }
+    if (this._forceTimeout) {
+      clearTimeout(this._forceTimeout);
+      this._forceTimeout = null;
+    }
+    // Any pending degraded-catch-up reconnect is owned by the stream
+    // lifecycle: whoever closes the stream (ws switch, giveUp, destroy,
+    // or a fresh manual connect — connectSSE's first line lands here)
+    // supersedes it.  _enterDegradedCatchup re-arms AFTER its own
+    // disconnect, so this never cancels the timer it is about to set.
+    if (this._degradedTimer) {
+      clearTimeout(this._degradedTimer);
+      this._degradedTimer = null;
+    }
+    // Same ownership rule for a pending jittered truncated-resync: a
+    // torn-down stream's scheduled resync must not fire against whatever
+    // the pane connects to next (its .finally reconnect would land on the
+    // NEW ws).  The timer's own firing path nulls the field before calling
+    // _loadHistoryThenConnect, so — like _degradedTimer above — this never
+    // cancels the work it is part of.  If the gap still exists after the
+    // teardown, the next connect's truncated envelope reschedules it.
+    if (this._resyncTimer) {
+      clearTimeout(this._resyncTimer);
+      this._resyncTimer = null;
+    }
+    if (this.evtSource) {
+      this.evtSource.close();
+      this.evtSource = null;
+    }
+    // Deliberately NOT cleared here: _agentCards/_agentOrphans, any armed
+    // _replayQueue, and _staleRetryTimer.  The retry's survival is
+    // load-bearing, not an oversight: it is a REST heal, not transport
+    // state, so a transport-only redial must keep the pending repair intent
+    // — and it is precisely why that timer can fire against a dead stream,
+    // which is what its OPEN fire-guard term exists to handle.  Cancelling
+    // it here would silently make that guard unreachable.  Terminal-only
+    // cancel (destroy/giveUp); pinned negatively in
+    // tests/test_interactive_pane_js.py.  disconnectSSE also runs for
+    // transport-only reconnects
+    // (connectSSE's first line, the host's 5s recovery beat) where the DOM
+    // survives — wiping the card map there made the next child event build a
+    // DUPLICATE agent card beside the still-attached one, and cancelling
+    // orphan grace timers silently dropped buffered steps.  Ws-switch and
+    // full-reload cleanup happens in _loadHistoryThenConnect; terminal
+    // cleanup in the factory's destroy().
+    this._stopRecording(true);
+    this._stopTTS();
+  }
+
+  // composer.setBusy runs unconditionally so the Stop button label /
+  // dataset.forceCancel / placeholder stay canonical even on a redundant
+  // call (Pane.reset() and any future caller relies on that idempotent
+  // reset). queue.onIdleEdge runs only on the actual edge — it carries
+  // the heavier work (querySelectorAll-driven promote sweep + cancel-
+  // timer cleanup wired via the queue's onIdle hook).
+  setBusy(b, source) {
+    const next = !!b;
+    if (!next) this._reasoningActivity.finish();
+    // Who asserted busy: "server" (default — state events, thinking_start,
+    // every existing/future writer) or "optimistic" (ONLY the send flow's
+    // pre-POST flip). The deferred/queue_full settle arms may clear busy
+    // solely when it is still this send's own optimistic flip — a server-
+    // stamped busy is a real turn and must never be clobbered. Centralized
+    // HERE so an unstamped future writer fails safe as "server".
+    this.busySource = next ? source || "server" : null;
+    this.composer.setBusy(next);
+    this.messagesEl.dataset.busy = next ? "true" : "false";
+    const edge = next !== this.busy;
+    this.busy = next;
+    // Re-evaluate the shared-workstream cross-user send gate on every busy
+    // edge (the acting-user id is tracked from state_change events).
+    this._reconcileSendBlock();
+    if (edge && !next) this.queue.onIdleEdge();
+    // The mic produces composer input the user can only send when idle — keep
+    // it in lockstep with the send button (which composer.setBusy gates).
+    if (this._micBtn && !this._micDenied) {
+      if (next) {
+        this._stopRecording(true); // abandon any in-flight recording
+        this._micBtn.disabled = true;
+      } else if (!this._micBtn.classList.contains("is-busy")) {
+        this._micBtn.disabled = false;
+      }
+    }
+  }
+
+  // Shared-workstream send gate: while another participant's turn is in flight,
+  // disable this viewer's send. A mid-turn interjection would run under the
+  // initiator's identity (their MCP credentials, not this viewer's) and be
+  // misattributed to them, so the server rejects it with a 409 — this is the
+  // proactive UX half. No-ops on a single-user workstream (the acting user is
+  // this viewer) or when the acting id is unknown (older backend). Compares
+  // opaque user_id uuids: the acting id from state_change vs the viewer's own
+  // id retained from /whoami (ts.user_id).
+  _reconcileSendBlock() {
+    let me = null;
+    try {
+      me = sessionStorage.getItem("ts.user_id");
+    } catch (_e) {
+      me = null;
+    }
+    const blocked =
+      !!this.busy && !!this._actingUserId && !!me && this._actingUserId !== me;
+    this._crossUserBlocked = blocked;
+    // Still drive the Composer's placeholder / title hint — externalDisable
+    // suppresses only its disabled write, not the hint.
+    this.composer.setSendBlocked(
+      blocked,
+      blocked
+        ? "Another participant's turn is in progress - wait for it to finish."
+        : "",
+    );
+    this._reconcileSendDisabled();
+  }
+
+  // Single owner of ``sendBtn.disabled``.  The Composer runs with
+  // ``externalDisable``, so it never writes the flag itself (it still
+  // rotates the Send/Queue label + placeholder + stop button on
+  // ``setBusy``); this combines every disable axis instead, so two
+  // writers can't clobber each other on event ordering.
+  //
+  // ``busy`` is deliberately NOT an axis: this composer is
+  // ``queueWhileBusy``, so a running turn keeps Send clickable as
+  // "Queue".  The old ``pendingApproval || this.busy`` both defeated
+  // that affordance (Send disabled while merely busy) and let
+  // ``composer.setBusy`` — which re-enables in queue mode — race the
+  // approval disable back off when a ``state_change`` fired after the
+  // approve_request card rendered.
+  _reconcileSendDisabled() {
+    this.sendBtn.disabled = this.pendingApproval || this._crossUserBlocked;
+  }
+
+  showEmptyState() {
+    if (!this.messagesEl.querySelector(".empty-state")) {
+      const el = document.createElement("div");
+      el.className = "empty-state";
+      el.textContent = "Type a message to start";
+      this.messagesEl.appendChild(el);
+    }
+  }
+
+  removeEmptyState() {
+    const el = this.messagesEl.querySelector(".empty-state");
+    if (el) el.remove();
+  }
+
+  addThinkingIndicator() {
+    if (this._compaction.card) return; // the compaction card owns the affordance
+    this._reasoningActivity.start(this.messagesEl);
+    this.scrollToBottom();
+  }
+
+  addSystemNudgeMarker() {
+    // The marker DOM is shared (conversation.buildSystemNudgeMarker); the Pane
+    // owns empty-state removal + placement.
+    this.removeEmptyState();
+    const el = buildSystemNudgeMarker();
+    this.messagesEl.appendChild(el);
+    return el;
+  }
+
+  addSystemContext(content, source, meta) {
+    // First-class operator-context system turn — the consolidation of the
+    // legacy metacognition reminders / user interjections / output-guard
+    // notes into one role="system" trajectory turn.  Rendered as a distinct
+    // operator bubble in sequence (it FOLLOWS the turn it advises);
+    // `source` carries the kind (user_interjection / output_guard /
+    // tool_error / ...) for the bubble label.  `watch_triggered` additionally
+    // carries structured `meta` (watch_name / command / poll counters) → the
+    // richer `.msg.watch-result` card instead of the plain operator bubble.
+    this.removeEmptyState();
+    // The /history projection of a persisted compaction marker (an in-place
+    // source="compaction" system row) — render the same result card the live
+    // `compaction` end event paints, so a reload reproduces the transcript.
+    if (source === "compaction") {
+      const card = buildCompactionCard(meta, content || "");
+      this.messagesEl.appendChild(card);
+      this.scrollToBottom();
+      return card;
+    }
+    if (source === "watch_triggered" && meta && typeof meta === "object") {
+      const card = buildWatchResultCard(meta, content || "");
+      this.messagesEl.appendChild(card);
+      this.scrollToBottom();
+      return card;
+    }
+    if (source === "output_guard" && meta && typeof meta === "object") {
+      const card = _buildGuardFindingBubble(meta);
+      this.messagesEl.appendChild(card);
+      this.scrollToBottom();
+      return card;
+    }
+    // user_interjection renders as a "queued message" bubble showing the user's
+    // RAW words (`meta.message`) rather than the model-directed framing in
+    // `content`, with brighter emphasis for `!!!`-important interjections.
+    const isInterjection =
+      source === "user_interjection" && meta && typeof meta === "object";
+    const important = isInterjection && meta.priority === "important";
+    const el = document.createElement("div");
+    el.className =
+      "msg system-context operator-context" + (important ? " important" : "");
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    const labelEl = document.createElement("span");
+    labelEl.className = "msg-system-context-label";
+    labelEl.textContent = isInterjection
+      ? "queued message" + (important ? " · important" : "")
+      : operatorSourceLabel(source);
+    const textEl = document.createElement("span");
+    textEl.className = "msg-system-context-text";
+    textEl.textContent =
+      isInterjection && meta.message != null
+        ? String(meta.message)
+        : content || "";
+    body.appendChild(labelEl);
+    body.appendChild(textEl);
+    el.appendChild(body);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+    return el;
+  }
+
+  handleCompactionEvent(evt) {
+    if ((evt.target || "workstream") === "task_agent") {
+      this._handleAgentCompaction(evt);
+      return;
+    }
+    // Shared reducer (conversation.applyCompactionEvent) — one lifecycle
+    // state machine for this pane and the coordinator viewer.  The dedup
+    // set is the same one the system_turn path uses: the persisted marker
+    // row is stamped with the ok-end event's id, so whichever of /history
+    // repaint or live/replayed event renders first wins.  reason="error"
+    // ends render through the paired `error` event (red row), not here.
+    this.removeEmptyState();
+    applyCompactionEvent(this._compaction, evt, {
+      container: this.messagesEl,
+      renderedIds: this._renderedSystemEventIds,
+      onNotice: (msg) => this.addInfoMessage(msg),
+      scroll: () => this.scrollToBottom(),
+    });
+    // Manual compaction's busy state can start reasoning before this card.
+    if (this._compaction.card) this._reasoningActivity.finish();
+  }
+
+  addCommandEcho(text) {
+    // A slash command is control-plane input, not a conversational turn —
+    // echo it as a distinct command chip (styled like a prompt line), not a
+    // user bubble.  It is deliberately NOT persisted: commands don't join
+    // the trajectory, so a bubble that vanished on reload was a lie.
+    this.removeEmptyState();
+    const el = document.createElement("div");
+    el.className = "msg command-echo";
+    el.setAttribute("aria-label", "command");
+    el.textContent = text;
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom(true);
+    return el;
+  }
+
+  addUserMessage(text, attachments, opts) {
+    opts = opts || {};
+    this.removeEmptyState();
+    const el = document.createElement("div");
+    el.className = "msg user";
+    if (opts.clientSendId) el.dataset.clientSendId = opts.clientSendId;
+    if (opts.eventId != null) el.dataset.eventId = String(opts.eventId);
+    if (opts.sender) el.dataset.sender = opts.sender;
+    if (opts.source) el.dataset.source = opts.source;
+    const textEl = document.createElement("div");
+    textEl.className = "msg-user-text";
+    textEl.textContent = text;
+    el.appendChild(textEl);
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      const pills = document.createElement("div");
+      pills.className = "msg-user-attach";
+      const attachWsId = this.wsId;
+      const attachBase = this._base;
+      attachments.forEach(function (a) {
+        const pill = document.createElement("span");
+        pill.className = "msg-user-attach-pill";
+        const icon = document.createElement("span");
+        icon.className = "msg-user-attach-icon";
+        icon.setAttribute("aria-hidden", "true");
+        icon.textContent = kindIcon(a.kind);
+        pill.appendChild(icon);
+        const nameEl = document.createElement("span");
+        nameEl.className = "msg-user-attach-name";
+        nameEl.textContent =
+          a.filename ||
+          (a.kind === "image"
+            ? "image"
+            : a.kind === "audio"
+              ? "audio"
+              : "document");
+        pill.appendChild(nameEl);
+        const prev =
+          typeof window.buildAttachmentPreview === "function"
+            ? window.buildAttachmentPreview({
+                kind: a.kind,
+                wsId: attachWsId,
+                base: attachBase,
+                attachmentId: a.attachment_id,
+                filename: a.filename,
+              })
+            : null;
+        if (prev) {
+          if (a.kind === "image" || a.kind === "pdf") icon.replaceWith(prev);
+          else pill.appendChild(prev);
+        }
+        pills.appendChild(pill);
+      });
+      el.appendChild(pills);
+    }
+    this._addUserMsgActions(el, text);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+    // Returned so the send flow can retro-convert the optimistic bubble
+    // into a queued chip when the server answers queued+deferred.
+    return el;
+  }
+
+  _markAcceptedClientSends(clientSendIds, remove, skipAlreadyAccepted = false) {
+    return settleAcceptedClientSends(
+      this.messagesEl,
+      this.queue,
+      clientSendIds,
+      remove,
+      skipAlreadyAccepted,
+    );
+  }
+
+  _acceptUserTurn(evt) {
+    acceptUserTurnEvent(evt, {
+      renderedEventIds: this._renderedUserEventIds,
+      messagesEl: this.messagesEl,
+      queue: this.queue,
+      consumeAttachments: (ids) => this.attachments.consume(ids, []),
+      renderNudgeMarker: () => this.addSystemNudgeMarker(),
+      renderUserTurn: (content, attachments, opts) =>
+        this.addUserMessage(content, attachments || null, opts),
+    });
+  }
+
+  // --- Approval-cycle bookkeeping -----------------------------------------
+  // The backend registers one ApprovalCycle per human-gated batch; parallel
+  // task agents make several live at once.  Cards register here on paint and
+  // deregister on resolution; the composer stays disabled while ANY cycle is
+  // live.
+
+  _syncApprovalState() {
+    // Prune orphaned cycles whose block elements are no longer in the DOM.
+    // A rebuild that wipes the conversation subtree (clear_ui re-render,
+    // truncated resync — messagesEl.replaceChildren()) also clears
+    // approvalCycles via _resetStreamingRefs.  But if an approve_request
+    // event is processed between the wipe and the refetch, its cycle card
+    // is in a detached
+    // subtree and the matching approval_resolved may never arrive — leaving
+    // pendingApproval=true and the send button disabled forever.
+    for (const [cid, entry] of this.approvalCycles) {
+      if (entry.blockEls && !entry.blockEls.some((el) => el.isConnected)) {
+        this.approvalCycles.delete(cid);
+      }
+    }
+    const first = this.approvalCycles.values().next();
+    const active = first.done ? null : first.value;
+    this.pendingApproval = this.approvalCycles.size > 0;
+    this.approvalBlockEl = active ? active.blockEls[0] : null;
+    this.inputEl.disabled = this.pendingApproval;
+    this._reconcileSendDisabled();
+    StatusBar.paintApprovalChip(
+      { approvalEl: this._sbApproval, focusFallbackEl: this.inputEl },
+      this.approvalCycles.size,
+    );
+  }
+
+  _oldestCycleId() {
+    const first = this.approvalCycles.keys().next();
+    return first.done ? null : first.value;
+  }
+
+  // Status-bar chip click: bring the card the keyboard shortcuts act on
+  // (the OLDEST live cycle — see the keydown handler) into view and hand
+  // focus to its feedback field, exactly as a freshly painted first cycle
+  // does.  The card may have scrolled far away or, for a task-agent
+  // sub-batch, sit inside an agent card the user re-collapsed after the
+  // approve paint forced it open — unfold both layers first, otherwise
+  // scrollIntoView on a display:none row is a no-op.
+  revealPendingApproval() {
+    const id = this._oldestCycleId();
+    const entry = id ? this.approvalCycles.get(id) : null;
+    const block = entry
+      ? entry.blockEls.find((el) => el && el.isConnected)
+      : null;
+    if (!block) return;
+    const agentCard = block.closest(".conv-agent");
+    if (agentCard) {
+      agentCard.dataset.collapsed = "false";
+      const toggle = agentCard.querySelector(".conv-agent-toggle");
+      if (toggle) toggle.setAttribute("aria-expanded", "true");
+    }
+    const batch = block.closest(".conv-batch");
+    if (batch) setConvBatchExpanded(batch, true, { blocker: true });
+    StatusBar.scrollToApprovalTarget(block);
+    const fb = block.querySelector(".conv-feedback");
+    // preventScroll: the smooth scroll above owns the viewport; a focus
+    // jump would cut it short and land the card at the viewport edge.
+    if (fb) fb.focus({ preventScroll: true });
+  }
+
+  _registerApprovalCycle(cycleId, blockEls, items) {
+    const callIds = (items || []).map((it) => it && it.call_id).filter(Boolean);
+    this.approvalCycles.set(cycleId, { blockEls, callIds });
+    this._syncApprovalState();
+  }
+
+  // Cycle id for pre-multi-cycle servers that omit it: synthesize a stable
+  // key from the batch's first call_id so the Map still routes uniquely.
+  _cycleKey(evt) {
+    if (evt.cycle_id) return evt.cycle_id;
+    const first = ((evt.items || [])[0] || {}).call_id || "";
+    return "legacy:" + first;
+  }
+
+  getFeedback(blockEl) {
+    const el = blockEl || this.approvalBlockEl;
+    if (!el) return null;
+    const inp = el.querySelector(".conv-feedback");
+    return inp && inp.value.trim() ? inp.value.trim() : null;
+  }
+
+  appendToolOutputChunk(callId, chunk) {
+    if (!chunk) return;
+    const stripped = stripAnsi(chunk);
+    if (!stripped) return;
+    let el = this._streamEl(callId);
+    if (!el) {
+      let target = this._toolRow(callId);
+      if (!target) {
+        // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't
+        // nested yet must NOT graft its stream onto the last top-level batch —
+        // that mislabels a sub-tool's output as a main-harness tool's.  Its row
+        // arrives via the orphan flush; skip the chunk until then.
+        if (callId && callId.includes("::")) return;
+        const blocks = this.messagesEl.querySelectorAll(".conv-batch");
+        if (!blocks.length) return;
+        const block = blocks[blocks.length - 1];
+        const tools = block.querySelectorAll(
+          '.conv-row[data-func-name="bash"]',
+        );
+        target = tools.length ? tools[tools.length - 1] : null;
+        if (!target) {
+          const allTools = block.querySelectorAll(".conv-row");
+          target = allTools.length ? allTools[allTools.length - 1] : null;
+        }
+      }
+      if (!target) return;
+
+      el = document.createElement("pre");
+      el.className = "tool-output tool-output-stream";
+      el.dataset.callId = callId;
+      el.setAttribute("aria-label", "Streaming command output");
+      el.setAttribute("aria-live", "off");
+      el.textContent = "";
+      target.after(el);
+      if (callId) this._streamElIndex.set(callId, el);
+    }
+
+    el.appendChild(document.createTextNode(stripped));
+    // rAF-coalesced inner pin: the eager scrollTop=scrollHeight after every
+    // text append forced one whole-page reflow per chunk (geometry read on a
+    // just-dirtied layout).  One pin per frame is visually identical.
+    if (!el._pinPending) {
+      el._pinPending = true;
+      requestAnimationFrame(() => {
+        el._pinPending = false;
+        el.scrollTop = el.scrollHeight;
+      });
+    }
+    this.scrollToBottom();
+  }
+
+  showOutputWarning(evt) {
+    if (!evt.call_id || evt.risk_level === "none") return;
+    const toolDiv = this._toolRow(evt.call_id);
+    if (!toolDiv) return;
+    const warningBatch = toolDiv.closest(".conv-batch");
+    if (warningBatch) {
+      setConvBatchExpanded(warningBatch, true, { blocker: true });
+    }
+    // Shared DOM-builder with replayHistory \u2014 single source of truth for
+    // role / class / escape semantics.  Argument shape mirrors the
+    // server-side output_assessment dict AND the replay payload built by
+    // build_merged_output_assessment_payload (both via the shared
+    // merge_guard_display_payload), so the live chip and the refresh chip
+    // render identically (tier / judge_risk / confidence / reasoning).
+    const warning = _buildOutputWarningEl({
+      risk_level: evt.risk_level,
+      flags: evt.flags,
+      redacted: evt.redacted,
+      tier: evt.tier,
+      judge_risk: evt.judge_risk,
+      confidence: evt.confidence,
+      reasoning: evt.reasoning,
+      judge_model: evt.judge_model,
+    });
+    const nextEl = toolDiv.nextElementSibling;
+    if (nextEl && nextEl.classList.contains("tool-output")) {
+      nextEl.insertAdjacentElement("afterend", warning);
+    } else {
+      toolDiv.insertAdjacentElement("afterend", warning);
+    }
+  }
+
+  updateVerdictBadge(verdict) {
+    if (!verdict || !verdict.call_id) return;
+    const escapedId = CSS.escape(verdict.call_id);
+    // Badges anchor either inside the row (solo verdicts, replay) or at the
+    // batch-block level (judge-pending panels) — scope the query to the
+    // row's batch, which covers both, instead of scanning the whole
+    // transcript per verdict event.  Row-less lookups (row already replaced
+    // by output) fall back to the container scan so the late-verdict toast
+    // path keeps working.
+    const vRow = this._toolRow(verdict.call_id);
+    const vScope = (vRow && vRow.closest(".conv-batch")) || this.messagesEl;
+    const verdictBatch = vRow ? vRow.closest(".conv-batch") : null;
+    preserveTranscriptBottomPin(this.messagesEl, () => {
+      if (verdictBatch && isConvVerdictCompactBlocker(verdict)) {
+        setConvBatchExpanded(verdictBatch, true, { blocker: true });
+      }
+      const badge = vScope.querySelector(
+        '.conv-verdict[data-call-id="' + escapedId + '"]',
+      );
+      if (!badge) {
+        // Badge no longer in DOM (tool block replaced by output) — toast the
+        // late-arriving verdict so the user still sees it.
+        const conf = Math.round((verdict.confidence || 0) * 100);
+        const rec = verdict.recommendation || "review";
+        const func = verdict.func_name || "";
+        showToast(
+          "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
+          rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+        );
+        return;
+      }
+      // Replace the badge (+ its detail sibling) with a freshly-built one so the
+      // landed LLM verdict, its risk stripe, and the detail all refresh at once.
+      const detail = badge.nextElementSibling;
+      if (detail && detail.classList.contains("conv-verdict-detail")) {
+        detail.remove();
+      }
+      badge.replaceWith(buildConvVerdict(verdict, { judgePending: false }));
+
+      this.updateVerdictGlow(verdict.recommendation, verdictBatch);
+    });
+  }
+
+  updateVerdictGlow(recommendation, batchEl) {
+    // Glow is a PER-BATCH aggregate: score the batch that owns the
+    // verdict, not whichever cycle happens to be oldest.  With
+    // concurrent approval cycles a sibling's verdict must neither
+    // recolor the oldest card (the old single-El read seeded `worst`
+    // with the sibling's recommendation) nor leave its own card
+    // stale.  Batch-less rows (legacy replay shapes) fall back to the
+    // oldest live cycle — the pre-multi-cycle behavior.
+    const scope = batchEl || this.approvalBlockEl;
+    if (!scope) return;
+    const actions = scope.querySelector(".conv-actions");
+    if (!actions) return;
+    // Collect all verdict badges currently visible in this approval block.
+    const badges = scope.querySelectorAll(".conv-verdict");
+    let worst = recommendation;
+    for (let i = 0; i < badges.length; i++) {
+      const recEl = badges[i].querySelector(".conv-verdict-rec");
+      if (recEl) {
+        const r = recEl.textContent;
+        if (r === "deny") {
+          worst = "deny";
+          break;
+        }
+        if (r === "review" && worst !== "deny") worst = "review";
+      }
+    }
+    actions.classList.remove(
+      "conv-verdict-glow--approve",
+      "conv-verdict-glow--deny",
+      "conv-verdict-glow--review",
+    );
+    if (worst === "approve")
+      actions.classList.add("conv-verdict-glow--approve");
+    else if (worst === "deny") actions.classList.add("conv-verdict-glow--deny");
+    else actions.classList.add("conv-verdict-glow--review");
+  }
+
+  addInfoMessage(text) {
+    const el = document.createElement("div");
+    el.className = "msg info";
+    el.textContent = stripAnsi(text);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+  }
+
+  addErrorMessage(text) {
+    const el = document.createElement("div");
+    el.className = "msg error";
+    el.setAttribute("role", "alert");
+    el.textContent = stripAnsi(text);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+  }
+
+  updateStatus(evt) {
+    StatusBar.paint(
+      {
+        rootEl: this.statusBarEl,
+        tokensEl: this._sbTokens,
+        toolsEl: this._sbTools,
+        turnsEl: this._sbTurns,
+      },
+      evt,
+    );
+    // Model moved out of the status bar into the composer chip; capture the
+    // (optional) effort off the status event and repaint the chip.
+    this._effort = (evt && evt.effort) || "";
+    this._paintModelChip();
+    this._lastStatusEvt = evt;
+  }
+
+  // Paint the composer's "model · effort" read-out chip.  SILENT_EFFORTS
+  // mirror (status_bar.js): "medium" is the implicit default and "" means no
+  // knob — neither is worth showing, so only a non-medium effort appends the
+  // "· effort" suffix.  An empty alias resets the chip to its placeholder.
+  _paintModelChip() {
+    if (!this.composer || !this.composer.setModel) return;
+    const alias = this.modelAlias || this.model || "";
+    const eff =
+      this._effort && this._effort !== "medium" ? " · " + this._effort : "";
+    this.composer.setModel(alias ? alias + eff : "");
+  }
+
+  // Paint the composer's "has a project" badge from the connected event's
+  // project_name ("" = no project → the chip stays hidden).
+  _paintProjectChip() {
+    if (this.composer && this.composer.setProject)
+      this.composer.setProject(this.projectName || "");
+  }
+
+  isNearBottom() {
+    return this._scrollFollow.isFollowing();
+  }
+
+  scrollToBottom(force) {
+    if (force) this._scrollFollow.jumpToLatest();
+    else this._scrollFollow.schedule();
+  }
+
+  _createDOM() {
+    this.el = document.createElement("div");
+    this.el.className = "pane pane--embedded";
+    this.el.dataset.paneId = this.id;
+
+    // Approval keyboard shortcuts.  The converged card advertises y/n/a (+Enter/
+    // Esc) kbd hints, so route those keys to resolveApproval when this pane has a
+    // pending approval.  Pane-owned (on this.el) so it works for every embedded
+    // L-shell pane without a global handler — the old standalone wired this via
+    // the app.js global keydown + getFocusedPane, which the fork collapse retired.
+    // The composer is disabled while pending, so the only typing surface is the
+    // feedback field: there Enter approves (with feedback) / Esc denies and other
+    // keys type; elsewhere y|Enter approve, n|Esc deny, a = approve-all.
+    this.el.addEventListener("keydown", (e) => {
+      if (!this.pendingApproval || !this.approvalBlockEl) return;
+      // The status-bar chip is a button inside this.el: Enter on it must
+      // reach its own click (reveal), never the approve arm below — and
+      // preventDefault here would swallow that click outright.
+      if (e.target === this._sbApproval) return;
+      // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
+      // tracks); sibling cards from parallel task agents resolve by
+      // their own buttons or become oldest in turn.  When the feedback
+      // field getting the keystroke belongs to a DIFFERENT cycle's
+      // card, route to THAT cycle instead — the user is clearly acting
+      // on the card they're typing into.
+      let targetId = this._oldestCycleId();
+      let targetBlock = this.approvalBlockEl;
+      const ae = document.activeElement;
+      if (ae && ae.classList && ae.classList.contains("conv-feedback")) {
+        for (const [cid, entry] of this.approvalCycles) {
+          if (entry.blockEls.some((el) => el.contains(ae))) {
+            targetId = cid;
+            targetBlock = entry.blockEls[0];
+            break;
+          }
+        }
+      }
+      const fb = targetBlock
+        ? targetBlock.querySelector(".conv-feedback")
+        : null;
+      if (ae && fb && ae === fb) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          this.resolveApproval(
+            true,
+            false,
+            this.getFeedback(targetBlock),
+            false,
+            targetId,
+          );
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          this.resolveApproval(
+            false,
+            false,
+            this.getFeedback(targetBlock),
+            false,
+            targetId,
+          );
+        }
+        return;
+      }
+      const k = e.key.toLowerCase();
+      if (k === "y" || e.key === "Enter") {
+        e.preventDefault();
+        this.resolveApproval(
+          true,
+          false,
+          this.getFeedback(targetBlock),
+          false,
+          targetId,
+        );
+      } else if (k === "n" || e.key === "Escape") {
+        e.preventDefault();
+        this.resolveApproval(
+          false,
+          false,
+          this.getFeedback(targetBlock),
+          false,
+          targetId,
+        );
+      } else if (k === "a") {
+        e.preventDefault();
+        this.resolveApproval(
+          true,
+          true,
+          this.getFeedback(targetBlock),
+          false,
+          targetId,
+        );
+      }
+    });
+
+    // Click-to-play for media embeds.  Pane-owned (on this.el) and root-scoped
+    // via closest(".media-play-btn") so every embedded L-shell pane activates
+    // its own players — the old standalone wired this via a document-level
+    // delegated listener in app.js, which the console host never loaded (so the
+    // Play button was dead in console-hosted panes).  Enter on a focused button
+    // routes through the same path, mirroring the approval keydown above.
+    this.el.addEventListener("click", (e) => {
+      const btn = e.target.closest(".media-play-btn");
+      if (!btn) return;
+      e.preventDefault();
+      activateMediaPlayButton(btn);
+    });
+    this.el.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      const btn = e.target.closest(".media-play-btn");
+      if (!btn || btn.disabled) return;
+      // Single-path activation: preventDefault stops the browser's native
+      // Enter-to-click from dispatching a second activation behind ours.
+      e.preventDefault();
+      activateMediaPlayButton(btn);
+    });
+
+    // No pane header: the workstream name, persona, and state are shown by the
+    // tab and the rail (Workspaces); the --skip-permissions banner lands in
+    // messagesEl (see the host warningTarget).  The standalone split-pane
+    // chrome that used to live here (focus tracking, right-click context menu,
+    // a header with split/close buttons) was retired with the step-6 fork
+    // collapse.
+
+    // Messages area
+    this.messagesEl = document.createElement("div");
+    this.messagesEl.className = "pane-messages";
+    this.messagesEl.setAttribute("role", "log");
+    this.messagesEl.setAttribute("aria-live", "polite");
+    this.messagesEl.setAttribute("aria-label", "Chat messages");
+    this.el.appendChild(this.messagesEl);
+    this._scrollFollow = mountConversationScroll(this.messagesEl);
+    this._unregisterTranscriptScroller = registerTranscriptScroller(
+      this.messagesEl,
+      {
+        isFollowing: () => this.isNearBottom(),
+        scrollToBottom: () => this.scrollToBottom(),
+      },
+    );
+
+    // Per-workstream status bar (above input)
+    this.statusBarEl = document.createElement("div");
+    this.statusBarEl.className = "ws-status-bar";
+    this.statusBarEl.setAttribute("role", "status");
+    this.statusBarEl.setAttribute("aria-live", "polite");
+    this.statusBarEl.setAttribute("aria-atomic", "true");
+    this.statusBarEl.setAttribute("aria-label", "Workstream status");
+
+    this._sbTokens = document.createElement("span");
+    this._sbTokens.className = "ws-sb-tokens";
+    this._sbTokens.textContent = "0 / \u2014";
+    this._sbTokens.setAttribute("aria-label", "Token usage");
+    this._sbTools = document.createElement("span");
+    this._sbTools.className = "ws-sb-tools";
+    this._sbTools.textContent = "0 tools";
+    this._sbTools.setAttribute("aria-label", "Tool calls this turn");
+    this._sbTurns = document.createElement("span");
+    this._sbTurns.className = "ws-sb-turns";
+    this._sbTurns.textContent = "turn 0";
+    this._sbTurns.setAttribute("aria-label", "Conversation turn");
+    // Pending-approval chip: sticky count of the live human gates in this
+    // transcript, painted by _syncApprovalState (the one approval-state
+    // chokepoint) and hidden at zero.  A button, so it tabs and clicks:
+    // the click brings the card the keyboard shortcuts act on into view.
+    this._sbApproval = document.createElement("button");
+    this._sbApproval.type = "button";
+    this._sbApproval.className = "warn-chip ws-sb-approval";
+    this._sbApproval.hidden = true;
+    this._sbApproval.addEventListener("click", () =>
+      this.revealPendingApproval(),
+    );
+
+    this.statusBarEl.appendChild(this._sbTokens);
+    this.statusBarEl.appendChild(this._sbTools);
+    this.statusBarEl.appendChild(this._sbApproval);
+    this.statusBarEl.appendChild(this._sbTurns);
+    this.el.appendChild(this.statusBarEl);
+
+    // Input area — DOM + behavior comes from shared/composer.js.  The
+    // pane keeps the attachment-upload pipeline (because attachments are
+    // pane-specific state) and routes file events through the composer's
+    // attach/paste/drop callbacks.
+    this.composer = new Composer(this.el, {
+      sendGlyph: "\u2191",
+      layout: "stacked",
+      modelChip: true,
+      projectChip: true,
+      attachments: {
+        onAttach: (file) => {
+          this.attachments.upload(file);
+        },
+      },
+      stopBtn: true,
+      queueWhileBusy: true,
+      // The App owns sendBtn.disabled: it has to combine three axes the
+      // Composer can't see together \u2014 a live approval cycle, the
+      // cross-user send gate, and busy \u2014 so the Composer's own
+      // disabled write (which re-enables in queueWhileBusy mode) would
+      // otherwise race the approval disable back off on event ordering.
+      externalDisable: true,
+      busyPlaceholder: "Queue a message\u2026 (!!! for urgent)",
+      onSend: () => {
+        this.sendMessage();
+      },
+      onStop: () => {
+        this.cancelGeneration();
+      },
+      dragDrop: { targetEl: this.el, dropClass: "pane-drop-target" },
+    });
+    this.inputEl = this.composer.inputEl;
+    this.sendBtn = this.composer.sendBtn;
+    this.stopBtn = this.composer.stopBtn;
+    // Lazy wsId read \u2014 a tab swap (Pane re-bound to a new workstream)
+    // changes the closure target without re-instantiating the controllers.
+    this.attachments = createAttachmentController({
+      chipsEl: this.composer.chipsEl,
+      getWsId: () => {
+        return this.wsId;
+      },
+      getBase: () => {
+        return this._base;
+      },
+      onError: (msg) => {
+        showToast(msg);
+      },
+    });
+    this.queue = createQueueController({
+      messagesEl: this.messagesEl,
+      scroll: () => this.scrollToBottom(),
+      getWsId: () => {
+        return this.wsId;
+      },
+      // Node-proxy prefix — same seam the attachment controller uses, so
+      // the dequeue DELETE reaches the node owning the session (a proxied
+      // remote-node workstream has base "/node/{id}"; without this the
+      // x-delete hit the console root and silently failed).
+      getBase: () => {
+        return this._base;
+      },
+      onAfterDequeue: () => {
+        this.attachments.rehydrate();
+      },
+      onNotice: (msg) => {
+        showToast(msg);
+      },
+      // Idle-edge cleanup of the cancel/force-stop timers — without
+      // this they fire on the *next* busy turn, relabel Stop to "Force
+      // Stop", and surface a misleading "Cancel didn't complete in
+      // time" toast about a turn the user already moved past.
+      onIdle: () => {
+        if (this._cancelTimeout) {
+          clearTimeout(this._cancelTimeout);
+          this._cancelTimeout = null;
+        }
+        if (this._forceTimeout) {
+          clearTimeout(this._forceTimeout);
+          this._forceTimeout = null;
+        }
+      },
+    });
+
+    // Voice input: mic button, hidden until the STT role is confirmed
+    // available (so it never appears when voice isn't configured).
+    this._buildMicButton();
+    getVoiceRoles(this._base).then((roles) => {
+      this._voiceRoles = roles;
+      if (this._micBtn) this._micBtn.style.display = roles.stt ? "" : "none";
+      // Right-align the mic next to send (instead of stranded by the model
+      // chip) only when STT is actually available; .has-mic drives the CSS.
+      if (this.composer && this.composer.actionsRowEl)
+        this.composer.actionsRowEl.classList.toggle("has-mic", !!roles.stt);
+    });
+  }
+
+  connectSSE(wsId) {
+    this.disconnectSSE();
+    const wsChanged = this.wsId !== wsId;
+    if (wsChanged) this._historyRepair.supersede(wsId);
+    this.wsId = wsId;
+    if (wsChanged) {
+      this.attachments.clearChips();
+      this.attachments.rehydrate();
+    }
+
+    // Build the events URL with a ``?last_event_id=N`` query param
+    // if we have a saved high-water mark from a prior connection.
+    // The EventSource constructor can't set custom headers, so the
+    // browser-native ``Last-Event-ID`` header isn't available here;
+    // the server accepts both forms.  ``_lastEventId`` is captured
+    // from the prior source's onmessage handler.
+    let evtUrl =
+      this._base +
+      "/v1/api/workstreams/" +
+      encodeURIComponent(wsId) +
+      "/events";
+    // A recorded truncation gap OVERRIDES the live cursor: while
+    // _truncatedFromCursor is set (gap detected, no full render yet),
+    // every manual (re)connect presents the truncation-time cursor, so
+    // the server re-answers replay_truncated and the resync re-arms —
+    // whatever teardown cancelled the pending jittered resync in the
+    // meantime (close-on-hide, degraded entry, ws reassignment beat).
+    // This connect chokepoint is what makes the gap-repair guarantee
+    // interleaving-proof; a cancellable timer alone silently lost the
+    // repair when a hide/show cycle landed inside the jitter window
+    // after the live cursor had advanced past the truncation point.
+    // Safe against double-render: ring eviction is forward-only, so a
+    // once-truncated cursor can never re-enter replay range — this
+    // connect always draws the envelope, never a bulk replay.  (Native
+    // EventSource auto-reconnects bypass this — the browser's header
+    // carries the advanced id — but they never run disconnectSSE, so
+    // the pending resync timer survives them.)
+    //
+    // ``!= null`` (not truthiness): a resume cursor of 0 is valid — the
+    // ring buffer's first emitted event is id 1, so register_listener_with_replay(0)
+    // replays the whole in-flight turn. A brand-new ws seeds _event_id at 0,
+    // so its first user row (and thus a first-turn /history cursor) can be 0;
+    // a truthiness gate would silently drop it and fall back to the lossy
+    // fresh snapshot. Mirrors the ``data.cursor != null`` guard in _refetchHistory.
+    const connectCursor =
+      this._truncatedFromCursor != null
+        ? this._truncatedFromCursor
+        : this._lastEventId;
+    if (connectCursor != null) {
+      evtUrl += "?last_event_id=" + encodeURIComponent(connectCursor);
+    }
+    // Capability is declared on every manual URL so browser-native
+    // reconnects retain it too. Without this query, the server must project a
+    // user_turn into a strong-repair frame for older reducers.
+    evtUrl += (evtUrl.includes("?") ? "&" : "?") + "user_turn=1";
+    // Accepted TOOL rows use the same capability discipline. Preliminary
+    // executor receipts remain backward-compatible ``tool_result`` events;
+    // only the final guarded row requires reducer upsert semantics.
+    evtUrl += "&tool_turn=1";
+    // Close-on-hide / replay-on-show: installed once per pane, removed
+    // by the factory's destroy().  A hidden tab's throttled drain is the
+    // likeliest slow consumer behind server-side queue overflow, and an
+    // idle hidden tab holds a node connection for nothing — closing on
+    // hide removes both, and the saved _lastEventId makes the show-edge
+    // reconnect lossless (replay_ok from the server's ring buffer).
+    if (!this._visHandler) {
+      this._visHandler = () => this._onVisibilityChange();
+      document.addEventListener("visibilitychange", this._visHandler);
+    }
+    // Never open an EventSource into a hidden (throttled) tab — including on a
+    // FIRST load in a background tab, where the close-on-hide handler never
+    // fires because there was no open stream to close (a throttled hidden tab
+    // is the worst-case slow consumer that overflows the server send queue).
+    // This is the single connect chokepoint, so it backstops every caller —
+    // fresh connect, degraded retry, recover beat, show edge; the wsId + the
+    // visibilitychange handler installed just above make the show edge
+    // reconnect (replay_ok from the ring). The timer callbacks keep their own
+    // pre-checks (the recover beat's also gates failCount), so this is the
+    // net that closes the fresh-connect gap they never covered.
+    if (document.hidden) {
+      this._hiddenDisconnect = true;
+      return;
+    }
+    if (this._historyRepair.isRepairing(wsId)) {
+      // Never fail open from a history mismatch into a cursorless/tokenless
+      // stream. Only a successfully rendered /history payload clears this
+      // latch and supplies the token for the next EventSource.
+      this.statusBarEl.classList.add("ws-sb-disconnected");
+      this._sbTokens.textContent = "History out of date — retrying…";
+      this._historyRepair.schedule();
+      return;
+    }
+    if (this._historyHandoffToken != null) {
+      evtUrl +=
+        (evtUrl.includes("?") ? "&" : "?") +
+        "history_token=" +
+        encodeURIComponent(this._historyHandoffToken);
+    }
+    this.evtSource = new EventSource(evtUrl);
+    // One successfully-constructed EventSource owns this bootstrap attempt.
+    // Native reconnects on that source carry Last-Event-ID (which the server
+    // prioritises); brand-new sources must never reuse the history token.
+    this._historyHandoffToken = null;
+
+    this.evtSource.onopen = () => {
+      // Connection generation (#900) — bumped HERE and nowhere else, because
+      // "a stream generation began" is the only thing a cursor can be
+      // anchored to.  onopen is the sole site that means that: per spec the
+      // announce-the-connection step fires `open` for EVERY established
+      // connection, including the ones the browser's own reestablish loop
+      // produces — and a NATIVE auto-reconnect calls neither connectSSE nor
+      // disconnectSSE (see onerror below), so those two are blind to the
+      // case this exists for.  connectSSE would also FALSE-bump on the
+      // document.hidden early return above, which establishes nothing.  And
+      // a close()d source can never fire a late open (the spec's queued task
+      // early-returns on readyState CLOSED), so a discarded stream cannot
+      // bump a generation the pane has moved past.  Read once, by
+      // _refetchHistory's render-time gate.
+      this._connectEpoch += 1;
+      this.retryDelay = 1000;
+      this.statusBarEl.classList.remove("ws-sb-disconnected");
+      if (this._lastStatusEvt) this.updateStatus(this._lastStatusEvt);
+      this._host.onStreamOpen(this);
+    };
+
+    this.evtSource.onmessage = (e) => {
+      // Capture lastEventId from the MESSAGE EVENT, before JSON.parse,
+      // so a malformed frame can't desync the manual-reconnect cursor
+      // from native auto-reconnect.  Spec shape — do NOT revert to
+      // reading the property off the EventSource OBJECT: per WHATWG the
+      // id lives on MessageEvent only, so the pre-2026-07 object-form
+      // read was a dead conditional and every manual reconnect (show
+      // edge, degraded retry, recover beat) went cursorless, silently
+      // dropping turns committed during the gap.  Guard: ``!= null &&
+      // !== ""`` — no-id frames carry "" per spec.  (lastEventId is a
+      // DOMString, so the valid id "0" — the error-surface snap_seq —
+      // is TRUTHY and plain truthiness would also accept it; the
+      // explicit form is for parity with the NUMERIC cursor gates
+      // below, where bare truthiness genuinely drops 0.)  Stamping
+      // contract: ``id:`` rides only ring-buffered events; synthetic
+      // replay frames never advance it.
+      if (e.lastEventId != null && e.lastEventId !== "") {
+        this._lastEventId = e.lastEventId;
+      }
+      // Guarded parse + dispatch.  onmessage is the pane's whole event
+      // pipeline: an exception escaping it doesn't close the EventSource, so
+      // pre-guard a single malformed frame (or one throwing handler case)
+      // left the streaming refs (currentAssistantEl / contentBuffer) stale
+      // and every later turn painted into the poisoned segment — the
+      // "output stops rendering while the backend is healthy" wedge.
+      let data = null;
+      try {
+        data = JSON.parse(e.data);
+      } catch (err) {
+        this._streamHealth.malformedFrames += 1;
+        console.warn(
+          "interactive: dropping malformed SSE frame (total " +
+            this._streamHealth.malformedFrames +
+            ")",
+          err,
+        );
+        return;
+      }
+      // Tag the event with its own SSE id so the system_turn handler can
+      // dedup a turn already painted from /history against the same turn
+      // redelivered by an SSE replay.  e.lastEventId is this event's id;
+      // buffered events (system_turn included) always carry one.
+      if (e.lastEventId) data._event_id = e.lastEventId;
+      try {
+        this.handleEvent(data);
+      } catch (err) {
+        this._streamHealth.renderThrows += 1;
+        console.error(
+          "interactive: handleEvent failed for " +
+            (data && data.type) +
+            " (render-throw total " +
+            this._streamHealth.renderThrows +
+            ")",
+          err,
+        );
+      }
+    };
+
+    this.evtSource.onerror = () => {
+      // Do NOT close evtSource for transient network errors — native
+      // EventSource auto-reconnect handles them with the
+      // ``Last-Event-ID`` header automatically (now that the server
+      // emits ``id:`` on every buffered event).  Closing here would
+      // force a CONNECTING -> CLOSED transition that defeats native
+      // reconnect, which is exactly the reconnect-with-replay defect
+      // PR-D ships to fix.  See
+      // tests/test_app_js.py::test_pane_connectsse_onerror_preserves_native_reconnect.
+      const loginOverlay = document.getElementById("login-overlay");
+      if (loginOverlay && loginOverlay.style.display !== "none") return;
+      this.statusBarEl.classList.add("ws-sb-disconnected");
+      this._sbTokens.textContent = "Reconnecting\u2026";
+      // Stream-error recovery is the host's policy.  Native EventSource
+      // auto-reconnect transparently covers the transient case for every
+      // pane; the standalone focused pane additionally refetches the global
+      // workstream list to reassign a ws evicted during the gap (app.js),
+      // while a console/embedded pane owns one ws and relies on native
+      // reconnect alone.
+      this._host.onStreamError(this);
+    };
+  }
+
+  _onVisibilityChange() {
+    if (document.hidden) {
+      // Closing beats letting the hidden tab's throttled event loop
+      // starve the drain until the server-side queue overflows.  The
+      // streaming refs (contentBuffer / currentAssistantEl) survive —
+      // disconnectSSE is transport-only — so the visible tail is intact
+      // when the tab comes back.
+      if (this.evtSource) {
+        this.disconnectSSE();
+        this._hiddenDisconnect = true;
+      }
+    } else if (this._hiddenDisconnect) {
+      this._hiddenDisconnect = false;
+      if (this.wsId) this.connectSSE(this.wsId);
+    }
+  }
+
+  _removeVisibilityHandler() {
+    if (this._visHandler) {
+      document.removeEventListener("visibilitychange", this._visHandler);
+      this._visHandler = null;
+    }
+    this._hiddenDisconnect = false;
+  }
+
+  _recordChurnAndMaybeTrip() {
+    // The ONE rolling-window churn accounting step for the degraded
+    // ladder — stream_overflow closes (_noteStreamOverflow) AND
+    // truncated resyncs (_noteTruncatedResync) land here, so the trip
+    // parameters and the degraded-entry call have a single
+    // implementation that cannot silently diverge.  The cooldown-ladder
+    // reset lives in _enterDegradedCatchup (keyed off _lastDegradedAt),
+    // NOT here — this method only counts and trips.  Returns true when
+    // this entry ENTERED degraded catch-up.
+    const now = Date.now();
+    this._overflowTimes.push(now);
+    if (
+      overflowWindowTripped(
+        this._overflowTimes,
+        now,
+        OVERFLOW_TRIP_COUNT,
+        OVERFLOW_TRIP_WINDOW_MS,
+      )
+    ) {
+      this._enterDegradedCatchup();
+      return true;
+    }
+    return false;
+  }
+
+  _noteStreamOverflow() {
+    this._streamHealth.overflows += 1;
+    console.warn(
+      "interactive: server closed the stream after a send-queue overflow " +
+        "(total " +
+        this._streamHealth.overflows +
+        "); reconnect will replay the gap",
+    );
+    this._recordChurnAndMaybeTrip();
+  }
+
+  _recordTruncatedGap() {
+    // The one increment+log step for the replay-window class — EVERY
+    // truncatedGaps bump goes through here so the console invariant
+    // documented at the _streamHealth initializer holds (each increment
+    // carries the running count).  Class-of-event wording only: the
+    // recovery that follows differs by caller (jittered fresh-connect,
+    // idle-edge fresh-connect, or a degraded-catchup skip), so the line
+    // must not assert an action a trip may skip.  Churn accounting is
+    // deliberately NOT here — the idle-edge caller records the gap
+    // without feeding the degraded ladder.
+    this._streamHealth.truncatedGaps += 1;
+    console.warn(
+      "interactive: replay window could not cover the reconnect gap " +
+        "(total " +
+        this._streamHealth.truncatedGaps +
+        ")",
+    );
+  }
+
+  _noteTruncatedResync() {
+    // Count a truncated-triggered full resync into the SAME rolling
+    // churn window as overflow closes (_overflowTimes): both are "this
+    // consumer needed heavyweight recovery", and the degraded ladder is
+    // the bound for either loop.  Separate _streamHealth counter (via
+    // _recordTruncatedGap) so a field report distinguishes the
+    // dropped-events class (overflows) from the replay-window class
+    // (truncatedGaps).
+    //
+    // Returns true when this trip ENTERED degraded catch-up — the
+    // caller must then SKIP starting its resync: the cooldown ladder
+    // just disconnected the stream, and a _loadHistoryThenConnect
+    // started now would reconnect from its .finally and defeat the
+    // cooldown it triggered.  The wake-up reconnect re-arrives here via
+    // a fresh replay_truncated (its cursor is still stale), so the
+    // resync is deferred, not lost.
+    this._recordTruncatedGap();
+    return this._recordChurnAndMaybeTrip();
+  }
+
+  _scheduleTruncatedResync() {
+    // Start the truncated-triggered fresh connect after a random
+    // 0..TRUNCATED_RESYNC_JITTER_MS spread.  The truncated envelope is
+    // herd-shaped — a node restart makes every stale-cursor tab
+    // reconnect inside the EventSource retry jitter and each answers
+    // with a /history fetch — and the per-tab churn limiter cannot see
+    // a cross-tab herd (one resync per tab never trips it), so the
+    // spread is applied here, before the fetch.  During the wait the
+    // pane keeps painting live events from the still-open stream; the
+    // gap predates the resync either way, so the only cost is a
+    // delayed backfill.  disconnectSSE cancels teardown-orphaned resyncs
+    // and replayHistory supersedes on a heal (ws switch,
+    // hide, degraded entry, destroy — see the field comment).
+    if (this._resyncTimer != null) return; // one pending resync at a time
+    this._resyncTimer = setTimeout(() => {
+      this._resyncTimer = null;
+      if (this.wsId) this._loadHistoryThenConnect(this.wsId);
+    }, Math.random() * TRUNCATED_RESYNC_JITTER_MS);
+  }
+
+  _enterDegradedCatchup() {
+    // Repeated overflow closes inside one window: this consumer cannot
+    // keep up with live streaming right now, and each reconnect round
+    // just stalls rendering behind the 2.5-4.5 s retry before
+    // re-saturating.  Stop the churn: close the stream, say so in plain
+    // language, and come back after a (doubling) cooldown — that
+    // reconnect replays the gap from the server's ring buffer, or falls
+    // to the replay_truncated → /history resync floor once the gap has
+    // outgrown it.  Either path is lossless for committed turns.
+    const now = Date.now();
+    // Escalate the cooldown when trips recur; reset to base only after a
+    // genuine quiet gap.  Keyed off _lastDegradedAt (a timestamp), NOT
+    // _overflowTimes — this method clears that array below, so keying the
+    // reset off it would restart the ladder on the next storm's first
+    // overflow and the doubling (15→30→60→120s) would never take effect.
+    const step = degradedCooldownStep(
+      this._degradedCooldownMs,
+      this._lastDegradedAt,
+      now,
+      DEGRADED_COOLDOWN_BASE_MS,
+      DEGRADED_COOLDOWN_MAX_MS,
+      DEGRADED_COOLDOWN_RESET_MS,
+    );
+    this._lastDegradedAt = now;
+    this._degradedCooldownMs = step.nextCooldownMs;
+    this._overflowTimes.length = 0;
+    this.disconnectSSE(); // also cancels any earlier degraded timer
+    this.statusBarEl.classList.add("ws-sb-disconnected");
+    this._sbTokens.textContent = "Connection is slow — catching up…";
+    const cooldown = step.cooldown;
+    this._degradedTimer = setTimeout(() => {
+      this._degradedTimer = null;
+      if (document.hidden) {
+        // Reopening into a throttled hidden tab would overflow again —
+        // defer to the visibilitychange show edge instead.
+        this._hiddenDisconnect = true;
+        return;
+      }
+      if (this.wsId) this.connectSSE(this.wsId);
+    }, cooldown);
+  }
+
+  _loadHistoryThenConnect(wsId, manualAttempt = false) {
+    this._historyRepair.supersede(wsId);
+    const repairingHistoryHandoff = this._historyRepair.isRepairing(wsId);
+    if (
+      repairingHistoryHandoff &&
+      !this._historyRepair.admitAttempt(manualAttempt)
+    ) {
+      return;
+    }
+    // Mirror coord's init() ordering: render history from REST first,
+    // THEN open the live stream. Disconnect any existing stream up
+    // front so stray events from the previously-assigned ws don't paint
+    // into the pane mid-fetch. History is no longer replayed over SSE,
+    // so this REST fetch is the sole first-paint source; connectSSE's
+    // in_progress_snapshot still covers a generation that lands between
+    // the fetch and the stream opening.
+    this.disconnectSSE();
+    // (Re)load of a (possibly different) ws: drop the per-ws SSE replay
+    // cursor + cached status. Sending the previous ws's last_event_id to a
+    // new ws mis-triggers the server's replay_ok path and skips the synthetic
+    // replay (connected / status / in_progress_snapshot); the fresh connect
+    // below gets the new ws's full initial state instead.
+    this._lastEventId = null;
+    this._lastStatusEvt = null;
+    this._historyHandoffToken = null;
+    // Full-reload cleanup (NOT in disconnectSSE — transport-only reconnects
+    // must preserve these): a stale quiesce queue would wedge the new load's
+    // events behind a flush that never comes, stale agent tracking points at
+    // the DOM this load is about to replace, and a pending truncated-resync
+    // is superseded by the full refetch below.  The truncation-gap cursor
+    // is dropped ONLY on a ws switch (it names a gap in the OLD ws); a
+    // same-ws reload keeps it armed until a successful full render
+    // (replayHistory clears it) so a failed fetch can retry below.
+    if (this.wsId !== wsId) this._truncatedFromCursor = null;
+    // A reassignment also invalidates the staleness latch's referent —
+    // whatever transcript is visible belongs to the OLD ws, so any
+    // DOM-derived count is wrong until the new ws renders.  Set, not
+    // clear: replayHistory's render releases it.  (Near-vacuous under
+    // one-Pane-per-ws; kept defensively with the other wsId!==wsId
+    // branches.)
+    if (this.wsId !== wsId) this._historyStale = true;
+    // Streaming-ref reset, gated on RESUMABILITY rather than ws
+    // identity: refs may survive a reload only when the reconnect can
+    // resume into them — same ws AND an armed truncation cursor (the
+    // ring replay continues the mid-jitter bubble; resetting there
+    // orphaned it beside a duplicate).  Every other flavor resets: a
+    // ws SWITCH (the drop above just nulled the cursor — old-ws refs
+    // must not survive into the new ws's stream), a first paint or
+    // idle-edge reload (refs already null; no-op), and an UNARMED
+    // same-ws reload (the onLogin re-auth fan-out): its reconnect is
+    // cursorless, a turn that completed during the outage sends no
+    // resuming snapshot, and a stale non-null ref would concatenate
+    // the NEXT turn's content into the old bubble at its old DOM
+    // position.
+    //
+    // KNOWN RESIDUAL (ruled, do not re-derive): the armed-case
+    // preservation adds one route into the pre-existing cross-client
+    // in_progress_snapshot stale-ref secondary — a turn that starts
+    // streaming during the resync jitter leaves these refs non-null,
+    // and a reconnect snapshot reflecting a NEWER turn reuses the
+    // stale bubble (transient; heals at the next idle-edge resync).
+    // Deferred to the both-clients snapshot sweep: resetting armed
+    // refs here kills the mid-jitter continuity contract, and
+    // patching the snapshot handler in ONE client diverges parity
+    // (coordinator.js's handler is identical).
+    if (this._truncatedFromCursor == null) this._resetStreamingRefs();
+    this._replayQueue = null;
+    this._clearAgentTracking();
+    this._pendingTruncatedResync = false;
+    // Generation token — a slow refetch (e.g. a large resumed session) must
+    // not render its history, reconnect its stream, or fire its resend after
+    // the pane has switched to another ws. Newest load wins; older ones drop.
+    const token = (this._historyLoadToken || 0) + 1;
+    this._historyLoadToken = token;
+    // ``seedCursor=true``: every caller of THIS path reconnects (the
+    // ``.finally``), so a resume cursor from /history should seed
+    // _lastEventId for that connect.  Callers: first paint, ws switch,
+    // and — since the 2026-07 dead-stream ruling — both replay_truncated
+    // resync branches (a truncated stream is torn down and fully
+    // re-established, so cursor adoption is safe AND required: /history
+    // trims the in-flight turn whenever it returns a cursor).  Only the
+    // clear_ui re-render still calls _refetchHistory directly with
+    // seedCursor=false — it runs on an already-live stream and must NOT
+    // rewind _lastEventId off the live position.
+    let repairAttempt = null;
+    let repairAttemptId = null;
+    let repairDeadline = null;
+    let historyLoad;
+    if (repairingHistoryHandoff) {
+      const repairCtrl =
+        typeof AbortController === "function" ? new AbortController() : null;
+      const deadlineHandle = createHistoryHandoffDeadline(() => {
+        if (repairCtrl) repairCtrl.abort();
+      }, HISTORY_HANDOFF_FETCH_TIMEOUT_MS);
+      repairDeadline = deadlineHandle;
+      repairAttempt = deadlineHandle.state;
+      repairAttemptId = this._historyRepair.startAttempt(manualAttempt, () => {
+        if (repairCtrl) repairCtrl.abort();
+        // Cancelled mid-flight: dead-not-inert — expire so the late render
+        // discards, resolve so the race and its timer closure release now.
+        deadlineHandle.dispose({ expire: true, resolve: true });
+      });
+      // The logical deadline is load-bearing even when AbortController is
+      // unavailable and while authFetch is sleeping for Retry-After (that
+      // sleep is not abort-aware). The late request may still settle, but the
+      // attempt flag below makes its render inert.
+      historyLoad = Promise.race([
+        this._refetchHistory(
+          wsId,
+          token,
+          true,
+          repairCtrl ? repairCtrl.signal : undefined,
+          repairAttempt,
+        ),
+        deadlineHandle.promise,
+      ]);
+    } else {
+      historyLoad = this._refetchHistory(wsId, token, true);
+    }
+    historyLoad
+      .catch((err) => {
+        // Normalize to a fail-closed settle below, but never silently: a
+        // render throw on the ordinary first-paint path used to surface as
+        // an unhandled rejection — keep the diagnostic loud.
+        console.error("history load/render failed", err);
+        return undefined;
+      })
+      .then((outcome) => {
+        // Natural settlement: retire the timer and settle slot without
+        // resolving (the race already settled through whichever arm won).
+        if (repairDeadline) repairDeadline.dispose();
+        this._historyRepair.endAttempt(repairAttemptId);
+        if (token !== this._historyLoadToken) return;
+
+        if (repairingHistoryHandoff) {
+          this._historyRepair.settle({
+            outcome,
+            hasToken: this._historyHandoffToken != null,
+            manualAttempt,
+          });
+          return;
+        }
+
+        // Ordinary first paint / truncation recovery retains its established
+        // reconnect behaviour. A truncated failure still re-presents the
+        // recorded numeric gap; only history_resync needs the stronger proof.
+        this.connectSSE(wsId);
+      });
+  }
+
+  async _refetchHistory(
+    wsId,
+    token,
+    seedCursor = false,
+    signal,
+    repairAttempt,
+  ) {
+    // Fetch conversation history over REST. Used for first paint (before
+    // connecting SSE) and to re-render after a clear_ui signal (rewind /
+    // retry / resume / open). The FETCH is wrapped (network/parse failure
+    // → empty pane); the render is deliberately OUTSIDE the catch so a
+    // render bug surfaces loudly instead of being masked as an empty pane.
+    //
+    // ``seedCursor`` is true ONLY via _loadHistoryThenConnect (which
+    // reconnects via .finally — first paint, ws switch, truncated
+    // resync). The live-stream re-render caller (clear_ui) leaves it
+    // false so a fast-forward cursor never rewinds the live stream's
+    // _lastEventId backward (which would double-render on a later
+    // transient reconnect, or — on a re-render that trims an orphan
+    // with no reconnect — strand the omitted turn).
+    const id = wsId || this.wsId;
+    // Stream generation at DISPATCH (#900), captured at entry rather than
+    // beside the await — it mirrors coordinator.js refetchHistory's
+    // `const seq = ++refetchSeq;`, and entry-capture can only ever decline
+    // MORE if a future edit inserts transport-touching work ahead of the
+    // fetch, which is the safe direction.
+    const epoch = this._connectEpoch;
+    let data = null;
+    // Ordinary history loads retain their established authFetch retry
+    // policy. Strong handoff repair passes both an AbortSignal and a logical
+    // attempt flag: the outer Promise.race settles after 15s even if this
+    // authFetch is inside its non-abort-aware Retry-After sleep, and the flag
+    // prevents that late request from ever rendering.
+    try {
+      const r = await authFetch(
+        this._base +
+          "/v1/api/workstreams/" +
+          encodeURIComponent(id) +
+          "/history",
+        signal ? { signal: signal } : undefined,
+      );
+      if (r && r.ok) data = await r.json();
+    } catch (err) {
+      data = null;
+    }
+    if (repairAttempt && repairAttempt.expired) return;
+    // Drop a superseded load: a newer _loadHistoryThenConnect (ws switch)
+    // bumped the token while this fetch was in flight, so rendering now would
+    // paint the wrong ws's history into the pane.
+    if (token !== undefined && token !== this._historyLoadToken) {
+      this._endReplayQuiesce(token);
+      return;
+    }
+    // Render-time transport gate (#900) — the correctness half of the
+    // clear_ui retry's fire-time OPEN term, covering the AWAIT window the
+    // fire-time check cannot: a hide edge, an onerror redial, or degraded
+    // entry can tear the transport down while THIS fetch is outstanding.
+    // A SEEDLESS render commits /history's as-of-now truth while leaving
+    // _lastEventId where the stream stopped delivering, so any turn
+    // committed during the outage gets painted with the cursor still
+    // BELOW it — the next connect presents that cursor, the server
+    // answers replay_ok, and the slice paints a second time (only
+    // system_turn and compaction markers carry id dedup; content and tool
+    // rows do not, and replayHistory has just reset the streaming refs and
+    // the announce map).  Handled exactly like a failed fetch below: no
+    // wipe, the latch survives, the quiesce releases, and the retry /
+    // idle-edge backstop own the heal.
+    //
+    // seedCursor renders are EXEMPT by construction and must stay so: their
+    // only caller is _loadHistoryThenConnect, which disconnects FIRST
+    // (evtSource is null for its whole fetch) and reconnects from
+    // data.cursor in its .finally — that adoption is what makes its render
+    // cursor-safe.
+    //
+    // SCOPE, ruled (#900): this ports the stream-OPENness term of
+    // coordinator.js's render-time gate and deliberately NOT its liveness
+    // terms (liveToolCalls / optimistic busySource / content refs).
+    // Interactive's replay quiesce holds every LIVE SSE event across the
+    // await, so no stream-driven turn state can appear beneath a render
+    // that is already committed — coord needed those terms because it has
+    // no quiesce.  Known residual, accepted: the user's own send is not an
+    // SSE event, so a send landing inside the await has its optimistic row
+    // wiped by the render.  The message is already committed server-side
+    // and a DOM short one user row can only UNDER-count a later rewind —
+    // non-destructive, the same ruling the Route-L reload carries at
+    // _historyStale's declaration.
+    // The generation term is what makes this gate total rather than
+    // point-in-time (#900 r2).  A transport that DROPPED and finished
+    // RE-ESTABLISHING inside the await — natively, or via a hide/show, the
+    // recover beat, or the degraded timer — reads back `OPEN` and is
+    // indistinguishable from one that never moved.  It is not: the redial
+    // presented the frozen _lastEventId, the server answered replay_ok, and
+    // the quiesce BUFFERED that slice, so rendering here would commit the
+    // same turns the flush is about to repaint on top.  Only a counter can
+    // see it — object identity cannot, since a native reconnect reuses the
+    // same EventSource.  (Do NOT cite coordinator.js's REMOVED r8 epoch as
+    // precedent: that one was a clear_ui/truncation-generation stamp made
+    // redundant by its seq gate.  This is a connection generation — a
+    // different value with a different matrix.)
+    //
+    // KNOWN FALSE-DECLINE, accepted: if the reconnect answered fresh or
+    // truncated rather than replay_ok, its slice carries no ring content and
+    // the render would have been safe.  Cost is one wasted /history, and it
+    // self-heals — the flushed synthetic state_change lands in the idle-edge
+    // backstop, or the truncated handler schedules a seeded resync.
+    //
+    // (Coord's half of this gate is tracked as #904 — its exposure is a
+    // race rather than this determinism, so it is not ported blind.)
+    //
+    // KNOWN RESIDUAL, server-side-blocked (#903): a refetch DISPATCHED in
+    // the gap between onopen and the replay slice actually arriving captures
+    // an already-bumped generation and still renders past the frozen cursor.
+    // replay_ok emits no end-of-replay marker, so no client-side signal
+    // exists to gate on; closing it needs a server change.  Narrow (the
+    // replay almost always beats a fresh HTTP round-trip) but real.
+    const cursorSafe =
+      seedCursor ||
+      (!!this.evtSource &&
+        this.evtSource.readyState === EventSource.OPEN &&
+        this._connectEpoch === epoch);
+    if (data && cursorSafe) {
+      // Fresh-connect fast-forward: when the trailing turn is an
+      // executing in-flight tool batch the server can replay, /history
+      // returns a non-null ``cursor`` (a Last-Event-ID) and OMITS that
+      // turn from ``messages``. On the initial-connect path only
+      // (``seedCursor``), seed ``_lastEventId`` so the connectSSE below
+      // opens the initial stream with ?last_event_id=, taking the
+      // replay_ok delta path that rebuilds the in-flight turn (tool
+      // calls, results, prompts) through the live handlers — no synthetic
+      // snapshot, no /history-vs-delta double-render. Null cursor leaves
+      // _lastEventId untouched (fresh connect, already nulled by
+      // _loadHistoryThenConnect); the re-render callers never seed.
+      if (seedCursor && data.cursor != null) this._lastEventId = data.cursor;
+      // The REST /history payload is already the canonical projected wire
+      // shape (server-side projection in make_history_handler:
+      // flat tool_calls, top-level source/reminders/attachments, collapsed
+      // content, derived denied/is_error/pending) — feed it straight to
+      // replayHistory. No client-side normalisation.  The quiesce release
+      // rides a finally so a loud replay throw (deliberately uncaught, see
+      // above) can't strand the event queue and wedge the pane.
+      try {
+        this.replayHistory(data.messages || []);
+      } finally {
+        this._endReplayQuiesce(token);
+      }
+      // Arm the handoff only after the full render succeeds. A render throw
+      // must not open a stream claiming an incomplete transcript matches this
+      // revision; _loadHistoryThenConnect's rejected promise remains loud.
+      if (seedCursor) {
+        this._historyHandoffToken =
+          typeof data.handoff_token === "string" && data.handoff_token
+            ? data.handoff_token
+            : null;
+      }
+      // The outcome tells the repair settle whether a TOKENLESS response
+      // was a completed render (the server's deliberate cold storage-only
+      // read — downgrade to the tokenless bootstrap) or a failure (fail
+      // closed and retry).
+      return "rendered";
+    } else {
+      // Failed fetch = DOM + ref + repair-intent no-op (#890, the G3
+      // guard-before-wipe ported from coordinator.js refetchHistory) —
+      // and, since #900, the same no-op for a good payload the
+      // cursor-safety gate above declined to render.
+      // The prior transcript stays on screen: no wipe ever ran (see
+      // the clear_ui case), and appending an empty-state hint below
+      // real content was the old resync-route wart.  The streaming
+      // refs stay untouched — null per the turn-free-at-clear_ui
+      // invariant, or validly attached on the resync route, where
+      // resetting them orphaned a mid-jitter turn's bubble and let
+      // the reconnect snapshot build a duplicate beside it.
+      // _truncatedFromCursor stays SET (only replayHistory clears
+      // it), which is what arms the connect chokepoint's retry for a
+      // failed truncated resync.  Only the quiesce must release, or
+      // a queued clear_ui backlog would wedge the pane.
+      this._endReplayQuiesce(token);
+    }
+  }
+
+  _beginReplayQuiesce(token) {
+    // Arm the handleEvent queue for a full re-render on a LIVE stream
+    // (clear_ui — the sole remaining quiescing caller; the truncated
+    // resync disconnects first instead).  Token-owned: a newer load's
+    // quiesce replaces this one wholesale — events queued before the
+    // newer snapshot was fetched are covered by that snapshot, so
+    // dropping them is lossless.
+    this._replayQueue = { token: token, events: [] };
+  }
+
+  _endReplayQuiesce(token) {
+    const q = this._replayQueue;
+    if (!q || q.token !== token) return;
+    this._replayQueue = null;
+    // Replay the backlog in arrival order.  A queued clear_ui re-arms the
+    // quiesce mid-flush and the remainder queues behind ITS rebuild.  Each
+    // dispatch is guarded like onmessage: one bad event must not drop the
+    // rest of the backlog.
+    for (const evt of q.events) {
+      try {
+        this.handleEvent(evt);
+      } catch (err) {
+        console.error("interactive: queued event replay failed", err);
+      }
+    }
+  }
+
+  _deferStaleHistoryBackstop() {
+    if (this._staleBackstopMicrotaskPending) return;
+    this._staleBackstopMicrotaskPending = true;
+    const staleToken = this._historyLoadToken;
+    const staleWs = this.wsId;
+    queueMicrotask(() => {
+      this._staleBackstopMicrotaskPending = false;
+      // Re-check every owner at the backlog tail. A later event in the same
+      // flush may have started a turn, re-armed a clear_ui queue, transferred
+      // repair ownership to replay_truncated, switched workstreams, or torn
+      // the pane down. None of those may be overtaken by this stale-idle heal.
+      if (
+        !staleWs ||
+        this.wsId !== staleWs ||
+        staleToken !== this._historyLoadToken ||
+        !this._historyStale ||
+        this._replayQueue ||
+        this.busy ||
+        this.currentAssistantEl ||
+        this.currentReasoningEl ||
+        this._pendingTruncatedResync ||
+        this._truncatedFromCursor != null ||
+        this._resyncTimer != null ||
+        !this.el ||
+        !this.el.isConnected
+      ) {
+        return;
+      }
+      this._beginReplayQuiesce(staleToken);
+      this._refetchHistory(staleWs, staleToken);
+    });
+  }
+
+  _clearAgentTracking() {
+    // Release task-agent bookkeeping ahead of (or after) a full rebuild.
+    // Entries left in _agentCards would pin every replaced card subtree as
+    // reachable detached DOM — unbounded growth across an hours-long
+    // session's rewinds/compaction re-syncs — and a stale _agentOrphans
+    // grace timer would escape buffered steps into the rebuilt pane.
+    if (this._agentCards) this._agentCards.clear();
+    if (this._agentContexts) this._agentContexts.clear();
+    if (this._agentCompactions) {
+      for (const holder of this._agentCompactions.values()) {
+        resetCompactionHolder(holder);
+      }
+      this._agentCompactions.clear();
+    }
+    if (this._agentOrphans) {
+      for (const entry of this._agentOrphans.values()) {
+        if (entry.timer != null) clearTimeout(entry.timer);
+      }
+      this._agentOrphans.clear();
+    }
+    // The row/stream lookup caches share this exact lifecycle (entries are
+    // DOM refs into the subtree being replaced) — drop them together.
+    if (this._toolRowIndex) this._toolRowIndex.clear();
+    if (this._streamElIndex) this._streamElIndex.clear();
+    if (this._toolResultNodes) this._toolResultNodes.clear();
+  }
+
+  _toolRow(callId) {
+    // O(1) call_id → .conv-row resolution with a self-healing cache: a hit
+    // is validated for liveness (isConnected + id match) so a row replaced
+    // by the pending→resolved upgrade or a batch rebuild falls back to one
+    // scoped query and re-caches.  The old per-event attribute-selector
+    // scan walked the whole transcript — O(N) per tool event.
+    if (!callId) return null;
+    let row = this._toolRowIndex.get(callId);
+    if (row && row.isConnected && row.dataset.callId === callId) return row;
+    const rows = this.messagesEl.querySelectorAll(
+      '.conv-row[data-call-id="' + CSS.escape(callId) + '"]',
+    );
+    row = rows.length ? rows[rows.length - 1] : null;
+    if (row) this._toolRowIndex.set(callId, row);
+    else this._toolRowIndex.delete(callId);
+    return row;
+  }
+
+  _indexToolRows(root) {
+    if (!root) return;
+    root.querySelectorAll(".conv-row[data-call-id]").forEach((row) => {
+      const callId = row.dataset.callId || "";
+      if (!callId) return;
+      // Reused provider ids are valid across turns. The newest rendered batch
+      // owns future result events; release only the old tracking reference,
+      // never the old turn's still-visible DOM.
+      indexLatestToolRow(
+        this._toolRowIndex,
+        this._toolResultNodes,
+        callId,
+        row,
+      );
+    });
+  }
+
+  _streamEl(callId) {
+    // Same cache discipline as _toolRow for the per-tool streaming <pre> —
+    // resolved on every tool_output_chunk, the chattiest event in an agent
+    // session.
+    if (!callId) return null;
+    let el = this._streamElIndex.get(callId);
+    if (el && el.isConnected && el.dataset.callId === callId) return el;
+    el = this.messagesEl.querySelector(
+      '.tool-output-stream[data-call-id="' + CSS.escape(callId) + '"]',
+    );
+    if (el) this._streamElIndex.set(callId, el);
+    else this._streamElIndex.delete(callId);
+    return el;
+  }
+
+  handleEvent(evt) {
+    // Guard: drop events that belong to a different workstream.
+    // This prevents cross-contamination during tab switches and reconnects.
+    if (evt.ws_id && evt.ws_id !== this.wsId) return;
+    // While a clear_ui rebuild is in flight, live events
+    // must not paint into a DOM the imminent replaceChildren() will wipe —
+    // anything painted in the [snapshot-fetch → rebuild] window is lost with
+    // no redelivery (the re-render callers never rewind _lastEventId).  Queue
+    // them; _endReplayQuiesce replays the backlog once the rebuild lands.
+    if (this._replayQueue) {
+      this._replayQueue.events.push(evt);
+      return;
+    }
+    switch (evt.type) {
+      case "thinking_start":
+        this.setBusy(true);
+        this.removeEmptyState();
+        this.addThinkingIndicator();
+        break;
+
+      case "thinking_stop":
+        this._reasoningActivity.hideWaiting();
+        break;
+
+      case "reasoning":
+        let reasoningBody = null;
+        if (!this.currentReasoningEl) {
+          this.currentReasoningEl = document.createElement("div");
+          this.currentReasoningEl.className = "msg reasoning";
+          reasoningBody = document.createElement("div");
+          reasoningBody.className = "msg-body";
+          this.currentReasoningEl.appendChild(reasoningBody);
+          this.messagesEl.appendChild(this.currentReasoningEl);
+        } else {
+          reasoningBody = this.currentReasoningEl.querySelector(".msg-body");
+        }
+        this._reasoningActivity.attach(this.currentReasoningEl);
+        if (reasoningBody) reasoningBody.textContent += evt.text;
+        this.scrollToBottom();
+        break;
+
+      case "content":
+        this._reasoningActivity.finish();
+        this.currentReasoningEl = null;
+        if (!this.currentAssistantEl) {
+          this._newAssistantBubble();
+        }
+        this.contentBuffer += evt.text;
+        streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
+        this.scrollToBottom();
+        break;
+
+      case "stream_end": {
+        if (this._cancelTimeout) {
+          clearTimeout(this._cancelTimeout);
+          this._cancelTimeout = null;
+        }
+        if (this._forceTimeout) {
+          clearTimeout(this._forceTimeout);
+          this._forceTimeout = null;
+        }
+        // A live in-progress compaction card at stream_end means a FORCE
+        // stop abandoned the compaction worker (the lifecycle wrapper
+        // otherwise always retires the card with an end event before any
+        // stream_end can follow) — remove it now instead of leaving a
+        // frozen bar until the abandoned worker notices at its next
+        // checkpoint.
+        resetCompactionHolder(this._compaction);
+        // Reset the segment state BEFORE the finalize render, and guard the
+        // render with a plain-text fallback (mirrors coordinator.js).  With
+        // the old order a finalize throw skipped these clears, so every
+        // later content delta appended into the poisoned buffer/bubble and
+        // no new assistant segment ever painted — the permanent-wedge shape
+        // of "output stops rendering while the backend stays healthy".
+        const doneBodyEl = this.currentAssistantBodyEl;
+        const doneBuffer = this.contentBuffer;
+        this.currentAssistantBodyEl = null;
+        this.currentAssistantEl = null;
+        this._reasoningActivity.finish();
+        this.currentReasoningEl = null;
+        this.contentBuffer = "";
+        // Finalize the completed streaming segment's markdown.  This fires
+        // per-segment (between tool calls), NOT per-turn.  Busy state is
+        // managed by state_change events instead.
+        if (doneBodyEl && doneBuffer) {
+          try {
+            streamingRenderFinalize(doneBodyEl, doneBuffer);
+          } catch (err) {
+            this._streamHealth.renderThrows += 1;
+            console.warn(
+              "interactive: streamingRenderFinalize failed (render-throw total " +
+                this._streamHealth.renderThrows +
+                ")",
+              err,
+            );
+            doneBodyEl.textContent = doneBuffer;
+          }
+        }
+        this.scrollToBottom();
+        break;
+      }
+
+      case "in_progress_snapshot":
+        // One-shot replay of the in-progress turn's reasoning + content
+        // when this client connects mid-stream (page refresh while the
+        // model is generating).  Both fields may be empty; render only
+        // the non-empty halves.  Idempotent on EventSource auto-reconnect:
+        // skip overwrite when the current buffer is already at-or-past
+        // the snapshot length, so a stale replay can't reset the live-
+        // streamed view back to a shorter prefix.
+        if (evt.reasoning || evt.content) this._reasoningActivity.hideWaiting();
+        if (evt.reasoning) {
+          let snapshotReasoningBody = null;
+          if (!this.currentReasoningEl) {
+            this.currentReasoningEl = document.createElement("div");
+            this.currentReasoningEl.className = "msg reasoning";
+            snapshotReasoningBody = document.createElement("div");
+            snapshotReasoningBody.className = "msg-body";
+            this.currentReasoningEl.appendChild(snapshotReasoningBody);
+            this.messagesEl.appendChild(this.currentReasoningEl);
+          } else {
+            snapshotReasoningBody =
+              this.currentReasoningEl.querySelector(".msg-body");
+          }
+          this._reasoningActivity.attach(this.currentReasoningEl);
+          const curReason = snapshotReasoningBody
+            ? snapshotReasoningBody.textContent || ""
+            : "";
+          if (
+            snapshotReasoningBody &&
+            curReason.length < evt.reasoning.length
+          ) {
+            snapshotReasoningBody.textContent = evt.reasoning;
+          }
+        }
+        if (evt.content) {
+          this._reasoningActivity.finish();
+          // Content snapshot supersedes any reasoning bubble — matches
+          // the "case content" invariant of clearing currentReasoningEl
+          // when content begins.
+          this.currentReasoningEl = null;
+          if (!this.currentAssistantEl) {
+            this._newAssistantBubble();
+          }
+          if (this.contentBuffer.length < evt.content.length) {
+            this.contentBuffer = evt.content;
+            streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
+          }
+        }
+        this.scrollToBottom();
+        break;
+
+      case "state_change":
+        // Track who holds the in-flight turn (acting user) so the send gate
+        // can compare against this viewer. Present on busy transitions from a
+        // shared workstream; absent on single-user / older backends (then the
+        // gate simply never engages). Cleared when the turn settles.
+        if (evt.state === "idle" || evt.state === "error") {
+          this._actingUserId = null;
+        } else if (evt.acting_user_id) {
+          this._actingUserId = evt.acting_user_id;
+        }
+        if (evt.state === "idle" || evt.state === "error") {
+          this._reasoningActivity.finish();
+          this.setBusy(false);
+          // A context event received while its call id still resolved to a
+          // prior terminal row is retained briefly for a possible successor
+          // row with a recycled provider id. If no such row appeared before
+          // the turn settled, the reading belonged to the terminal occurrence.
+          for (const [parentId, reading] of this._agentContexts.entries()) {
+            if (reading.blockedByTerminalRow) {
+              this._agentContexts.delete(parentId);
+            }
+          }
+          for (const [parentId, holder] of this._agentCompactions.entries()) {
+            if (holder.blockedByTerminalRow) {
+              resetCompactionHolder(holder);
+              this._agentCompactions.delete(parentId);
+            }
+          }
+          this._attachRetryToLastAssistant();
+          // Deferred replay_truncated re-sync: the truncation arrived while
+          // a segment was streaming (refetching then would have detached the
+          // live bubble), so repair the lost-event gap now that the turn is
+          // settled and /history is complete.  Same dead-stream flow as the
+          // immediate branch (full fresh connect, cursor adoption) — but NOT
+          // counted into the degraded-churn window, and NOT herd-jittered:
+          // this branch fires once per latch, and the latch only re-arms via
+          // a NEW truncated envelope followed by a full turn-settle —
+          // inherently rate-limited AND per-pane staggered by turn timing,
+          // unlike the immediate branch's reconnect loop (which the limiter
+          // bounds and _scheduleTruncatedResync spreads).  Usually /history
+          // returns no cursor here (no orphan at idle) and the reconnect is
+          // a plain fresh connect; a queued send racing the fetch just means
+          // a seeded reconnect instead — both converge.
+          if (this._pendingTruncatedResync) {
+            this._pendingTruncatedResync = false;
+            this._recordTruncatedGap();
+            this._loadHistoryThenConnect(this.wsId);
+          } else if (this._historyStale && !this._replayQueue) {
+            // Staleness-latch backstop (#890): a clear_ui refetch and
+            // its one bounded retry both failed, so the transcript
+            // still doesn't match the server and rewind/edit are
+            // latch-closed. The turn just settled — defer the refetch to the
+            // current event-backlog tail so an earlier synthetic idle cannot
+            // divert later canonical replay events into the repair queue.
+            //
+            // TRANSPORT-FREE BY DESIGN (ruled, do not "upgrade" this
+            // to _loadHistoryThenConnect): the heal must never touch
+            // the stream.  A reload's fresh reconnect draws the
+            // server's synthetic state_change:idle, which lands back
+            // in THIS branch — with /history down that was a
+            // zero-backoff disconnect/refetch/reconnect storm against
+            // a recovering node (the round-5 critical).  A quiesced
+            // REST refetch emits zero SSE events, so the trigger edge
+            // is only ever organic (turn-settle-driven, no server
+            // heartbeats) and the loop is structurally impossible.
+            // Stream death has its own owners (EventSource native
+            // auto-reconnect, the host recovery beat, the truncated
+            // resync) — the old reload's reconnect was redundant.
+            // The !_replayQueue guard skips the edge when a quiesced
+            // fetch is already in flight.  The else keeps the
+            // truncated branch's reload from doubling up (its render
+            // clears the latch too).  On another failure the latch
+            // persists and the next ORGANIC settle retries.  Accepted
+            // liveness lag: if /history recovers while the pane sits
+            // idle untouched, rewind/edit stay closed until the next
+            // organic settle — strictly safer than the storm.
+            //
+            // Fire-and-forget (no .catch) is deliberate: no composer state
+            // rides this heal to un-strand (that is the clear_ui caller's
+            // .catch), so a render throw stays loud, as in the load path.
+            this._deferStaleHistoryBackstop();
+          }
+          // Only steal focus if this is the active pane and no approval pending.
+          if (this._host.isFocused(this) && !this.pendingApproval) {
+            this.inputEl.focus();
+          }
+        } else if (
+          evt.state === "thinking" ||
+          evt.state === "running" ||
+          evt.state === "attention"
+        ) {
+          this.setBusy(true);
+          // A reconnect before the first token has only the current state,
+          // not the earlier thinking_start. Restore its waiting affordance.
+          if (
+            evt.state === "thinking" &&
+            !this.currentAssistantEl &&
+            !this.currentReasoningEl
+          ) {
+            this.addThinkingIndicator();
+          }
+        }
+        break;
+
+      case "tool_pending":
+        // Early paint — render the pending call the instant the model
+        // commits to it, before the judge verdict + approval gate resolve,
+        // so the operator can Stop in an emergency.  The authoritative
+        // tool_info / approve_request that follows upgrades THIS block in
+        // place (matched by call_id) rather than appending a duplicate.
+        // A sub-agent's steps (parent_call_id set) nest in the task card.
+        if (!this._routeAgentItems(evt.items, "pending")) {
+          this.announceToolBlock(evt.items);
+        }
+        break;
+
+      case "agent_context":
+        this._updateAgentContext(evt);
+        break;
+
+      case "tool_info":
+        // A sub-agent's auto-resolved step (policy / "Always" auto-approval, or
+        // a policy block) arrives as a tool_info with parent_call_id stamped —
+        // route it into the task card like tool_pending / approve_request,
+        // instead of painting a duplicate top-level row.  Top-level tool_info
+        // (no parent_call_id) falls through to the normal inline block.
+        if (!this._routeAgentItems(evt.items, "info")) {
+          this.showInlineToolBlock(evt.items, true);
+        }
+        break;
+
+      case "approve_request":
+        if (
+          !this._routeAgentItems(
+            evt.items,
+            "approve",
+            evt.judge_pending,
+            this._cycleKey(evt),
+          )
+        ) {
+          this.showInlineToolBlock(
+            evt.items,
+            false,
+            evt.judge_pending,
+            this._cycleKey(evt),
+          );
+        }
+        break;
+
+      case "intent_verdict":
+        this.updateVerdictBadge(evt);
+        break;
+
+      case "output_warning":
+        this.showOutputWarning(evt);
+        break;
+
+      case "approval_resolved":
+        // Route to the resolved cycle; an event without a cycle_id
+        // (pre-multi-cycle server) falls back to the oldest.
+        this.resolveApproval(
+          evt.approved,
+          false,
+          evt.feedback,
+          true,
+          evt.cycle_id || this._oldestCycleId(),
+        );
+        break;
+
+      case "tool_output_chunk":
+        this.appendToolOutputChunk(evt.call_id || "", evt.chunk);
+        break;
+
+      case "tool_result":
+        if (acceptedToolEventAlreadyRendered(this._renderedToolEventIds, evt)) {
+          break;
+        }
+        // Record the accepted event as rendered ONLY when a paint actually
+        // happened: a false return (no target row — clear_ui wipe with the
+        // refetch in flight, a fresh mid-turn join) must leave the id
+        // unrecorded so the ring's later replay of the same event can paint
+        // it instead of being deduped into a permanently missing output.
+        if (
+          this.appendToolOutput(
+            evt.call_id || "",
+            evt.name,
+            evt.output,
+            evt.is_error,
+            evt.preview,
+            {
+              accepted: evt.accepted === true,
+              eventId: evt._event_id,
+              effectStatus: evt.effect_status,
+            },
+          )
+        ) {
+          recordAcceptedToolEvent(this._renderedToolEventIds, evt);
+        }
+        break;
+
+      case "status":
+        this.updateStatus(evt);
+        break;
+
+      case "info":
+        this.addInfoMessage(evt.message);
+        break;
+
+      case "error":
+        // Show the error but don't change busy state — state_change
+        // handles idle/error transitions.  on_error fires for non-terminal
+        // errors (tool parse failures, truncation) mid-turn too.
+        this.addErrorMessage(evt.message);
+        break;
+
+      case "user_turn":
+        this._acceptUserTurn(evt);
+        break;
+
+      case "system_turn": {
+        // First-class operator-context system turn (output-guard finding,
+        // user interjection, metacognitive nudge — see
+        // tool_advisory.make_system_turn).  Consolidates the legacy
+        // user_reminder / tool_reminder events into one operator bubble
+        // rendered in trajectory sequence (it FOLLOWS the turn it advises,
+        // so by the time this SSE event arrives the related turn already
+        // rendered).  ``evt.source`` carries the kind for the bubble label;
+        // ``evt.meta`` the structured per-kind fields (watch-result card).
+        // Dedup: if this turn was already painted from /history (its row id
+        // matches this event's id) an SSE replay redelivered it — skip.  With
+        // the resume-cursor fix this shouldn't recur, but the guard keeps the
+        // /history+replay seam idempotent for system turns regardless.
+        const sysEid = evt._event_id != null ? String(evt._event_id) : null;
+        if (sysEid && this._renderedSystemEventIds.has(sysEid)) {
+          break;
+        }
+        if (
+          evt.source === "user_interjection" &&
+          evt.meta &&
+          evt.meta.client_send_id &&
+          clientSendMaySettleForViewer(evt.meta.sender, viewerUserId())
+        ) {
+          this._markAcceptedClientSends([evt.meta.client_send_id], true);
+        }
+        this.addSystemContext(
+          evt.content || "",
+          evt.source || "",
+          evt.meta || null,
+        );
+        if (sysEid) this._renderedSystemEventIds.add(sysEid);
+        break;
+      }
+
+      case "compaction":
+        // Context-compaction lifecycle: start paints the in-progress card,
+        // progress drives its bar, end swaps it for the result card (or a
+        // failure notice).  See handleCompactionEvent.
+        this.handleCompactionEvent(evt);
+        break;
+
+      case "message_queued":
+        // Confirmation from server that a queued message was accepted.
+        // Mark the exact optimistic chip as admitted before the HTTP response:
+        // if that ACK is lost, the catch must not erase/report an unsent row.
+        if (
+          evt.client_send_id &&
+          clientSendMaySettleForViewer(evt.sender, viewerUserId())
+        )
+          this._markAcceptedClientSends([evt.client_send_id], false, true);
+        break;
+
+      case "message_dispatched":
+        // A deferred send left the parked list: fresh spawn (promote the
+        // chip — the ×'s window is over) or interjection fold-in
+        // (folded: true — only the deferred flag clears; the chip resumes
+        // the normal queued lifecycle). No-op when this tab holds no
+        // matching chip.
+        this.queue.settleDeferred(evt.msg_id, !!evt.folded);
+        break;
+
+      case "busy_error":
+        // Server is still busy — don't transition to send mode.
+        // Re-enable the stop button so the user can try cancelling.
+        this.addErrorMessage(evt.message);
+        this.stopBtn.textContent = "\u25a0 Stop";
+        this.stopBtn.setAttribute("aria-label", "Stop generation");
+        delete this.stopBtn.dataset.forceCancel;
+        this.stopBtn.disabled = false;
+        break;
+
+      case "cancelled":
+        // Cancel requested but worker thread may still be finishing.
+        // Show "Cancelling..." state; state_change will transition to ready.
+        // If state_change already arrived (busy is false), the cancel is
+        // already handled — don't re-enter the cancelling state.
+        if (!this.busy) break;
+        // Clear any prior timeouts first (duplicate cancelled events).
+        clearTimeout(this._cancelTimeout);
+        clearTimeout(this._forceTimeout);
+        this.currentAssistantEl = null;
+        this._reasoningActivity.finish();
+        this.currentReasoningEl = null;
+        this.contentBuffer = "";
+        this.stopBtn.disabled = true;
+        this.stopBtn.textContent = "Cancelling\u2026";
+        this.stopBtn.setAttribute("aria-label", "Cancelling generation");
+        this.scrollToBottom();
+        // After 2s, offer "Force Stop" for a harder cancel that abandons
+        // the stuck worker thread.  Safety timeout at 10s auto-recovers
+        // if state_change never arrives (connection drop).
+        this._cancelTimeout = setTimeout(() => {
+          if (this.busy) {
+            this.stopBtn.disabled = false;
+            this.stopBtn.textContent = "\u26a0 Force Stop";
+            this.stopBtn.setAttribute("aria-label", "Force stop generation");
+            this.stopBtn.dataset.forceCancel = "true";
+          }
+        }, 2000);
+        this._forceTimeout = setTimeout(() => {
+          if (this.busy) {
+            this.addInfoMessage(
+              "Cancel didn\u2019t complete in time. You may need to resend your last message.",
+            );
+            this.setBusy(false);
+          }
+        }, 10000);
+        break;
+
+      case "connected":
+        this.model = evt.model || "";
+        this.modelAlias = evt.model_alias || evt.model || "";
+        this._paintModelChip();
+        this.projectName = evt.project_name || "";
+        this._paintProjectChip();
+        if (evt.skip_permissions) {
+          const existing = document.querySelector(".skip-permissions-warning");
+          if (!existing) {
+            const warn = document.createElement("div");
+            warn.className = "skip-permissions-warning";
+            warn.textContent =
+              "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
+            this._host.warningTarget(this).appendChild(warn);
+          }
+        }
+        break;
+
+      case "clear_ui": {
+        // Conversation was structurally reset (rewind / retry / resume /
+        // open / fork). Re-render from REST and dispatch any queued
+        // edit-and-resend once the (possibly truncated) history lands.
+        // The resend keys off this signal rather than an inline history
+        // SSE event.
+        //
+        // No pre-wipe (#890, the guard-before-wipe shape coord shipped
+        // in #882's G3): the wipe + streaming-ref reset live in
+        // replayHistory, reached only on a SUCCESSFUL fetch — so a
+        // failed /history keeps the prior transcript on screen.
+        // Stale-but-real beats a blank pane on a live stream, and
+        // /history failures cluster in exactly the restart windows
+        // that emit clear_ui replays.  The quiesce stays armed across
+        // the fetch either way: queued live events replay into the
+        // rebuilt pane on success, or onto the stale-but-real one on
+        // failure — safe because clear_ui emitters are turn-free at
+        // emission (see the _resyncTimer field comment), so the
+        // surviving streaming refs are null and replayed events build
+        // fresh rows below the stale transcript.  The stale rows stay
+        // VISIBLE but their mutating affordances gate on the
+        // _historyStale latch (set below, cleared only by a successful
+        // replayHistory render — see the field comment), so a turn
+        // count computed off the stale DOM can't reach the server
+        // during the fetch OR after a failed one.  A failed fetch
+        // schedules one turn-free retry (the .then below); the
+        // idle-edge heal backstops a double failure.  Coord's cosmetic
+        // [data-busy] grey-out stays a deferred parity item (#890 PR).
+        //
+        // Capture the load token AND the ws identity: a ws SWITCH
+        // mid-flight discards both the re-render and the resend (no
+        // cross-ws send), but a SAME-ws supersession — the jittered
+        // truncated resync bumps _historyLoadToken through
+        // _loadHistoryThenConnect — must still fire the resend: the
+        // superseding load renders the same post-rewind history, and
+        // silently dropping the queued edit stranded the composer busy
+        // with a message that never sent.  On a FAILED fetch the
+        // resend still fires (the rewind already committed
+        // server-side); its bubble lands on the stale transcript and
+        // the rewound truth arrives with the next successful refetch —
+        // coord's same ruling.
+        const token = this._historyLoadToken;
+        const editWs = this.wsId;
+        this._historyStale = true;
+        this._beginReplayQuiesce(token);
+        this._refetchHistory(this.wsId, token)
+          .then(() => {
+            // Failed fetch (the latch survived — only replayHistory
+            // clears it): schedule the ONE bounded retry.  Scheduled
+            // here rather than in the failure branch so a retry's own
+            // failure cannot re-schedule (bounded by construction);
+            // fire-time guards make it a no-op once superseded or
+            // while a turn streams (the idle-edge heal owns the busy
+            // case).
+            if (this._historyStale && token === this._historyLoadToken) {
+              if (this._staleRetryTimer) clearTimeout(this._staleRetryTimer);
+              this._staleRetryTimer = setTimeout(
+                () => {
+                  this._staleRetryTimer = null;
+                  if (
+                    token === this._historyLoadToken &&
+                    this._historyStale &&
+                    !this._replayQueue &&
+                    !this.busy &&
+                    !this.currentAssistantEl &&
+                    !this.currentReasoningEl &&
+                    this.evtSource &&
+                    this.evtSource.readyState === EventSource.OPEN
+                  ) {
+                    // !_replayQueue: yield to an in-flight quiesced
+                    // fetch (the idle-edge backstop shares this token)
+                    // instead of stomping its queue for a same-token
+                    // double-render.  Fire-and-forget like the backstop:
+                    // no composer state to strand here, so a render throw is
+                    // left loud/uncaught (see the backstop's note).
+                    //
+                    // The stream must be OPEN, not merely present (#900):
+                    // disconnectSSE deliberately keeps this timer armed, so
+                    // the fire can land with the transport down — hidden tab
+                    // (close-on-hide), degraded catch-up cooldown, or a
+                    // CLOSED source — and a CONNECTING one has a frozen
+                    // cursor with a replay pending.  A seedless refetch then
+                    // paints rows the frozen _lastEventId still sits BELOW,
+                    // and the next connect replays that slice on top (see
+                    // _refetchHistory's render-time gate for the full
+                    // trace).  Skipping keeps the latch, so the idle-edge
+                    // backstop heals at the next settle — the accepted
+                    // liveness lag already ruled there.  NOTE the polarity
+                    // is deliberately the OPPOSITE of the host recover
+                    // beat's `readyState !== CLOSED`: that one asks "is
+                    // native reconnect still working the problem" (don't
+                    // stomp it), this one asks "is the cursor live" (a
+                    // reconnecting stream's is not).  The idle-edge backstop
+                    // needs no such term, but NOT because its stream is live
+                    // by construction — it isn't.  handleEvent also runs from
+                    // _endReplayQuiesce's flush, which fires AFTER a seedless
+                    // fetch settles, so a state_change:idle queued during that
+                    // fetch reaches the backstop with the transport already
+                    // down.  What covers it is _refetchHistory's render-time
+                    // gate: the backstop's refetch is seedless, so the gate
+                    // declines it and the cost is one wasted /history, never a
+                    // double-render.  Add a fire-time term there only if a
+                    // backstop refetch is ever dispatched somewhere the
+                    // render-time gate does not cover.
+                    this._beginReplayQuiesce(token);
+                    this._refetchHistory(this.wsId, token);
+                  }
+                  // ADDITIVE spread over the 2000 floor: one clear_ui reaches
+                  // every listener on the ws, so an un-spread retry re-fetches
+                  // in lockstep across tabs.  The floor is load-bearing (the
+                  // e2e non-occurrence windows size on it) — jitter up, never
+                  // down.  Mirrored in coordinator.js; the constant is shared.
+                },
+                STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS,
+              );
+            }
+            if (token !== this._historyLoadToken && this.wsId !== editWs) {
+              // Cross-ws supersession: drop the pending edit + release
+              // busy so the composer recovers; the edit belongs to a pane
+              // state that no longer exists.  (_historyStale is NOT touched
+              // here — it clears only on a successful replayHistory render;
+              // the composer send path never consults the latch.)
+              this._pendingEditSend = null;
+              this.setBusy(false);
+              return;
+            }
+            if (!this._pendingEditSend) return;
+            const editText = this._pendingEditSend;
+            this._pendingEditSend = null;
+            const editClientSendId = mintClientSendId();
+            const editPriority = parsePriority(editText);
+            this.setBusy(true, "optimistic");
+            const editEl = this.addUserMessage(editText, null, {
+              clientSendId: editClientSendId,
+            });
+            this.scrollToBottom(true);
+            postAndSettleSend(
+              this.queue,
+              authFetch(
+                this._base +
+                  "/v1/api/workstreams/" +
+                  encodeURIComponent(this.wsId) +
+                  "/send",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    message: editText,
+                    client_send_id: editClientSendId,
+                  }),
+                },
+              ),
+              {
+                queuedEl: null,
+                optimisticEl: editEl,
+                isBusy: false,
+                displayText: editPriority.displayText,
+                priority: editPriority.priority,
+                clientSendId: editClientSendId,
+                setBusy: (value) => this.setBusy(value),
+                busyIsOptimistic: () =>
+                  this.busy && this.busySource === "optimistic",
+                paneIsBusy: () => this.busy,
+                restoreInput: () => {
+                  this.composer.value = mergeRejectedComposerText(
+                    editText,
+                    this.composer.value,
+                  );
+                },
+                renderError: (message) => this.addErrorMessage(message),
+                consumeAttachments: () => {},
+              },
+            );
+          })
+          .catch((err) => {
+            // The render runs outside _refetchHistory's try/catch by design;
+            // if it throws, don't strand the queued edit-and-resend — clear
+            // the latch + busy so the composer recovers.
+            this._pendingEditSend = null;
+            this.setBusy(false);
+            this.addErrorMessage("Failed to reload history: " + err.message);
+          });
+        break;
+      }
+
+      case "history_resync":
+        // The live conversation revision changed after /history rendered but
+        // before this listener registered. Numeric event replay is not an
+        // authoritative substitute for a committed conversation row. The
+        // explicit repair mode also survives a failed /history request: no
+        // cursorless/tokenless stream may reopen until a fresh proof renders.
+        this._historyRepair.begin(this.wsId);
+        break;
+
+      case "replay_truncated":
+        // The stream just admitted losing events past recovery — treat
+        // the connection as DEAD and run the full fresh-connect flow
+        // (_loadHistoryThenConnect: disconnect first, REST /history,
+        // rebuild, adopt the returned resume cursor, reconnect).  The
+        // cursor adoption is the point (ruled 2026-07-20, do not revert
+        // to an in-place refetch): /history TRIMS the trailing in-flight
+        // turn whenever it hands back a cursor (_resume_cursor_and_trim),
+        // on the assumption the caller replays from that cursor.  The old
+        // in-place refetch here discarded the cursor, so a mid-run
+        // truncation wiped the executing turn's rows (task cards
+        // included) with no redelivery — sub-agent children then escaped
+        // to top-level rows after the orphan grace.  Disconnect-first
+        // also removes the old flush-vs-reconnect ambiguity: no live
+        // events arrive during the rebuild, so nothing double-renders.
+        //
+        // Skip while a turn is mid-stream: an async refetch's
+        // replaceChildren() would detach the live bubble so content
+        // deltas render nowhere.  The guard covers BOTH streaming
+        // targets — a reasoning-only segment (currentReasoningEl
+        // without a content bubble yet) is just as detachable as a
+        // content one.  Mid-stream the resync is DEFERRED, not
+        // dropped; the idle edge consumes the flag.
+        //
+        // Record WHERE the gap sits before either branch: the envelope
+        // arrived at the connect cursor, but by the time the resync's
+        // /history fetch runs (after the jitter, or at the idle edge)
+        // the live stream has advanced _lastEventId well past it — the
+        // failed-fetch retry needs this truncation-time value, not the
+        // advanced one (see _truncatedFromCursor's field comment).
+        // Keep-oldest: a retry reconnect re-delivers an envelope for the
+        // SAME unrepaired gap and must not advance the record.
+        if (this._truncatedFromCursor == null) {
+          this._truncatedFromCursor = this._lastEventId;
+        }
+        if (!this.currentAssistantEl && !this.currentReasoningEl) {
+          // Limiter check BEFORE scheduling the resync — a trip has just
+          // disconnected the stream for a cooldown, and a resync started
+          // now would reconnect from its .finally and defeat the cooldown
+          // (see _noteTruncatedResync).  No trip → the fresh connect
+          // starts after a herd-spreading jitter
+          // (_scheduleTruncatedResync).
+          if (!this._noteTruncatedResync()) {
+            this._scheduleTruncatedResync();
+          }
+        } else {
+          this._pendingTruncatedResync = true;
+        }
+        break;
+
+      case "stream_overflow":
+        // The server poisoned this listener at its first queue overflow
+        // and closes the stream right after this frame.  The frame is
+        // id-less, so lastEventId still points below the gap and the
+        // native EventSource reconnect replays it losslessly from the
+        // ring buffer.  Count the close: a persistently slow consumer
+        // trips the degraded catch-up instead of churning reconnects.
+        this._noteStreamOverflow();
+        break;
+    }
+  }
+
+  _addUserMsgActions(el, text) {
+    const bar = document.createElement("div");
+    bar.className = "msg-actions";
+    bar.setAttribute("role", "toolbar");
+    bar.setAttribute("aria-label", "Message actions");
+    // Edit button
+    const editBtn = document.createElement("button");
+    editBtn.className = "msg-action-btn";
+    editBtn.title = "Edit & resend";
+    editBtn.setAttribute("aria-label", "Edit and resend this message");
+    const editIcon = document.createElement("span");
+    editIcon.className = "icon-edit";
+    editIcon.setAttribute("aria-hidden", "true");
+    editBtn.appendChild(editIcon);
+    editBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._startEdit(el, text);
+    });
+    bar.appendChild(editBtn);
+    // Rewind-to-here button
+    const rewindBtn = document.createElement("button");
+    rewindBtn.className = "msg-action-btn";
+    rewindBtn.title = "Rewind to before this message";
+    rewindBtn.setAttribute(
+      "aria-label",
+      "Rewind conversation to before this message",
+    );
+    const rewindIcon = document.createElement("span");
+    rewindIcon.className = "icon-rewind";
+    rewindIcon.setAttribute("aria-hidden", "true");
+    rewindBtn.appendChild(rewindIcon);
+    rewindBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._rewindToMessage(el);
+    });
+    bar.appendChild(rewindBtn);
+    el.appendChild(bar);
+  }
+
+  // The one creation path for live-streamed assistant bubbles (the
+  // content and in_progress_snapshot branches): bubble + body + the
+  // persistent copy action, with the streaming refs assigned as a unit
+  // so the two branches cannot drift.
+  _newAssistantBubble() {
+    this.currentAssistantEl = document.createElement("div");
+    this.currentAssistantEl.className = "msg assistant";
+    this.currentAssistantBodyEl = document.createElement("div");
+    this.currentAssistantBodyEl.className = "msg-body";
+    this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
+    this._addCopyAction(this.currentAssistantEl);
+    this.messagesEl.appendChild(this.currentAssistantEl);
+  }
+
+  // Every assistant bubble gets a persistent copy button at creation —
+  // O(1) per message, unlike the removed whole-transcript sweep this
+  // file's retry attach deliberately avoids (see
+  // _attachRetryToLastAssistant).  The bar is shared with the transient
+  // retry / TTS buttons the holder mechanism adds and removes.  Callers
+  // pass a JUST-CREATED bubble (both stream branches via
+  // _newAssistantBubble, and replay) — no dedup needed against an empty
+  // bar.
+  _addCopyAction(el) {
+    ensureMsgActionsBar(el).appendChild(buildMsgCopyButton(el));
+  }
+
+  _addRetryAction(el) {
+    const bar = ensureMsgActionsBar(el);
+    bar.insertBefore(
+      buildMsgRetryButton(() => this._retryLast()),
+      bar.firstChild,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Voice I/O: microphone dictation (STT) + per-message playback (TTS)
+  // -------------------------------------------------------------------------
+
+  _buildMicButton() {
+    if (!this.composer || !this.composer.actionsRowEl) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "composer-mic-btn";
+    btn.style.display = "none"; // revealed once the STT role is confirmed
+    btn.title = "Record speech to text";
+    btn.setAttribute("aria-label", "Record speech to text");
+    btn.setAttribute("aria-pressed", "false");
+    const icon = document.createElement("span");
+    icon.className = "composer-mic-icon icon-mic";
+    icon.setAttribute("aria-hidden", "true");
+    btn.appendChild(icon);
+    this._micIcon = icon;
+    btn.addEventListener("click", () => this._toggleRecording());
+    this.composer.actionsRowEl.insertBefore(btn, this.sendBtn || null);
+    this._micBtn = btn;
+  }
+
+  _syncMicButton() {
+    if (!this._micBtn) return;
+    const rec = !!this._isRecording;
+    this._micBtn.classList.toggle("is-recording", rec);
+    this._micBtn.setAttribute("aria-pressed", rec ? "true" : "false");
+    if (this._micIcon) {
+      this._micIcon.classList.toggle("icon-stop", rec);
+      this._micIcon.classList.toggle("icon-mic", !rec);
+    }
+    const label = rec
+      ? "Stop recording and transcribe"
+      : "Record speech to text";
+    this._micBtn.title = label;
+    this._micBtn.setAttribute("aria-label", label);
+  }
+
+  _toggleRecording() {
+    if (this._isRecording) {
+      this._stopRecording(false);
+    } else {
+      this._startRecording();
+    }
+  }
+
+  _startRecording() {
+    if (this._isRecording || this.busy) return;
+    if (
+      !navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia ||
+      typeof MediaRecorder === "undefined"
+    ) {
+      showToast("Microphone capture is not supported in this browser", "error");
+      return;
+    }
+    // Synchronous abort latch: if teardown (reset / pane switch) runs while the
+    // permission prompt is open, the stream the promise later hands us must be
+    // stopped instead of going hot after teardown.
+    this._recordAborted = false;
+    navigator.mediaDevices
+      .getUserMedia({ audio: true })
+      .then((stream) => {
+        if (this._recordAborted) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        this._recordingStream = stream;
+        let mimeType = "";
+        const candidates = [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/ogg;codecs=opus",
+          "audio/mp4",
+        ];
+        for (let i = 0; i < candidates.length; i++) {
+          if (
+            MediaRecorder.isTypeSupported &&
+            MediaRecorder.isTypeSupported(candidates[i])
+          ) {
+            mimeType = candidates[i];
+            break;
+          }
+        }
+        const rec = mimeType
+          ? new MediaRecorder(stream, { mimeType })
+          : new MediaRecorder(stream);
+        const chunks = [];
+        rec.addEventListener("dataavailable", (e) => {
+          if (e.data && e.data.size) chunks.push(e.data);
+        });
+        rec.addEventListener("stop", () => {
+          this._teardownRecordingStream();
+          this._isRecording = false;
+          this._stopRecordTimer();
+          this._syncMicButton();
+          const discard = this._discardRecording;
+          this._discardRecording = false;
+          if (discard) return;
+          const blob = new Blob(chunks, {
+            type: rec.mimeType || mimeType || "audio/webm",
+          });
+          if (blob.size) this._uploadForTranscription(blob);
+        });
+        this._recorder = rec;
+        this._isRecording = true;
+        this._discardRecording = false;
+        this._startRecordTimer();
+        this._syncMicButton();
+        voiceAnnounce(
+          "Recording. Activate the microphone button again to stop.",
+        );
+        rec.start();
+      })
+      .catch(() => {
+        // Denied / hardware unavailable: leave a persistent disabled state with
+        // guidance — a hot button reads as dead once the browser blocks re-prompts.
+        this._teardownRecordingStream();
+        this._isRecording = false;
+        this._stopRecordTimer();
+        this._setMicDenied();
+      });
+  }
+
+  _setMicDenied() {
+    this._micDenied = true;
+    showToast("Microphone access was denied", "error");
+    this._syncMicButton();
+    if (this._micBtn) {
+      this._micBtn.disabled = true;
+      const msg =
+        "Microphone blocked — enable it in your browser's site settings";
+      this._micBtn.title = msg;
+      this._micBtn.setAttribute("aria-label", msg);
+    }
+  }
+
+  _startRecordTimer() {
+    this._recordStartMs = Date.now();
+    this._stopRecordTimer();
+    this._recordTimer = window.setInterval(() => this._tickRecordTimer(), 500);
+  }
+
+  _stopRecordTimer() {
+    if (this._recordTimer) {
+      window.clearInterval(this._recordTimer);
+      this._recordTimer = null;
+    }
+  }
+
+  _tickRecordTimer() {
+    if (!this._isRecording || !this._micBtn) return;
+    const secs = Math.max(
+      0,
+      Math.floor((Date.now() - this._recordStartMs) / 1000),
+    );
+    const mmss =
+      Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+    this._micBtn.title = "Recording " + mmss + " — activate to stop";
+  }
+
+  _stopRecording(discard) {
+    this._discardRecording = !!discard;
+    this._recordAborted = true; // abort a getUserMedia still in flight
+    if (this._recorder && this._recorder.state !== "inactive") {
+      try {
+        this._recorder.stop();
+      } catch (e) {
+        /* already stopped */
+      }
+      return;
+    }
+    this._teardownRecordingStream();
+    this._stopRecordTimer();
+    if (this._isRecording) {
+      this._isRecording = false;
+      this._syncMicButton();
+    }
+  }
+
+  _teardownRecordingStream() {
+    if (this._recordingStream) {
+      this._recordingStream.getTracks().forEach((t) => t.stop());
+      this._recordingStream = null;
+    }
+    this._recorder = null;
+  }
+
+  _uploadForTranscription(blob) {
+    if (!this.wsId) return;
+    const ext =
+      blob.type.indexOf("ogg") !== -1
+        ? "ogg"
+        : blob.type.indexOf("mp4") !== -1
+          ? "mp4"
+          : "webm";
+    const fd = new FormData();
+    fd.append("audio", blob, "speech." + ext);
+    if (this._micBtn) {
+      this._micBtn.disabled = true;
+      this._micBtn.classList.add("is-busy");
+    }
+    voiceAnnounce("Transcribing…");
+    const resetMic = () => {
+      if (this._micBtn && !this._micDenied) {
+        this._micBtn.disabled = !!this.busy;
+        this._micBtn.classList.remove("is-busy");
+      }
+    };
+    authFetch(
+      this._base +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(this.wsId) +
+        "/speech-to-text/stream",
+      { method: "POST", body: fd },
+    )
+      .then(async (r) => {
+        if (!r.ok) {
+          let msg = "Transcription failed";
+          try {
+            const body = await r.json();
+            if (body && body.error) msg = body.error;
+          } catch (_e) {
+            /* non-JSON error body */
+          }
+          showToast(msg, "error");
+          return;
+        }
+        // Stream transcript deltas into the composer as they arrive (first word
+        // in ~0.3s) instead of waiting for the whole transcript.
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let started = false;
+        let got = false;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          if (!chunk || !this.inputEl) continue;
+          got = true;
+          if (!started) {
+            // Read the composer's value now (not before the await) so text the
+            // user typed while transcribing isn't clobbered.
+            const cur = this.inputEl.value || "";
+            this.inputEl.value = cur
+              ? cur.replace(/\s*$/, "") + " " + chunk
+              : chunk;
+            started = true;
+          } else {
+            this.inputEl.value += chunk;
+          }
+          // Drive the composer's auto-resize + send-enable listeners.
+          this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        if (got) {
+          if (this.inputEl) this.inputEl.focus();
+          voiceAnnounce("Transcript added to message.");
+        } else {
+          showToast("No speech detected", "error");
+        }
+      })
+      .catch((err) => {
+        showToast(
+          "Transcription failed: " + (err && err.message ? err.message : err),
+          "error",
+        );
+      })
+      .finally(resetMic);
+  }
+
+  _addTtsAction(el) {
+    const bar = ensureMsgActionsBar(el);
+    if (bar.querySelector(".msg-tts-btn")) return; // already added
+    // Inserted BEFORE the persistent copy button (below) so DOM order,
+    // tab order and visual order agree: [retry, tts, copy], with copy
+    // anchoring the corner on every bubble.
+    const btn = document.createElement("button");
+    btn.className = "msg-action-btn msg-tts-btn";
+    btn.title = "Play response aloud";
+    btn.setAttribute("aria-label", "Play response aloud");
+    btn.setAttribute("aria-pressed", "false");
+    const icon = document.createElement("span");
+    icon.className = "icon-speaker";
+    icon.setAttribute("aria-hidden", "true");
+    btn.appendChild(icon);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._playMessageTTS(el, btn);
+    });
+    bar.insertBefore(btn, bar.querySelector(".msg-copy-btn"));
+  }
+
+  // Strip code blocks / inline code / rendered math so TTS doesn't read source
+  // or KaTeX accessibility text out character-by-character.
+  _extractSpeakableText(bodyEl) {
+    const clone = bodyEl.cloneNode(true);
+    clone
+      .querySelectorAll("pre, code, .katex, .katex-display")
+      .forEach((n) =>
+        n.replaceWith(document.createTextNode(" (code omitted) ")),
+      );
+    return (clone.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  _playMessageTTS(el, btn) {
+    // Toggle: clicking the active button (or any while playing) stops first.
+    if (this._ttsAudio) {
+      const wasThis = this._ttsBtnActive === btn;
+      this._stopTTS();
+      if (wasThis) return;
+    }
+    const bodyEl = el.querySelector(".msg-body") || el;
+    const text = this._extractSpeakableText(bodyEl);
+    if (!text) return;
+    // Serialize: a monotonic token guards against an earlier (slower) request
+    // resolving after a newer one — which would double-play and leak the blob.
+    const token = ++this._ttsSeq;
+    btn.classList.add("is-busy");
+    btn.disabled = true;
+    authFetch(this._base + "/v1/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    })
+      .then((r) => {
+        if (!r.ok) {
+          return r.json().then((b) => {
+            throw new Error((b && b.error) || "Speech synthesis failed");
+          });
+        }
+        return r.blob();
+      })
+      .then((audioBlob) => {
+        const url = URL.createObjectURL(audioBlob);
+        if (token !== this._ttsSeq) {
+          URL.revokeObjectURL(url); // superseded — don't play or leak
+          return;
+        }
+        const audio = new Audio(url);
+        this._ttsAudio = audio;
+        this._ttsBtnActive = btn;
+        btn.classList.add("is-playing");
+        btn.setAttribute("aria-pressed", "true");
+        voiceAnnounce("Playing response.");
+        audio.addEventListener("ended", () => this._stopTTS());
+        audio.addEventListener("error", () => this._stopTTS());
+        audio.play().catch(() => this._stopTTS());
+      })
+      .catch((err) => {
+        showToast(
+          err && err.message ? err.message : "Speech synthesis failed",
+          "error",
+        );
+      })
+      .finally(() => {
+        btn.classList.remove("is-busy");
+        btn.disabled = false;
+      });
+  }
+
+  _stopTTS() {
+    this._ttsSeq++; // invalidate any in-flight request
+    if (this._ttsAudio) {
+      try {
+        this._ttsAudio.pause();
+      } catch (e) {
+        /* ignore */
+      }
+      const src = this._ttsAudio.src || "";
+      if (src.indexOf("blob:") === 0) URL.revokeObjectURL(src);
+      this._ttsAudio = null;
+    }
+    if (this._ttsBtnActive) {
+      this._ttsBtnActive.classList.remove("is-playing");
+      this._ttsBtnActive.setAttribute("aria-pressed", "false");
+      this._ttsBtnActive = null;
+    }
+  }
+
+  _retryLast() {
+    if (this.busy) return;
+    // Path-keyed retry (#549). Truncation + re-dispatch happen
+    // server-side; the clear_ui event drives the history refetch.
+    authFetch(
+      this._base +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(this.wsId) +
+        "/retry",
+      { method: "POST" },
+    ).catch((err) => {
+      this.addErrorMessage("Retry failed: " + err.message);
+    });
+  }
+
+  // Path-keyed rewind (#549) by absolute turn count. Shared by the
+  // per-message rewind button and the hand-typed /rewind reroute.
+  _rewindToTurns(turns) {
+    if (this.busy) return;
+    if (!Number.isInteger(turns) || turns < 1) return;
+    authFetch(
+      this._base +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(this.wsId) +
+        "/rewind",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ turns }),
+      },
+    ).catch((err) => {
+      this.addErrorMessage("Rewind failed: " + err.message);
+    });
+  }
+
+  _rewindToMessage(msgEl) {
+    if (this.busy || this._historyStale) return;
+    // Count how many user messages come at or after this one. Bare
+    // ``.msg.user`` is intentional: system-nudge markers carry that
+    // class and the server's _find_turn_boundaries counts them as
+    // turns too, so this matches the server's rewind-N semantics.
+    const userMsgs = this.messagesEl.querySelectorAll(".msg.user");
+    const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    if (idx < 0) return;
+    const turnsToRewind = userMsgs.length - idx;
+    this._rewindToTurns(turnsToRewind);
+  }
+
+  _startEdit(msgEl, originalText) {
+    if (this.busy || this._historyStale) return;
+    // Save current child nodes for cancel restoration
+    const savedNodes = [];
+    while (msgEl.firstChild) {
+      savedNodes.push(msgEl.removeChild(msgEl.firstChild));
+    }
+    msgEl.classList.add("msg-editing");
+
+    const form = document.createElement("div");
+    form.className = "msg-edit-form";
+
+    const textarea = document.createElement("textarea");
+    textarea.className = "msg-edit-textarea";
+    textarea.setAttribute("aria-label", "Edit message text");
+    textarea.value = originalText;
+    textarea.rows = Math.min(originalText.split("\n").length + 1, 8);
+    form.appendChild(textarea);
+
+    const actions = document.createElement("div");
+    actions.className = "msg-edit-actions";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "msg-edit-btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      // Restore original nodes
+      while (msgEl.firstChild) msgEl.removeChild(msgEl.firstChild);
+      savedNodes.forEach((n) => {
+        msgEl.appendChild(n);
+      });
+      msgEl.classList.remove("msg-editing");
+    });
+    actions.appendChild(cancelBtn);
+
+    const sendBtn = document.createElement("button");
+    sendBtn.className = "msg-edit-btn msg-edit-btn-send";
+    sendBtn.textContent = "Send";
+    sendBtn.addEventListener("click", () => {
+      const newText = textarea.value.trim();
+      if (!newText) return;
+      this._editAndResend(msgEl, newText);
+    });
+    actions.appendChild(sendBtn);
+
+    // Ctrl+Enter to send, Escape to cancel
+    textarea.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendBtn.click();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelBtn.click();
+      }
+    });
+
+    form.appendChild(actions);
+    msgEl.appendChild(form);
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  }
+
+  _editAndResend(msgEl, newText) {
+    if (this.busy || this._historyStale) return;
+    // Count turns to rewind (from this message onward). Bare
+    // ``.msg.user`` matches the server's turn semantics — see
+    // _rewindToMessage.
+    const userMsgs = this.messagesEl.querySelectorAll(".msg.user");
+    const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+    if (idx < 0) return;
+    const turnsToRewind = userMsgs.length - idx;
+
+    this.setBusy(true);
+    // Store pending send — dispatched from the clear_ui handler once
+    // the rewind's truncated history is re-fetched over REST.
+    this._pendingEditSend = newText;
+    authFetch(
+      this._base +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(this.wsId) +
+        "/rewind",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ turns: turnsToRewind }),
+      },
+    )
+      .then(async (r) => {
+        if (r && !r.ok) {
+          this._pendingEditSend = null;
+          this.setBusy(false);
+          this.addErrorMessage(
+            "Rewind failed (HTTP " + r.status + " " + r.statusText + ")",
+          );
+          return;
+        }
+        // A 200 {"status":"busy"} means the rewind was rejected because a
+        // generation is in flight — no clear_ui fires, so the pending-edit
+        // latch + busy state would otherwise stay stuck (and the latch
+        // would later resend into the next clear_ui). Clear them here.
+        let data = null;
+        try {
+          data = await r.json();
+        } catch {
+          data = null;
+        }
+        if (data && data.status === "busy") {
+          this._pendingEditSend = null;
+          this.setBusy(false);
+          this.addErrorMessage(
+            "Cannot edit & resend while the workstream is processing.",
+          );
+        }
+      })
+      .catch((err) => {
+        this._pendingEditSend = null;
+        this.addErrorMessage("Rewind failed: " + err.message);
+        this.setBusy(false);
+      });
+  }
+
+  _resetStreamingRefs() {
+    // Null every ref that can point into a wiped or non-resumable
+    // subtree, so the next event creates fresh targets instead of
+    // writing invisibly into detached nodes (or into a superseded
+    // bubble).  Callers (#890 shape): replayHistory's full render (the
+    // subtree was just replaced) and _loadHistoryThenConnect's
+    // non-resumable reloads (no armed truncation cursor — the
+    // reconnect cannot resume into the surviving refs).  The clear_ui
+    // pre-wipe and the refetch-failure call are GONE: a failed fetch
+    // preserves the pane, and preserved DOM keeps valid refs.
+    this.currentAssistantEl = null;
+    this.currentAssistantBodyEl = null;
+    this._reasoningActivity.finish();
+    this.currentReasoningEl = null;
+    this.contentBuffer = "";
+    // In-progress compaction card: the transcript wipe orphaned it; live
+    // events re-create it defensively (see handleCompactionEvent).
+    resetCompactionHolder(this._compaction);
+    // Approval cycles + announce shells point into the wiped subtree too;
+    // the replayed history / detail snapshot re-registers live ones.
+    this.approvalCycles = new Map();
+    this.announcedBlocks = new Map();
+    this._syncApprovalState();
+    this._retryHolderEl = null;
+  }
+
+  replayHistory(messages) {
+    const scrollTop = this.messagesEl.scrollTop;
+    this.messagesEl.replaceChildren();
+    // A full committed-history render repairs any recorded truncation
+    // gap — from the resync itself or an unrelated clear_ui rebuild — so
+    // it supersedes ALL pending repair intent in one place: retry cursor,
+    // deferred mid-turn latch, pending jittered timer.  The latch/timer
+    // clears do real work ONLY on the clear_ui heal (every
+    // _loadHistoryThenConnect flavor cleared both before the fetch); a
+    // latch or timer surviving that heal fired a phantom load at the next
+    // idle edge — false truncatedGaps bump, needless teardown, and a
+    // cursorless reconnect with nothing armed on its failed-fetch leg.
+    // The timer's fire path nulls its handle before loading, so this
+    // cancel never cancels work it is part of.  Safe on the heal path
+    // because clear_ui emitters are turn-free at emission (see the
+    // _resyncTimer field comment).  Mirrors coordinator.js
+    // refetchHistory's supersession.
+    this._truncatedFromCursor = null;
+    this._pendingTruncatedResync = false;
+    if (this._resyncTimer) {
+      clearTimeout(this._resyncTimer);
+      this._resyncTimer = null;
+    }
+    // The render also restores structural truth — clear the staleness
+    // latch (its ONLY clear site) and cancel any pending clear_ui
+    // failure retry, which exists to produce exactly this render.
+    //
+    // The clear assumes every successful render is POST-rewind truth.
+    // Two seams could break that assumption and both are closed (#900):
+    // server-side, a post-rewind request joining a pre-rewind #884
+    // coalescing flight — the flight key carries the workstream's
+    // truncation generation (#894), and make_history_handler is the
+    // SHARED body behind both clients' /history mounts, so interactive
+    // inherits it; client-side, a pre-clear_ui fetch landing after the
+    // latch was set — the replay quiesce makes that ordering unreachable
+    // (see the _replayQueue declaration).
+    this._historyStale = false;
+    if (this._staleRetryTimer) {
+      clearTimeout(this._staleRetryTimer);
+      this._staleRetryTimer = null;
+    }
+    // The rebuild just orphaned any in-flight streaming targets — reset them,
+    // and release the agent-card/orphan maps whose entries now point at
+    // replaced subtrees (detached-DOM retention).
+    this._resetStreamingRefs();
+    this._clearAgentTracking();
+    // Reset the per-pane dedup set: ids of operator-context system turns
+    // already painted from /history.  A later SSE replay that redelivers one
+    // (resume-cursor overlap) is skipped by the system_turn handler.
+    this._renderedSystemEventIds = new Set();
+    this._renderedUserEventIds = new Set();
+    this._renderedToolEventIds = new Set();
+    if (!messages.length) {
+      this.showEmptyState();
+      return;
+    }
+    // Suppress the polite live region while we batch-build the replay
+    // — messagesEl is aria-live="polite" so a fresh replay would otherwise
+    // queue an announcement for every approved/denied/verdict pill we
+    // insert.  Restored after the loop so live SSE updates announce
+    // normally.  WCAG 4.1.3 — historical content should not behave like
+    // real-time updates.
+    this.messagesEl.setAttribute("aria-busy", "true");
+    // Occurrence queues, not one-value call-id maps: providers may reuse an id
+    // in a later turn, and malformed same-batch duplicates deliberately take
+    // the strong /history repair path. The repair renderer must therefore pair
+    // each sequential TOOL row with the matching sequential call occurrence.
+    const pendingToolRows = new Map();
+    const pendingAssessments = new Map();
+    // Task-agent recall: call_id -> card .conv-agent wrap, so the tool-result
+    // branch can flip the card's done/error state from the task's own result
+    // (mirroring the live appendToolOutput), not from sub-step errors.
+    const agentCardWraps = {};
+    let lastToolBlock = null;
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role === "user") {
+        if (msg.source === "system_nudge") {
+          // Wake-driven empty user turn: render the thin marker (replaces
+          // the previously-skipped synthetic empty bubble).  The nudges it
+          // carried are now first-class system turns that follow it and
+          // render via their own `system` branch below.
+          this.addSystemNudgeMarker();
+          lastToolBlock = null;
+          continue;
+        }
+        this.addUserMessage(msg.content || "", msg.attachments || null, {
+          eventId: msg.event_id,
+          sender: msg.sender || "",
+          source: msg.source || "",
+        });
+        if (msg.event_id != null)
+          this._renderedUserEventIds.add(String(msg.event_id));
+        lastToolBlock = null;
+      } else if (msg.role === "assistant") {
+        // Reasoning bubble (Phase 1 reasoning persistence) — render
+        // BEFORE the content bubble so the visual order matches the
+        // live SSE flow (reasoning_delta arrives before content_delta
+        // for thinking-enabled models). Mirrors the live-stream
+        // construction at the "case 'reasoning':" branch above. Only
+        // surfaces when the active model's surface_persisted_reasoning flag is
+        // true and the message round-tripped a thinking lane.
+        if (msg.reasoning && msg.reasoning.length) {
+          const reasonEl = document.createElement("div");
+          reasonEl.className = "msg reasoning";
+          reasonEl.textContent = msg.reasoning;
+          this.messagesEl.appendChild(reasonEl);
+          lastToolBlock = null;
+        }
+        // Render content BEFORE the tool block so the visual order
+        // matches the live SSE flow (stream_text streams content first,
+        // then tool_info / approve_request paints the tool block, then
+        // tool_result fills it in).  Order also matters structurally:
+        // the tool-result message in the NEXT iteration anchors via
+        // lastToolBlock, which the tool-block branch sets last — so
+        // content must run first to avoid clobbering that anchor.
+        //
+        // Whitespace-only content (e.g. "\n\n" from a reasoning-parser
+        // model that strips <think>…</think> and leaves only trailing
+        // newlines before the tool call) is treated as empty — the
+        // live stream never accumulated a visible bubble for it, so
+        // surfacing one on replay would be a phantom card that diverges
+        // from what the originating tab saw.
+        if (msg.content && msg.content.trim()) {
+          const el = document.createElement("div");
+          el.className = "msg assistant";
+          const bodyEl = document.createElement("div");
+          bodyEl.className = "msg-body";
+          el.appendChild(bodyEl);
+          // Same render mechanism as the coordinator's history path: the
+          // finalize helper renders + post-renders AND stashes the raw
+          // markdown on the body for the copy affordance — replayed
+          // bubbles must copy identically to live-streamed ones.  The
+          // copy action attaches BEFORE the render, matching the
+          // streaming path's attach-then-fill order.
+          this._addCopyAction(el);
+          streamingRenderFinalize(bodyEl, msg.content);
+          this.messagesEl.appendChild(el);
+          lastToolBlock = null;
+        }
+        if (msg.tool_calls && msg.tool_calls.length) {
+          if (msg.pending) {
+            lastToolBlock = null;
+          } else {
+            const wasDenied = !!msg.denied;
+            const block = document.createElement("div");
+            block.className =
+              "conv-batch " +
+              (msg.tool_calls.length >= 2
+                ? "conv-batch--parallel "
+                : "conv-batch--solo ") +
+              (wasDenied ? "conv-batch--denied" : "conv-batch--approved");
+            block.appendChild(
+              _convApprovalHead(
+                batchKicker("done", msg.tool_calls.length),
+                msg.tool_calls.map((tc) => ({ func_name: tc.name })),
+              ),
+            );
+            msg.tool_calls.forEach((tc, idx) => {
+              // Synthesize the live `item` shape from the stored tool_call so
+              // replay renders the SAME .conv-row as the live path.
+              const row = buildToolDiv(
+                synthToolItem(tc),
+                indexLabel(idx, msg.tool_calls.length),
+              );
+              // Verdict anchored to THIS row; replay verdicts are final.
+              if (tc.verdict) {
+                row.appendChild(
+                  buildConvVerdict(tc.verdict, { judgePending: false }),
+                );
+              }
+              block.appendChild(row);
+              if (tc.id) {
+                enqueueToolOccurrence(pendingToolRows, tc.id, row);
+                indexLatestToolRow(
+                  this._toolRowIndex,
+                  this._toolResultNodes,
+                  tc.id,
+                  row,
+                );
+              }
+              // Task-agent recall: rebuild the collapsible card under this row
+              // from its stashed sub-trajectory (the /history `agent_steps`
+              // overlay).  Absent ⇒ flat parent row (cold / not-retained).
+              if (tc.agent_steps && tc.agent_steps.length) {
+                const wrap = this._replayAgentCard(row, tc.agent_steps);
+                if (tc.id) agentCardWraps[tc.id] = wrap;
+              }
+              // Output-guard finding — deferred until the tool result lands so
+              // it anchors under the output (mirrors live showOutputWarning).
+              if (
+                tc.output_assessment &&
+                tc.output_assessment.risk_level &&
+                tc.output_assessment.risk_level !== "none"
+              ) {
+                const assessmentKey = tc.id || "";
+                enqueueToolOccurrence(pendingAssessments, assessmentKey, {
+                  assessment: tc.output_assessment,
+                  toolDiv: row,
+                });
+              }
+            });
+            block.appendChild(
+              buildConvStatus(
+                wasDenied ? { approved: false } : { approved: true },
+              ),
+            );
+            this.messagesEl.appendChild(block);
+            lastToolBlock = block;
+          }
+        }
+      } else if (msg.role === "tool") {
+        if (lastToolBlock) {
+          const stripped = stripAnsi(msg.content || "").trim();
+          const isDenied =
+            msg.denied ||
+            /^Denied by user/.test(stripped) ||
+            /^Blocked/.test(stripped);
+          const isToolError = !!msg.is_error;
+          // Anchor the rendered output to the specific .conv-row
+          // element matching this result's tool_call_id — mirrors the
+          // live appendToolOutput path so multi-tool batches show
+          // [hdr A][out A][hdr B][out B] rather than [A][B][out A][out B].
+          // Falls back to "before badge" when tool_call_id is absent
+          // (legacy rows pre-dating the wire-format addition).
+          let resultTarget = null;
+          if (msg.tool_call_id) {
+            resultTarget = shiftToolOccurrence(
+              pendingToolRows,
+              msg.tool_call_id,
+            );
+            if (!resultTarget) {
+              resultTarget = lastToolBlock.querySelector(
+                '.conv-row[data-call-id="' +
+                  CSS.escape(msg.tool_call_id) +
+                  '"]',
+              );
+            }
+          }
+          // Cursor-style append: cursor advances after each insert so
+          // the next sibling lands AFTER the previous one.  Fixes the
+          // bug where calling resultTarget.after(node) twice put the
+          // second node BETWEEN resultTarget and the first (the second
+          // .after call was always relative to the same anchor).
+          // Resulting order with all present:
+          //   [tool div][output][output-warning]
+          let insertCursor = resultTarget;
+          const resultNodes = [];
+          const insertChained = (node, resultOwned = true) => {
+            if (insertCursor) {
+              insertCursor.after(node);
+              insertCursor = node;
+            } else {
+              const bdg = lastToolBlock.querySelector(".conv-status");
+              if (bdg) lastToolBlock.insertBefore(node, bdg);
+              else lastToolBlock.appendChild(node);
+            }
+            if (resultOwned) resultNodes.push(node);
+          };
+          if (stripped && !isDenied) {
+            const media = !isToolError ? tryParseMedia(stripped) : null;
+            if (media) {
+              insertChained(buildMediaEmbed(media, stripped));
+            } else {
+              insertChained(renderCollapsibleOutput(stripped, isToolError));
+            }
+          }
+          // Replayed preview descriptor: chip only — a reload must never
+          // auto-open panes for every historical preview (the live path's
+          // focused auto-open already happened when it was current).  Error
+          // turns keep their chip: a cancelled BATCH synthesizes an error
+          // result for an open_preview whose content committed fine.
+          if (msg.preview && !isDenied) {
+            insertChained(
+              buildPreviewChip(msg.preview, (d) => this._host.onPreview(d)),
+            );
+          }
+          // A row naming a call_id this batch does not own is an ORPHAN
+          // (a result for an earlier batch, or a second writer's append)
+          // — it must not stamp THIS batch as failed.  The shared outcome
+          // index skips unmatched occurrences for the same reason.  A row
+          // with no call_id at all is the legacy positional case and does
+          // belong to the preceding batch, so it still stamps.
+          const isOrphanResult = !!msg.tool_call_id && !resultTarget;
+          if (
+            isToolError &&
+            !isOrphanResult &&
+            !lastToolBlock.classList.contains("conv-batch--denied")
+          ) {
+            lastToolBlock.classList.add("conv-batch--error");
+            appendToolErrorBadge(lastToolBlock);
+          }
+          // Output-guard warning — pull the assessment out of the
+          // function-local pendingAssessments map (populated in the
+          // assistant branch).  Skip when the tool result was denied —
+          // the ✗ denied badge already signals the deny path.
+          if (!isDenied && msg.tool_call_id) {
+            const assessment = shiftToolOccurrence(
+              pendingAssessments,
+              msg.tool_call_id,
+            );
+            if (assessment) {
+              insertChained(
+                _buildOutputWarningEl(assessment.assessment),
+                false,
+              );
+            }
+          }
+          if (resultTarget) {
+            setToolOutputReviewState(resultTarget, msg.content);
+          }
+          if (msg.tool_call_id && resultTarget) {
+            if (msg.effect_status) {
+              resultTarget.dataset.effectStatus = String(msg.effect_status);
+            } else {
+              delete resultTarget.dataset.effectStatus;
+            }
+            this._toolResultNodes.set(msg.tool_call_id, {
+              row: resultTarget,
+              nodes: resultNodes,
+            });
+          }
+          // Task-agent recall: flip its card done/error from the task's OWN
+          // result (matching the live appendToolOutput) — NOT from sub-step
+          // errors, since a sub-tool can fail and the agent still synthesize.
+          const resultAgentWrap =
+            (resultTarget && resultTarget.querySelector(".conv-agent")) ||
+            (msg.tool_call_id && agentCardWraps[msg.tool_call_id]);
+          if (resultAgentWrap) {
+            resultAgentWrap.dataset.state = msg.is_error ? "error" : "done";
+            this._syncAgentToggleLabel(resultAgentWrap);
+          }
+          if (resultTarget) {
+            // Replay is already historical: stage a fold even while Default is
+            // selected, but never announce completion from the replay loop.
+            markConvRowResultSettled(resultTarget, { autoFold: true });
+          }
+        }
+        if (msg.event_id != null) {
+          this._renderedToolEventIds.add(String(msg.event_id));
+        }
+      } else if (msg.role === "system") {
+        // First-class operator-context turn (output-guard finding, user
+        // interjection, metacognitive nudge — see make_system_turn).  These
+        // now FOLLOW the turn they advise as their own rows; tool-channel
+        // nudges and queued interjections that used to splice into the tool
+        // result render here in sequence.  `source` is the kind; `meta` the
+        // structured per-kind fields (watch-result card) from /history.
+        this.addSystemContext(
+          msg.content || "",
+          msg.source || "",
+          msg.meta || null,
+        );
+        if (msg.event_id != null) {
+          this._renderedSystemEventIds.add(String(msg.event_id));
+        }
+        // Deliberately does NOT null lastToolBlock: a system row is not a
+        // turn boundary.  The batch's result window ends at the next
+        // assistant/user row (both reset the anchor in their own
+        // branches) — same rule as indexHistoryToolOutcomes.  Nulling
+        // here made every tool result AFTER an interleaved system row
+        // (mid-turn operator context, a second writer's append) silently
+        // vanish from this pane while the coordinator rendered it.
+      }
+    }
+    // Flush any output_assessments left in the map — these correspond
+    // to assistant tool_calls whose tool result row didn't carry a
+    // tool_call_id (legacy / migrated rows pre-dating the wire-format
+    // addition).  Render the warning under the tool div itself rather
+    // than dropping the safety information silently.
+    for (const leftovers of pendingAssessments.values()) {
+      for (const leftover of leftovers) {
+        leftover.toolDiv.insertAdjacentElement(
+          "afterend",
+          _buildOutputWarningEl(leftover.assessment),
+        );
+      }
+    }
+    this._attachRetryToLastAssistant();
+    this.messagesEl.scrollTop = scrollTop;
+    this.scrollToBottom();
+    // Focus the input so keyboard users land on the next-action target
+    // after replay finishes — but only when this is the focused pane,
+    // there's no pending approval competing for focus, and an input
+    // element actually exists.  Skipping when not the focused pane
+    // avoids stealing focus from another tab the user is interacting
+    // with while a background replay completes.
+    if (
+      this._host.isFocused(this) &&
+      !this.pendingApproval &&
+      this.inputEl &&
+      !this.busy
+    ) {
+      try {
+        this.inputEl.focus({ preventScroll: true });
+      } catch (_) {
+        this.inputEl.focus();
+      }
+    }
+    // Restore live-region semantics now that the batch build is done.
+    this.messagesEl.removeAttribute("aria-busy");
+  }
+
+  _attachRetryToLastAssistant() {
+    // Remove the previous holder's retry / TTS buttons via the tracked ref —
+    // the old whole-transcript ".msg.assistant .msg-actions" sweep was O(N)
+    // per busy→idle edge.  The bar itself stays: every assistant bubble owns
+    // one for its persistent copy button (_addCopyAction, at creation), and
+    // only the transient retry / TTS buttons move with the holder.  At most
+    // one bubble carries them (this method is their only writer); a holder
+    // detached by a rebuild no-ops harmlessly.
+    if (this._retryHolderEl) {
+      const oldBar = findMsgActionsBar(this._retryHolderEl);
+      if (oldBar) {
+        oldBar
+          .querySelectorAll(".msg-retry-btn, .msg-tts-btn")
+          .forEach((b) => b.remove());
+      }
+      this._retryHolderEl = null;
+    }
+    // Find the last assistant message with content and add retry.
+    // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
+    // .msg.assistant selector already excludes them — no extra guard needed.
+    //
+    // Skip retry attachment when the most recent semantic turn is
+    // tool-only — last DOM child is a .conv-batch block.  Walk back past
+    // operator-context rows (the plain system bubble AND the structured
+    // watch-result / guard-finding cards — every operator row carries
+    // .operator-context) which FOLLOW the tool batch they advise, so the
+    // guard fires even when the tool turn carried a nudge / guard finding.
+    // Keying on the shared marker (not any single card class) keeps the skip
+    // correct as new card kinds are added.  Without it, retry lands on a
+    // stale prior assistant content bubble belonging to an earlier turn.
+    let lastChild = this.messagesEl.lastElementChild;
+    while (lastChild && lastChild.classList.contains("operator-context")) {
+      lastChild = lastChild.previousElementSibling;
+    }
+    if (lastChild && lastChild.classList.contains("conv-batch")) {
+      return;
+    }
+    // Walk backwards from the tail for the last assistant bubble — the
+    // match is at (or near) the end of the transcript, so this touches a
+    // handful of siblings instead of collecting all N assistant rows.
+    let lastAssistant = this.messagesEl.lastElementChild;
+    while (
+      lastAssistant &&
+      !(
+        lastAssistant.classList.contains("msg") &&
+        lastAssistant.classList.contains("assistant")
+      )
+    ) {
+      lastAssistant = lastAssistant.previousElementSibling;
+    }
+    if (lastAssistant) {
+      this._addRetryAction(lastAssistant);
+      if (this._voiceRoles && this._voiceRoles.tts) {
+        this._addTtsAction(lastAssistant);
+      }
+      this._retryHolderEl = lastAssistant;
+    }
+  }
+
+  announceToolBlock(items) {
+    const list = (items || []).filter(Boolean);
+    if (!list.length) return;
+    // Key the shell by its call_id set.  A re-announce of the SAME batch
+    // replaces its own shell; shells of OTHER batches stay — parallel
+    // task agents announce concurrently and must not discard each other.
+    // Bounded: shells whose upgrade never arrives (dropped SSE) are
+    // evicted oldest-first past the cap so they can't pile up forever.
+    const key = this._announceKey(items);
+    const prior = this.announcedBlocks.get(key);
+    if (prior) {
+      prior.remove();
+      this.announcedBlocks.delete(key);
+    }
+    while (this.announcedBlocks.size >= 8) {
+      const oldestKey = this.announcedBlocks.keys().next().value;
+      const oldest = this.announcedBlocks.get(oldestKey);
+      if (oldest) oldest.remove();
+      this.announcedBlocks.delete(oldestKey);
+    }
+    const block = document.createElement("div");
+    block.className =
+      "conv-batch " +
+      (list.length >= 2 ? "conv-batch--parallel" : "conv-batch--solo");
+    // Indeterminate region until the judge/gate resolves; the upgrade in
+    // showInlineToolBlock clears aria-busy.
+    block.setAttribute("aria-busy", "true");
+    block.dataset.callIds = JSON.stringify(
+      list.map((it) => it.call_id).filter(Boolean),
+    );
+    block.appendChild(
+      _convApprovalHead(batchKicker("evaluating", list.length), list),
+    );
+    list.forEach((item, idx) => {
+      block.appendChild(buildToolDiv(item, indexLabel(idx, list.length)));
+      const verdict =
+        item.judge_verdict || item.heuristic_verdict || item.verdict;
+      if (verdict) {
+        block.appendChild(buildConvVerdict(verdict, { judgePending: true }));
+      }
+    });
+    this.announcedBlocks.set(key, block);
+    this.messagesEl.appendChild(block);
+    this._indexToolRows(block);
+    this._relinkAgentCards(list);
+    this.scrollToBottom();
+    toolAnnounce(_toolAnnounceText(list));
+  }
+
+  _announceKey(items) {
+    return JSON.stringify(
+      (items || [])
+        .map((it) => it && it.call_id)
+        .filter(Boolean)
+        .sort(),
+    );
+  }
+
+  // Hand back the early-paint shell to upgrade in place if one exists for
+  // this batch's call_id set, else null (caller builds fresh).  Deletes the
+  // entry so the shell is consumed exactly once.  Keyed lookup (not a single
+  // slot): parallel task agents keep several shells in flight, and taking
+  // one must not disturb the others.
+  _takeAnnouncedBlock(items) {
+    const key = this._announceKey(items);
+    const block = this.announcedBlocks.get(key);
+    if (!block) return null;
+    this.announcedBlocks.delete(key);
+    return block;
+  }
+
+  showInlineToolBlock(items, autoApproved, judgePending, cycleId) {
+    // Reuse the early-paint announce shell if it's for this batch (upgrade in
+    // place); else build fresh.
+    const announced = this._takeAnnouncedBlock(items);
+    const block = announced || document.createElement("div");
+    if (announced) {
+      announced.replaceChildren();
+      delete announced.dataset.resultsSettled;
+      delete announced.dataset.compactFolded;
+    }
+    block.removeAttribute("aria-busy");
+    block.className =
+      "conv-batch " +
+      (items.length >= 2 ? "conv-batch--parallel" : "conv-batch--solo") +
+      (autoApproved ? " conv-batch--auto" : "");
+    if (!autoApproved) {
+      block.setAttribute("role", "alertdialog");
+      block.setAttribute("aria-label", "Tool approval required");
+    }
+    block.appendChild(
+      _convApprovalHead(
+        autoApproved
+          ? batchKicker("done", items.length)
+          : batchKicker("pending", items.length),
+        items,
+      ),
+    );
+
+    let glowRec = null;
+    items.forEach((item, idx) => {
+      block.appendChild(buildToolDiv(item, indexLabel(idx, items.length)));
+      const verdict =
+        item.judge_verdict || item.heuristic_verdict || item.verdict;
+      if (verdict) {
+        block.appendChild(buildConvVerdict(verdict, { judgePending }));
+        const rec = verdict.recommendation || "review";
+        if (
+          !glowRec ||
+          rec === "deny" ||
+          (rec === "review" && glowRec === "approve")
+        ) {
+          glowRec = rec;
+        }
+      }
+    });
+
+    if (autoApproved) {
+      block.appendChild(buildConvStatus({ auto: true }));
+    } else {
+      const alwaysNames = items
+        .filter(
+          (it) =>
+            it.needs_approval &&
+            it.func_name &&
+            it.func_name !== "__budget_override__" &&
+            !it.error,
+        )
+        .map((it) => it.approval_label || it.func_name);
+      block.dataset.alwaysNames = JSON.stringify(alwaysNames);
+      const actions = buildConvActions({
+        kbd: { approve: "y", deny: "n", always: "a" },
+        alwaysLabel: alwaysNames.length
+          ? "Always approve " + alwaysNames.join(", ")
+          : "",
+        glowRec,
+        withFeedback: true,
+        onApprove: () =>
+          this.resolveApproval(
+            true,
+            false,
+            this.getFeedback(block),
+            false,
+            cycleId,
+          ),
+        onDeny: () =>
+          this.resolveApproval(
+            false,
+            false,
+            this.getFeedback(block),
+            false,
+            cycleId,
+          ),
+        onAlways: () =>
+          this.resolveApproval(
+            true,
+            true,
+            this.getFeedback(block),
+            false,
+            cycleId,
+          ),
+      });
+      block.appendChild(actions);
+    }
+
+    // Append BEFORE registering the approval cycle — the orphan-prune in
+    // _syncApprovalState checks that no blockEls are connected
+    // (!blockEls.some(el => el.isConnected)), so a freshly-built block
+    // (not yet in the DOM) would be mistaken for an orphan and immediately
+    // pruned if we registered before appending.
+    if (!announced) this.messagesEl.appendChild(block);
+    this._indexToolRows(block);
+    if (!autoApproved) {
+      this._registerApprovalCycle(cycleId, [block], items);
+      const fb = block.querySelector(".conv-feedback");
+      // Focus the feedback field only for the FIRST (oldest) live cycle —
+      // a sibling card arriving while the user is typing into another
+      // cycle's field must not steal focus mid-word.
+      if (this._oldestCycleId() === cycleId) {
+        requestAnimationFrame(() => {
+          if (fb) fb.focus();
+        });
+      }
+    }
+    this._relinkAgentCards(items);
+    this.scrollToBottom();
+  }
+
+  resolveApproval(approved, always, feedback, skipPost, cycleId) {
+    // Resolve exactly ONE cycle — parallel task agents can have several
+    // cards live; a decision must never bleed onto a sibling's.  No
+    // cycleId (legacy caller) → the oldest.
+    const id = cycleId || this._oldestCycleId();
+    if (!id) return;
+    const entry = this.approvalCycles.get(id);
+    if (!entry) return; // already resolved (peer tab / server race) — idempotent
+    this.approvalCycles.delete(id);
+
+    entry.blockEls.forEach((el) => {
+      const actions = el.querySelector(".conv-actions");
+      if (actions) actions.remove();
+    });
+    const statusHost = entry.blockEls[0];
+    if (statusHost) {
+      if (!approved) {
+        this._markAgentStepExceptional(statusHost, {
+          denied: true,
+          effectStatus: "none",
+        });
+      }
+      statusHost.appendChild(
+        buildConvStatus({ approved, always, feedback: feedback || "" }),
+      );
+      statusHost.classList.add(
+        approved ? "conv-batch--approved" : "conv-batch--denied",
+      );
+    }
+
+    this._syncApprovalState();
+    if (!this.pendingApproval) this.inputEl.focus();
+
+    // POST to server (skip when server already resolved, e.g. timeout).
+    // cycle_id pins the decision to THIS round server-side; call_id
+    // rides along as defense-in-depth (the server 409s a stale pair).
+    if (!skipPost) {
+      authFetch(
+        this._base +
+          "/v1/api/workstreams/" +
+          encodeURIComponent(this.wsId) +
+          "/approve",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            approved: approved,
+            feedback: feedback || null,
+            always: !!always,
+            cycle_id: id.startsWith("legacy:") ? null : id,
+            call_id: entry.callIds[0] || null,
+          }),
+        },
+      ).catch((err) => {
+        this.addErrorMessage("Connection error: " + err.message);
+      });
+    }
+
+    this.scrollToBottom();
+  }
+
+  // --- Task-agent card: nest a sub-agent's sub-tool steps under its row -----
+  _agentTransientRoute(parentId) {
+    const parentRow = this._toolRow(parentId);
+    const terminal = this._toolResultNodes.get(parentId);
+    if (!parentRow || !terminal || terminal.row !== parentRow) {
+      return { state: "current", row: parentRow };
+    }
+    // A fresh/truncated snapshot or live event can race a successor whose
+    // provider recycled the same public call id. While busy, hold the transient
+    // away from the earlier terminal occurrence; the next painted row relinks
+    // it. At idle there can be no successor, so the event is stale.
+    return this.busy
+      ? { state: "blocked", row: parentRow }
+      : { state: "drop", row: parentRow };
+  }
+
+  _handleAgentCompaction(evt) {
+    const parentId =
+      typeof evt.parent_call_id === "string" ? evt.parent_call_id : "";
+    if (!parentId) return;
+    let holder = this._agentCompactions.get(parentId);
+    const route = this._agentTransientRoute(parentId);
+    if (route.state === "drop") {
+      if (holder) resetCompactionHolder(holder);
+      this._agentCompactions.delete(parentId);
+      return;
+    }
+    if (!holder) {
+      // A terminal edge with no locally active attempt has no task-context
+      // result to render. In particular, do not manufacture an empty
+      // "0 steps · running" task card when a replay begins after start.
+      if (evt.phase === "end") return;
+      holder = { card: null, cid: null, pending: null };
+      this._agentCompactions.set(parentId, holder);
+    }
+    const pendingCid =
+      holder.pending && holder.pending.compaction_id != null
+        ? String(holder.pending.compaction_id)
+        : null;
+    const activeCid = holder.cid != null ? holder.cid : pendingCid;
+    const incomingCid =
+      evt.compaction_id != null ? String(evt.compaction_id) : null;
+    if (
+      evt.phase === "end" &&
+      activeCid != null &&
+      incomingCid != null &&
+      incomingCid !== activeCid
+    ) {
+      // The shared reducer also rejects this stale end. Return before the
+      // wrapper's terminal cleanup so it cannot delete the newer holder.
+      return;
+    }
+    holder.pending = evt;
+    if (route.state === "blocked") {
+      holder.blockedByTerminalRow = route.row;
+      if (evt.phase === "end") {
+        resetCompactionHolder(holder);
+        this._agentCompactions.delete(parentId);
+      }
+      return;
+    }
+    delete holder.blockedByTerminalRow;
+    const card = this._ensureAgentCard(parentId, true);
+    if (card) this._syncAgentCompaction(parentId, card);
+    if (evt.phase === "end") {
+      // _syncAgentCompaction consumes a visible end. If the parent row has not
+      // painted, there is no live task card to retire or historical result to
+      // render, so drop the buffered terminal edge too.
+      resetCompactionHolder(holder);
+      this._agentCompactions.delete(parentId);
+    }
+  }
+
+  _syncAgentCompaction(parentId, card) {
+    const holder = this._agentCompactions.get(parentId);
+    if (!holder || !holder.pending || holder.blockedByTerminalRow) return;
+    const evt = holder.pending;
+    holder.pending = null;
+    card.wrap.hidden = false;
+    if (evt.phase === "start") {
+      const parentBatch = card.wrap.closest(".conv-batch");
+      if (parentBatch) {
+        setConvBatchExpanded(parentBatch, true, { blocker: true });
+      }
+      const prior = card.wrap.querySelector(".conv-agent-compaction-notice");
+      if (prior) prior.remove();
+    }
+    applyCompactionEvent(holder, evt, {
+      container: card.wrap,
+      renderedIds: this._renderedSystemEventIds,
+      renderResult: false,
+      // Keep progress visible when the step body is collapsed.
+      append: (node) => card.wrap.insertBefore(node, card.body),
+      // Keep a task-local failure inside its card. It has no unscoped typed
+      // error twin, and escaping it into the workstream transcript would
+      // misattribute a non-fatal nested controller failure to the parent turn.
+      onNotice: (message) => {
+        let notice = card.wrap.querySelector(".conv-agent-compaction-notice");
+        if (!notice) {
+          notice = document.createElement("div");
+          notice.className = "conv-agent-compaction-notice";
+          notice.setAttribute("role", "status");
+          card.wrap.insertBefore(notice, card.body);
+        }
+        notice.textContent = stripAnsi(message);
+      },
+      scroll: () => this.scrollToBottom(),
+    });
+  }
+
+  // Child events (tool_pending / approve_request) carry parent_call_id; route
+  // them into the task_agent row's collapsible body.  tool_result /
+  // tool_output_chunk / intent_verdict / output_warning need no special-casing
+  // — their handlers find the row by call_id anywhere under messagesEl,
+  // including inside the card body.  Returns true when handled (the caller then
+  // skips the top-level rendering path).
+  _routeAgentItems(items, mode, judgePending, cycleId) {
+    if (!items || !items.length) return false;
+    const parentId = items[0] && items[0].parent_call_id;
+    if (!parentId) return false;
+    const card = this._ensureAgentCard(parentId);
+    if (!card) {
+      // Parent task_agent row isn't painted yet: under the 4-wide tool pool a
+      // sub-tool's SSE event can be handled before its task_agent row commits.
+      // Buffer the child step keyed by parent so it nests when the parent row
+      // lands (see _flushAgentOrphans), instead of escaping to a top-level row
+      // that looks like the main harness issued it.  An approval prompt is NOT
+      // buffered — it must stay visible to unblock the gate — so "approve"
+      // falls through to the top-level paint.
+      if (mode !== "approve") {
+        this._bufferAgentOrphan(parentId, items, mode);
+        return true;
+      }
+      return false; // parent row not painted yet — fall back top-level
+    }
+    if (mode === "approve") {
+      const parentBatch = card.wrap.closest(".conv-batch");
+      if (parentBatch) {
+        setConvBatchExpanded(parentBatch, true, { blocker: true });
+      }
+      // Cards default to collapsed, but a pending approval is BLOCKING — it
+      // can't hide behind the toggle or the turn stalls on a prompt the user
+      // never sees.  Force the card open (sync aria with the data attribute).
+      card.wrap.dataset.collapsed = "false";
+      const toggle = card.wrap.querySelector(".conv-agent-toggle");
+      if (toggle) toggle.setAttribute("aria-expanded", "true");
+    }
+    const approveRows = [];
+    items.forEach((item) => {
+      if (!item || !item.parent_call_id) return;
+      const escId = item.call_id ? CSS.escape(item.call_id) : "";
+      let row = escId
+        ? card.body.querySelector('.conv-row[data-call-id="' + escId + '"]')
+        : null;
+      if (!row) {
+        row = buildToolDiv(item, "");
+        card.body.appendChild(row);
+      }
+      this._markAgentStepExceptional(row, {
+        isError: !!(item.is_error || item.error),
+        denied: !!item.denied,
+        effectStatus: item.effect_status,
+      });
+      if (mode === "approve") {
+        const verdict =
+          item.judge_verdict || item.heuristic_verdict || item.verdict;
+        if (verdict) {
+          row.appendChild(buildConvVerdict(verdict, { judgePending }));
+        }
+        const actions = buildConvActions({
+          kbd: { approve: "y", deny: "n" },
+          glowRec: verdict && verdict.recommendation,
+          withFeedback: true,
+          onApprove: () =>
+            this.resolveApproval(
+              true,
+              false,
+              this.getFeedback(row),
+              false,
+              cycleId,
+            ),
+          onDeny: () =>
+            this.resolveApproval(
+              false,
+              false,
+              this.getFeedback(row),
+              false,
+              cycleId,
+            ),
+        });
+        row.appendChild(actions);
+        approveRows.push(row);
+      }
+    });
+    if (card.body.querySelector(".conv-row")) {
+      // A context event can create the card before the agent emits its first
+      // sub-tool. Once a real step lands the card is ordinary transcript UI;
+      // reveal it even if a terminal result raced ahead and hid the former
+      // context-only shell.
+      delete card.wrap.dataset.contextOnly;
+      card.wrap.hidden = false;
+    }
+    if (mode === "approve" && approveRows.length) {
+      // Register this nested batch as its own approval cycle — the
+      // backend gates each sub-agent batch independently, so buttons
+      // must resolve THIS cycle, not "the" pending one (parallel task
+      // agents can have several nested prompts live at once).
+      this._registerApprovalCycle(cycleId, approveRows, items);
+    }
+    this._updateAgentLabel(card);
+    this.scrollToBottom();
+    return true;
+  }
+
+  _ensureAgentCard(parentCallId, contextOnly = false) {
+    // _toolRow cache: a busy task agent resolves its parent row once per
+    // child event — the uncached scan was O(transcript) per step.
+    const parentRow = this._toolRow(parentCallId);
+    if (!parentRow) return null;
+    if (!this._agentCards) this._agentCards = new Map();
+    let card = this._agentCards.get(parentCallId);
+    if (card) {
+      if (parentRow.contains(card.wrap)) {
+        this._syncAgentContext(parentCallId, card);
+        this._syncAgentCompaction(parentCallId, card);
+        return card;
+      }
+      if (!card.wrap.isConnected) {
+        // Same-turn row rebuild: showInlineToolBlock's replaceChildren on the
+        // pending->resolved upgrade detached our card.  Re-attach the SAME card
+        // so its already-rendered steps survive the upgrade.
+        if (card.wrap.dataset.state === "running") {
+          const parentBatch = parentRow.closest(".conv-batch");
+          if (parentBatch) {
+            setConvBatchExpanded(parentBatch, true, { blocker: true });
+          }
+        }
+        parentRow.appendChild(card.wrap);
+        this._syncAgentContext(parentCallId, card);
+        this._syncAgentCompaction(parentCallId, card);
+        return card;
+      }
+      // The cached card is still attached to a DIFFERENT (earlier) row — a
+      // call_id reused across turns (some local providers recycle ids).  Fall
+      // through to build a fresh card for THIS row rather than stealing the
+      // prior agent's steps.  (Full cross-turn id correctness is the task-agent
+      // id-consistency follow-up.)
+    }
+    card = buildAgentCardBody();
+    card.wrap.dataset.state = "running";
+    if (contextOnly) card.wrap.dataset.contextOnly = "true";
+    const parentBatch = parentRow.closest(".conv-batch");
+    if (parentBatch) {
+      setConvBatchExpanded(parentBatch, true, { blocker: true });
+    }
+    parentRow.appendChild(card.wrap);
+    this._agentCards.set(parentCallId, card);
+    this._syncAgentToggleLabel(card);
+    this._syncAgentContext(parentCallId, card);
+    this._syncAgentCompaction(parentCallId, card);
+    return card;
+  }
+
+  _markAgentStepExceptional(row, details) {
+    details = details || {};
+    const effectStatus =
+      details.effectStatus == null ? "" : String(details.effectStatus);
+    if (
+      !details.isError &&
+      !details.denied &&
+      !details.exceptional &&
+      (!effectStatus || effectStatus === "committed")
+    ) {
+      return false;
+    }
+    const card = row && row.closest ? row.closest(".conv-agent") : null;
+    if (!card) return false;
+    const parentBatch = card.closest(".conv-batch");
+    if (parentBatch) {
+      setConvBatchExpanded(parentBatch, true, { blocker: true });
+    }
+    const changed = card.dataset.agentStepExceptional !== "true";
+    card.dataset.agentStepExceptional = "true";
+    const issue = card.querySelector(".conv-agent-step-issue");
+    if (issue) issue.hidden = false;
+    this._syncAgentToggleLabel(card);
+    return changed;
+  }
+
+  _syncAgentToggleLabel(card) {
+    const wrap = card.wrap || card;
+    const toggle = card.toggle || wrap.querySelector(".conv-agent-toggle");
+    const label = card.label || wrap.querySelector(".conv-agent-label");
+    const context = card.context || wrap.querySelector(".conv-agent-context");
+    const issue = card.issue || wrap.querySelector(".conv-agent-step-issue");
+    if (!toggle || !label) return;
+    const parts = [
+      "Show or hide sub-agent steps",
+      label.textContent || "0 steps",
+    ];
+    const state = wrap.dataset.state;
+    if (state === "running") parts.push("running");
+    else if (state === "done") parts.push("done");
+    else if (state === "error") parts.push("failed");
+    if (context && !context.hidden && context.title) {
+      parts.push(
+        context.classList.contains("conv-agent-context--warning")
+          ? "Warning: " + context.title
+          : context.title,
+      );
+    }
+    if (issue && !issue.hidden) {
+      parts.push("contains an exceptional child step");
+    }
+    toggle.setAttribute("aria-label", parts.join(". "));
+  }
+
+  _syncAgentContext(parentCallId, card) {
+    const reading = this._agentContexts.get(parentCallId);
+    if (!reading || card.wrap.dataset.state !== "running") return;
+    const used = formatAgentContextTokens(reading.promptTokens);
+    const total = formatAgentContextTokens(reading.contextWindow);
+    if (!used || !total) return;
+    const warning = agentContextIsWarning(
+      reading.promptTokens,
+      reading.contextWindow,
+    );
+    card.context.textContent = used + " / " + total;
+    card.context.hidden = false;
+    card.context.classList.toggle("conv-agent-context--warning", warning);
+    const full =
+      reading.promptTokens.toLocaleString() +
+      " of " +
+      reading.contextWindow.toLocaleString() +
+      " context tokens used";
+    card.context.title = full;
+    this._syncAgentToggleLabel(card);
+  }
+
+  _resetAgentContextBadge(card) {
+    card.context.hidden = true;
+    card.context.textContent = "";
+    card.context.classList.remove("conv-agent-context--warning");
+    card.context.removeAttribute("title");
+    this._syncAgentToggleLabel(card);
+  }
+
+  _updateAgentContext(evt) {
+    const parentId =
+      typeof evt.parent_call_id === "string" ? evt.parent_call_id : "";
+    const promptTokens = Number(evt.prompt_tokens);
+    const contextWindow = Number(evt.context_window);
+    if (
+      !parentId ||
+      !Number.isInteger(promptTokens) ||
+      promptTokens < 0 ||
+      !Number.isInteger(contextWindow) ||
+      contextWindow <= 0
+    ) {
+      return;
+    }
+
+    const route = this._agentTransientRoute(parentId);
+    if (route.state === "drop") {
+      this._agentContexts.delete(parentId);
+      return;
+    }
+    if (route.state === "blocked") {
+      this._agentContexts.set(parentId, {
+        promptTokens,
+        contextWindow,
+        blockedByTerminalRow: route.row,
+      });
+      return;
+    }
+
+    this._agentContexts.set(parentId, { promptTokens, contextWindow });
+    const card = this._ensureAgentCard(parentId, true);
+    if (card && card.wrap.dataset.state !== "running") {
+      this._agentContexts.delete(parentId);
+    }
+  }
+
+  _bufferAgentOrphan(parentId, items, mode) {
+    // Hold a child step whose task_agent row hasn't painted yet, keyed by
+    // parent, so it nests when the row lands (_flushAgentOrphans).  Bounded two
+    // ways so a parent row that never arrives (an id-correlation mismatch, or
+    // an agent aborted before its row painted) can't leak or hide steps: the
+    // per-parent queue is capped (oldest dropped), and a grace timer escapes
+    // the queue to a top-level row (_escapeAgentOrphans) so the steps stay
+    // VISIBLE rather than buffered forever.
+    if (!this._agentOrphans) this._agentOrphans = new Map();
+    const entry = this._agentOrphans.get(parentId) || {
+      queue: [],
+      timer: null,
+    };
+    entry.queue.push({ items, mode });
+    while (entry.queue.length > _AGENT_ORPHAN_CAP) entry.queue.shift();
+    if (entry.timer == null) {
+      entry.timer = setTimeout(
+        () => this._escapeAgentOrphans(parentId),
+        _AGENT_ORPHAN_GRACE_MS,
+      );
+    }
+    this._agentOrphans.set(parentId, entry);
+  }
+
+  _flushAgentOrphans(parentIds) {
+    // Drain buffered child steps for the just-painted parents (their card now
+    // exists) — targeted by parentId so an unrelated tool paint doesn't replay
+    // every parent's queue.  A step that still can't nest re-buffers (with a
+    // fresh grace timer) for the next paint / escape.
+    if (!this._agentOrphans || !this._agentOrphans.size) return;
+    parentIds.forEach((pid) => {
+      const entry = this._agentOrphans.get(pid);
+      if (!entry) return;
+      this._agentOrphans.delete(pid);
+      if (entry.timer != null) clearTimeout(entry.timer);
+      entry.queue.forEach((o) => this._routeAgentItems(o.items, o.mode));
+    });
+  }
+
+  _escapeAgentOrphans(parentId) {
+    // The parent row never painted within the grace window — render the
+    // buffered steps at top-level so they stay visible (the pre-buffer
+    // behaviour) instead of vanishing.  Batched per mode to avoid the
+    // announce-shell churn of one paint per step.
+    const entry = this._agentOrphans && this._agentOrphans.get(parentId);
+    if (!entry) return;
+    this._agentOrphans.delete(parentId);
+    const pending = [];
+    const info = [];
+    entry.queue.forEach((o) =>
+      (o.mode === "info" ? info : pending).push(...o.items),
+    );
+    if (pending.length) this.announceToolBlock(pending);
+    if (info.length) this.showInlineToolBlock(info, true);
+  }
+
+  _relinkAgentCards(items) {
+    // After a top-level tool row is (re)painted: re-attach any agent card the
+    // rebuild detached, then drain buffered child steps for the parents that
+    // just painted.  Closes the parallel-pool ordering race and keeps a task
+    // agent's nested card intact across its parent's pending->resolved upgrade.
+    const paintedIds = [];
+    (items || []).forEach((it) => {
+      if (!it || !it.call_id) return;
+      paintedIds.push(it.call_id);
+      const row = this._toolRow(it.call_id);
+      const reading = this._agentContexts.get(it.call_id);
+      const compaction = this._agentCompactions.get(it.call_id);
+      if (
+        (reading && reading.blockedByTerminalRow === row) ||
+        (compaction && compaction.blockedByTerminalRow === row)
+      ) {
+        return;
+      }
+      if (reading && reading.blockedByTerminalRow) {
+        delete reading.blockedByTerminalRow;
+      }
+      if (compaction && compaction.blockedByTerminalRow) {
+        delete compaction.blockedByTerminalRow;
+      }
+      if (
+        (this._agentCards && this._agentCards.has(it.call_id)) ||
+        this._agentContexts.has(it.call_id) ||
+        this._agentCompactions.has(it.call_id)
+      ) {
+        this._ensureAgentCard(
+          it.call_id,
+          this._agentContexts.has(it.call_id) ||
+            this._agentCompactions.has(it.call_id),
+        );
+      }
+    });
+    if (paintedIds.length) this._flushAgentOrphans(paintedIds);
+  }
+
+  _updateAgentLabel(card) {
+    const n = card.body.querySelectorAll(".conv-row").length;
+    card.label.textContent = n === 1 ? "1 step" : n + " steps";
+    this._syncAgentToggleLabel(card);
+  }
+
+  _replayAgentCard(row, steps) {
+    // Rebuild a finished task agent's card from its recalled step items
+    // (/history `agent_steps`), mirroring the live _routeAgentItems nesting so a
+    // reload looks identical: a collapsed body of step rows, each with its
+    // result.  Recall is terminal — no live approval affordances.  Card state
+    // defaults to "done"; the caller flips it to "error" from the task's OWN
+    // result (the role==="tool" branch), matching the live path — sub-step
+    // errors don't decide it (an agent can recover and synthesize fine).
+    const card = buildAgentCardBody();
+    steps.forEach((step) => {
+      const stepRow = buildToolDiv(synthToolItem(step), "");
+      card.body.appendChild(stepRow);
+      this._markAgentStepExceptional(stepRow, {
+        isError: !!step.is_error,
+        denied: !!step.denied,
+        exceptional: !!step.contains_exceptional,
+        effectStatus: step.effect_status,
+      });
+      const out = stripAnsi(String(step.output || "")).trim();
+      if (out) {
+        card.body.appendChild(renderCollapsibleOutput(out, !!step.is_error));
+      }
+    });
+    card.wrap.dataset.state = "done";
+    this._updateAgentLabel(card);
+    row.appendChild(card.wrap);
+    return card.wrap;
+  }
+
+  appendToolOutput(callId, name, output, isError, preview, opts = {}) {
+    const accepted = opts.accepted === true;
+    // Folding uses the pre-mutation follow state; the deferred scroll also
+    // checks for a newer user scroll before it moves the viewport.
+    const stick = this.isNearBottom();
+    // A task_agent's OWN result completing flips its card running -> done/error
+    // (child sub-tool results carry namespaced ids, never keys of _agentCards).
+    // The entry deliberately SURVIVES the result: a late child event (SSE
+    // replay overlap) re-entering _ensureAgentCard with no Map entry would
+    // build a duplicate empty card beside the finished one.  Entries hold
+    // attached DOM (not a leak); the detached-retention hazard is rebuilds,
+    // which _clearAgentTracking covers in replayHistory.
+    if (this._agentCards && this._agentCards.has(callId)) {
+      const agentCard = this._agentCards.get(callId);
+      agentCard.wrap.dataset.state = isError ? "error" : "done";
+      this._resetAgentContextBadge(agentCard);
+      if (
+        agentCard.wrap.dataset.contextOnly === "true" &&
+        !agentCard.body.querySelector(".conv-row")
+      ) {
+        // A one-turn agent can report usage without ever invoking a sub-tool.
+        // Retain the hidden card in the id-ownership map so a late child event
+        // reuses it, but do not leave an empty "0 steps · done" card visible.
+        agentCard.wrap.hidden = true;
+      }
+    }
+    this._agentContexts.delete(callId);
+    if (this._agentCompactions && this._agentCompactions.has(callId)) {
+      resetCompactionHolder(this._agentCompactions.get(callId));
+      this._agentCompactions.delete(callId);
+    }
+    let target = this._toolRow(callId);
+    if (!target) {
+      // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't
+      // nested yet must NOT graft its output onto the last top-level batch row
+      // — that mislabels a sub-tool's result as a main-harness tool's.  Its row
+      // arrives via the orphan flush; skip until then.
+      if (callId && callId.includes("::")) return false;
+      const blocks = this.messagesEl.querySelectorAll(".conv-batch");
+      if (!blocks.length) return false;
+      const block = blocks[blocks.length - 1];
+      const tools = block.querySelectorAll(".conv-row");
+      for (let i = tools.length - 1; i >= 0; i--) {
+        if (tools[i].dataset.funcName === name) {
+          target = tools[i];
+          break;
+        }
+      }
+      if (!target && tools.length) target = tools[tools.length - 1];
+    }
+    if (!target) return false;
+    const parentBlock = target.closest(".conv-batch");
+    const stripped = stripAnsi(output || "").trim();
+    const isDenied =
+      target.classList.contains("conv-batch--denied") ||
+      (parentBlock && parentBlock.classList.contains("conv-batch--denied")) ||
+      /^Denied by user/.test(stripped) ||
+      /^Blocked/.test(stripped);
+    this._markAgentStepExceptional(target, {
+      isError: !!isError,
+      denied: isDenied,
+      effectStatus: opts.effectStatus,
+    });
+
+    if (accepted) {
+      clearConvVerdictPending(target);
+      setToolOutputReviewState(target, output);
+      // Stop can synthesize a final result after tool_pending but before the
+      // authoritative tool_info/approval event consumes the early shell. Once
+      // this exact shell owns an accepted row it is committed transcript DOM,
+      // not replaceable early paint. Retire map ownership without removing it;
+      // a later turn may legitimately reuse the same provider call id.
+      if (parentBlock && this.announcedBlocks) {
+        for (const [key, announced] of this.announcedBlocks.entries()) {
+          if (announced === parentBlock) {
+            this.announcedBlocks.delete(key);
+            break;
+          }
+        }
+      }
+      if (opts.effectStatus) {
+        if (opts.effectStatus !== "committed" && parentBlock) {
+          setConvBatchExpanded(parentBlock, true, { blocker: true });
+        }
+        target.dataset.effectStatus = String(opts.effectStatus);
+      } else {
+        delete target.dataset.effectStatus;
+      }
+    }
+
+    // Remove the streaming output element for this tool
+    let streamEl = this._streamEl(callId);
+    if (!streamEl) {
+      const next = target.nextElementSibling;
+      if (next && next.classList.contains("tool-output-stream")) {
+        streamEl = next;
+      }
+    }
+    if (streamEl) {
+      streamEl.remove();
+      if (callId) this._streamElIndex.delete(callId);
+    }
+
+    // A preliminary receipt and its final accepted row own the same result
+    // slot. Remove only nodes we created for THIS row; warnings and approval
+    // badges are independent siblings and remain intact. A provider may reuse
+    // call ids in a later turn, so never remove nodes tracked against an older
+    // still-visible row.
+    const priorResult = callId ? this._toolResultNodes.get(callId) : null;
+    if (priorResult && priorResult.row === target) {
+      priorResult.nodes.forEach((node) => {
+        if (node && node.isConnected) node.remove();
+      });
+    } else if (callId) {
+      this._toolResultNodes.delete(callId);
+    }
+
+    // Skip rendering for denied/blocked tool results — the ✗ denied
+    // badge from resolveApproval already shows the denial reason; the
+    // SSE tool_result event would otherwise duplicate the text.  Mirror
+    // the guard in the history-replay path (the live path used to be
+    // safe because no tool_result event was ever emitted for denied
+    // items, but we now emit one so _tool_error_flags gets set).
+    const resultNodes = [];
+    let insertCursor = target;
+    const insertResult = (node) => {
+      insertCursor.after(node);
+      insertCursor = node;
+      resultNodes.push(node);
+    };
+
+    if (!isDenied && stripped) {
+      let resultNode = null;
+      // Detect structured media output and render interactive embed.
+      if (!isError) {
+        const media = tryParseMedia(stripped);
+        if (media) resultNode = buildMediaEmbed(media, stripped);
+      }
+
+      // Detect structured MCP error envelopes before the plain renderer. The
+      // shared consent card remains the canonical error presentation.
+      if (!resultNode && isError) {
+        const mcpErr = tryParseMcpError(stripped);
+        if (mcpErr) {
+          resultNode = buildMcpErrorEmbed(mcpErr, stripped, (s) =>
+            this._host.onConsentDetected(s),
+          );
+        }
+      }
+
+      if (!resultNode) {
+        resultNode = renderCollapsibleOutput(stripped, isError);
+      }
+      insertResult(resultNode);
+    }
+
+    // Mark the parent approval block as errored. Idempotent badge construction
+    // preserves the approval verdict beside the error disposition.
+    if (
+      isError &&
+      !isDenied &&
+      parentBlock &&
+      !parentBlock.classList.contains("conv-batch--denied")
+    ) {
+      setConvBatchExpanded(parentBlock, true, { blocker: true });
+      parentBlock.classList.add("conv-batch--error");
+      appendToolErrorBadge(parentBlock);
+    }
+
+    // Accepted preview rows mirror /history: the reopen chip survives even on
+    // a cancelled/error result, but accepted publication never auto-opens a
+    // pane. The provisional receipt remains the sole focused auto-open edge.
+    if (preview && !isDenied && (!isError || accepted)) {
+      const chip = buildPreviewChip(preview, (d) => this._host.onPreview(d));
+      insertResult(chip);
+      if (!accepted && !isError && this._host.isFocused(this)) {
+        this._host.onPreview(preview);
+      }
+    }
+
+    if (callId) {
+      this._toolResultNodes.set(callId, { row: target, nodes: resultNodes });
+    }
+    let settlement = null;
+    if (accepted) {
+      const compact = getTranscriptPresentation() === "compact";
+      const allowAutoFold =
+        !compact ||
+        canAutoFoldTranscriptBatch(this.messagesEl, parentBlock, {
+          atBottom: stick,
+        });
+      settlement = markConvRowResultSettled(target, {
+        autoFold: allowAutoFold,
+      });
+      if (compact && settlement.autoFolded) {
+        toolAnnounce("Completed: " + convBatchSummaryText(parentBlock));
+      }
+    }
+    if (resultNodes.length || (settlement && settlement.autoFolded)) {
+      this.scrollToBottom();
+    }
+    return true;
+  }
+
+  sendMessage() {
+    const text = this.inputEl.value.trim();
+    if (!text) {
+      if (!this.attachments.isEmpty()) {
+        this.addInfoMessage("Add a message to send with this attachment.");
+      }
+      return;
+    }
+
+    if (text.startsWith("/")) {
+      if (this.busy) {
+        // Was a silent return — say why nothing happened.
+        this.addInfoMessage("Session is busy — commands can't run mid-turn.");
+        return;
+      }
+      // /rewind and /retry were lifted to path-keyed endpoints (#549);
+      // reroute hand-typed ones so they don't 400 against /command.
+      const parts = text.split(/\s+/);
+      const cmdWord = parts[0].toLowerCase();
+      if (cmdWord === "/rewind") {
+        const n = parseInt(parts[1], 10);
+        if (!Number.isInteger(n) || n < 1) {
+          this.addErrorMessage(
+            "Usage: /rewind <N> — N must be a positive integer",
+          );
+          this.composer.clear();
+          return;
+        }
+        this._rewindToTurns(n);
+        this.composer.clear();
+        return;
+      }
+      if (cmdWord === "/retry") {
+        this._retryLast();
+        this.composer.clear();
+        return;
+      }
+      authFetch(this._base + "/v1/api/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: text, ws_id: this.wsId }),
+      })
+        .then((r) =>
+          // Thread {ok, status} alongside the parsed body — the loud
+          // arms below ride NON-2xx codes (busy = 409, error = 503), so
+          // an /send-style throw-on-!ok pre-gate would wrongly reroute
+          // them into the transport catch.
+          r.json().then(
+            (b) => ({ ok: r.ok, status: r.status, body: b || {} }),
+            () => ({ ok: r.ok, status: r.status, body: {} }),
+          ),
+        )
+        .then(({ ok, status, body }) => {
+          // /compact dispatched onto an already-busy worker reports
+          // {status: "busy"} — surface it (the optimistic busy guard
+          // above can lose that race).
+          if (body.status === "busy") {
+            this.addInfoMessage(
+              body.error || "Session is busy — try again shortly.",
+            );
+          } else if (body.status === "running") {
+            // The command outlived the endpoint's completion backstop
+            // (kept under the console proxy's client bound precisely so
+            // this answer can traverse a proxied pane). The worker is
+            // still going; its output and pane refreshes arrive over SSE.
+            this.addInfoMessage(
+              "Command is still running — results will appear here when it finishes.",
+            );
+          } else if (body.status === "error") {
+            // 503: the command worker could not be started (thread
+            // exhaustion) — the command did NOT run. Loud, like the busy
+            // arm: silence here reads as success.
+            this.addErrorMessage(
+              body.error || "Command failed to start — retry shortly.",
+            );
+          } else if (!ok) {
+            // Status-less non-2xx (404 unknown workstream, proxy 502
+            // HTML): the same silence-reads-as-success rule as the arms
+            // above. Rendered directly — not thrown into the catch,
+            // which would double-prefix the message.
+            this.addErrorMessage(
+              body.error || "Command failed (HTTP " + status + ")",
+            );
+          }
+        })
+        .catch((err) => {
+          // Transport failure (network drop, abort): the command-echo
+          // chip is already rendered — say the command did not run.
+          this.addErrorMessage("Command failed: " + err.message);
+        });
+      // Echo as a command chip, not addUserMessage — a slash command is
+      // control-plane input, not a conversational user turn.
+      this.addCommandEcho(text);
+      this.composer.clear();
+      return;
+    }
+
+    // Attachments cannot ride the live turn's text-only interjection queue.
+    // Refuse before the optimistic clear so the user's companion text and
+    // staged chips remain ready to send once the worker is idle.
+    if (this.busy && !this.attachments.isEmpty()) {
+      this.addInfoMessage(
+        "Attachments can't be sent while the assistant is working. Wait for it to finish, then send again.",
+      );
+      return;
+    }
+
+    const isBusy = this.busy;
+    let queuedEl = null;
+    let optimisticEl = null;
+    const clientSendId = mintClientSendId();
+    const snap = this.attachments.snapshot();
+    if (snap.uploading) {
+      this.addInfoMessage(
+        "Wait for attachments to finish uploading before sending.",
+      );
+      return;
+    }
+
+    // Display-only strip of the !!! prefix (the server re-parses it
+    // authoritatively); shared parse so the settle helper's retro-convert
+    // renders the same chip either pane would have built pre-POST.
+    const { displayText, priority } = parsePriority(text);
+
+    if (isBusy) {
+      this.removeEmptyState();
+      queuedEl = this.queue.addQueuedMessage(
+        displayText,
+        priority,
+        clientSendId,
+      );
+    } else {
+      // "optimistic": no server state event asserted this — the settle
+      // arms may undo it if the send turns out deferred/refused (see
+      // setBusy's busySource contract).
+      this.setBusy(true, "optimistic");
+      optimisticEl = this.addUserMessage(text, snap.attachments, {
+        clientSendId,
+      });
+    }
+    this.scrollToBottom(true);
+    this.composer.clear();
+
+    // Bound the send POST with an AbortController + ~15s timeout (mirrors
+    // composer_queue.js _deleteRequest) so a wedged proxied node can't leave a
+    // pre-bind-dismissed card frozen forever — bind/promote/remove only run
+    // off this response, so the .catch must always eventually fire.
+    const sendCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const sendInit = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: text,
+        attachment_ids: snap.attachment_ids,
+        client_send_id: clientSendId,
+      }),
+    };
+    let sendTimer = null;
+    if (sendCtrl) {
+      sendInit.signal = sendCtrl.signal;
+      // Flat wedged-node bound: every /send answers within RTT now —
+      // dispatched, queued, or deferred-with-msg_id during a command
+      // window (the server parks nothing against this POST), so a
+      // response slower than this means a wedged node, not a long
+      // command.  Dismissal is bind() → DELETE, never a POST abort.
+      sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
+    }
+    let sendReq = authFetch(
+      this._base +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(this.wsId) +
+        "/send",
+      sendInit,
+    );
+    if (sendTimer) sendReq = sendReq.finally(() => clearTimeout(sendTimer));
+    // Response normalization, the full status dispatch (queued/retro-convert,
+    // busy, queue_full, attachments_busy, cross_user, unknown-ok) and the
+    // accepted-guarded transport catch all live in the shared helper — ONE
+    // send settle for both panes and both of each pane's send flows.
+    postAndSettleSend(this.queue, sendReq, {
+      queuedEl,
+      optimisticEl,
+      isBusy,
+      displayText,
+      priority,
+      clientSendId,
+      setBusy: (b) => this.setBusy(b),
+      busyIsOptimistic: () => this.busy && this.busySource === "optimistic",
+      paneIsBusy: () => this.busy,
+      restoreInput: () => {
+        this.composer.value = mergeRejectedComposerText(
+          text,
+          this.composer.value,
+        );
+      },
+      renderError: (msg) => this.addErrorMessage(msg),
+      consumeAttachments: (attached, droppedIds) =>
+        this.attachments.consume(attached, droppedIds),
+    });
+  }
+
+  cancelGeneration() {
+    if (!this.busy || !this.wsId || this.stopBtn.disabled) return;
+    const isForce = this.stopBtn.dataset.forceCancel === "true";
+    this.stopBtn.disabled = true;
+    authFetch(
+      this._base +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(this.wsId) +
+        "/cancel",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: isForce }),
+      },
+    )
+      .then(() => {
+        if (isForce) {
+          // Force cancel abandons the worker — transition immediately.
+          // Clear timeouts to prevent stale timers firing on next send.
+          if (this._cancelTimeout) {
+            clearTimeout(this._cancelTimeout);
+            this._cancelTimeout = null;
+          }
+          if (this._forceTimeout) {
+            clearTimeout(this._forceTimeout);
+            this._forceTimeout = null;
+          }
+          this.addInfoMessage("Force stopped. Previous generation abandoned.");
+          this.setBusy(false);
+        }
+      })
+      .catch((err) => {
+        this.addErrorMessage("Cancel error: " + err.message);
+        this.stopBtn.disabled = false;
+      });
+  }
+}
+
+// Build a structured ``.msg.guard-finding`` card for an ``output_guard``
+// operator-context system turn.  ``meta`` carries the structured finding
+// ``{flags, risk_level, annotations, redacted}``.  Reuses the tool-result
+// warning chip (``_buildOutputWarningEl``) for the risk / flags / redaction
+// header so the operator-context finding speaks the same visual vocabulary,
+// then appends the annotations (matched-pattern detail) — which the inline
+// tool chip omits to stay terse.  All text via textContent.
+function _buildGuardFindingBubble(meta) {
+  const el = document.createElement("div");
+  el.className = "msg guard-finding operator-context";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "output_guard");
+  el.setAttribute("aria-label", "output guard");
+  el.appendChild(_buildOutputWarningEl(meta));
+  const anns = Array.isArray(meta.annotations) ? meta.annotations : [];
+  for (let i = 0; i < anns.length; i++) {
+    const a = document.createElement("div");
+    a.className = "msg-guard-annotation";
+    a.textContent = String(anns[i]);
+    el.appendChild(a);
+  }
+  return el;
+}
+
+// Shared output-warning DOM builder — used by both replayHistory
+// (saved-workstream rendering) and the live appendToolOutput path
+// via showOutputWarning.  Single source of truth keeps the two
+// surfaces from drifting on role / class / escape semantics.
+function _buildOutputWarningEl(assessment) {
+  // Thin wrapper over the shared builder (risk normalized -> unknown=medium).
+  return buildConvWarning(assessment);
+}
+
+function _formatRuntime(item) {
+  let mins = 0;
+  if (typeof item.runtime_minutes === "number") {
+    mins = Math.round(item.runtime_minutes);
+  } else if (typeof item.runtime_ticks === "number") {
+    mins = Math.round(item.runtime_ticks / 600000000);
+  }
+  if (!mins) return "";
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return h > 0 ? h + "h " + m + "m" : m + "m";
+}
+
+// ---------------------------------------------------------------------------
+//  HLS lazy-loader + click-to-play (lifted from the standalone app.js so
+//  console-hosted panes activate media too).  Follows the mermaid.js
+//  lazy-load pattern in /shared/renderer.js: the vendor is fetched by absolute
+//  /shared/ URL on first use, so it resolves in BOTH the standalone server and
+//  the console (where /shared is mounted at the root and node-proxied panes
+//  also reach it via /node/{id}/shared/).
+// ---------------------------------------------------------------------------
+let _hlsState = "idle";
+let _hlsQueue = [];
+
+function _loadHls(callback) {
+  if (_hlsState === "ready") {
+    callback();
+    return;
+  }
+  _hlsQueue.push(callback);
+  if (_hlsState === "loading") return;
+  _hlsState = "loading";
+  const script = document.createElement("script");
+  script.src = "/shared/hls-1.7.0/hls.min.js";
+  script.onload = function () {
+    _hlsState = "ready";
+    const q = _hlsQueue;
+    _hlsQueue = [];
+    for (let i = 0; i < q.length; i++) q[i]();
+  };
+  script.onerror = function () {
+    _hlsState = "idle";
+    const q = _hlsQueue;
+    _hlsQueue = [];
+    // Fall through — _activatePlayer will use stream_url since Hls is undefined
+    for (let i = 0; i < q.length; i++) q[i]();
+  };
+  document.head.appendChild(script);
+}
+
+function _isHlsUrl(url) {
+  return typeof url === "string" && /\.m3u8(\?|$)/i.test(url);
+}
+
+function _activatePlayer(btn) {
+  const url = btn.dataset.streamUrl;
+  const hlsUrl = btn.dataset.hlsUrl;
+  const isAudio = btn.dataset.audioOnly === "true";
+  const directStream = btn.dataset.directStream === "true";
+
+  const player = document.createElement(isAudio ? "audio" : "video");
+  player.controls = true;
+  player.autoplay = true;
+  player.className = "media-player";
+
+  // Held so the error handler can tear the instance down before the player
+  // node is replaced — otherwise its listeners/loader timers run detached.
+  let hls = null;
+
+  // Prefer direct stream when the source supports it; fall back to HLS
+  // only when transcoding is needed.
+  if (directStream && url) {
+    player.src = url;
+  } else if (
+    hlsUrl &&
+    !isAudio &&
+    typeof Hls !== "undefined" &&
+    Hls.isSupported()
+  ) {
+    hls = new Hls();
+    hls.loadSource(hlsUrl);
+    hls.attachMedia(player);
+  } else if (
+    hlsUrl &&
+    !isAudio &&
+    player.canPlayType("application/vnd.apple.mpegurl")
+  ) {
+    player.src = hlsUrl;
+  } else {
+    player.src = url;
+  }
+
+  player.addEventListener("error", function () {
+    if (hls) {
+      hls.destroy();
+      hls = null; // media error events can repeat — never double-destroy
+    }
+    const card = player.closest(".media-embed");
+    const titleEl = card ? card.querySelector(".media-card-title") : null;
+    const label = titleEl ? ": " + titleEl.textContent : "";
+
+    const err = document.createElement("div");
+    err.className = "media-player-error";
+    err.setAttribute("role", "alert");
+    err.textContent = "Failed to load stream" + label;
+
+    const retry = document.createElement("button");
+    retry.className = "media-play-btn";
+    retry.type = "button";
+    retry.dataset.streamUrl = url;
+    retry.dataset.hlsUrl = hlsUrl || "";
+    retry.dataset.audioOnly = String(isAudio);
+    retry.dataset.directStream = String(directStream);
+    retry.setAttribute("aria-label", "Retry" + label);
+    retry.appendChild(document.createTextNode("▶ Retry"));
+
+    const container = document.createElement("div");
+    container.appendChild(err);
+    container.appendChild(retry);
+    player.replaceWith(container);
+  });
+
+  btn.replaceWith(player);
+}
+
+// Activate a clicked/Enter-pressed play button: show the loading affordance,
+// then ensure hls.js is loaded before swapping in the player when the source
+// needs it.  The pane wires this from a root-scoped this.el listener.
+function activateMediaPlayButton(btn) {
+  btn.disabled = true;
+  const labelEl = btn.querySelector("span:last-child");
+  if (labelEl) {
+    labelEl.textContent = "Loading…";
+  } else {
+    btn.textContent = "▶ Loading…";
+  }
+
+  const hlsUrl = btn.dataset.hlsUrl;
+  const isAudio = btn.dataset.audioOnly === "true";
+
+  // If HLS URL present and not audio, ensure hls.js is loaded first
+  if (hlsUrl && !isAudio && _isHlsUrl(hlsUrl)) {
+    _loadHls(function () {
+      _activatePlayer(btn);
+    });
+  } else {
+    _activatePlayer(btn);
+  }
+}
+
+function buildMediaCard(item) {
+  const card = document.createElement("div");
+  card.className = "media-card";
+
+  // Thumbnail
+  const thumbUrl = item.thumbnail_url || item.image_url || "";
+  if (thumbUrl) {
+    const img = document.createElement("img");
+    img.className = "media-card-thumb";
+    img.loading = "lazy";
+    img.alt = item.title || item.name || "Media thumbnail";
+    img.onerror = function () {
+      this.style.display = "none";
+    };
+    img.src = thumbUrl;
+    card.appendChild(img);
+  }
+
+  // Info container
+  const info = document.createElement("div");
+  info.className = "media-card-info";
+
+  // Title (Year)
+  const title = document.createElement("div");
+  title.className = "media-card-title";
+  let titleText = item.title || item.name || "Untitled";
+  if (item.year || item.production_year) {
+    titleText += " (" + (item.year || item.production_year) + ")";
+  }
+  title.textContent = titleText;
+  info.appendChild(title);
+
+  // Metadata line: type, runtime, genres
+  const metaParts = [];
+  if (item.type || item.media_type) {
+    metaParts.push(item.type || item.media_type);
+  }
+  const runtime = _formatRuntime(item);
+  if (runtime) metaParts.push(runtime);
+  if (item.genres && item.genres.length) {
+    metaParts.push(item.genres.join(", "));
+  }
+  if (metaParts.length) {
+    const meta = document.createElement("div");
+    meta.className = "media-card-meta";
+    meta.textContent = metaParts.join(" \u00b7 ");
+    info.appendChild(meta);
+  }
+
+  card.appendChild(info);
+  return card;
+}
+
+function buildPlayButton(media) {
+  const btn = document.createElement("button");
+  btn.className = "media-play-btn";
+  btn.type = "button";
+  btn.dataset.streamUrl = media.stream_url || "";
+  btn.dataset.hlsUrl = media.hls_url || "";
+  btn.dataset.audioOnly =
+    media.audio_only === true ||
+    (media.container &&
+      /^(mp3|flac|ogg|aac|wma|wav|m4a|opus)$/i.test(media.container))
+      ? "true"
+      : "false";
+  btn.dataset.directStream =
+    media.supports_direct_play || media.supports_direct_stream
+      ? "true"
+      : "false";
+
+  btn.setAttribute(
+    "aria-label",
+    "Play " + (media.title || media.name || "media"),
+  );
+
+  const icon = document.createElement("span");
+  icon.textContent = "\u25b6";
+  btn.appendChild(icon);
+  const label = document.createElement("span");
+  label.textContent = "Play";
+  btn.appendChild(label);
+  return btn;
+}
+
+function buildMediaResultsList(results, totalCount) {
+  const container = document.createElement("div");
+  container.className = "media-results-list";
+
+  for (let i = 0; i < results.length; i++) {
+    const item = results[i];
+    const row = document.createElement("div");
+    row.className = "media-result-row";
+
+    // Small thumbnail
+    const thumbUrl = item.thumbnail_url || item.image_url || "";
+    if (thumbUrl) {
+      const img = document.createElement("img");
+      img.className = "media-result-thumb";
+      img.loading = "lazy";
+      img.alt = item.name || item.title || "Media thumbnail";
+      img.onerror = function () {
+        this.style.display = "none";
+      };
+      img.src = thumbUrl;
+      row.appendChild(img);
+    }
+
+    // Title (Year)
+    const titleSpan = document.createElement("span");
+    titleSpan.className = "media-result-title";
+    let titleText = item.name || item.title || "Untitled";
+    if (item.year || item.production_year) {
+      titleText += " (" + (item.year || item.production_year) + ")";
+    }
+    titleSpan.textContent = titleText;
+    row.appendChild(titleSpan);
+
+    // Metadata: type, runtime or season info
+    const metaParts = [];
+    if (item.type || item.media_type) {
+      metaParts.push(item.type || item.media_type);
+    }
+    const runtime = _formatRuntime(item);
+    if (runtime) metaParts.push(runtime);
+    if (item.season_name) metaParts.push(item.season_name);
+    if (
+      typeof item.index_number === "number" &&
+      typeof item.parent_index_number === "number"
+    ) {
+      metaParts.push(
+        "S" +
+          String(item.parent_index_number).padStart(2, "0") +
+          "E" +
+          String(item.index_number).padStart(2, "0"),
+      );
+    }
+    if (metaParts.length) {
+      const metaSpan = document.createElement("span");
+      metaSpan.className = "media-result-meta";
+      metaSpan.textContent = " \u00b7 " + metaParts.join(" \u00b7 ");
+      row.appendChild(metaSpan);
+    }
+
+    container.appendChild(row);
+  }
+
+  // "showing X of Y results" footer
+  if (typeof totalCount === "number" && totalCount > results.length) {
+    const count = document.createElement("div");
+    count.className = "media-results-count";
+    count.textContent =
+      "showing " + results.length + " of " + totalCount + " results";
+    container.appendChild(count);
+  }
+
+  return container;
+}
+
+// ---------------------------------------------------------------------------
+// Conversational rendering helpers — tool output, media embeds, MCP-error
+// cards.  Used only by the Pane.  The approval-card builders (rows, verdict,
+// warning, actions, status) were unified into the shared conversation.js
+// (steps 5e.1/5e.2); buildToolDiv + the wrappers below delegate to them so
+// both panes emit the SAME .conv-* card.  The .tool-output / media result
+// subsystem stays interactive-only (live stream / collapse / embeds).
+// ---------------------------------------------------------------------------
+
+// Converged approval-card head strip (kicker + summary).  Module-level so
+// both showInlineToolBlock and announceToolBlock (and replay) build the same
+// head as the coordinator's buildConvBatchShell, without a fresh shell element.
+function _convApprovalHead(kickerText, items) {
+  const head = document.createElement("div");
+  head.className = "conv-batch-head";
+  const k = document.createElement("span");
+  k.className = "conv-batch-kicker";
+  k.textContent = kickerText;
+  head.appendChild(k);
+  const first =
+    items[0] && (items[0].func_name || items[0].approval_label)
+      ? items[0].func_name || items[0].approval_label
+      : "tool";
+  const summary = document.createElement("span");
+  summary.className = "conv-batch-summary";
+  summary.textContent =
+    items.length >= 2 ? first + " + " + (items.length - 1) + " more" : first;
+  head.appendChild(summary);
+  head.appendChild(buildConvBatchDisclosure());
+  return head;
+}
+
+function buildToolDiv(item, indexLabel) {
+  // Tool row for the converged card: the shared call line (name + auto tag)
+  // plus the bash `$ cmd` / diff preview.  data-func-name is stamped for the
+  // append-time finders (buildConvRow already stamps data-call-id/-tool-name).
+  // indexLabel ("1/3") numbers parallel rows so the head's "+ N more" reads
+  // as a label, not hidden calls (mirrors the coordinator).
+  const row = buildConvRow(item, indexLabel ? { indexLabel } : {});
+  row.dataset.funcName = item.func_name || "";
+  row.appendChild(buildConvCmd(item));
+  return row;
+}
+
+// Synthesize the live `item` shape ({func_name, call_id, header}) from a stored
+// tool_call ({name, id, arguments}) so /history replay AND task-agent card
+// recall render the SAME .conv-row as the live path.  Header derivation mirrors
+// the live serialize: bash shows the command; other tools show `key: value`
+// lines, values clipped at 80 chars; unparseable args fall back to a raw clip.
+function synthToolItem(tc) {
+  tc = tc || {};
+  let header = "";
+  try {
+    const args = JSON.parse(tc.arguments);
+    if (tc.name === "bash") {
+      header = String(Object.values(args)[0] || "");
+    } else {
+      const parts = [];
+      const keys = Object.keys(args);
+      for (let k = 0; k < keys.length; k++) {
+        const val = args[keys[k]];
+        let valStr = val === null || val === undefined ? "null" : String(val);
+        if (valStr.length > 80) valStr = valStr.substring(0, 77) + "...";
+        parts.push(keys[k] + ": " + valStr);
+      }
+      header = parts.join("\n");
+    }
+  } catch (e) {
+    header = String(tc.arguments || "").substring(0, 100);
+  }
+  return { func_name: tc.name, call_id: tc.id || "", header };
+}
+
+// Append an "✗ error" pill to an approval block as a sibling of the
+// existing approved/denied/auto-approved pill, so the approval verdict
+// stays visible alongside the execution outcome. Idempotent — re-fires
+// (live + history rerender) do not stack badges.
+function appendToolErrorBadge(blockEl) {
+  if (!blockEl) return;
+  if (blockEl.querySelector(".conv-status--error")) return;
+  const errBadge = document.createElement("div");
+  errBadge.setAttribute("role", "status");
+  errBadge.className = "conv-status conv-status--error";
+  errBadge.textContent = "✗ error";
+  blockEl.appendChild(errBadge);
+}
+
+function makeCollapsible(el) {
+  el.classList.add("collapsed");
+  el.setAttribute("tabindex", "0");
+  el.setAttribute("role", "button");
+  el.setAttribute("aria-label", "Tool output (collapsed). Activate to expand.");
+  const handler = function () {
+    this.classList.remove("collapsed");
+    this.removeAttribute("tabindex");
+    this.removeAttribute("role");
+    this.removeAttribute("aria-label");
+  };
+  el.addEventListener("click", handler);
+  el.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      handler.call(this);
+    }
+  });
+}
+
+function tryParseMedia(text) {
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+  if (obj && typeof obj.stream_url === "string") return obj;
+  if (obj && obj.name && obj.type && obj.id) return obj;
+  if (obj && Array.isArray(obj.results) && obj.results.length > 0) return obj;
+  if (obj && Array.isArray(obj.sessions)) return obj;
+  return null;
+}
+
+function renderToolOutput(stripped, isError) {
+  const out = document.createElement("div");
+  out.className = "tool-output" + (isError ? " tool-output-error" : "");
+  if (!isError) {
+    const pretty = tryPrettyJson(stripped);
+    if (pretty) {
+      out.textContent = pretty;
+      return out;
+    }
+  }
+  out.textContent = redactCredentials(stripped);
+  return out;
+}
+
+// Shared recipe: render tool output and auto-collapse past 10 lines.  The one
+// source for the live appendToolOutput's plain-output path, the /history
+// tool-result replay, and the task-agent card recall — so the collapse
+// threshold can't drift between them.
+function renderCollapsibleOutput(stripped, isError) {
+  const out = renderToolOutput(stripped, isError);
+  if (out.textContent.split("\n").length > 10) makeCollapsible(out);
+  return out;
+}
+
+function buildMediaEmbed(media, rawJson) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "media-embed";
+
+  if (media.stream_url) {
+    const card = buildMediaCard(media);
+    card.querySelector(".media-card-info").appendChild(buildPlayButton(media));
+    wrapper.appendChild(card);
+  } else if (media.results) {
+    wrapper.appendChild(
+      buildMediaResultsList(media.results, media.total_count),
+    );
+  } else if (media.sessions) {
+    wrapper.appendChild(buildMediaResultsList(media.sessions, null));
+  } else if (media.name && media.type && media.id) {
+    wrapper.appendChild(buildMediaCard(media));
+  }
+
+  // Collapsed raw JSON for inspection (with redacted API keys)
+  const raw = document.createElement("div");
+  raw.className = "tool-output";
+  raw.textContent = tryPrettyJson(rawJson) || redactCredentials(rawJson);
+  makeCollapsible(raw);
+  wrapper.appendChild(raw);
+
+  return wrapper;
+}
+
+// tryParseMcpError / buildMcpErrorEmbed moved to the shared mcp_error.js
+// module (#725) so the coordinator pane renders the same consent /
+// forbidden / operator card — imported at the top of this file.
+
+// ---------------------------------------------------------------------------
+// createInteractivePane — the console L-shell factory.
+//
+// Mirrors createCoordinatorPane: it builds one embedded interactive Pane into a
+// pane-host root and returns the lifecycle controller the shell drives
+// (connect / deactivate / destroy / onLogin).  Transport is node-proxied — an
+// interactive session lives on a cluster node, so every request is prefixed
+// with /node/{nodeId} (the LOCALITY invariant).  No children/tasks affordance:
+// an interactive persona has no spawn tools (that sidebar is the coordinator's).
+// ---------------------------------------------------------------------------
+function createInteractivePane(root, wsId, opts) {
+  opts = opts || {};
+  if (!wsId) {
+    const missing = document.createElement("div");
+    missing.className = "msg error";
+    missing.textContent = "Missing ws_id.";
+    root.replaceChildren(missing);
+    return null;
+  }
+  // A console pane proxies a node-hosted session, so its transport base is
+  // /node/{id}; opts.base ("" by default) is the pass-through for a future
+  // local standalone mount.
+  const base = opts.nodeId
+    ? "/node/" + encodeURIComponent(opts.nodeId)
+    : opts.base || "";
+
+  let active = false;
+  let connected = false;
+  let recoverTimer = null;
+  // Terminal-failure tracking.  Native EventSource auto-reconnect (plus the 5s
+  // CLOSED-state recovery below) covers transient drops — but a session that is
+  // GONE from its node (closed/evicted, node restarted, re-homed) 404s every
+  // reconnect forever.  After 3 consecutive CLOSED checks the controller gives
+  // up: stream closed, timers dropped, status bar terminal, `opts.onDead()`
+  // fired ONCE so the shell can paint its reconnect affordance.  Recovery is
+  // the shell's revive path (re-resolve node + POST /open + rebuild) — never
+  // automatic, so a deliberately-closed session is not resurrected by a timer.
+  // A successful stream open resets the counter (host.onStreamOpen).
+  let dead = false;
+  let failCount = 0;
+
+  const giveUp = function () {
+    if (dead) return;
+    dead = true;
+    failCount = 0;
+    if (recoverTimer) {
+      clearTimeout(recoverTimer);
+      recoverTimer = null;
+    }
+    // Invalidate any in-flight history load: its .finally would otherwise
+    // reopen a stream for a session we just declared dead.
+    pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;
+    pane._historyRepair.clear();
+    // Same dead-not-inert rule destroy() applies (#900): the bump above
+    // already fails the retry's fire guard, but a pane whose session is
+    // gone must not hold a live timer — /history would 404 anyway, and a
+    // give-up is not always followed by a destroy (the shell can leave a
+    // dead-but-visible pane parked behind its reconnect banner).
+    if (pane._staleRetryTimer) {
+      clearTimeout(pane._staleRetryTimer);
+      pane._staleRetryTimer = null;
+    }
+    pane._reasoningActivity.finish();
+    pane.disconnectSSE();
+    // Detach the visibility handler and clear the hide-close marker: a dead
+    // controller must NOT be resurrected by a tab-visibility change.  Without
+    // this, a tab hidden BEFORE the give-up (which set _hiddenDisconnect) would,
+    // on return, fire _onVisibilityChange and connectSSE() the closed ws —
+    // reopening a stream the shell has declared gone and 404-reconnecting it
+    // forever (onStreamError early-returns when dead, so nothing stops it).
+    // Idempotent with destroy()'s own _removeVisibilityHandler call.
+    pane._removeVisibilityHandler();
+    // Terminal wording — the transient error path says "Reconnecting…".
+    pane.statusBarEl.classList.add("ws-sb-disconnected");
+    pane._sbTokens.textContent = "Disconnected";
+    if (typeof opts.onDead === "function") {
+      try {
+        opts.onDead();
+      } catch (e) {
+        console.error("interactive pane: onDead callback failed", e);
+      }
+    }
+  };
+
+  const host = {
+    // Only the visible tab steals focus — never yank the caret into a
+    // backgrounded pane mid background-replay.
+    isFocused() {
+      return active;
+    },
+    // Native EventSource auto-reconnect handles transient drops (connectSSE
+    // deliberately does not close the source on error).  Guard the terminal
+    // case: if the source is genuinely CLOSED after a beat, open a fresh
+    // same-ws stream.  No global ws-list refetch — a console pane owns one ws.
+    // Three consecutive CLOSED beats = the session is gone, not flaky: give up
+    // (a dead session would otherwise be 404-polled every 5s indefinitely).
+    onStreamError(pane) {
+      if (dead) return;
+      if (recoverTimer) clearTimeout(recoverTimer);
+      recoverTimer = setTimeout(() => {
+        recoverTimer = null;
+        if (document.hidden) {
+          // Don't reopen an EventSource into a hidden (throttled) tab —
+          // that re-creates the slow-consumer overflow close-on-hide
+          // exists to prevent.  Mark it so the visibilitychange show edge
+          // owns the reconnect (a hide close normally set this already;
+          // set it defensively for the error-before-hide ordering).
+          pane._hiddenDisconnect = true;
+          return;
+        }
+        if (
+          pane.evtSource &&
+          pane.evtSource.readyState !== EventSource.CLOSED
+        ) {
+          return; // native reconnect is still working the problem
+        }
+        failCount += 1;
+        if (failCount >= 3) giveUp();
+        else pane.connectSSE(pane.wsId);
+      }, 5000);
+    },
+    // Stream (re)opened — the session is reachable again; reset the give-up
+    // counter so unrelated future blips get a fresh allowance.
+    onStreamOpen() {
+      failCount = 0;
+    },
+    // The --skip-permissions banner lands in the pane's own slim header.
+    warningTarget(pane) {
+      return pane.messagesEl;
+    },
+    // MCP re-consent surfaces inline in the pane card; the STANDALONE additionally
+    // drives a Manage-row attention badge — bridged through the TS_APP seam so the
+    // shared factory stays deployment-agnostic (the console doesn't define the
+    // hook, so this stays a no-op there).
+    onConsentDetected(server) {
+      if (
+        window.TS_APP &&
+        typeof window.TS_APP.onConsentDetected === "function"
+      ) {
+        window.TS_APP.onConsentDetected(server);
+      }
+    },
+    // Preview descriptors open the shell's preview pane beside this one.
+    // Bridged through the TS_SHELL seam (mountShell defines it) with THIS
+    // pane's transport context attached, so the preview pane fetches blob
+    // content from the same workstream through the same node proxy the
+    // session streams from.
+    onPreview(descriptor) {
+      if (
+        window.TS_SHELL &&
+        typeof window.TS_SHELL.openPreview === "function"
+      ) {
+        window.TS_SHELL.openPreview(descriptor, { base: base, wsId: wsId });
+      }
+    },
+  };
+
+  const pane = new Pane(wsId, {
+    base,
+    host,
+    onClose: opts.onClose,
+  });
+  root.appendChild(pane.el);
+
+  return {
+    wsId: wsId,
+    pane: pane,
+    // The transport base this controller talks through ("" local, "/node/{id}"
+    // proxied) — the shell's tab-menu verbs aim at the SAME backend the pane
+    // streams from.
+    base: base,
+    // First activation opens the Tier-2 stream (REST history first, then live);
+    // re-activations just re-mark focus.  Idempotent — the shell calls it on
+    // every tab switch.
+    connect() {
+      active = true;
+      if (!connected) {
+        connected = true;
+        // Load-bearing pre-seed (#890): _refetchHistory's failure path
+        // no longer appends an empty-state, so a FAILED first paint
+        // shows this placeholder only because it is seeded here,
+        // before the fetch.  Removing it would leave a genuinely blank
+        // pane when the first /history fails.
+        pane.showEmptyState();
+        pane._loadHistoryThenConnect(wsId);
+      }
+    },
+    // Tab backgrounded — stop stealing focus, keep the stream live.
+    deactivate() {
+      active = false;
+    },
+    // Re-auth fan-out: reconnect the stream.  A dead controller stays dead —
+    // recovery is the shell's revive path (which may need a different node).
+    onLogin() {
+      if (connected && !dead) pane._loadHistoryThenConnect(wsId);
+    },
+    // Terminal-state surface for the shell: `isDead()` gates revive-vs-connect
+    // on activate/reopen; `markDead()` lets Tier-1 lifecycle (ws_closed) stop
+    // the retry loop NOW instead of after three failed beats.
+    isDead() {
+      return dead;
+    },
+    markDead: giveUp,
+    // Full teardown — close the stream + all timers/recording/tts, drop the
+    // recovery timer, detach the DOM.  A backgrounded pane must not leak an
+    // upstream node connection.
+    destroy() {
+      active = false;
+      connected = false;
+      if (recoverTimer) {
+        clearTimeout(recoverTimer);
+        recoverTimer = null;
+      }
+      // Invalidate any in-flight history load — the SAME bump giveUp()
+      // makes, and for the same reason (#900): the load token is the one
+      // chokepoint every post-await consumer already reads, so one write
+      // here closes all four escapes at once.  Without it destroy() was
+      // the WEAKER terminal path: (1) _loadHistoryThenConnect's .finally
+      // (token gate) reopened an EventSource on the detached pane AND
+      // re-registered the document-level visibilitychange listener
+      // _removeVisibilityHandler drops below — whose onerror then re-armed
+      // the host recover beat forever, since it gives up only on `dead`,
+      // which destroy never sets; (2) a settling _refetchHistory passed
+      // its supersession check and replayHistory'd into the detached DOM;
+      // (3) the clear_ui .then re-armed _staleRetryTimer AFTER the cancel
+      // below (its arm guard is latch + token, and destroy touched
+      // neither).  Every future terminal path must bump this too.
+      pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;
+      pane._historyRepair.clear();
+      // The clear_ui failure retry survives everything EXCEPT a token
+      // bump, so the bump above already renders a firing inert — but a
+      // timer into a destroyed pane must be DEAD, not merely inert (it
+      // pins the closure for its remaining delay), so cancel an
+      // already-armed one here.  Terminal-only: disconnectSSE must NOT
+      // cancel it — transport-only reconnects keep the pending heal
+      // intent.
+      if (pane._staleRetryTimer) {
+        clearTimeout(pane._staleRetryTimer);
+        pane._staleRetryTimer = null;
+      }
+      pane._reasoningActivity.finish();
+      pane.disconnectSSE();
+      // The document-level visibilitychange listener holds a strong ref
+      // to the pane — leaving it registered would both leak the pane and
+      // let a show edge reopen a stream for a destroyed controller.
+      pane._removeVisibilityHandler();
+      // Terminal cleanup that transport-only reconnects must NOT do (see
+      // disconnectSSE): cancel orphan grace timers so a post-destroy escape
+      // can't paint into the detached pane / shared announcer, release the
+      // card maps, and stop observing the detached scroller.
+      pane._clearAgentTracking();
+      pane._replayQueue = null;
+      pane._scrollFollow.destroy();
+      if (pane._unregisterTranscriptScroller) {
+        pane._unregisterTranscriptScroller();
+        pane._unregisterTranscriptScroller = null;
+      }
+      if (pane.el && pane.el.parentNode) {
+        pane.el.parentNode.removeChild(pane.el);
+      }
+    },
+  };
+}
+
+// --- Shared-module exports -------------------------------------------------
+// ES module: the shell (shared_static/shell.js) imports the factory directly in
+// BOTH deployments (console + standalone), so there is no window bridge — step 6
+// retired the classic standalone app.js path that read window.InteractivePane.
+export { Pane as InteractivePane, createInteractivePane };

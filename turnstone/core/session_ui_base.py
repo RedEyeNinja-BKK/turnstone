@@ -1,0 +1,4751 @@
+"""Shared scaffolding for :class:`SessionUI` implementations.
+
+Both :class:`turnstone.server.WebUI` (interactive node UI) and
+:class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI` wrap a
+:class:`~turnstone.core.session.ChatSession` and fan events out over
+SSE to one or more connected browser tabs. They also block the worker
+thread on a pending-input gate (tool approval) that HTTP handlers
+resolve.
+
+That skeleton — plus per-workstream metrics tracking, intent-verdict
+bookkeeping, output-warning persistence, and the canonical
+``on_status`` / ``on_content_token`` / activity-tracking bodies —
+lives here. Subclasses add only kind-specific broadcast
+(``_broadcast_state`` / ``_broadcast_activity`` override hooks) and
+any node-level metrics adapters (``_metrics.record_*`` calls stay on
+``WebUI`` since they feed the node's prometheus endpoint).
+
+This module intentionally does not satisfy
+:class:`turnstone.core.session.SessionUI` by itself — ``on_state_change``
+and ``on_rename`` still require subclass implementation, since their
+storage/transport routing is kind-specific.
+"""
+
+from __future__ import annotations
+
+import collections
+import contextlib
+import contextvars
+import copy
+import functools
+import json
+import math
+import os
+import queue
+import threading
+import time
+import uuid
+import weakref
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+from turnstone.core.log import get_logger
+from turnstone.core.workstream import session_persistence_state
+
+log = get_logger(__name__)
+
+# Matches WebUI's historical listener queue size and the coordinator
+# UI's ``_LISTENER_QUEUE_MAX``. Per-queue cap keeps a slow SSE consumer
+# from bloating memory.  Headroom only — the load fix for fast models
+# is emit-time token batching (below), and the recovery for a consumer
+# that still can't keep up is the poison-at-first-overflow close in
+# :class:`_ListenerQueue` + the events handler's reconnect replay.
+_DEFAULT_LISTENER_QUEUE_MAX = 500
+
+# Emit-time micro-batching of content/reasoning fragments.  At
+# local-inference rates (500-2000 tok/s) per-delta ``_enqueue`` calls
+# were the event load that overflowed listener queues; coalescing
+# fragments over a small window cuts the wire event rate 10-20x while
+# staying invisible at human reading speed (tokens already arrive
+# faster than a display frame).  A batch is assembled BEFORE
+# ``_enqueue`` and gets one fresh ``_event_id``, so it never violates
+# the no-in-ring-coalescing rule (see ``_resolve_event_buffer_max``):
+# no consumer's ``last_event_id`` can fall inside a batch.
+# ``tool_output_chunk`` shares this cadence (same two constants) via
+# the per-call_id batcher (``_PendingChunkBatch`` below) — line-chatty
+# tools under the 4-wide pool were the OTHER storm source, one event
+# per stdout line, and each line's ``_enqueue`` also force-flushed the
+# pending token batch (the amplifier).
+#
+# The window is measured from the LAST flush, checked on token
+# arrival (no timer thread): the first fragment after ≥window of
+# quiet flushes immediately (time-to-first-token protection at turn
+# starts and after tool pauses), a sustained stream flushes every
+# ~window, and a slow stream (fragments arriving further apart than
+# the window) degenerates to per-token flushes — batching
+# self-disables.  The size cap bounds worst-case batch size (client
+# repaint cost) independent of rate.  Both are read at call time so
+# tests can pin cadence-sensitive behaviour deterministically.
+_TOKEN_BATCH_WINDOW_SECS = 0.025
+_TOKEN_BATCH_MAX_CHARS = 4096
+
+
+class _PendingChunkBatch:
+    """One tool call's pending ``tool_output_chunk`` accumulator.
+
+    ``tool_output_chunk`` shares the token batcher's cadence (window +
+    size cap, same constants) but is keyed PER call_id — up to four
+    concurrent tools stream lines at once and their batches must not
+    interleave text.  ``last_flush`` lives on the entry (not a UI-level
+    scalar like ``_last_token_flush``) so each call's stream keeps its
+    own window clock; it starts at 0.0 so a call's FIRST line flushes
+    immediately (time-to-first-output protection, mirroring tokens).
+    The entry survives window flushes (the clock must persist) and is
+    removed at the call's terminal flush or turn teardown.
+    """
+
+    __slots__ = ("fragments", "last_flush", "size")
+
+    def __init__(self) -> None:
+        self.fragments: list[str] = []
+        self.size: int = 0
+        self.last_flush: float = 0.0
+
+
+class _ListenerOverflow(queue.Full):
+    """Raised by :meth:`_ListenerQueue.put_nowait` exactly once per queue —
+    at the rejected put that latches ``poisoned``.  A ``queue.Full``
+    subclass so any caller that suppresses ``Full`` keeps working; the
+    fan-out in ``_enqueue_direct`` catches this subclass first to log the
+    overflow transition exactly once without racy flag bookkeeping."""
+
+
+class _ListenerQueue(queue.Queue[dict[str, Any]]):
+    """Per-SSE-listener queue that poisons itself at the FIRST rejected put.
+
+    A silently-dropped event is unrecoverable: once the consumer keeps
+    draining past a drop, its ``Last-Event-ID`` advances beyond the hole
+    and the reconnect replay (``eid > last_event_id``) never revisits it —
+    scattered interleaved drops under saturation corrupt the pane
+    permanently.  Poisoning at the first full instead freezes the queue's
+    contents as a contiguous prefix: the drain loop closes the stream, the
+    client reconnects with the last id it processed, and the ring buffer
+    replays the whole gap (the rejected event included — the ring append
+    precedes the per-listener put).
+
+    The latch and the rejection are one atomic step under the queue's own
+    ``mutex`` — the same lock every ``put_nowait``/``get`` uses — and a
+    poisoned queue refuses every later put.  Without that atomicity a
+    concurrent producer could land a later event in a slot the consumer
+    freed mid-latch, leaving an interior hole BEHIND the delivered
+    high-water mark (exactly the unrecoverable shape poisoning exists to
+    prevent).
+
+    Reimplements ``put_nowait`` against the documented ``queue.Queue``
+    extension surface (``mutex`` / ``_qsize`` / ``_put`` /
+    ``unfinished_tasks`` / ``not_empty``) because the stdlib body offers
+    no hook between the full-check and the insert;
+    ``test_listener_queue_basic_put_get_semantics`` canaries stdlib drift.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize)
+        # Latched under ``self.mutex``; read locklessly by the events
+        # handler's drain loop (a stale read just delays the close by
+        # one iteration) and by ``_enqueue_direct``'s fan-out snapshot.
+        self.poisoned = False
+        # Set at ws teardown by ``_broadcast_ws_closed_to_listeners``.
+        # The drain loop consults this INSIDE its ``poisoned`` branch: a
+        # queue that is both poisoned AND closing unwinds as a CLEAN close
+        # rather than emitting a false ``stream_overflow`` frame + client
+        # reconnect.  (A healthy closing queue needs no flag — it drains
+        # its tail FIFO to the in-band ``ws_closed`` sentinel.)  The flag
+        # has to travel out-of-band because a poisoned/full queue rejects
+        # that sentinel — the exact case the eviction-safe retry in
+        # ``_broadcast_ws_closed_to_listeners`` targets.
+        self.closing = False
+
+    def put_nowait(self, item: dict[str, Any]) -> None:
+        with self.mutex:
+            if self.poisoned:
+                raise queue.Full
+            if 0 < self.maxsize <= self._qsize():
+                self.poisoned = True
+                raise _ListenerOverflow
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def mark_closing(self) -> None:
+        """Flag this listener's stream for a clean close at ws teardown.
+
+        Out-of-band (a bare bool set under ``self.mutex``) because a
+        poisoned/full queue rejects the in-band ``ws_closed`` sentinel,
+        yet the drain loop must still unwind as a clean close rather than
+        emit a spurious overflow frame.  Idempotent."""
+        with self.mutex:
+            self.closing = True
+
+
+# Recall: how many finished task agents' projected sub-trajectories to retain
+# in memory for /history card rebuilds.  LRU-bounded so a marathon workstream
+# can't grow it without limit; eviction (and a cold reopen, which starts empty)
+# recalls honestly as "not retained" rather than a fabricated 0-step card.
+_AGENT_TRAJECTORY_CAP = 256
+
+# How many resolved-cycle decisions to remember (call_id → decision) so a
+# late LLM verdict — the run-to-completion judge can deliver seconds after
+# its gate resolved — still lands with the decision the operator actually
+# took.  Bounded because call_ids of resolved cycles accrue forever on a
+# long-running workstream.  Invariant for the cap: it must exceed the
+# number of call_ids the session can resolve inside one judge-deadline
+# window (the daemon's delivery bound), or an eviction could orphan a
+# still-in-flight verdict as forever-"pending" in the audit table.  A
+# smart-approvals storm across parallel task agents resolves tens of
+# calls per second at the extreme; 1024 covers minutes of that, and the
+# entries are (str, (str, Event)) — negligible memory.
+_RECENT_DECISION_CAP = 1024
+
+
+@dataclass(frozen=True)
+class _SmartApprovalConfig:
+    """One gate's coherent Smart Approval settings snapshot."""
+
+    enabled: bool
+    threshold: float
+    wait_seconds: float
+
+
+class CrossPrincipalApprovalError(ValueError):
+    """A peer attempted a resolver action reserved for the executor."""
+
+
+def _execution_principal_for_items(items: list[dict[str, Any]]) -> str:
+    """Return the one immutable execution principal carried by a tool batch."""
+    principals = {
+        principal for item in items if (principal := str(item.get("_principal_id") or "").strip())
+    }
+    if len(principals) > 1:
+        raise ValueError("approval batch contains multiple execution principals")
+    return next(iter(principals), "")
+
+
+class ApprovalCycle:
+    """One in-flight human-approval round on a workstream.
+
+    The approval gate used to be a per-UI singleton — one pending card,
+    one ``threading.Event``, one result slot.  Parallel task agents
+    broke that: each sub-agent thread runs its own gate, so several
+    rounds are now live at once and each needs its own wait/result/
+    verdict bookkeeping.  ``approve_tools`` registers one of these per
+    human-gated batch in ``_approval_cycles`` (insertion-ordered =
+    oldest-first); HTTP resolvers route a decision to exactly one cycle
+    by ``cycle_id`` / member ``call_id`` (or the oldest, for legacy
+    selector-less clients).
+
+    Lifecycle: created + registered by the gate thread, resolved
+    exactly once by :meth:`SessionUIBase.resolve_approval` (double
+    resolution is a guarded no-op), unregistered by the gate thread
+    after its wait returns.  ``event``/``result`` are per-cycle so one
+    decision can never leak onto a concurrent sibling round — the
+    cross-approval hazard the singleton design had.
+    """
+
+    __slots__ = (
+        "call_ids",
+        "card",
+        "cancel_witnesses",
+        "cycle_id",
+        "decision",
+        "event",
+        "execution_principal_id",
+        "items",
+        "judge_event",
+        "pending_verdicts",
+        "publication_done",
+        "resolved",
+        "resolver_principal_id",
+        "result",
+    )
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        card: dict[str, Any],
+        judge_event: threading.Event | None,
+    ) -> None:
+        self.cycle_id: str = card.get("cycle_id", "") or uuid.uuid4().hex
+        self.items = items
+        self.card = card
+        self.call_ids: set[str] = {it.get("call_id", "") for it in items if it.get("call_id")}
+        self.execution_principal_id = _execution_principal_for_items(items)
+        self.resolver_principal_id = ""
+        # The judge generation that evaluated this batch — identity-
+        # compared against the delivering daemon's cancel event so a
+        # stale generation (a prior turn's run-to-completion daemon
+        # whose provider reused call_ids) can never satisfy THIS
+        # cycle's Smart-Approvals wait or park verdicts on it.
+        self.judge_event: threading.Event | None = judge_event
+        self.event = threading.Event()
+        # Resolution waits for this one-shot latch before emitting.  The gate
+        # sets it after the complete prompt bundle (local event, cross-stream
+        # event, cached-verdict replay), or after deciding cancellation means
+        # no prompt should exist.  A latch rather than a mutex keeps transport
+        # callbacks and verdict persistence outside lifecycle locks.
+        self.publication_done = threading.Event()
+        # Operation-local, monotonic cancellation witnesses.  A workstream
+        # sweep resolves only cycles owned by the cancelled operation; a
+        # force-successor that registers between ``session.cancel()`` and the
+        # later UI sweep therefore remains live.  Direct/legacy cycles carry
+        # no witness and retain the established resolve-all behavior.
+        self.cancel_witnesses = tuple(
+            witness
+            for item in items
+            if (witness := item.get("_approval_cancel_witness")) is not None
+        )
+        self.result: tuple[bool, str | None] = (False, None)
+        self.resolved = False
+        self.decision = ""
+        # LLM verdicts that fired during this round, awaiting the
+        # operator's decision stamp (was the UI-global
+        # ``_pending_verdicts`` list).
+        self.pending_verdicts: list[dict[str, Any]] = []
+
+
+# Sub-agent scope, PER-THREAD.  A task agent's progress chatter reaches the UI as
+# ``on_info`` lines ("[task done] N chars", a tool's "fetched N chars") that
+# carry no call_id — they can't nest under the task card and would escape to the
+# top level, so the web pane drops them while a sub-agent runs.  A contextvar,
+# not a session-global counter, so the suppression follows the sub-agent's OWN
+# thread: a parallel sibling tool running in another pool thread keeps its info
+# lines.  Incremented/decremented by begin_/end_agent_scope around each
+# ``_run_agent``; the CLI overrides ``on_info`` and is unaffected (no card → the
+# lines are its only signal).
+_agent_scope_var: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "turnstone_agent_scope_depth", default=0
+)
+
+
+def _resolve_event_buffer_max() -> int:
+    """Read ``TURNSTONE_SSE_EVENT_BUFFER_MAX`` env override at import time.
+
+    Default 50000 events.  Two pressures push the cap larger than a
+    casual reading of "how many events does an SSE stream see":
+
+    1. Local-inference deployments stream at 500–2000 tok/s per
+       active model.  Emit-time batching (``_TOKEN_BATCH_*``)
+       coalesces those into ~40 events/sec of content, so the cap
+       now buys the ring MINUTES of coverage at any token rate —
+       but tool-chunk storms and multi-listener turns still burst,
+       and the cap is deliberately sized for the pre-batching worst
+       case as safety margin.
+    2. Browsers throttle the SSE-drain microtask aggressively when
+       the tab isn't visible (Chrome's background-tab budget drops
+       to ~1 wake/min after ~5 min hidden).  The client closes its
+       EventSource on tab-hide and reconnects with the saved
+       ``Last-Event-ID`` on show (interactive.js ``visibilitychange``
+       handler), so the ring's job is covering that hide window;
+       a consumer that stays slow while visible is handled by the
+       listener-queue poison → reconnect-replay path instead.  If
+       the buffer evicted in the interim, the snapshot floor is all
+       that's left.
+
+    Why not coalesce consecutive content/reasoning tokens IN THE
+    RING?  A naive in-buffer text-merge breaks the replay-slice
+    semantic: a coalesced entry has the latest ``_event_id`` but
+    text that includes content the client already received under an
+    earlier id, so any consumer with ``last_event_id`` falling
+    INSIDE the coalesced span would double-render.  A correctness-
+    preserving coalesce would need a per-consumer high-water tracker
+    we deliberately don't maintain (consumers register and
+    disconnect independently).  Bigger cap + simple per-event
+    storage avoids the trap.  (Emit-time batching is different in
+    kind: it merges fragments BEFORE they get an id, so a batch is
+    one ordinary ring entry no cursor can fall inside.)
+
+    Memory cost is ~200–500 bytes per event (deque node + dict
+    overhead + payload), so 50000 × 100-ws design ceiling caps at
+    roughly 2.5 GB worst-case — and practically never anywhere
+    close because the cap is the per-ws ceiling, not per-ws steady-
+    state.  Operators on heavier workloads can raise via
+    ``TURNSTONE_SSE_EVENT_BUFFER_MAX``; below-cap reconnects always
+    hit the replay path, above-cap reconnects fall back to the
+    snapshot recovery floor with an explicit ``replay_truncated``
+    envelope.
+    """
+    raw = os.environ.get("TURNSTONE_SSE_EVENT_BUFFER_MAX", "").strip()
+    default = 50000
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return n if n > 0 else default
+
+
+# Per-ws ring buffer for ``Last-Event-ID`` SSE replay.  Holds the most
+# recent events keyed by monotonic ``_event_id``; deque ``maxlen`` evicts
+# oldest automatically.  See :func:`_resolve_event_buffer_max` for the
+# sizing rationale (why 50000 and not 2000; why no in-buffer coalescing).
+_EVENT_BUFFER_MAX = _resolve_event_buffer_max()
+
+
+# Cap on the assistant content / reasoning accumulators. Used by two
+# independent buffer pairs:
+#  - ``_ws_turn_content`` (multi-turn, drained at idle/error) — the
+#    IDLE-piggyback payload the cluster collector / dashboard renders
+#    without round-tripping storage.
+#  - ``_ws_inflight_content`` / ``_ws_inflight_reasoning`` (per-turn,
+#    drained at :meth:`on_turn_start`) — the SSE refresh-resume
+#    snapshot a reconnecting client sees for the in-progress turn.
+# 512 KiB gives headroom for current commercial models; bump if a
+# single turn legitimately exceeds it.
+_MAX_TURN_CONTENT_CHARS = 512 * 1024
+
+
+def fire_judge_verdict_metric(
+    metrics: Any,
+    verdict: dict[str, Any],
+    default_tier: str,
+) -> None:
+    """Fire ``record_judge_verdict`` on the given Prometheus collector.
+
+    Both :class:`turnstone.server.WebUI` (per-node ``MetricsCollector``)
+    and :class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`
+    (console-side :class:`ConsoleMetrics`) route their hook overrides
+    through this helper. Pins the ``(tier, risk_level, latency_ms)``
+    extraction shape so a future signature change to
+    ``record_judge_verdict`` lands in one place instead of four.
+
+    ``default_tier`` is the call-site label (``"heuristic"`` or
+    ``"llm"``) used only when the verdict dict doesn't already carry
+    a ``tier`` key — both real producers always set it, but the
+    fallback keeps a malformed verdict on the right histogram bucket.
+    """
+    metrics.record_judge_verdict(
+        verdict.get("tier", default_tier),
+        verdict.get("risk_level", "medium"),
+        verdict.get("latency_ms", 0),
+    )
+
+
+class AutoApproveReason:
+    """Source vocabulary for ``auto_approve_reason`` annotations.
+
+    Pinned as constants so writers can't typo a reason silently and
+    desync the wire from the JS pill renderer.  Kept on a class
+    rather than an Enum so the wire-format string IS the value (no
+    ``.value`` dance at every emit site, and no surprise behaviour
+    if a consumer compares against the literal).
+
+    The six reasons reflect the disjoint set of paths that bypass
+    the operator approval gate:
+
+    - :attr:`SKILL` — workstream's skill template populated
+      ``auto_approve_tools`` from its ``allowed_tools`` JSON list at
+      create time.  The dashboard pill flags this so an operator
+      can see when a child is silently auto-approving because of a
+      previously-installed skill they may have forgotten about.
+    - :attr:`ALWAYS` — operator clicked "Approve + Always" on a
+      tool earlier in this session, adding its name to that execution
+      principal's runtime grant set.
+    - :attr:`POLICY` — admin-defined ``tool_policies`` row with
+      ``action='allow'`` matched the tool name (or pattern).
+    - :attr:`BLANKET` — workstream-level ``auto_approve=True`` flag
+      (server config / skill ``auto_approve``).  Drains every
+      remaining pending tool unconditionally except for
+      ``__budget_override__`` which always prompts.
+    - :attr:`AUTO_APPROVE_TOOLS` — fallback when ``auto_approve_tools``
+      contains a name but the per-tool source map was never
+      populated (legacy / pre-source-tracking instances).  Visible
+      as a generic pill rather than a misleading ``skill`` /
+      ``always`` claim.
+    - :attr:`SMART_APPROVAL` — Smart Approvals (``judge.smart_approvals``)
+      auto-approved the call because the intent judge's LLM verdict
+      recommended ``approve`` with confidence at or above
+      ``judge.confidence_threshold``.  Distinct pill so an operator
+      can see the judge — not a policy or a prior "Always" click —
+      cleared this call.
+    """
+
+    SKILL = "skill"
+    ALWAYS = "always"
+    POLICY = "policy"
+    BLANKET = "blanket"
+    AUTO_APPROVE_TOOLS = "auto_approve_tools"
+    SMART_APPROVAL = "smart_approval"
+
+    ALL: frozenset[str] = frozenset(
+        {SKILL, ALWAYS, POLICY, BLANKET, AUTO_APPROVE_TOOLS, SMART_APPROVAL}
+    )
+
+
+class SessionUIBase:
+    """SSE listener fan-out + approval event machinery.
+
+    Thread-safety: the ChatSession worker thread calls the ``on_*``
+    methods (and the approval blocking helpers that live on
+    subclasses); HTTP handlers drive ``_register_listener`` /
+    ``_unregister_listener`` / ``resolve_approval`` from the event
+    loop. All shared state is guarded by ``_listeners_lock`` /
+    ``_ws_lock`` or ``threading.Event`` primitives.
+
+    Three ``on_*`` methods are additionally safe to call from a
+    *concurrent* auxiliary thread (e.g. background title generation in
+    ``ChatSession._generate_title``, or ``task_agent`` sub-agents), even
+    while the worker thread is mid-stream: :meth:`on_aux_usage` (a
+    storage ``usage_event`` write + thread-safe metric counters — it
+    touches none of the ``_ws_lock``-guarded inflight state
+    :meth:`on_status`/token writers mutate) and :meth:`on_rename` (a
+    queue / locked fan-out), plus :meth:`on_agent_context` (its own
+    snapshot lock followed by the same locked fan-out). Keep those three free of unguarded
+    ``_ws_*`` writes so the auxiliary-thread guarantee holds.
+    """
+
+    def __init__(self, ws_id: str = "", user_id: str = "") -> None:
+        self.ws_id = ws_id
+        self._user_id = user_id
+        # The session this UI projects, bound by ChatSession.__init__.  Weak:
+        # SSE generators can outlive retirement holding the UI, and a strong
+        # back-reference would pin the whole retired session behind them.
+        # Self-derivation exists so persistence reporting never resolves the
+        # session through a registry by id — that lookup fails open to
+        # "healthy" (or to a replacement after id reuse) exactly while
+        # tombstone retention or retirement has the row out of the map.
+        self._session_ref: weakref.ref[Any] | None = None
+        # Acting user of the current/last turn (the ``bind_acting_user``
+        # initiator, owner fallback) — pushed by ``ChatSession._emit_state``
+        # so web clients can gate cross-user sends on a shared workstream
+        # (disable send when busy AND this id != the viewer's own). Carries the
+        # owner id even on a single-user authenticated session (the gate just
+        # no-ops there — it equals the viewer); empty only on unauthenticated
+        # lanes or before the session has emitted any state.
+        self._acting_user_id: str = ""
+        # SSE listener fan-out — one queue per connected browser tab.
+        self._listeners: list[queue.Queue[dict[str, Any]]] = []
+        self._listeners_lock = threading.Lock()
+        # Terminal registration fence, guarded by ``_listeners_lock``.
+        # Teardown sets this before snapshotting/clearing the current queues;
+        # a stale events request that already holds the Workstream reference
+        # but reaches registration afterward receives an internal ws_closed
+        # sentinel on a non-retained queue instead of blocking forever.
+        self._listeners_terminal = False
+        # Per-ws event ring buffer for ``Last-Event-ID`` SSE replay.
+        # Holds ``(event_id, event_dict)`` tuples; deque ``maxlen``
+        # evicts the oldest automatically when the cap is hit.  The
+        # listener fan-out path stamps every event with a monotonic
+        # ``_event_id`` (see :meth:`_enqueue`) and appends here under
+        # the same ``_listeners_lock`` that gates the per-listener
+        # queues — keeps the buffer and the live fan-out in lockstep.
+        # A reconnecting client with a ``Last-Event-ID`` header (or
+        # ``?last_event_id=N`` query-param fallback for manual reconnect
+        # paths that can't set custom headers) is served the slice of
+        # the buffer past that id; clients whose ``Last-Event-ID``
+        # predates the buffer's earliest retained id get a
+        # ``replay_truncated`` envelope plus the in-progress snapshot
+        # as the recovery floor.  Guarded by ``_listeners_lock`` (NOT
+        # ``_ws_lock``) so a writer holding ``_ws_lock`` for the
+        # inflight-buffer append doesn't serialize the buffer write
+        # against unrelated readers.
+        self._event_buffer: collections.deque[tuple[int, dict[str, Any]]] = collections.deque(
+            maxlen=_EVENT_BUFFER_MAX
+        )
+        # Monotonic per-ws event counter.  Stamps every fan-out event
+        # (every ``_enqueue`` call) and also drives the existing
+        # ``_seq`` snapshot-dedup tag on token events (``content`` /
+        # ``reasoning``) — one counter, two consumers.  Renamed from
+        # the pre-replay ``_ws_inflight_seq`` because the counter now
+        # spans every event, not just the inflight token stream.
+        # Guarded by ``_listeners_lock`` (incremented under that lock
+        # in :meth:`_enqueue`); the snapshot helper for the in-progress
+        # replay path captures it under ``_listeners_lock`` too.
+        self._event_id: int = 0
+        # Sub-agent step tagging: child tool call_id -> parent task_agent
+        # call_id.  ``_enqueue`` reads it to stamp ``parent_call_id`` on every
+        # child event (tool_pending / approve_request / tool_result /
+        # tool_output_chunk / output_warning) so the UI can nest a task agent's
+        # steps under its card.  Written by ``note_agent_child`` /
+        # ``clear_agent_children`` (the session brackets each ``_run_agent``);
+        # keyed on the immutable call_id so it stays correct under the parent's
+        # 4-wide parallel tool pool (several task agents in flight at once).  Its
+        # own lock so the hot fan-out path never serializes on ``_listeners_lock``.
+        self._agent_children: dict[str, str] = {}
+        self._agent_children_lock = threading.Lock()
+        # Latest normalized prompt usage for each RUNNING task-agent parent.
+        # This is an in-memory reconnect snapshot only: the parent result clears
+        # it, and completed readings are deliberately not durable history.  A
+        # separate lock avoids inverting ``_agent_children_lock`` against the
+        # listener fan-out path. Values retain their owner generation so a
+        # force-abandoned predecessor cannot overwrite or clear its successor
+        # when a provider reuses the public parent call id, and so force-abandon
+        # can purge every reading owned by the retired generation at once.
+        self._agent_contexts: dict[str, tuple[int, dict[str, Any]]] = {}
+        # Latest in-flight compaction lifecycle event for each running task
+        # agent. Stored beside context usage because both are transient,
+        # parent-keyed reconnect state and share the same generation cleanup.
+        # Value: (owner generation, compaction id, event payload).
+        self._agent_compactions: dict[str, tuple[int, int, dict[str, Any]]] = {}
+        self._agent_contexts_lock = threading.Lock()
+        # Recall store: a finished task agent's projected sub-trajectory (step
+        # items: id/name/arguments/output/is_error), keyed by its (parent)
+        # call_id, so /history can rebuild the collapsible card after a fresh
+        # connect / reopen while the workstream is still in memory.  LRU-bounded
+        # (oldest evicted past the cap); IN-MEMORY ONLY — durable persistence is
+        # deferred, so a cold reopen (new session) finds it empty and renders the
+        # flat parent record.  Guarded by ``_agent_children_lock`` (same low-rate
+        # agent-state path).  [[HYPOTHESIS]] the sub-trajectory is the ledger;
+        # an absent one is unknown ("not retained"), never none ("0 steps").
+        self._agent_trajectories: collections.OrderedDict[str, list[dict[str, Any]]] = (
+            collections.OrderedDict()
+        )
+        # (Sub-agent ``on_info`` suppression is per-thread via the module-level
+        # ``_agent_scope_var`` contextvar — no instance field.)
+        # Approval blocking — each gate thread (main loop, or a parallel
+        # task-agent thread) registers an :class:`ApprovalCycle` here and
+        # waits on the CYCLE's own event; the /approve endpoint routes a
+        # decision to exactly one cycle via resolve_approval.  Insertion-
+        # ordered (dict) = oldest-first, which is the resolution order for
+        # legacy selector-less approvals.  Guarded by ``_ws_lock``.
+        self._approval_cycles: dict[str, ApprovalCycle] = {}
+        # Legacy single-slot view of the OLDEST live cycle's card — many
+        # read-only consumers (cancel gating, dashboard booleans, history
+        # ``awaiting_approval``) only need "is something pending"; they
+        # keep working unchanged against this view.  Maintained under
+        # ``_ws_lock`` by ``_refresh_pending_approval_view`` on every
+        # register/unregister.  Multi-cycle-aware surfaces (SSE replay,
+        # dashboard detail, approve routing) use ``_approval_cycles``.
+        self._pending_approval: dict[str, Any] | None = None
+        self.auto_approve = False
+        self.auto_approve_tools: set[str] = set()
+        # Runtime "Approve + Always" grants are scoped to the immutable
+        # execution principal, not the shared session. Configured/template
+        # grants remain in ``auto_approve_tools`` as workstream policy.
+        self._always_approve_tools_by_principal: dict[str, set[str]] = {}
+        # Smart Approvals (``judge.smart_approvals``): when enabled, a
+        # tool call whose LLM intent verdict recommends ``approve`` with
+        # confidence ≥ ``smart_approval_threshold`` is auto-approved
+        # without an operator prompt.  ChatSession stamps one immutable
+        # three-field snapshot on each prepared gate batch so a hot reload
+        # takes effect on the next batch without parallel gates tearing the
+        # values.  These instance defaults remain the legacy/direct-call
+        # fallback for UIs invoked outside ChatSession (eval, fixtures).
+        self.smart_approvals_enabled = False
+        self.smart_approval_threshold = 0.95
+        # How long ``approve_tools`` waits for the async LLM verdict
+        # before falling back to a human prompt (fail-closed).  Bounded
+        # by the judge timeout; the wait returns early the moment every
+        # pending call has a verdict.
+        self.smart_approval_wait_seconds = 0.0
+        # Per-tool source for configured ``auto_approve_tools`` membership.
+        # A skill template's ``allowed_tools`` JSON list lands here through
+        # ``server.py``; the operator may not have opted in tool-by-tool.
+        # Runtime user "Approve + Always" grants live separately in
+        # ``_always_approve_tools_by_principal`` and are always tagged with
+        # ``AutoApproveReason.ALWAYS``. This map is populated at the same point
+        # as the configured set; missing entries retain the legacy generic
+        # ``auto_approve_tools`` reason.
+        self._auto_approve_tools_source: dict[str, str] = {}
+        # Ring buffer of recent auto-approve events for /dashboard
+        # visibility — a child workstream whose tool calls bypass the
+        # approval gate (skill allowlist / blanket / admin policy)
+        # would otherwise leave no operator-facing trace at all.  Fed
+        # by :meth:`_record_auto_approves`; surfaced through
+        # :meth:`serialize_recent_auto_approvals` and the per-ws
+        # ``/dashboard`` payload.  Capped so a long-running skill
+        # workstream can't fill the live block with stale rows.
+        self._recent_auto_approvals: list[dict[str, Any]] = []
+        # Maps ``call_id`` → ``(auto_approve_reason, inserted_ts)`` for
+        # verdicts that arrive AFTER ``approve_tools`` already returned.
+        # The LLM judge tier is asynchronous: ``on_intent_verdict`` can
+        # fire seconds later for a tool that ``approve_tools``
+        # short-circuited via one of the auto-approve branches.  Without
+        # this lookup the late-arriving LLM verdict lands with
+        # ``user_decision="pending"`` and stays that way forever (no
+        # ``resolve_approval`` cycle on the auto-approve path).
+        #
+        # Lifetime is bounded by ``_AUTO_APPROVE_REASON_TTL`` rather
+        # than by a count-cap or by session lifetime: a fixed cap
+        # would silently break the fix on the (N+1)th in-flight
+        # auto-approve; "evict on consume" alone would leak entries
+        # whenever the LLM judge is disabled (no ``on_intent_verdict``
+        # ever fires to drain them).  TTL means entries clear lazily
+        # on the next ``_record_auto_approves`` write whether or not
+        # the LLM judge tier is active.  Guarded by ``_ws_lock``.
+        self._auto_approve_reasons: dict[str, tuple[str, float]] = {}
+        # Foreground gate — used by the CLI's WorkstreamTerminalUI to
+        # block output when the workstream is in the background.
+        # Starts set so non-CLI UIs can skip any explicit management.
+        # Also read by cleanup_session_ui so close() can unblock any
+        # waiter.
+        self._fg_event = threading.Event()
+        self._fg_event.set()
+        # Per-workstream metrics + verdict bookkeeping. Written by the
+        # worker thread (on_tool_result / on_status / on_intent_verdict)
+        # and read by HTTP handlers (/metrics, /dashboard). Guarded by
+        # ``_ws_lock`` so HTTP reads see a consistent snapshot even
+        # mid-turn. Coord sessions previously tracked none of this —
+        # they share a ChatSession that emits the same usage/verdict
+        # hooks, so the dashboard gets coord visibility for free once
+        # a consumer (future work) wires it up.
+        #
+        # Approval UI/state commits take a short logical lease.  A cancel/close
+        # sweep begins after advancing the operation witness, refuses new
+        # leases, and waits for admitted ones to drain before publishing any
+        # resolutions.  The Condition mutex is NEVER held while a lease's UI
+        # callbacks run; storage is deferred beyond the lease too.
+        self._approval_admission_cond = threading.Condition(threading.Lock())
+        self._active_approval_admissions = 0
+        self._approval_sweeps = 0
+        self._ws_lock = threading.Lock()
+        self._ws_prompt_tokens: int = 0
+        self._ws_completion_tokens: int = 0
+        self._ws_messages: int = 0
+        self._ws_tool_calls: dict[str, int] = {}
+        self._ws_tool_calls_reported: int = 0
+        self._ws_context_ratio: float = 0.0
+        self._ws_turn_tool_calls: int = 0
+        # Activity tracking for dashboard ("thinking" / "tool" / "").
+        self._ws_current_activity: str = ""
+        self._ws_activity_state: str = ""
+        # Compaction pill window: while True, on_thinking_start leaves the
+        # activity alone (the impl's own thinking wrap would otherwise
+        # clobber "Compacting context…" with "Reasoning…" milliseconds after
+        # the start event set it, for the whole summarize phase).  The end
+        # event restores the pre-compaction pair, so a bail can't strand a
+        # stale "Compacting context…" on an idle workstream either.
+        self._compaction_activity_live: bool = False
+        self._pre_compaction_activity: tuple[str, str] = ("", "")
+        # Which compaction owns the latch (its ``compaction_id``): a
+        # force-abandoned compaction's LATE end event must not restore a
+        # stale pill pair over — or unlatch — a successor compaction that
+        # has since taken the latch over.
+        self._compaction_activity_owner: int = 0
+        # Turn-content accumulator: assistant tokens piggybacked onto
+        # the ``ws_state:idle`` broadcast so the dashboard renders the
+        # turn without an extra storage round-trip. Cleared on IDLE /
+        # ERROR transitions by :meth:`snapshot_and_consume_state_payload`.
+        # Multi-turn (per-``send()``) — accumulates across all internal
+        # turns within one user-facing send.
+        self._ws_turn_content: list[str] = []
+        self._ws_turn_content_size: int = 0
+        # Segment watermark for :meth:`on_stream_discarded` — (list length,
+        # size) of ``_ws_turn_content`` at the current stream segment's
+        # start, snapshotted in :meth:`on_thinking_start`.
+        self._turn_content_watermark: tuple[int, int] = (0, 0)
+        # Per-turn inflight accumulators: the in-progress turn's content
+        # + reasoning, exposed to a reconnecting SSE client via the
+        # ``in_progress_snapshot`` event so a mid-stream page refresh
+        # restores the partial assistant text. Reset at the start of
+        # each turn by :meth:`on_turn_start` (separate from the multi-
+        # turn IDLE-piggyback buffer above so prior committed turns
+        # don't leak into the snapshot and double-render against the
+        # replayed history).  The per-turn dedup-tag counter
+        # (``_event_id``) is initialised above alongside the per-ws
+        # event ring buffer — one monotonic counter drives both the
+        # ``Last-Event-ID`` replay slice AND the existing snapshot
+        # ``_seq <= snap_seq`` filter; see :meth:`_enqueue` for the
+        # stamping pattern.
+        self._ws_inflight_content: list[str] = []
+        self._ws_inflight_content_size: int = 0
+        self._ws_inflight_reasoning: list[str] = []
+        self._ws_inflight_reasoning_size: int = 0
+        # Emit-time token-batch accumulator (see the module-level
+        # ``_TOKEN_BATCH_*`` constants).  Holds not-yet-emitted
+        # content/reasoning fragments; at most ONE kind pends at a time
+        # (a kind switch flushes the other first, preserving arrival
+        # order on the wire).  Pending text is INVISIBLE everywhere —
+        # not in the inflight buffers, not in the ring, no event id —
+        # until ``_flush_token_batch_locked`` appends it to the inflight
+        # buffers AND enqueues the batched event inside one ``_ws_lock``
+        # section, which is what keeps a snapshot's ``snap_seq`` a true
+        # high-water mark for its text (no double-render across a
+        # straddling batch).  All four fields guarded by ``_ws_lock``.
+        self._pending_tokens: list[str] = []
+        self._pending_tokens_size: int = 0
+        self._pending_kind: str = ""
+        # ``time.monotonic()`` of the last real flush; 0.0 makes the
+        # first fragment of a fresh UI flush immediately.
+        self._last_token_flush: float = 0.0
+        # Per-call_id chunk batches (tool_output_chunk coalescing — the
+        # same emit-time batching as tokens, keyed per call because up
+        # to 4 concurrent tools stream lines at once).  Guarded by
+        # ``_ws_lock``; each KEY is single-writer (one bash drain
+        # thread per call_id — order within a key assumes that, see
+        # :meth:`_buffer_chunk_locked`), the DICT is multi-writer.
+        # Entries persist across window flushes (they carry the
+        # per-call cadence clock) and are removed at the call's
+        # terminal flush (:meth:`on_tool_result`) or turn teardown.
+        self._pending_chunks: dict[str, _PendingChunkBatch] = {}
+        # Last broadcast (activity, activity_state) tuple — used by
+        # :meth:`_broadcast_activity` overrides to dedup back-to-back
+        # identical activity ticks. Tool-heavy turns can fire many
+        # ``on_tool_result`` calls in succession that all clear the
+        # activity to ``("", "")``; without the dedup, each fan-out
+        # acquires the cluster collector's lock for a no-op write.
+        # ``None`` until the first broadcast so the first emit always
+        # fires.
+        self._last_broadcast_activity: tuple[str, str] | None = None
+        # Decisions of recently-resolved cycles (call_id → decision
+        # string) so a late LLM verdict — the run-to-completion daemon
+        # can deliver after its gate resolved — is stamped with what the
+        # operator actually chose.  Replaces the single
+        # ``_last_verdict_decision`` string, which under concurrent
+        # cycles stamped sibling B's late verdicts with sibling A's
+        # decision.  FIFO-bounded; guarded by ``_ws_lock``.
+        self._recent_decisions: collections.OrderedDict[str, tuple[str, threading.Event | None]] = (
+            collections.OrderedDict()
+        )
+        self._recent_decision_principals: dict[str, tuple[str, str]] = {}
+        # Verdict cache for SSE reconnect replay (tab switching
+        # shouldn't lose the judge's final call on a just-run tool).
+        self._llm_verdicts: dict[str, dict[str, Any]] = {}
+        # Judge-generation origin per cached verdict: ``call_id`` →
+        # ``id(cancel_event)`` of the daemon that delivered it.  The
+        # Smart-Approvals qualification loop compares this against the
+        # batch's own generation so a stale daemon's verdict (reused
+        # call_id across turns) can satisfy neither the wait nor the
+        # auto-approve bar.  Evicted in lockstep with ``_llm_verdicts``.
+        self._verdict_origins: dict[str, int] = {}
+        # Signalled by ``on_intent_verdict`` whenever an LLM verdict
+        # lands in ``_llm_verdicts``; Smart Approvals (``approve_tools``)
+        # waits on it for the verdicts of the calls it's about to gate.
+        # Shares ``_ws_lock`` so the wait + the cache write are one
+        # critical section (no separate lock to order).
+        self._verdict_cond = threading.Condition(self._ws_lock)
+        # Re-populate the recent-auto-approve ring buffer from the
+        # audit log so the dashboard pill survives UI rebuilds —
+        # saved-workstream rehydrate / coord→node click-through /
+        # process restart all build a fresh UI whose buffer would
+        # otherwise start empty even though the audit row is still
+        # there.  Best-effort: storage outage / not-yet-wired silently
+        # leaves the buffer empty (the next live auto-approve will
+        # populate it).  Runs last in __init__ so all the lock + state
+        # fields the replay touches are already initialised.
+        self.replay_recent_auto_approvals_from_audit()
+        # Reseed the monotonic event-id counter from the persisted
+        # high-water so the ``Last-Event-ID`` cursor space stays
+        # monotonic across UI rebuilds (process restart / rehydrate /
+        # coord→node click-through).  Without this it would restart at
+        # 0 and re-issue ids the prior process already stamped onto
+        # ``conversations.event_id`` rows, corrupting cursor ordering.
+        self._seed_event_id_from_storage()
+
+    # ------------------------------------------------------------------
+    # Session binding
+    # ------------------------------------------------------------------
+
+    def bind_session(self, session: Any) -> None:
+        """Bind the owning session (called once by ChatSession.__init__)."""
+        self._session_ref = weakref.ref(session)
+
+    def _bound_session(self) -> Any:
+        """The bound session, or None before binding / after collection."""
+        ref = self._session_ref
+        return ref() if ref is not None else None
+
+    def _current_persistence_state(self) -> str:
+        """Sanitized journal state of the UI's own session.
+
+        Derives through the bound session, never a registry lookup by id:
+        the registry fails open to "healthy" — or to a replacement
+        workstream after id reuse — exactly while failed-delete tombstone
+        retention or retirement has the row out of the map, which is
+        precisely when the operator badge must keep telling the truth.
+        """
+        return session_persistence_state(self._bound_session())
+
+    # ------------------------------------------------------------------
+    # Listener plumbing (SSE)
+    # ------------------------------------------------------------------
+
+    def _enqueue(self, data: dict[str, Any]) -> int:
+        """Fan ``data`` out to every registered listener queue.
+
+        This is the choke point for every NON-token emit — base-class
+        ``on_*`` hooks, subclass overrides (``state_change`` /
+        ``clear_ui`` / rename), and route-level emits (``cancelled``,
+        the interject path's synthetic ``stream_end``) all land here —
+        so it first flushes any pending token batch.  Without that, a
+        ``stream_end`` could overtake its own turn's trailing content
+        batch: the client resets its streaming refs on ``stream_end``
+        and the late batch would paint into a NEW assistant bubble.
+        Emits that happen on the worker thread (the token producer) are
+        therefore strictly ordered after the tokens that preceded them;
+        cross-thread emits (a streaming tool's background
+        ``tool_output_chunk``) keep their pre-existing best-effort
+        ordering.
+
+        MUST NOT be called while holding ``_ws_lock`` — the flush
+        acquires it (non-reentrant).  Token events never come through
+        here: :meth:`on_content_token` / :meth:`on_reasoning_token`
+        buffer under ``_ws_lock`` and their flush emits via
+        :meth:`_enqueue_direct`.  ``tool_output_chunk`` likewise
+        bypasses this path via the per-call chunk batcher
+        (:meth:`on_tool_output_chunk`) — which is also why chunk
+        emission no longer force-flushes the token batch (chunk-vs-
+        content interleaving is cosmetic: independent DOM subtrees;
+        the load-bearing chunk ordering is against its OWN call's
+        ``tool_result``, enforced in :meth:`on_tool_result`).  Every
+        current call site enqueues outside ``_ws_lock``; a violation
+        deadlocks immediately (and loudly) in any test that exercises
+        the path.
+
+        Returns the monotonic ``_event_id`` assigned to this event so a
+        caller that also persists the same turn (e.g.
+        ``ChatSession._append_system_turn``) can stamp the row with the
+        matching id, keeping the ``/history`` resume cursor and the live
+        event stream aligned.
+        """
+        self._flush_token_batch()
+        return self._enqueue_direct(data)
+
+    def _enqueue_direct(self, data: dict[str, Any]) -> int:
+        """Stamp + ring-append + fan out ``data`` (no batch flush).
+
+        Only two kinds of caller: :meth:`_enqueue` (after it flushed the
+        pending token batch) and :meth:`_flush_token_batch_locked` (the
+        flush itself, which runs under ``_ws_lock`` — acquisition order
+        ``_ws_lock`` outer → ``_listeners_lock`` inner matches the
+        snapshot helpers).
+
+        Stamps ``ws_id`` on the payload if not already present so the
+        browser can validate it belongs to the pane's current
+        workstream.  Stamps a monotonic ``_event_id`` on every event
+        (drives the ``Last-Event-ID`` replay buffer) and additionally
+        stamps the per-turn snapshot dedup tag ``_seq`` on token
+        events (``content`` / ``reasoning``) so the existing
+        in-progress snapshot dedup at the events handler stays
+        byte-identical.  Shallow-copies before each stamp so a
+        caller-owned dict is never mutated.
+
+        The counter increment, the buffer append, AND the listener
+        snapshot all run under ``_listeners_lock`` so a concurrent
+        :meth:`register_listener_with_in_progress_snapshot` or
+        :meth:`register_listener_with_replay` sees a consistent
+        ``(event_id, listeners, buffer)`` tuple — no event is
+        fanned out to a not-yet-registered listener AND missing from
+        the replay buffer.
+
+        Fan-out skips queues already poisoned (their stream is closing;
+        puts would be latch-refused anyway) and logs the poison
+        TRANSITION exactly once per listener via the
+        :class:`_ListenerOverflow` first-rejection signal — the node-side
+        visibility for an overflow that is otherwise only observable in
+        the browser (a proxied coordinator pane hides it entirely).
+        """
+        if "ws_id" not in data:
+            data = {**data, "ws_id": self.ws_id}
+        # Only events that can carry a child step — a top-level ``call_id`` or an
+        # ``items`` list — need the parent-tag lookup; skip the lock+scan for the
+        # high-frequency rest (content / reasoning / status / info / …).
+        if self._agent_children and ("call_id" in data or "items" in data):
+            data = self._stamp_agent_parent(data)
+        with self._listeners_lock:
+            self._event_id += 1
+            event_id = self._event_id
+            data = {**data, "_event_id": event_id}
+            if data.get("type") in ("content", "reasoning"):
+                # Preserve the existing dedup contract: only token
+                # events carry the ``_seq`` tag.  Non-token events
+                # (``tool_started``, ``state_change``, …) keep
+                # bypassing the snapshot filter by absence of ``_seq``.
+                data = {**data, "_seq": event_id}
+            self._event_buffer.append((event_id, data))
+            snapshot = [lq for lq in self._listeners if not getattr(lq, "poisoned", False)]
+        for lq in snapshot:
+            try:
+                lq.put_nowait(data)
+            except _ListenerOverflow:
+                log.warning(
+                    "sse.listener_overflow ws=%s event_id=%d: listener queue full; "
+                    "poisoned — its drain loop will close the stream and the "
+                    "client reconnect replays the gap from the ring buffer",
+                    self.ws_id[:8],
+                    event_id,
+                )
+            except queue.Full:
+                # Poison latched by a concurrent producer between our
+                # snapshot and this put (or a raw ``queue.Queue`` a test
+                # registered directly): same silent-skip as before.
+                continue
+        return event_id
+
+    def _buffer_token_locked(self, kind: str, text: str) -> None:
+        """Accumulate one content/reasoning fragment; flush on window/size.
+
+        Caller holds ``_ws_lock``.  A kind switch (reasoning→content or
+        back) flushes the other kind first so the wire preserves arrival
+        order between the two token streams.  The window is measured
+        from the last flush and checked here, on arrival — no timer
+        thread, so a mid-stream stall just holds the final partial batch
+        until the next fragment or the next non-token emit's
+        choke-point flush (``stream_end`` at the latest).
+        """
+        if self._pending_kind and self._pending_kind != kind:
+            self._flush_token_batch_locked()
+        if not self._pending_tokens:
+            self._pending_kind = kind
+        self._pending_tokens.append(text)
+        self._pending_tokens_size += len(text)
+        if (
+            time.monotonic() - self._last_token_flush >= _TOKEN_BATCH_WINDOW_SECS
+            or self._pending_tokens_size >= _TOKEN_BATCH_MAX_CHARS
+        ):
+            self._flush_token_batch_locked()
+
+    def _flush_token_batch_locked(self) -> None:
+        """Emit the pending token batch as ONE event.  Caller holds ``_ws_lock``.
+
+        The inflight-buffer append and the enqueue are deliberately one
+        critical section: ``register_listener_with_in_progress_snapshot``
+        / ``register_listener_with_replay`` capture ``(inflight text,
+        _event_id)`` under the same lock, so ``snap_seq`` stays a true
+        high-water mark for the snapshot text.  Splitting them (e.g.
+        appending inflight per-token while enqueueing per-batch) lets a
+        straddling snapshot carry text whose batch then arrives with
+        ``_seq > snap_seq`` — the client (a blind ``+=``, no content
+        dedup) double-renders it.  Pinned by
+        ``test_snapshot_mid_batch_sees_only_flushed_text_no_double_render``
+        and the writer-race test in ``test_sse_reconnect_replay.py``.
+
+        Cap semantics match the old per-token appends: check-before-
+        append, so overshoot is bounded by one batch
+        (``_TOKEN_BATCH_MAX_CHARS`` + one fragment) instead of one
+        token; the live stream continues past the cap either way.
+        """
+        if not self._pending_tokens:
+            return
+        self._last_token_flush = time.monotonic()
+        text = "".join(self._pending_tokens)
+        kind = self._pending_kind
+        self._reset_pending_locked()
+        if kind == "content":
+            if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_turn_content.append(text)
+                self._ws_turn_content_size += len(text)
+            if self._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_inflight_content.append(text)
+                self._ws_inflight_content_size += len(text)
+        else:
+            if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_inflight_reasoning.append(text)
+                self._ws_inflight_reasoning_size += len(text)
+        self._enqueue_direct({"type": kind, "text": text})
+
+    def _flush_token_batch(self) -> None:
+        """Flush the pending token batch from OUTSIDE ``_ws_lock``.
+
+        The lockless empty-check is the fast path for every non-token
+        emit (the overwhelmingly common case).  Same-thread visibility
+        is what correctness needs: the worker that buffered the tokens
+        sees its own append when it later emits ``stream_end`` /
+        ``tool_*`` — cross-thread emits racing a concurrent append keep
+        their pre-existing best-effort ordering either way.
+        """
+        if not self._pending_tokens:
+            return
+        with self._ws_lock:
+            self._flush_token_batch_locked()
+
+    def _reset_pending_locked(self) -> None:
+        """Zero the pending token accumulator.  Caller holds ``_ws_lock``.
+
+        Single source of truth for the reset so a later accumulator field
+        can't be half-cleared by one of its two callers
+        (:meth:`_flush_token_batch_locked` after capturing the text,
+        :meth:`_discard_pending_tokens_locked` on the crash path)."""
+        self._pending_tokens = []
+        self._pending_tokens_size = 0
+        self._pending_kind = ""
+
+    def _discard_pending_tokens_locked(self) -> None:
+        """Drop a never-emitted pending batch.  Caller holds ``_ws_lock``.
+
+        Only for the stale-crash path (:meth:`on_turn_start`): the text
+        was never enqueued, never ring-buffered, never inflight — so
+        discarding it is consistent everywhere, whereas flushing it
+        would paint a dead ``send()``'s tail into the NEW turn's bubble.
+        """
+        self._reset_pending_locked()
+
+    def _buffer_chunk_locked(self, call_id: str, chunk: str) -> None:
+        """Accumulate one tool-output line; flush on window/size.
+
+        Caller holds ``_ws_lock``.  Chunks share the token batcher's
+        cadence constants but batch PER call_id (concurrent tools must
+        not interleave text) — see :class:`_PendingChunkBatch` for the
+        per-entry clock semantics.  Order within a key assumes ONE
+        producer thread per call_id, true by construction today (a
+        single ``bash-drain-out-{call_id}`` thread streams stdout;
+        stderr is not streamed) and pinned by
+        ``test_chunk_producer_surface_is_single_site``.
+
+        Tail latency, ruled ACCEPTED (do not add a flush timer): a tool
+        that prints a burst then runs silently holds the trailing
+        sub-window batch until its next line, its own ``tool_result``,
+        or turn teardown — the same arrival-driven stall the token
+        batcher documents (its backstop is the ``_enqueue`` chokepoint;
+        chunks' backstop is the call's terminal).  Bounded at one
+        sub-window batch, the burst's first line already painted
+        (first-line-immediate), and the result delivers the complete
+        output regardless; a timer thread would break the batchers'
+        deliberately timer-less design for that sliver.
+
+        Late chunks from a LEAKED drain thread (past its join timeout,
+        ``bash.drain_leaked``) are gated at the PRODUCER — the
+        ``capture_closed`` gate in ``_exec_bash``'s stdout closure — not
+        here: the execution closure is the one identity that call_id
+        reuse across turns can't confuse, whereas a UI-side
+        closed-call ledger keyed on call_id would either discard a
+        reusing provider's NEW stream or re-open under per-turn resets
+        / LRU churn (both found in review).  A chunk that slips the
+        gate's one-line race re-buffers here and emits — identical to
+        the pre-batching behaviour for the same line.
+        """
+        batch = self._pending_chunks.get(call_id)
+        if batch is None:
+            batch = _PendingChunkBatch()
+            self._pending_chunks[call_id] = batch
+        batch.fragments.append(chunk)
+        batch.size += len(chunk)
+        if (
+            time.monotonic() - batch.last_flush >= _TOKEN_BATCH_WINDOW_SECS
+            or batch.size >= _TOKEN_BATCH_MAX_CHARS
+        ):
+            self._flush_chunk_batch_locked(call_id)
+
+    def _flush_chunk_batch_locked(self, call_id: str) -> None:
+        """Emit ``call_id``'s pending chunks as ONE event.  Caller holds
+        ``_ws_lock``.
+
+        The entry stays in the dict (its ``last_flush`` clock re-arms
+        the window for the ongoing stream); removal happens only at the
+        call's terminal (:meth:`_finish_chunk_call_locked`) or turn
+        teardown.  Emits via :meth:`_enqueue_direct` — the same
+        lock-order (``_ws_lock`` outer → ``_listeners_lock`` inner) as
+        the token flush; ``_stamp_agent_parent`` runs at the chokepoint,
+        so a sub-agent's batch stamps by its (still-registered) call_id
+        at flush time.  Deliberately does NOT flush the token batch:
+        chunk-vs-content interleaving is cosmetic (independent DOM
+        subtrees) — wiring chunks into the token flush is the per-line
+        amplifier this batching removes.
+        """
+        batch = self._pending_chunks.get(call_id)
+        if batch is None or not batch.fragments:
+            return
+        text = "".join(batch.fragments)
+        batch.fragments = []
+        batch.size = 0
+        batch.last_flush = time.monotonic()
+        self._enqueue_direct({"type": "tool_output_chunk", "call_id": call_id, "chunk": text})
+
+    def _flush_all_chunk_batches_locked(self) -> None:
+        """Flush every call's pending chunks and drop the entries.
+
+        Caller holds ``_ws_lock``.  The turn-teardown backstop
+        (``stream_end`` / idle-error snapshot / turn commit / error) —
+        after it, no stream continues, so the per-call clocks are dead
+        weight and the entries go with the flush.  A tool that died
+        with NEITHER a self-reported nor a synthesized ``tool_result``
+        (unproven-reachable) self-heals here: its <pre> was never
+        removed (no result rendered), so the late batch paints in
+        place.
+        """
+        for call_id in list(self._pending_chunks):
+            self._flush_chunk_batch_locked(call_id)
+        self._pending_chunks.clear()
+
+    def _discard_pending_chunks_locked(self) -> None:
+        """Drop all pending chunk text without emitting.  Caller holds
+        ``_ws_lock``.
+
+        Only for the stale-crash path (:meth:`on_turn_start`) — the
+        mirror of :meth:`_discard_pending_tokens_locked`, same
+        rationale: never enqueued, never ring-buffered, so discarding
+        is consistent everywhere.
+        """
+        self._pending_chunks.clear()
+
+    def _finish_chunk_call_locked(self, call_id: str) -> None:
+        """Terminal flush for one call: emit its pending chunks and drop
+        the entry (its window clock included).  Caller holds ``_ws_lock``.
+
+        Runs BEFORE the call's ``tool_result`` enqueues (the
+        load-bearing ordering: the client removes the streaming <pre>
+        when it renders the result, so trailing chunks must be on the
+        wire first).  Late leaked-drain chunks after this point are
+        gated at the producer (see :meth:`_buffer_chunk_locked`), so no
+        closed-call bookkeeping lives here.
+        """
+        self._flush_chunk_batch_locked(call_id)
+        self._pending_chunks.pop(call_id, None)
+
+    def _stamp_agent_parent(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Stamp ``parent_call_id`` on a sub-agent's child event.
+
+        A task agent's sub-tool events flow through the same emit path as
+        top-level tool events; the only thing marking them as a *child* is the
+        ``call_id`` registered in ``_agent_children`` by the session running
+        ``_run_agent``.  Stamping at this one fan-out choke point (rather than at
+        each call site) also catches events emitted from a tool's own background
+        thread — a streaming bash's ``tool_output_chunk`` — which an ambient
+        context var set on the worker thread would miss.  Returns a shallow copy
+        when it stamps; the input dict is never mutated."""
+        with self._agent_children_lock:
+            if not self._agent_children:
+                return data
+            cid = data.get("call_id")
+            if isinstance(cid, str) and cid in self._agent_children:
+                data = {**data, "parent_call_id": self._agent_children[cid]}
+            items = data.get("items")
+            if isinstance(items, list) and any(
+                isinstance(it, dict) and it.get("call_id") in self._agent_children for it in items
+            ):
+                data = {
+                    **data,
+                    "items": [
+                        {**it, "parent_call_id": self._agent_children[it["call_id"]]}
+                        if isinstance(it, dict) and it.get("call_id") in self._agent_children
+                        else it
+                        for it in items
+                    ],
+                }
+        return data
+
+    def note_agent_child(self, child_call_id: str, parent_call_id: str) -> None:
+        """Register a sub-agent's child tool call so ``_enqueue`` tags its events
+        with ``parent_call_id``.  Called by the session for each sub-tool a
+        ``_run_agent`` issues, before the tool emits anything.
+
+        The session mints each sub-agent child id session-unique
+        (``f"{parent_call_id}::r{run}s{step}::{tc_id}"``) before registering
+        it here: the run tag de-collides agent runs (concurrent in the
+        parent's 4-wide pool, or sequential runs whose PARENT id a local
+        server reused), and the step tag de-collides that server's
+        per-response sequential sub-tool ids (``call_0``) across the SAME
+        agent's turns — one key names one call, so steps can't mis-nest or
+        collapse."""
+        if not child_call_id or not parent_call_id:
+            return
+        with self._agent_children_lock:
+            self._agent_children[child_call_id] = parent_call_id
+
+    def clear_agent_children(
+        self,
+        parent_call_id: str,
+        *,
+        child_ids: set[str] | None = None,
+    ) -> None:
+        """Drop one task invocation's child registrations.
+
+        ``child_ids=None`` retains the historical broad cleanup.  A concrete
+        set is used by live task runs because a provider can reuse the parent
+        call id across force-successor generations; exact cleanup must not
+        delete the successor's independently minted children.
+        """
+        with self._agent_children_lock:
+            if child_ids is None:
+                candidates = [c for c, p in self._agent_children.items() if p == parent_call_id]
+            else:
+                candidates = [
+                    child_id
+                    for child_id in child_ids
+                    if self._agent_children.get(child_id) == parent_call_id
+                ]
+            for c in candidates:
+                del self._agent_children[c]
+
+    def on_agent_context(
+        self,
+        parent_call_id: str,
+        prompt_tokens: int,
+        context_window: int,
+        *,
+        generation: int = 0,
+    ) -> None:
+        """Publish and retain one task agent's latest context reading.
+
+        Store-before-enqueue is load-bearing for refresh races: a subscriber
+        registering between those operations sees the synthetic snapshot and
+        also may receive the live event, so clients reduce this event
+        idempotently. Reversing the order admits a window in which the event is
+        in neither the listener queue nor the snapshot.
+        """
+        if not parent_call_id or prompt_tokens < 0 or context_window <= 0:
+            return
+        event = {
+            "type": "agent_context",
+            "ws_id": self.ws_id,
+            "parent_call_id": parent_call_id,
+            "prompt_tokens": prompt_tokens,
+            "context_window": context_window,
+        }
+        with self._agent_contexts_lock:
+            current = self._agent_contexts.get(parent_call_id)
+            if current is not None and current[0] > generation:
+                return
+            self._agent_contexts[parent_call_id] = (generation, event)
+        self._enqueue(event)
+
+    def clear_agent_transients(self, parent_call_id: str, *, generation: int = 0) -> None:
+        """Drop one completed task agent's transient reconnect state.
+
+        Cleanup is exact-generation: a retiring predecessor whose public call
+        id was reused cannot remove the successor's active reading.
+        """
+        if not parent_call_id:
+            return
+        with self._agent_contexts_lock:
+            current = self._agent_contexts.get(parent_call_id)
+            if current is not None and current[0] == generation:
+                del self._agent_contexts[parent_call_id]
+            compaction = self._agent_compactions.get(parent_call_id)
+            if compaction is not None and compaction[0] == generation:
+                del self._agent_compactions[parent_call_id]
+
+    def clear_agent_transients_before_generation(self, generation: int) -> None:
+        """Drop every agent transient owned by a force-abandoned generation.
+
+        A force successor may be claimed specifically because the retiring
+        worker is wedged and will never reach its per-agent ``finally`` block.
+        The cutoff form also preserves any reading already owned by the new
+        generation if a provider immediately reuses a public parent call id.
+        """
+        with self._agent_contexts_lock:
+            stale = [
+                parent_call_id
+                for parent_call_id, (owner_generation, _event) in self._agent_contexts.items()
+                if owner_generation < generation
+            ]
+            for parent_call_id in stale:
+                del self._agent_contexts[parent_call_id]
+            stale_compactions = [
+                parent_call_id
+                for parent_call_id, (owner_generation, _cid, _event) in (
+                    self._agent_compactions.items()
+                )
+                if owner_generation < generation
+            ]
+            for parent_call_id in stale_compactions:
+                del self._agent_compactions[parent_call_id]
+
+    def _snapshot_agent_transients(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Atomically copy task-agent context and compaction reconnect state."""
+
+        with self._agent_contexts_lock:
+            contexts = [dict(event) for _generation, event in self._agent_contexts.values()]
+            compactions = [
+                dict(event)
+                for _generation, _compaction_id, event in self._agent_compactions.values()
+            ]
+        return contexts, compactions
+
+    def _snapshot_agent_contexts(self) -> list[dict[str, Any]]:
+        """Copy active task-agent readings for focused callers/tests."""
+
+        contexts, _compactions = self._snapshot_agent_transients()
+        return contexts
+
+    def _snapshot_agent_compactions(self) -> list[dict[str, Any]]:
+        """Copy active task-agent compactions for fresh/truncated replay."""
+
+        _contexts, compactions = self._snapshot_agent_transients()
+        return compactions
+
+    def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
+        """Paint a sub-agent's auto-executed tool step as pending under its
+        parent card so it shows live before it completes.  (Approval-gated
+        sub-tools paint via :meth:`approve_tools`.)  The child is already
+        registered via ``note_agent_child``, so ``_enqueue`` stamps
+        ``parent_call_id`` onto this ``tool_pending``."""
+        self._enqueue({"type": "tool_pending", "items": self._serialize_approval_items([item])})
+
+    def begin_agent_scope(self) -> None:
+        """Enter a task agent's execution.  Until the matching
+        :meth:`end_agent_scope`, the web pane drops ``on_info`` lines from THIS
+        thread (the task card carries the sub-agent's visible output, so the info
+        chatter would only escape to the top level).  Per-thread via
+        :data:`_agent_scope_var` so a parallel SIBLING tool in another pool
+        thread isn't suppressed; depth-counted for safety though task agents
+        don't nest.  The session brackets each ``_run_agent`` with this pair."""
+        _agent_scope_var.set(_agent_scope_var.get() + 1)
+
+    def end_agent_scope(self) -> None:
+        """Leave a task agent's execution (see :meth:`begin_agent_scope`)."""
+        _agent_scope_var.set(max(0, _agent_scope_var.get() - 1))
+
+    def stash_agent_trajectory(self, call_id: str, steps: list[dict[str, Any]]) -> None:
+        """Retain a finished task agent's projected sub-trajectory (step items)
+        keyed by its call_id so ``/history`` can rebuild the card on a fresh
+        connect / reopen while the workstream is in memory.  LRU-bounded; the
+        newest write is most-recently-used, oldest evicted past the cap.  See
+        :data:`_AGENT_TRAJECTORY_CAP` and the field comment in ``__init__``."""
+        if not call_id:
+            return
+        with self._agent_children_lock:
+            self._agent_trajectories[call_id] = steps
+            self._agent_trajectories.move_to_end(call_id)
+            while len(self._agent_trajectories) > _AGENT_TRAJECTORY_CAP:
+                self._agent_trajectories.popitem(last=False)
+
+    def get_agent_trajectory(self, call_id: str) -> list[dict[str, Any]] | None:
+        """Read a stashed sub-trajectory, or ``None`` if not retained (evicted,
+        or a cold reopen with an empty store).  ``None`` is the honest "unknown"
+        signal — the caller renders the flat parent record, never a 0-step card."""
+        if not call_id:
+            return None
+        with self._agent_children_lock:
+            return self._agent_trajectories.get(call_id)
+
+    def _register_listener(
+        self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
+    ) -> queue.Queue[dict[str, Any]]:
+        """Create a per-client queue and register it as a listener."""
+        client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
+        with self._listeners_lock:
+            self._register_or_close_listener_locked(client_queue)
+        return client_queue
+
+    def _register_or_close_listener_locked(
+        self,
+        client_queue: queue.Queue[dict[str, Any]],
+    ) -> None:
+        """Register live, or pre-close a stale post-terminal request.
+
+        Caller holds ``_listeners_lock``. The terminal queue is deliberately
+        not retained: the events route consumes ``ws_closed`` internally and
+        exits, while a nonexistent consumer cannot leak a queue on the dead UI.
+        """
+        if getattr(self, "_listeners_terminal", False):
+            client_queue.put_nowait({"type": "ws_closed"})
+            return
+        self._listeners.append(client_queue)
+
+    def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
+        """Remove a client queue from the listener list."""
+        with self._listeners_lock, contextlib.suppress(ValueError):
+            self._listeners.remove(client_queue)
+
+    def register_listener_with_in_progress_snapshot(
+        self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
+    ) -> tuple[queue.Queue[dict[str, Any]], dict[str, Any]]:
+        """Register a listener AND snapshot the per-turn inflight buffers.
+
+        Used by :func:`make_events_handler` (the fresh-connect path,
+        and the ``replay_truncated`` fallback path) so a SSE subscriber
+        connecting mid-stream can be told the in-progress turn's content
+        and reasoning text-so-far in a one-shot ``in_progress_snapshot``
+        event, on top of the kind-specific replay (history / pending).
+        The ``Last-Event-ID`` replay path (see
+        :meth:`register_listener_with_replay`) bypasses this — the
+        buffered events already carry the partial token stream.
+
+        Lock acquisition order: ``_ws_lock`` (outer) → ``_listeners_lock``
+        (inner) — matches the writer's order in :meth:`on_content_token`
+        / :meth:`on_reasoning_token` (``_ws_lock`` then ``_enqueue``'s
+        ``_listeners_lock``).  Nested under both locks we read
+        ``inflight_content``, ``inflight_reasoning``, AND the
+        ``_event_id`` counter as a consistent triple, plus register
+        the listener.  Writers calling :meth:`_enqueue` block on
+        ``_listeners_lock`` for the snapshot's duration so no event is
+        fanned out between counter-read and listener-registration —
+        every event with ``_event_id > snap_seq`` lands in the
+        registered listener's queue, every event with
+        ``_event_id <= snap_seq`` is already covered by the snapshot's
+        ``content`` / ``reasoning`` text or by token events that the
+        events handler's ``_seq <= snap_seq`` filter drops.
+
+        Returns ``(client_queue, snapshot_dict)`` where ``snapshot_dict``
+        has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int), and
+        ``agent_contexts`` (active task-agent context events) and
+        ``agent_compactions`` (their active targeted compaction events).
+        Caller checks for non-empty content / reasoning to decide
+        whether to yield the event at all (empty snapshots are common
+        between turns and on freshly-opened workstreams).
+
+        Joins the captured fragments OUTSIDE the locks — bounded at
+        ``_MAX_TURN_CONTENT_CHARS`` but still O(n) over fragments, so
+        worth not blocking concurrent on-token writers for the
+        duration. The shallow ``list(...)`` copies under the lock mean
+        subsequent appends to the live buffers don't mutate our view.
+        """
+        client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
+        with self._ws_lock:
+            captured_content = list(self._ws_inflight_content)
+            captured_reasoning = list(self._ws_inflight_reasoning)
+            with self._listeners_lock:
+                self._register_or_close_listener_locked(client_queue)
+                snap_seq = self._event_id
+        agent_contexts, agent_compactions = self._snapshot_agent_transients()
+        snapshot = {
+            "content": "".join(captured_content),
+            "reasoning": "".join(captured_reasoning),
+            "seq": snap_seq,
+            "agent_contexts": agent_contexts,
+            "agent_compactions": agent_compactions,
+        }
+        return client_queue, snapshot
+
+    def register_listener_with_replay(
+        self,
+        last_event_id: int,
+        maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX,
+    ) -> tuple[
+        queue.Queue[dict[str, Any]],
+        list[dict[str, Any]],
+        str,
+        int,
+        int,
+        dict[str, Any],
+    ]:
+        """Register a listener AND capture buffered events for replay
+        AND snapshot the per-turn inflight content/reasoning + snap_seq
+        in one atomic-against-writers step.
+
+        Used by :func:`make_events_handler` when the client sends
+        ``Last-Event-ID`` (header or ``?last_event_id=`` query-param
+        fallback for the manual-reconnect path).  Returns
+
+            ``(client_queue, replay_events, status, lost_count,
+            earliest_available_id, snapshot)``
+
+        where ``status`` is one of ``"replay_ok"`` (caller emits the
+        replay events then drops into live drain, skipping
+        ``replay_cb`` / ``state_change`` / ``in_progress_snapshot``)
+        or ``"truncated"`` (caller emits a ``replay_truncated``
+        envelope then falls through to the fresh-connect replay path
+        as the recovery floor — the snapshot picks up the partial
+        content/reasoning that the evicted events would have carried).
+        ``snapshot`` has the same shape as
+        :meth:`register_listener_with_in_progress_snapshot`'s second
+        return value, including its active ``agent_contexts`` list.
+
+        Atomicity contract: under ``_ws_lock`` (outer) + ``_listeners_lock``
+        (inner) — matches writer order in :meth:`on_content_token` —
+        we snapshot the buffer, the listener registration, the
+        inflight content/reasoning, AND the ``_event_id`` counter as
+        a consistent tuple.  Writers' :meth:`_enqueue` blocks on
+        ``_listeners_lock`` for the duration, so events either
+          - land in the buffer snapshot but NOT the listener queue
+            (writer ran before our lock acquire — caught by the
+            replay slice on the ``replay_ok`` path, or by the
+            content snapshot on the ``truncated`` path), or
+          - land in the listener queue but NOT the buffer snapshot
+            (writer ran after our lock release — live drain handles
+            them, ``_event_id`` is strictly above
+            ``earliest_available_id`` AND strictly above
+            ``snapshot["seq"]``).
+        No event is double-delivered, none is lost across the
+        registration boundary.  Crucially, the truncated path can
+        now use ``snapshot["seq"]`` as the live-drain ``snap_seq``
+        filter — the events handler's existing ``_seq <= snap_seq``
+        dedup catches any token event that landed in the listener
+        queue AND was covered by the snapshot's content/reasoning
+        text (prevents double-rendering after a truncated emit).
+
+        ``last_event_id`` semantics:
+          - ``< 0`` or ``> _event_id`` at the registration boundary →
+            ``"truncated"``.  Per-workstream ids start at 1 and the captured
+            counter is their authoritative high-water mark, so neither cursor
+            can have been issued by this stream.  Failing closed forces the
+            caller through its authoritative snapshot/history recovery floor
+            instead of accepting an empty replay from a forged or corrupt
+            future cursor.
+          - Otherwise, ``< earliest_available_id - 1`` → ``"truncated"``.
+            ``lost_count`` is the minimum gap (the buffer may have
+            evicted strictly more than this — we only know the
+            lower bound from what's still retained).
+          - ``>= earliest_available_id - 1`` → ``"replay_ok"``.  Replay
+            events are those with id strictly greater than
+            ``last_event_id`` (the client has already seen everything
+            up to and including ``last_event_id``).
+
+        Empty buffer: the ring is created once and only ever appended
+        (one call site, :meth:`_enqueue_direct`; a ``deque(maxlen=…)``
+        past its cap evicts but never empties), so an empty ring means
+        exactly one of two things and the ``_event_id`` counter
+        distinguishes them:
+
+          - ``_event_id == 0`` — genuine cold start (brand-new ws,
+            nothing ever emitted).  Cursor 0 is the sole valid bootstrap
+            cursor and returns ``"replay_ok"`` with an empty slice; negative
+            or future cursors are rejected by the range check above.
+          - ``_event_id > 0`` — this UI instance was rebuilt over an
+            existing conversation (:meth:`_seed_event_id_from_storage`
+            reseeds the counter from ``MAX(conversations.event_id)``
+            on rehydrate / node restart) and the ring died with the
+            old process.  A client whose ``last_event_id`` is BELOW
+            the counter provably missed events that no ring can
+            replay → ``"truncated"``, so the client runs its
+            /history resync instead of silently continuing with a
+            hole (the pre-fix behaviour: stuck-busy panes and
+            committed turns missing until a manual reload).
+            ``last_event_id == _event_id`` (strict ``<`` is
+            load-bearing) means the client saw everything before the
+            rebuild — no loss, ``"replay_ok"``.
+
+        On the ordinary stale empty-ring path ``lost_count`` is the exact
+        counter gap and ``earliest_available_id`` is ``_event_id + 1`` (the
+        next id that will exist; nothing below it is retained).  For an
+        out-of-range cursor, ``lost_count`` is a conservative numeric floor
+        (zero for a future cursor) and ``earliest_available_id`` is the first
+        retained id, or the next counter id when the ring is empty.  No
+        production client reads either field — they are envelope forensics —
+        but tests assert them.
+        """
+        client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
+        # Lock order matches writer: ``_ws_lock`` outer, ``_listeners_lock``
+        # inner.  Both inflight buffers AND the buffer slice AND the
+        # ``_event_id`` counter AND the listener registration captured
+        # as one atomic against any concurrent ``_enqueue``.  The string
+        # joins for content/reasoning happen OUTSIDE the locks (bounded
+        # at ``_MAX_TURN_CONTENT_CHARS`` but O(n) over fragments — not
+        # worth blocking on-token writers for the duration).  See
+        # the per-fresh-path helper for the same rationale.
+        with self._ws_lock:
+            captured_content = list(self._ws_inflight_content)
+            captured_reasoning = list(self._ws_inflight_reasoning)
+            with self._listeners_lock:
+                buffered = list(self._event_buffer)
+                self._register_or_close_listener_locked(client_queue)
+                snap_seq = self._event_id
+        agent_contexts, agent_compactions = self._snapshot_agent_transients()
+        snapshot: dict[str, Any] = {
+            "content": "".join(captured_content),
+            "reasoning": "".join(captured_reasoning),
+            "seq": snap_seq,
+            "agent_contexts": agent_contexts,
+            "agent_compactions": agent_compactions,
+        }
+        if last_event_id < 0 or last_event_id > snap_seq:
+            # Event ids start at 1, with cursor 0 reserved for the initial
+            # bootstrap.  A negative or beyond-high-water cursor was never
+            # issued by this UI.  Treat it as an uncovered gap so the route
+            # emits replay_truncated and the client rebuilds from
+            # authoritative history instead of silently trusting an empty
+            # replay slice.
+            earliest_id = buffered[0][0] if buffered else snap_seq + 1
+            lost_count = max(0, (earliest_id - 1) - last_event_id)
+            return client_queue, [], "truncated", lost_count, earliest_id, snapshot
+        if not buffered:
+            # Derived staleness — see the docstring's empty-buffer
+            # section.  ``snap_seq`` (the counter captured under the
+            # registration locks) rather than a re-read of
+            # ``self._event_id`` keeps the check atomic with the
+            # listener registration.
+            if snap_seq > 0 and last_event_id < snap_seq:
+                lost_count = snap_seq - last_event_id
+                return client_queue, [], "truncated", lost_count, snap_seq + 1, snapshot
+            return client_queue, [], "replay_ok", 0, 0, snapshot
+        earliest_id = buffered[0][0]
+        if last_event_id < earliest_id - 1:
+            lost_count = (earliest_id - 1) - last_event_id
+            return client_queue, [], "truncated", lost_count, earliest_id, snapshot
+        replay_events = [ev for eid, ev in buffered if eid > last_event_id]
+        return client_queue, replay_events, "replay_ok", 0, earliest_id, snapshot
+
+    def can_replay_from(self, cursor: int) -> bool:
+        """Would an SSE connect with ``Last-Event-ID = cursor`` replay a
+        non-empty delta through the ``replay_ok`` path?
+
+        This is the ``/history`` gate for the fresh-connect fast-forward:
+        the handler returns a resume cursor (and drops the in-flight turn
+        from the committed snapshot) ONLY when this is true, so the
+        in-flight turn is rebuilt from the ring buffer via the existing
+        delta replay.  When it is false — empty buffer (cold reload /
+        process restart), an evicted/truncated cursor, or simply no
+        events past ``cursor`` — the handler keeps the in-flight turn in
+        ``/history`` and returns no cursor, so the connect takes the
+        synthetic-snapshot floor (preserving the #610 in-flight render
+        and never leaving a turn unrenderable).
+
+        Mirrors :meth:`register_listener_with_replay`'s slice semantics
+        without registering a listener:
+          - empty buffer → False (nothing buffered to fast-forward);
+          - ``cursor < earliest_id - 1`` → False (would be ``truncated``);
+          - no event id strictly greater than ``cursor`` → False (the
+            delta would be empty — nothing in-flight to replay).
+
+        DELIBERATE asymmetry with ``register_listener_with_replay``'s
+        empty-ring branch (ruled 2026-07-20, do not "fix"): on an empty
+        ring with a stale cursor the register path reports
+        ``"truncated"`` (honesty — the client must resync from REST),
+        while this predicate stays False (an empty ring genuinely
+        cannot fast-forward, so ``/history`` must keep the in-flight
+        turn and withhold the cursor).  Mirroring the truncated rule
+        here would hand out cursors that point into a ring with
+        nothing in it — every such connect would immediately
+        re-truncate, looping the client through resync until new
+        events happen to cover the gap.  Both branches answer the same
+        underlying question ("can the ring cover it?" — no) at
+        different decision points: one picks the recovery MESSAGE, the
+        other picks the recovery ROUTE.
+        """
+        with self._listeners_lock:
+            if not self._event_buffer:
+                return False
+            earliest_id = self._event_buffer[0][0]
+            latest_id = self._event_buffer[-1][0]
+        if cursor < earliest_id - 1:
+            return False
+        return latest_id > cursor
+
+    # ------------------------------------------------------------------
+    # Approval blocking gates
+    # ------------------------------------------------------------------
+
+    def _purge_round_verdicts(
+        self,
+        call_ids: set[str],
+        keep_origin: threading.Event | None = None,
+    ) -> None:
+        """Evict stale verdict state for the call_ids entering a new gate.
+
+        Successor of the old whole-cache ``_reset_approval_cycle``: with
+        concurrent cycles a full clear wiped a live sibling's verdicts
+        mid-wait, so eviction is now scoped to the entering batch.  It
+        protects the same two things the reset did — a provider that
+        reuses call_ids across turns can't have a PRIOR round's cached
+        verdict pre-satisfy this round's Smart-Approvals wait, and the
+        reconnect-replay cache can't serve that stale verdict onto the
+        new round's card — without touching any other cycle's state.
+
+        ``keep_origin`` is the entering batch's own judge generation
+        (its cancel event): a cached verdict THAT generation delivered
+        survives the purge.  The judge daemon is spawned before the
+        gate is entered, so a fast judge can deliver ahead of this
+        purge (the policy DB round-trip sits in between) — evicting its
+        verdict would stall the Smart-Approvals wait to its full budget
+        and send an already-cleared batch to a human.  Prior-round
+        decisions for a reused call_id are evicted unconditionally:
+        this round has not been decided yet, whatever generation ruled
+        before.
+        """
+        with self._ws_lock:
+            for cid in call_ids:
+                if keep_origin is None or self._verdict_origins.get(cid) != id(keep_origin):
+                    self._llm_verdicts.pop(cid, None)
+                    self._verdict_origins.pop(cid, None)
+                self._recent_decisions.pop(cid, None)
+                self._recent_decision_principals.pop(cid, None)
+
+    # ------------------------------------------------------------------
+    # Approval-cycle registry
+    # ------------------------------------------------------------------
+
+    def _refresh_pending_approval_view(self) -> None:
+        """Point the legacy ``_pending_approval`` slot at the oldest cycle.
+
+        Caller must hold ``_ws_lock``.  Boolean-ish consumers (cancel
+        gating, dashboard ``pending_approval`` flags, history
+        ``awaiting_approval``) read the slot directly; they see "some
+        cycle is live", which is exactly the question they ask.
+        """
+        first = next(
+            (cycle for cycle in self._approval_cycles.values() if not cycle.resolved), None
+        )
+        self._pending_approval = first.card if first is not None else None
+
+    def _register_approval_cycle(self, cycle: ApprovalCycle) -> None:
+        """Register an already-published cycle (legacy/test helper).
+
+        Production :meth:`approve_tools` registers before publishing and
+        therefore manages ``publication_done`` itself.  This explicit helper
+        historically injects an externally visible live cycle, so mark its
+        publication complete before a resolver can discover it.
+        """
+        cycle.publication_done.set()
+        with self._ws_lock:
+            self._approval_cycles[cycle.cycle_id] = cycle
+            self._refresh_pending_approval_view()
+
+    def _unregister_approval_cycle(self, cycle: ApprovalCycle) -> None:
+        with self._ws_lock:
+            self._approval_cycles.pop(cycle.cycle_id, None)
+            self._refresh_pending_approval_view()
+
+    def _begin_approval_admission(self, cancelled: Callable[[], bool]) -> bool:
+        """Acquire one logical approval-publication lease.
+
+        The Condition lock protects counters only.  The caller runs its state
+        and UI callbacks after this method returns, so a slow transport hook
+        cannot hold a mutex needed by another gate.  A workstream-wide sweep
+        refuses new leases until every cycle has been resolved.
+        """
+        with self._approval_admission_cond:
+            # A successor with a fresh witness waits for an older Stop sweep
+            # to finish.  An operation targeted by that Stop observes its
+            # monotonic witness and refuses immediately.
+            while self._approval_sweeps and not cancelled():
+                self._approval_admission_cond.wait()
+            if cancelled():
+                return False
+            self._active_approval_admissions += 1
+            return True
+
+    def _end_approval_admission(self) -> None:
+        """Release a logical approval-publication lease."""
+        with self._approval_admission_cond:
+            self._active_approval_admissions -= 1
+            if self._active_approval_admissions == 0:
+                self._approval_admission_cond.notify_all()
+
+    def _select_cycle_locked(
+        self,
+        *,
+        cycle_id: str | None = None,
+        call_id: str | None = None,
+    ) -> ApprovalCycle | None:
+        """Pick the cycle a decision addresses.  Caller holds ``_ws_lock``.
+
+        Precedence: explicit ``cycle_id`` → member ``call_id`` → the
+        oldest unresolved cycle (legacy clients that never learned to
+        send a selector: CLI wrappers, channel adapters, old tabs).
+        Only unresolved cycles are eligible — a second click racing the
+        gate thread's unregister must not re-resolve.
+        """
+        if cycle_id:
+            cycle = self._approval_cycles.get(cycle_id)
+            return cycle if cycle is not None and not cycle.resolved else None
+        if call_id:
+            for cycle in self._approval_cycles.values():
+                if call_id in cycle.call_ids and not cycle.resolved:
+                    return cycle
+            return None
+        return next((c for c in self._approval_cycles.values() if not c.resolved), None)
+
+    def find_approval_cycle(
+        self,
+        *,
+        cycle_id: str | None = None,
+        call_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Public card lookup for HTTP handlers (pre-resolve inspection).
+
+        Returns the matched cycle's ``approve_request`` card (the dict
+        also used for SSE replay), or ``None``.  Same selector
+        precedence as resolution, so "which cycle will this decision
+        hit" and "which cycle did it hit" can never disagree.
+        """
+        with self._ws_lock:
+            cycle = self._select_cycle_locked(cycle_id=cycle_id, call_id=call_id)
+            return cycle.card if cycle is not None else None
+
+    def pending_approval_cards(self) -> list[dict[str, Any]]:
+        """All live cycles' ``approve_request`` cards, oldest first.
+
+        SSE fresh-connect/reconnect replay yields each so a returning
+        tab repaints EVERY outstanding prompt, not just the newest.
+        """
+        with self._ws_lock:
+            return [cycle.card for cycle in self._approval_cycles.values() if not cycle.resolved]
+
+    @staticmethod
+    def _approval_cycle_owner_aborted(cycle: ApprovalCycle) -> bool:
+        """Whether a production cycle's owning operation was cancelled."""
+        return bool(cycle.cancel_witnesses) and any(
+            bool(getattr(witness, "aborted", False)) for witness in cycle.cancel_witnesses
+        )
+
+    @staticmethod
+    def _approval_grant_names(cycle: ApprovalCycle) -> set[str]:
+        """Return the human-gated tool labels eligible for an Always grant."""
+        names = {
+            item.get("approval_label", "") or item.get("func_name", "")
+            for item in cycle.items
+            if item.get("needs_approval") and item.get("func_name") and not item.get("error")
+        }
+        names.discard("")
+        names.discard("__budget_override__")
+        return names
+
+    @staticmethod
+    def _validate_approval_resolver(
+        cycle: ApprovalCycle,
+        *,
+        resolver_principal_id: str | None,
+        feedback: str | None,
+        always: bool,
+    ) -> str:
+        """Validate peer-resolution limits and return durable resolver identity.
+
+        ``None`` identifies internal timeout/cancel/legacy callers which do not
+        represent an authenticated human resolver. HTTP callers always pass a
+        concrete principal, including the anonymous empty-string principal.
+        """
+        if resolver_principal_id is None:
+            return ""
+        resolver = resolver_principal_id.strip()
+        if resolver != cycle.execution_principal_id and (
+            bool(str(feedback or "").strip()) or always
+        ):
+            raise CrossPrincipalApprovalError(
+                "A peer may approve or reject this action, but only the initiating "
+                "principal may add feedback or choose Approve + Always"
+            )
+        return resolver
+
+    def _claim_approval_cycle_locked(
+        self,
+        cycle: ApprovalCycle,
+        *,
+        approved: bool,
+        feedback: str | None,
+        decision: str,
+    ) -> list[dict[str, Any]]:
+        """Claim one unresolved cycle. Caller holds ``_ws_lock``."""
+        cycle.resolved = True
+        cycle.decision = decision
+        cycle.result = (approved, feedback)
+        pending = cycle.pending_verdicts
+        cycle.pending_verdicts = []
+        self._refresh_pending_approval_view()
+        for cid in cycle.call_ids:
+            self._recent_decisions[cid] = (decision, cycle.judge_event)
+            self._recent_decision_principals[cid] = (
+                cycle.resolver_principal_id,
+                cycle.execution_principal_id,
+            )
+            self._recent_decisions.move_to_end(cid)
+        while len(self._recent_decisions) > _RECENT_DECISION_CAP:
+            evicted_call_id, _decision = self._recent_decisions.popitem(last=False)
+            self._recent_decision_principals.pop(evicted_call_id, None)
+        return pending
+
+    def _publish_approval_resolution(
+        self,
+        cycle: ApprovalCycle,
+        *,
+        approved: bool,
+        feedback: str | None,
+        always: bool,
+    ) -> None:
+        """Publish a claimed decision and always wake its gate."""
+        sorted_call_ids = sorted(cycle.call_ids)
+        try:
+            self._enqueue(
+                {
+                    "type": "approval_resolved",
+                    "approved": approved,
+                    "feedback": feedback or "",
+                    "always": bool(always),
+                    "cycle_id": cycle.cycle_id,
+                    "call_ids": sorted_call_ids,
+                }
+            )
+            self._broadcast_approval_resolved(
+                approved,
+                feedback,
+                always=always,
+                cycle_id=cycle.cycle_id,
+                call_ids=tuple(sorted_call_ids),
+            )
+        finally:
+            cycle.event.set()
+
+    def resolve_approval(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        always: bool = False,
+        timeout: bool = False,
+        call_id: str | None = None,
+        cycle_id: str | None = None,
+        resolver_principal_id: str | None = None,
+    ) -> str | None:
+        """Unblock ONE pending approval cycle with the caller's decision.
+
+        Routes to a single :class:`ApprovalCycle` — by ``cycle_id``, by
+        member ``call_id``, or (selector-less legacy callers: CLI
+        wrappers, channel adapters, cancel/timeout paths) the oldest
+        unresolved cycle.  Returns the resolved ``cycle_id`` or ``None``
+        when nothing matched — a second click racing the gate thread, or
+        a stale selector.  One decision can no longer fan out to every
+        parked gate: each cycle owns its event/result, which is the
+        whole fix for the cross-approval hazard the singleton slot had.
+
+        Broadcasts ``approval_resolved`` (now carrying ``cycle_id`` +
+        ``call_ids``) so every connected tab dismisses the RIGHT prompt
+        in sync. Updates ``user_decision`` on every LLM intent-verdict
+        that fired during this cycle's round — the audit trail reflects
+        what the user actually chose for THESE calls.
+
+        ``resolver_principal_id`` is supplied by authenticated HTTP callers.
+        A different authorized peer may make the binary approve/reject choice,
+        but cannot inject feedback or create an ``always`` grant. Same-principal
+        Always grants are owned here and scoped by execution principal + tool.
+
+        ``timeout`` flips the persisted ``user_decision`` from
+        ``"denied"`` to ``"timeout"`` so the audit trail can
+        distinguish an active user denial from a passive
+        approval-timeout expiry.  Mutually exclusive with
+        ``approved=True`` (a timeout is a passive denial); the
+        combination raises ``ValueError``.
+        """
+        if timeout and approved:
+            raise ValueError("resolve_approval: timeout=True is incompatible with approved=True")
+        decision_str = "timeout" if timeout else ("approved" if approved else "denied")
+        # Select first, then take the same logical admission lease used by gate
+        # publication.  If Stop already advanced this cycle's monotonic owner
+        # witness, a click cannot win afterward and stamp a false approval;
+        # the workstream sweep owns the denial.  A fresh successor waits behind
+        # an older sweep rather than being denied by it.
+        with self._ws_lock:
+            cycle = self._select_cycle_locked(cycle_id=cycle_id, call_id=call_id)
+        if cycle is None:
+            return None
+        if not self._begin_approval_admission(lambda: self._approval_cycle_owner_aborted(cycle)):
+            return None
+        pending: list[dict[str, Any]] | None = None
+        effective_always = False
+        try:
+            # A resolver can discover the cycle immediately after
+            # registration. Wait outside every state lock until the gate has
+            # published its complete prompt bundle (or deliberately none).
+            cycle.publication_done.wait()
+            with self._ws_lock:
+                selected = self._select_cycle_locked(cycle_id=cycle.cycle_id)
+                if selected is not cycle:
+                    return None
+                cycle.resolver_principal_id = self._validate_approval_resolver(
+                    cycle,
+                    resolver_principal_id=resolver_principal_id,
+                    feedback=feedback,
+                    always=always,
+                )
+                effective_always = bool(always and approved)
+                if effective_always:
+                    grant_names = self._approval_grant_names(cycle)
+                    if grant_names:
+                        self._always_approve_tools_by_principal.setdefault(
+                            cycle.execution_principal_id, set()
+                        ).update(grant_names)
+                pending = self._claim_approval_cycle_locked(
+                    cycle,
+                    approved=approved,
+                    feedback=feedback,
+                    decision=decision_str,
+                )
+            try:
+                self._publish_approval_resolution(
+                    cycle,
+                    approved=approved,
+                    feedback=feedback,
+                    always=effective_always,
+                )
+            except Exception:
+                # The decision is authoritative and the gate was awakened in
+                # the helper's ``finally``. A failed transport mirror must not
+                # turn an accepted click into a stranded approval thread.
+                log.warning(
+                    "approval.resolve.publish_failed ws=%s cycle=%s",
+                    self.ws_id,
+                    cycle.cycle_id,
+                    exc_info=True,
+                )
+        finally:
+            self._end_approval_admission()
+        if pending:
+            self._persist_verdict_decisions(
+                pending,
+                decision_str,
+                resolver_principal_id=cycle.resolver_principal_id,
+                execution_principal_id=cycle.execution_principal_id,
+            )
+        return cycle.cycle_id
+
+    def resolve_all_approvals(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        timeout: bool = False,
+        resolver_principal_id: str | None = None,
+    ) -> int:
+        """Resolve EVERY live cycle with one decision; returns the count.
+
+        For the sweep paths where the operator's intent addresses the
+        workstream, not a specific batch: cancel ("stop everything"),
+        session close, worker-recovery.  Loops :meth:`resolve_approval`
+        oldest-first so per-cycle bookkeeping (verdict stamps, SSE
+        dismissals, per-cycle events) runs identically to a targeted
+        resolution.
+
+        The admission barrier drains every bundle already linearized before
+        the sweep, then atomically claims the eligible cycles. New admissions
+        wait behind the barrier; cycles carrying a fresh successor witness are
+        deliberately excluded. Live dismissals publish before the barrier is
+        retired, while durable verdict updates run afterward so storage latency
+        never delays successor admission.
+
+        Authenticated request paths pass ``resolver_principal_id`` so durable
+        verdicts retain the human actor. Internal recovery and teardown paths
+        omit it and remain explicitly unattributed.
+        """
+        # A Smart Approval gate can still be waiting for its asynchronous
+        # verdict before an ApprovalCycle exists.  Wake that pre-cycle wait as
+        # part of every workstream-wide sweep, including an idle/zero-cycle
+        # sweep.  The gate's operation witness is the predicate: notification
+        # alone is only a spurious wake, while the predicate also covers cancel
+        # winning immediately before the wait begins.
+        with self._approval_admission_cond:
+            self._approval_sweeps += 1
+            self._approval_admission_cond.wait_for(lambda: self._active_approval_admissions == 0)
+        claimed: list[tuple[ApprovalCycle, list[dict[str, Any]]]] = []
+        try:
+            with self._verdict_cond:
+                self._verdict_cond.notify_all()
+            # No admitted gate bundle can still register while this snapshot
+            # is claimed, and new admissions remain behind the sweep barrier.
+            # Claim only legacy cycles or cycles whose own monotonic witness is
+            # aborted; a force-successor's fresh cycle is not this Stop's work.
+            with self._ws_lock:
+                targets = [
+                    cycle
+                    for cycle in self._approval_cycles.values()
+                    if not cycle.resolved
+                    and (not cycle.cancel_witnesses or self._approval_cycle_owner_aborted(cycle))
+                ]
+                for cycle in targets:
+                    cycle.resolver_principal_id = resolver_principal_id or ""
+                    pending = self._claim_approval_cycle_locked(
+                        cycle,
+                        approved=approved,
+                        feedback=feedback,
+                        decision=("timeout" if timeout else ("approved" if approved else "denied")),
+                    )
+                    claimed.append((cycle, pending))
+            # Keep the sweep barrier active through live dismissal so a fresh
+            # successor cannot publish a reused call-id card before the old
+            # resolution. Storage is deferred until after the barrier.
+            for cycle, _pending in claimed:
+                cycle.publication_done.wait()
+                try:
+                    self._publish_approval_resolution(
+                        cycle,
+                        approved=approved,
+                        feedback=feedback,
+                        always=False,
+                    )
+                except Exception:
+                    log.warning(
+                        "approval.resolve_all.publish_failed ws=%s cycle=%s",
+                        self.ws_id,
+                        cycle.cycle_id,
+                        exc_info=True,
+                    )
+        finally:
+            with self._approval_admission_cond:
+                self._approval_sweeps -= 1
+                if self._approval_sweeps == 0:
+                    self._approval_admission_cond.notify_all()
+        decision_str = "timeout" if timeout else ("approved" if approved else "denied")
+        for _cycle, pending in claimed:
+            if pending:
+                self._persist_verdict_decisions(
+                    pending,
+                    decision_str,
+                    resolver_principal_id=_cycle.resolver_principal_id,
+                    execution_principal_id=_cycle.execution_principal_id,
+                )
+        return len(claimed)
+
+    def _persist_verdict_decisions(
+        self,
+        pending: list[dict[str, Any]],
+        decision_str: str,
+        *,
+        resolver_principal_id: str | None = None,
+        execution_principal_id: str | None = None,
+    ) -> None:
+        """Persist a verdict decision safely in either arrival order.
+
+        The async LLM verdict's base UPSERT may be deferred so judge lifecycle
+        locks never cover storage I/O.  Approval resolution can therefore win
+        the race and reach this method before that row exists.  UPSERT the full
+        decided row first, then UPDATE: if this path wins it creates the row;
+        if the base verdict wins, the update stamps it.  A later base UPSERT
+        deliberately does not overwrite ``user_decision`` on conflict.
+        """
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            for v in pending:
+                vid = v.get("verdict_id", "")
+                if vid:
+                    resolver = (
+                        str(v.get("resolver_principal_id") or "")
+                        if resolver_principal_id is None
+                        else resolver_principal_id
+                    )
+                    executor = (
+                        str(v.get("execution_principal_id") or "")
+                        if execution_principal_id is None
+                        else execution_principal_id
+                    )
+                    decided = dict(v)
+                    decided["user_decision"] = decision_str
+                    decided["resolver_principal_id"] = resolver
+                    decided["execution_principal_id"] = executor
+                    self._persist_intent_verdict(decided)
+                    update_fields = {"user_decision": decision_str}
+                    if resolver or executor:
+                        update_fields.update(
+                            resolver_principal_id=resolver,
+                            execution_principal_id=executor,
+                        )
+                    storage.update_intent_verdict(vid, **update_fields)
+        except Exception:
+            log.debug("Failed to update verdict user_decision", exc_info=True)
+
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
+        """Two-phase approval gate for a batch of tool calls.
+
+        Shared body for both interactive (:class:`turnstone.server.WebUI`)
+        and coordinator (:class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`)
+        sessions. Order of resolution:
+
+        1. Reset the per-round verdict cache so late LLM verdicts from
+           the previous round can't leak onto this one.
+        2. Evaluate admin-defined tool policies (deny short-circuits;
+           allow tags items as auto-approved with ``AutoApproveReason.POLICY``).
+        3. Per-tool auto-approve via configured ``self.auto_approve_tools``
+           plus execution-principal-scoped "Approve + Always" grants.
+        4. Budget-override carve-out + blanket ``self.auto_approve``.
+           Synthetic ``__budget_override__`` items always prompt.
+        5. Activity tagging + ``_broadcast_activity`` so the dashboard
+           reflects approval state.
+        6. Heuristic verdict persistence (one row per ``_heuristic_verdict``
+           item) + ``_record_judge_metric`` hook (subclass-overridden to
+           feed the node's or console's Prometheus collector).
+        7. Check the batch's private cancellation witness around every
+           pre-cycle wait/publication, register an :class:`ApprovalCycle`,
+           re-check once more, emit its ``approve_request`` card, and block on
+           the CYCLE's event up to the batch's configured human wait deadline.
+
+        ``__budget_override__`` is interactive-only today (coord
+        workstreams don't have token budgets), but the carve-out check
+        is cheap (``any(...)`` over pending) and is a no-op on coord;
+        kept unconditional so a future coord-skill path picks it up
+        for free.
+
+        Reentrant by design: several gate threads (main loop + parallel
+        task agents) run this body concurrently, each against its own
+        :class:`ApprovalCycle`.  Shared state is touched only under
+        ``_ws_lock`` and scoped to this batch's call_ids.
+        """
+
+        execution_principal_id = _execution_principal_for_items(items)
+
+        def _cancelled() -> bool:
+            return any(
+                bool(getattr(it.get("_approval_cancel_witness"), "aborted", False)) for it in items
+            )
+
+        def _admit(action: Callable[[], object]) -> bool:
+            """Commit one bounded approval state/UI bundle before Stop.
+
+            ``resolve_all_approvals`` refuses new leases after the session
+            advances the monotonic witness, then waits for admitted bundles to
+            drain before resolving cycles.  The counter mutex is not held while
+            ``action`` runs.  Callers must still defer storage work until after
+            this function returns so Stop is never coupled to database latency.
+            """
+            if not self._begin_approval_admission(_cancelled):
+                return False
+            try:
+                action()
+                return True
+            finally:
+                self._end_approval_admission()
+
+        # Production ChatSession gates carry the coherent judge-config
+        # snapshot captured for THIS batch. Parallel task-agent gates may be
+        # queued while another batch observes a hot reload; reading mutable UI
+        # attributes here would let one gate combine the other's enabled flag,
+        # threshold, and timeout. Direct/legacy UI callers do not stamp the
+        # private field, so retain their established instance-attribute path.
+        stamped_configs = [it.get("_smart_approval_config") for it in items]
+        if any(isinstance(cfg, _SmartApprovalConfig) for cfg in stamped_configs):
+            first_config = stamped_configs[0] if stamped_configs else None
+            if isinstance(first_config, _SmartApprovalConfig) and all(
+                cfg == first_config for cfg in stamped_configs
+            ):
+                smart_config = first_config
+            else:
+                # A partially/multiply stamped batch is not one coherent
+                # controller snapshot.  Fail closed to the human gate.
+                smart_config = _SmartApprovalConfig(False, 1.0, 0.0)
+        else:
+            smart_config = _SmartApprovalConfig(
+                self.smart_approvals_enabled,
+                self.smart_approval_threshold,
+                self.smart_approval_wait_seconds,
+            )
+
+        # The independently configured human wait uses the same immutable
+        # per-item channel. Every member must carry one identical value; a
+        # partial/mixed stamp falls back to the historical one-hour deadline.
+        approval_wait_seconds: float | None = float(self._APPROVAL_WAIT_TIMEOUT)
+        if items and all("_approval_wait_seconds" in item for item in items):
+            candidate = items[0]["_approval_wait_seconds"]
+            if all(item["_approval_wait_seconds"] == candidate for item in items) and (
+                candidate is None or isinstance(candidate, (int, float))
+            ):
+                approval_wait_seconds = float(candidate) if candidate is not None else None
+
+        # The batch's judge generation, stamped by ``_evaluate_intent`` —
+        # one event per spawn, shared by every item in the batch.  Read
+        # before the purge so the purge can spare verdicts this very
+        # generation already delivered.
+        judge_event = next(
+            (it.get("_judge_event") for it in items if it.get("_judge_event") is not None),
+            None,
+        )
+        if not _admit(
+            lambda: self._purge_round_verdicts(
+                {it.get("call_id", "") for it in items if it.get("call_id")},
+                keep_origin=judge_event,
+            )
+        ):
+            return False, "Cancelled by user"
+
+        # Early-paint the pending tool batch — BEFORE the tool-policy lookup,
+        # the Smart Approvals verdict wait (``judge.smart_approvals`` parks here
+        # for up to ``judge.timeout``), and the human gate — so the operator
+        # sees what the model just committed to and can hit Stop in an emergency
+        # the instant the call appears, not only once the judge has ruled.  This
+        # is a UI paint ONLY: the authoritative ``tool_info`` / ``approve_request``
+        # / ``tool_result`` events that follow carry the resolved state and
+        # upgrade THIS SAME construct in place — both UIs key the card by
+        # ``call_id`` and morph it rather than appending a duplicate — and on
+        # reconnect the replayed ``Last-Event-ID`` slice reconstructs it
+        # identically.  No persistence / audit / verdict bookkeeping happens
+        # here; those stay on the resolved-state events so this can't perturb
+        # the gate's accounting.  ``_heuristic_verdict`` is already attached
+        # (``_evaluate_intent`` runs before the gate), so the card paints with
+        # the heuristic verdict + a "judge analysing" cue from the first frame.
+        if items and not _admit(
+            lambda: self._enqueue(
+                {"type": "tool_pending", "items": self._serialize_approval_items(items)}
+            )
+        ):
+            return False, "Cancelled by user"
+
+        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
+
+        # ``__budget_override__`` is a synthetic UI-only pseudo-tool injected
+        # by ChatSession.send when a skill's token budget is exhausted; its
+        # whole purpose is to force an operator prompt before the next turn
+        # spends past the cap. Read from the pre-filter ``items`` list (not
+        # ``pending``) so a wildcard ``*: allow`` policy or a stray entry in
+        # ``auto_approve_tools`` cannot strip the override from ``pending``
+        # before the carve-out gate at the auto-approve fall-through can see
+        # it. Same intent gates the policy block above.
+        has_budget_override = any(it.get("func_name") == "__budget_override__" for it in items)
+
+        # -- Tool policy evaluation -----------------------------------------------
+        # Check admin-defined tool policies before the auto_approve check.
+        # ``__budget_override__`` is excluded from policy matching: it is a
+        # synthetic UI-only pseudo-tool that exists specifically to force an
+        # operator prompt when a skill's token budget is exhausted, so a
+        # wildcard ``*: allow`` policy must never auto-approve it. Same
+        # rationale gates the carve-out check below at line 470.
+        if pending:
+            try:
+                from turnstone.core.policy import evaluate_tool_policies_batch
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    tool_names = [
+                        it.get("approval_label", "") or it.get("func_name", "")
+                        for it in pending
+                        if it.get("func_name") and it.get("func_name") != "__budget_override__"
+                    ]
+                    if tool_names:
+                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
+                        if _cancelled():
+                            return False, "Cancelled by user"
+                        still_pending = []
+                        for it in pending:
+                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                            # Synthetic budget-override item bypasses policy
+                            # matching entirely — falls through to the carve-out
+                            # gate so an operator always sees the prompt.
+                            if it.get("func_name") == "__budget_override__":
+                                still_pending.append(it)
+                                continue
+                            verdict = verdicts.get(policy_name)
+                            if verdict == "deny":
+                                it["denied"] = True
+                                it["denial_msg"] = (
+                                    f"Blocked by tool policy (pattern match for '{policy_name}')"
+                                )
+                            elif verdict == "allow":
+                                # Admin-defined ``allow`` rule fires the
+                                # auto-approve gate without any UI prompt.
+                                # Tag for /dashboard visibility so the
+                                # operator can see which calls bypassed
+                                # the prompt and why.
+                                it["needs_approval"] = False
+                                self._tag_auto_approved([it], AutoApproveReason.POLICY)
+                            else:
+                                still_pending.append(it)
+                        # If all were resolved by policy, check if any were denied
+                        if not still_pending:
+                            any_denied = any(it.get("denied") for it in items)
+                            if any_denied:
+                                # Record the policy-allowed siblings before
+                                # the early return — the fall-through
+                                # branch never runs on this path, so without
+                                # this the policy bypass is invisible to
+                                # /dashboard + audit.  ``_record_auto_approves``
+                                # MUST run before ``_persist_auto_approved_*``
+                                # so the call_id → reason lookup map is
+                                # populated before the heuristic INSERTs go
+                                # in: otherwise an LLM judge verdict firing
+                                # in the gap lands with ``user_decision=
+                                # "pending"`` and stays that way.
+                                policy_deferred: list[Callable[[], None]] = []
+
+                                def _commit_policy_result() -> None:
+                                    self._record_auto_approves(items, deferred=policy_deferred)
+                                    self._persist_auto_approved_heuristic_verdicts(
+                                        items,
+                                        deferred=policy_deferred,
+                                    )
+                                    self._enqueue(
+                                        {
+                                            "type": "tool_info",
+                                            "items": self._serialize_approval_items(items),
+                                        }
+                                    )
+
+                                if not _admit(_commit_policy_result):
+                                    return False, "Cancelled by user"
+                                for persist in policy_deferred:
+                                    persist()
+                                return False, "Blocked by tool policy"
+                        pending = still_pending
+            except Exception:
+                log.debug("Tool policy evaluation failed", exc_info=True)
+        if _cancelled():
+            return False, "Cancelled by user"
+        # -- End tool policy evaluation -------------------------------------------
+
+        # Per-tool auto-approve check. Template/config grants are shared
+        # workstream policy; interactive "Always" grants apply only to calls
+        # executing as the same immutable principal that received the grant.
+        # Suppressed when a budget-override item is present so the carve-out
+        # at the next gate stays effective even if ``__budget_override__`` ever
+        # lands in ``auto_approve_tools`` (defensive — listings filter it out
+        # today, but the worker can be configured by a skill template).
+        with self._ws_lock:
+            principal_grants = set(
+                self._always_approve_tools_by_principal.get(execution_principal_id, set())
+            )
+        auto_approve_names = set(self.auto_approve_tools) | principal_grants
+        if pending and auto_approve_names and not has_budget_override:
+            pending_names = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending
+                if it.get("func_name")
+            }
+            if pending_names and pending_names.issubset(auto_approve_names):
+                if _cancelled():
+                    return False, "Cancelled by user"
+                # Merge configured-source labels with the current execution
+                # principal's explicit Always grants for dashboard attribution.
+                source_map = dict(self._auto_approve_tools_source)
+                source_map.update({name: AutoApproveReason.ALWAYS for name in principal_grants})
+                self._tag_auto_approved(
+                    pending,
+                    AutoApproveReason.AUTO_APPROVE_TOOLS,
+                    source_map=source_map,
+                )
+                pending = []
+
+        # Budget override requires explicit approval — never auto-approved by
+        # blanket auto_approve (tool policies can still allow it explicitly,
+        # but the policy block above carves out ``__budget_override__`` so
+        # that path is unreachable too). ``has_budget_override`` was computed
+        # from the pre-filter ``items`` list at the top of the function so a
+        # policy/auto-approve pass that drained the override from ``pending``
+        # cannot disarm this gate.
+        blanket_active = self.auto_approve and not has_budget_override
+
+        # -- Smart Approvals (judge.smart_approvals) -----------------------------
+        # Last automatic gate before the human prompt, after the explicit
+        # operator-configured ones (policy / "Always" / blanket): wait
+        # briefly for the async LLM intent verdict and auto-approve every
+        # still-pending call the judge cleared with a high-confidence
+        # ``approve``.  Skipped under blanket auto-approve (everything is
+        # approved already) and when a ``__budget_override__`` pseudo-tool
+        # is present (it must always reach a human).
+        # Smart qualification is read-only.  Its mutations, audit stamps, and
+        # visible auto-approval commit join the one terminal admission below;
+        # a Stop between the verdict wait and that admission therefore leaves
+        # no half-approved batch behind.
+        smart_commit_actions: list[Callable[[], None]] = []
+        auto_deferred: list[Callable[[], None]] = []
+        if pending and smart_config.enabled and not blanket_active and not has_budget_override:
+            pending = self._apply_smart_approvals(
+                pending,
+                cancelled=_cancelled,
+                threshold=smart_config.threshold,
+                wait_seconds=smart_config.wait_seconds,
+                commit_actions=smart_commit_actions,
+                persistence_actions=auto_deferred,
+            )
+
+        if not pending or blanket_active:
+            first = items[0] if items else {}
+            label = first.get("func_name", "")
+            preview = first.get("preview", "")[:80]
+
+            def _commit_auto_approval() -> None:
+                for commit in smart_commit_actions:
+                    commit()
+                if blanket_active and pending:
+                    # Blanket flag drained the rest of pending — tag so the
+                    # dashboard can distinguish it from the other automatic
+                    # paths.  These item mutations share the same admission as
+                    # their visible/audited decision.
+                    self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
+                with self._ws_lock:
+                    self._ws_current_activity = f"⚙ {label}: {preview}" if label else ""
+                    self._ws_activity_state = "tool" if label else ""
+                self._broadcast_activity()
+                # Populate the call_id → reason lookup before preparing the
+                # heuristic write so a racing LLM verdict observes the final
+                # decision.  Actual storage runs after admission.
+                self._record_auto_approves(items, deferred=auto_deferred)
+                self._persist_auto_approved_heuristic_verdicts(
+                    items,
+                    deferred=auto_deferred,
+                )
+                self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
+
+            if not _admit(_commit_auto_approval):
+                return False, "Cancelled by user"
+            for persist in auto_deferred:
+                persist()
+            return True, None
+
+        # Prepare the manual gate locally.  Shared activity, mixed automatic
+        # bookkeeping, cycle registration, and the entire prompt bundle commit
+        # under ONE logical admission below; storage and metric callbacks run
+        # afterward so neither Stop nor a successor waits on I/O.
+        first_pending = pending[0]
+        label = first_pending.get("func_name", "")
+        preview = first_pending.get("preview", "")[:60]
+        heuristic_verdicts: list[dict[str, Any]] = []
+        pending_verdicts: list[dict[str, Any]] = []
+        for item in items:
+            if _cancelled():
+                return False, "Cancelled by user"
+            hv = item.get("_heuristic_verdict")
+            if not hv:
+                continue
+            heuristic_row = dict(hv)
+            heuristic_row["execution_principal_id"] = execution_principal_id
+            heuristic_row.setdefault("resolver_principal_id", "")
+            if item.get("auto_approved"):
+                heuristic_row["user_decision"] = item.get("auto_approve_reason", "") or "pending"
+            else:
+                heuristic_row["user_decision"] = "pending"
+                pending_verdicts.append(heuristic_row)
+            heuristic_verdicts.append(heuristic_row)
+
+        deferred_auto_audit: list[Callable[[], None]] = []
+        cycle_id = uuid.uuid4().hex
+        card: dict[str, Any] = {
+            "type": "approve_request",
+            "cycle_id": cycle_id,
+            "items": self._serialize_approval_items(items),
+        }
+        cycle = ApprovalCycle(items, card, judge_event)
+        prompt_published = False
+        cycle_registered = False
+
+        def _commit_manual_prompt() -> None:
+            nonlocal cycle_registered, prompt_published
+            # Record policy-approved siblings before registration so a racing
+            # late LLM verdict observes the final reason.  Only the in-memory
+            # lookup changes here; durable audit is deferred below.
+            self._record_auto_approves(items, deferred=deferred_auto_audit)
+            with self._ws_lock:
+                self._ws_current_activity = f"⏳ Awaiting approval: {label} — {preview}"
+                self._ws_activity_state = "approval"
+                # Evict a stale generation that landed after the entry purge
+                # but before this final ownership transaction.
+                if judge_event is not None:
+                    for cid in {it.get("call_id", "") for it in items if it.get("call_id")}:
+                        if cid in self._llm_verdicts and self._verdict_origins.get(cid) != id(
+                            judge_event
+                        ):
+                            del self._llm_verdicts[cid]
+                            self._verdict_origins.pop(cid, None)
+                card["judge_pending"] = any(
+                    it.get("_heuristic_verdict") and it.get("call_id", "") not in self._llm_verdicts
+                    for it in items
+                )
+                pending_cids = {hv.get("call_id") for hv in pending_verdicts}
+                early_llm = [
+                    llm_verdict
+                    for cid, llm_verdict in self._llm_verdicts.items()
+                    if cid in pending_cids
+                    and llm_verdict.get("user_decision", "pending") == "pending"
+                ]
+                cycle.pending_verdicts = pending_verdicts + early_llm
+                self._approval_cycles[cycle.cycle_id] = cycle
+                self._refresh_pending_approval_view()
+                cycle_registered = True
+            self._broadcast_activity()
+            self._enqueue(card)
+            self._broadcast_approve_request(card)
+            self._replay_pending_verdicts(items)
+            prompt_published = True
+
+        try:
+            if not _admit(_commit_manual_prompt):
+                return False, "Cancelled by user"
+        except BaseException:
+            if cycle_registered:
+                self._unregister_approval_cycle(cycle)
+            raise
+        finally:
+            cycle.publication_done.set()
+        if not prompt_published:
+            if cycle_registered:
+                self._unregister_approval_cycle(cycle)
+            return False, "Cancelled by user"
+
+        # The admission point above authorizes these immutable audit rows.
+        # Persisting after release preserves Stop latency.  A racing decision
+        # first UPSERTs its final value, and the base UPSERT deliberately does
+        # not overwrite ``user_decision`` on conflict.
+        for heuristic_row in heuristic_verdicts:
+            self._record_judge_metric(heuristic_row)
+        self._persist_intent_verdicts_bulk(heuristic_verdicts, default_tier="heuristic")
+        for persist in deferred_auto_audit:
+            persist()
+        try:
+            if not cycle.event.wait(timeout=approval_wait_seconds):
+                # ``Event.wait(None)`` only returns after the event is set.
+                # Reaching this branch therefore proves a finite deadline.
+                assert approval_wait_seconds is not None
+                # Approval timed out (e.g., user disconnected). Deny via
+                # resolve_approval so verdicts and state are updated
+                # consistently — targeted at THIS cycle so a sibling gate
+                # timing out can't deny someone else's round.  Feedback
+                # derives from this cycle's immutable config snapshot so a
+                # hot reload cannot make the audit text disagree with the
+                # deadline that actually fired.
+                log.warning("Approval timed out for ws_id=%s", self.ws_id)
+                self.resolve_approval(
+                    False,
+                    f"Approval timed out after {approval_wait_seconds:g}s",
+                    timeout=True,
+                    cycle_id=cycle.cycle_id,
+                )
+        finally:
+            # Gate thread owns the cycle's lifecycle end-to-end; the
+            # resolver only flips its state.  Unregister even if the
+            # wait raises so a dead gate can't strand a zombie card.
+            self._unregister_approval_cycle(cycle)
+        approved, feedback = cycle.result
+
+        if not approved:
+            denial_msg = "Denied by user"
+            if feedback:
+                denial_msg += f": {feedback}"
+            for item in pending:
+                item["denied"] = True
+                item["denial_msg"] = denial_msg
+
+        return approved, feedback
+
+    # ------------------------------------------------------------------
+    # Smart Approvals (judge.smart_approvals)
+    # ------------------------------------------------------------------
+
+    def _apply_smart_approvals(
+        self,
+        pending: list[dict[str, Any]],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        admit: Callable[[Callable[[], None]], bool] | None = None,
+        threshold: float | None = None,
+        wait_seconds: float | None = None,
+        commit_actions: list[Callable[[], None]] | None = None,
+        persistence_actions: list[Callable[[], None]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Auto-approve a tool batch the LLM judge cleared confidently.
+
+        **Batch-atomic.**  Waits (bounded by ``smart_approval_wait_seconds``)
+        for the async LLM verdicts of EVERY pending call, then auto-approves
+        the whole batch only if EVERY call qualifies; a single non-qualifying
+        call sends the entire batch to a human.  Parallel tool calls are one
+        unit of intent — approving the safe-looking members while a sibling
+        is held would let a multi-step action through piecemeal — so it is
+        all-or-nothing.
+
+        A call qualifies when its LLM verdict is a *completed* ``approve`` —
+        tier ``"llm"`` (NOT the ``"llm_fallback"`` error tier) at confidence
+        ≥ ``smart_approval_threshold`` — AND the deterministic heuristic did
+        not *explicitly* flag it ``deny`` / ``critical``.  That heuristic
+        floor only blocks the explicit danger verdicts: the heuristic
+        DEFAULT for an unmatched tool is ``review``, and upgrading ``review``
+        → ``approve`` on a confident LLM verdict is exactly this feature's
+        job, so ``review`` is not a floor.  But a call the pattern rules
+        matched as ``deny`` / ``critical`` (e.g. ``rm -rf /``) is never
+        cleared by the (promptable) LLM — those always reach a human.
+
+        Returns ``[]`` when the whole batch is auto-approved, or *pending*
+        unchanged when anything is uncertain (review/deny/low-confidence/
+        error/timeout/heuristic-danger/no-verdict) — fails closed.
+        """
+        is_cancelled = cancelled or (lambda: False)
+        if is_cancelled():
+            return pending
+        # Only calls the judge actually evaluated carry a heuristic verdict;
+        # the ``__budget_override__`` pseudo-tool is never smart-approved, so
+        # its presence makes ``candidates`` smaller than ``pending`` and the
+        # batch-completeness check below holds the whole batch for a human.
+        candidates = [
+            it
+            for it in pending
+            if it.get("_heuristic_verdict") and it.get("func_name") != "__budget_override__"
+        ]
+        needed = {it.get("call_id", "") for it in candidates if it.get("call_id")}
+        if not needed:
+            return pending
+        # The whole batch must be eligible before we pay the verdict wait:
+        #   - every pending call must be a judged candidate — an unjudged
+        #     sibling or the ``__budget_override__`` pseudo-tool makes
+        #     candidates < pending, AND
+        #   - call_ids must be unique — some local models emit duplicate
+        #     non-empty tool-call ids (``model_turn.ensure_tool_call_ids`` only fills
+        #     MISSING ones), which collapse in the ``needed`` set and would let
+        #     one verdict clear two distinct calls (their args differ).
+        # Either mismatch → hold the whole batch for a human.  Checked
+        # pre-wait so an ineligible batch never pays the (up-to-timeout) wait.
+        if len(candidates) != len(pending) or len(needed) != len(candidates):
+            return pending
+        # The per-round verdict cache is FIFO-capped; a batch with more calls
+        # than the cap can't hold every verdict at once, so the wait could
+        # never see them all and would stall to its full budget.  Hold such
+        # (pathological) batches for a human.
+        if len(needed) > self._LLM_VERDICT_CACHE_MAX:
+            log.info("judge.smart_approval.batch_too_large", ws_id=self.ws_id, count=len(needed))
+            return pending
+        self._await_llm_verdicts(
+            needed,
+            self.smart_approval_wait_seconds if wait_seconds is None else wait_seconds,
+            cancelled=is_cancelled,
+        )
+        if is_cancelled():
+            return pending
+
+        effective_threshold = self.smart_approval_threshold if threshold is None else threshold
+        # This batch's judge generation — every cached verdict must have
+        # been delivered by THIS spawn's daemon.  A verdict of a stale
+        # generation (prior turn's run-to-completion daemon + a provider
+        # that reuses call_ids) fails qualification and the batch goes to
+        # a human.  ``None`` when the caller never ran the judge (legacy
+        # tests) — origin check skipped, matching the old behavior.
+        expected_gen = next(
+            (it.get("_judge_event") for it in candidates if it.get("_judge_event") is not None),
+            None,
+        )
+        qualified: dict[str, dict[str, Any]] = {}
+        with self._ws_lock:
+            if is_cancelled():
+                return pending
+            for it in candidates:
+                cid = it.get("call_id", "")
+                v = self._llm_verdicts.get(cid)
+                # Require a COMPLETED LLM verdict — tier "llm", not the
+                # "llm_fallback" error carry-over ("heuristic" never lands in
+                # this cache) — recommending "approve" at/above threshold,
+                # delivered by this batch's own judge generation.
+                if (
+                    v is None
+                    or v.get("tier") != "llm"
+                    or v.get("recommendation") != "approve"
+                    or self._verdict_confidence(v) < effective_threshold
+                    or (
+                        expected_gen is not None
+                        and self._verdict_origins.get(cid) != id(expected_gen)
+                    )
+                ):
+                    return pending  # one fails → none of the batch auto-approves
+                hv = it.get("_heuristic_verdict") or {}
+                if hv.get("recommendation") == "deny" or hv.get("risk_level") == "critical":
+                    return pending  # explicit deterministic danger flag → human
+                v.setdefault(
+                    "execution_principal_id",
+                    str(it.get("_principal_id") or "").strip(),
+                )
+                v.setdefault("resolver_principal_id", "")
+                qualified[cid] = v
+
+        # Whole batch qualified.  Commit its shared state through the caller's
+        # cancellation admission point: a Stop that wins after qualification
+        # must not leave a durable ``smart_approval`` decision for tools that
+        # never crossed the gate.  Storage remains deferred until after that
+        # short admission lock is released.
+        deferred = persistence_actions if persistence_actions is not None else []
+
+        def _commit() -> None:
+            # Clear the gate flag (mirrors the policy ``allow`` branch) so each
+            # call is treated as resolved.  Attach the driving LLM verdict so
+            # the auto-approved row renders the decision that cleared it.
+            for item in candidates:
+                item["needs_approval"] = False
+                item["_llm_verdict"] = qualified.get(item.get("call_id", ""))
+            self._tag_auto_approved(candidates, AutoApproveReason.SMART_APPROVAL)
+            self._finalize_smart_verdicts(qualified, deferred=deferred)
+            log.info("judge.smart_approval", ws_id=self.ws_id, approved=len(candidates))
+
+        if commit_actions is not None:
+            commit_actions.append(_commit)
+        elif admit is not None:
+            if not admit(_commit):
+                return pending
+        elif is_cancelled():
+            return pending
+        else:
+            _commit()
+        if persistence_actions is None:
+            for persist in deferred:
+                persist()
+        return []
+
+    @staticmethod
+    def _verdict_confidence(verdict: dict[str, Any]) -> float:
+        """Verdict confidence clamped to ``[0.0, 1.0]``; ``0.0`` if malformed.
+
+        Rejects non-finite values explicitly: ``min``/``max`` would let a NaN
+        through as ``1.0`` (every comparison with NaN is False), and
+        ``json.loads`` accepts ``NaN`` by default — so a verdict reporting
+        ``"confidence": NaN`` could otherwise clear the auto-approve bar.
+        """
+        try:
+            confidence = float(verdict.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(confidence):
+            return 0.0
+        return max(0.0, min(1.0, confidence))
+
+    def _await_llm_verdicts(
+        self,
+        needed: set[str],
+        budget_seconds: float,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        """Block until every call_id in *needed* has an LLM verdict cached.
+
+        Returns the instant the last verdict lands; otherwise gives up
+        after *budget_seconds* and leaves the missing calls for the human
+        gate (fail-closed).  A cancelled operation also returns immediately;
+        workstream-wide approval sweeps wake this pre-cycle wait even when no
+        :class:`ApprovalCycle` exists yet.  ``on_intent_verdict`` notifies
+        ``_verdict_cond`` on every cache write, and the judge delivers exactly
+        one verdict (LLM or ``llm_fallback``) per call, so the common case is
+        an early return at real judge latency rather than a full-budget wait.
+        """
+        if budget_seconds <= 0 or not needed:
+            return
+        is_cancelled = cancelled or (lambda: False)
+        deadline = time.monotonic() + budget_seconds
+        with self._verdict_cond:
+            while not needed.issubset(self._llm_verdicts.keys()) and not is_cancelled():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._verdict_cond.wait(timeout=remaining)
+
+    def _finalize_smart_verdicts(
+        self,
+        qualified: dict[str, dict[str, Any]],
+        *,
+        deferred: list[Callable[[], None]] | None = None,
+    ) -> None:
+        """Stamp ``smart_approval`` on the LLM verdicts of auto-approved calls.
+
+        The verdicts arrived during ``_await_llm_verdicts`` — before any
+        cycle existed for this round (the gate registers its
+        :class:`ApprovalCycle` only after the wait, and a fully
+        smart-approved batch never registers one at all). Stamp the exact
+        objects captured at qualification and UPDATE those persisted rows. If
+        the object is still cached, reconnect replay sees the final decision;
+        if a sibling reused the call_id and replaced it, that sibling stays
+        untouched. The matching heuristic verdict is stamped by
+        ``approve_tools``'s own persistence path via the ``auto_approved`` tag
+        set just before this call.
+        """
+        stamped: list[dict[str, Any]] = []
+        with self._ws_lock:
+            for _cid, verdict in qualified.items():
+                # Finalize the EXACT object qualified by this gate. Parallel
+                # task-agent gates can reuse provider call_ids; a sibling may
+                # purge/replace the shared cache between qualification and the
+                # terminal admission. Re-reading by cid here would stamp that
+                # sibling's deny/review verdict as smart-approved. Mutating the
+                # captured object updates the cache only when it is still this
+                # generation's resident entry, and always persists the correct
+                # verdict_id even after replacement.
+                verdict["user_decision"] = AutoApproveReason.SMART_APPROVAL
+                stamped.append(verdict)
+        if not stamped:
+            return
+        action = functools.partial(
+            self._persist_verdict_decisions,
+            [dict(verdict) for verdict in stamped],
+            AutoApproveReason.SMART_APPROVAL,
+        )
+        if deferred is None:
+            action()
+        else:
+            deferred.append(action)
+
+    def _replay_pending_verdicts(self, items: list[dict[str, Any]]) -> None:
+        """Re-emit already-cached LLM verdicts for the human-pending calls.
+
+        Mirrors the reconnect-replay re-injection: after the
+        ``approve_request`` card exists, re-send each pending call's cached
+        ``intent_verdict`` so a live client (which dropped the events the
+        Smart Approvals wait fanned out before the card) applies them to the
+        chip.  Snapshots under the lock, fans out without it.
+        """
+        cids = {it.get("call_id", "") for it in items if it.get("call_id")}
+        with self._ws_lock:
+            verdicts = [dict(self._llm_verdicts[c]) for c in cids if c in self._llm_verdicts]
+        for verdict in verdicts:
+            self._enqueue({"type": "intent_verdict", **verdict})
+            self._broadcast_intent_verdict(verdict)
+
+    # ------------------------------------------------------------------
+    # Intent-judge + output-guard plumbing
+    # ------------------------------------------------------------------
+
+    # Hard cap on the in-memory verdict cache so a long-running session
+    # can't grow unbounded. FIFO eviction on insert.
+    _LLM_VERDICT_CACHE_MAX = 50
+
+    # Compatibility fallback for direct/legacy SessionUIBase callers whose
+    # items were not produced by ChatSession. Production batches carry the
+    # live ``tools.approval_timeout_seconds`` value per private approval item.
+    _APPROVAL_WAIT_TIMEOUT = 3600
+
+    def on_intent_verdict(
+        self,
+        verdict: dict[str, Any],
+        judge_event: object | None = None,
+    ) -> None:
+        """Deliver an LLM intent-judge verdict to the frontend + persist.
+
+        Caches under ``_ws_lock`` for SSE reconnect replay, persists
+        the row to storage, and either records the caller's
+        ``user_decision`` immediately (if the approval already
+        resolved) or parks the verdict on its owning
+        :class:`ApprovalCycle` for ``resolve_approval`` to stamp.
+
+        ``judge_event`` is the delivering daemon's cancel event —
+        its identity names the judge GENERATION.  When the verdict's
+        call_id belongs to an unresolved cycle evaluated by a DIFFERENT
+        generation (a provider that reuses call_ids across turns +
+        a prior turn's run-to-completion daemon still delivering),
+        the verdict is persisted for audit only: no cache write, no
+        cond notify, no park — a stale ``approve`` must never satisfy
+        the new round's Smart-Approvals wait.  Ownership requires exact
+        event identity (``None`` therefore matches only a legacy cycle
+        whose event is also ``None``); resolved cycles are never owners.
+
+        When the verdict arrives for a call_id that ``approve_tools``
+        already auto-approved (the LLM judge is async and can fire
+        seconds after the auto-approve path returned), stamp the
+        ``auto_approve_reason`` onto the verdict before persist so
+        the row lands with a meaningful ``user_decision`` instead of
+        the default ``"pending"`` (which would never be updated for
+        this code path).
+        """
+        persist_actions = self._publish_intent_verdict_live(verdict, judge_event)
+        for persist in persist_actions:
+            persist()
+
+    def _publish_intent_verdict_live(
+        self,
+        verdict: dict[str, Any],
+        judge_event: object | None = None,
+    ) -> list[Callable[[], None]]:
+        """Commit live verdict state and return its storage writes.
+
+        The judge lifecycle lock may need to bracket the live cache/SSE
+        publication so close or a successor cannot overtake it.  Storage I/O
+        is deliberately returned as deferred work: a slow database must never
+        hold that lifecycle lock and delay Stop from closing model streams.
+        The public :meth:`on_intent_verdict` preserves the historical
+        synchronous contract by running the returned actions immediately.
+        """
+        persist_actions: list[Callable[[], None]] = []
+        call_id = verdict.get("call_id", "")
+        auto_reason = ""
+        decision = ""
+        decision_resolver_principal_id = ""
+        decision_execution_principal_id = ""
+        initial_owner: ApprovalCycle | None = None
+
+        def _unresolved_owner_locked() -> tuple[ApprovalCycle | None, bool]:
+            """Return this generation's owner and whether another owns the id.
+
+            The caller holds ``_ws_lock``.  Several parallel gates can reuse a
+            provider call id, so call-id membership alone is not ownership:
+            the cycle must still be unresolved and carry this delivery's exact
+            judge event.  The boolean distinguishes the pre-cycle cache-only
+            case from a live foreign generation, which is audit-only.
+            """
+
+            live = [
+                cycle
+                for cycle in self._approval_cycles.values()
+                if call_id in cycle.call_ids and not cycle.resolved
+            ]
+            owner = next(
+                (cycle for cycle in live if cycle.judge_event is judge_event),
+                None,
+            )
+            return owner, bool(live)
+
+        if call_id:
+            with self._ws_lock:
+                initial_owner, has_unresolved_owner = _unresolved_owner_locked()
+                if has_unresolved_owner and initial_owner is None:
+                    # Stale generation aimed at a LIVE cycle — the one
+                    # collision that could smart-approve the wrong call.
+                    stale = dict(verdict)
+                    stale.setdefault("user_decision", "superseded")
+                    persist_actions.append(functools.partial(self._persist_intent_verdict, stale))
+                    return persist_actions
+                if initial_owner is not None and initial_owner.execution_principal_id:
+                    verdict.setdefault(
+                        "execution_principal_id", initial_owner.execution_principal_id
+                    )
+                if (
+                    len(self._llm_verdicts) >= self._LLM_VERDICT_CACHE_MAX
+                    and call_id not in self._llm_verdicts
+                ):
+                    oldest_key = next(iter(self._llm_verdicts))
+                    del self._llm_verdicts[oldest_key]
+                    self._verdict_origins.pop(oldest_key, None)
+                self._llm_verdicts[call_id] = verdict
+                self._verdict_origins[call_id] = id(judge_event)
+                # Wake any Smart Approvals wait parked on this call's
+                # verdict (``_verdict_cond`` shares ``_ws_lock``, so the
+                # notify is valid here and the waiter re-checks its
+                # call-id set on wake).
+                self._verdict_cond.notify_all()
+                # Pop (not get) — once consumed the entry isn't useful
+                # again; TTL pruning at the writer side keeps the
+                # never-consumed case bounded too.
+                entry = self._auto_approve_reasons.pop(call_id, None)
+                if entry is not None:
+                    auto_reason = entry[0]
+            if auto_reason:
+                verdict["user_decision"] = auto_reason
+        self._enqueue({"type": "intent_verdict", **verdict})
+        # Kind-specific cross-stream broadcast — ConsoleCoordinatorUI
+        # overrides to push onto the cluster bus so a coord parent's
+        # tree UI sees the verdict without polling. Default is no-op
+        # (the per-ws ``_enqueue`` above already covers WebUI's own
+        # SSE listeners). Stage 3 Step 4.
+        self._broadcast_intent_verdict(verdict)
+        persist_actions.append(functools.partial(self._persist_intent_verdict, dict(verdict)))
+        try:
+            self._record_llm_judge_metric(verdict)
+        except Exception:
+            # Metrics are auxiliary.  A transport-specific collector failure
+            # must not discard the verdict's cache/UI or deferred audit work.
+            log.debug("Failed to record LLM judge metric", exc_info=True)
+        # If ``auto_reason`` was stamped above, the verdict already
+        # carries the final ``user_decision`` for this row.  Neither
+        # path below applies: parking on a cycle would cause
+        # ``resolve_approval`` (on the manual-approval sibling in a
+        # mixed batch) to overwrite the auto-reason with
+        # ``"approved"``/``"denied"``/``"timeout"``; the
+        # ``_persist_verdict_decisions`` immediate-stamp path would
+        # overwrite it the same way from the round's decision.
+        # Skip both so the audit trail keeps the auto-approve reason.
+        if auto_reason:
+            return persist_actions
+        with self._ws_lock:
+            # Park-or-stamp under ONE lock acquisition so
+            # ``resolve_approval`` can't interleave: it marks the cycle
+            # resolved AND records the per-call decision atomically
+            # under this same lock, so exactly one of the two branches
+            # below sees the verdict — parked pre-decision (the resolve
+            # stamps it from ``pending_verdicts``) or stamped
+            # post-decision (from ``_recent_decisions``).  A two-step
+            # check-then-park reintroduces the audit-corruption race
+            # the old single-slot code fixed.
+            #
+            # Skip both when the verdict already carries a final
+            # ``user_decision`` — Smart Approvals'
+            # ``_finalize_smart_verdicts`` runs on the worker thread
+            # the moment ``_await_llm_verdicts`` wakes (this method's
+            # ``notify_all`` above) and can stamp ``smart_approval``
+            # on this same cached dict before we get here; re-parking
+            # it would let a later resolution overwrite the audit row.
+            # No live owner and no decision (pre-cycle Smart-Approvals
+            # arrival) → cache-only: the gate's registration sweep
+            # picks pending verdicts up from ``_llm_verdicts`` when
+            # the cycle is created.
+            if verdict.get("user_decision", "pending") == "pending":
+                owner, _has_unresolved_owner = _unresolved_owner_locked()
+                if owner is not None:
+                    # Park only on the exact cycle that owned the verdict at
+                    # initial classification.  If there was no owner then, a
+                    # cycle registered in the intervening cache→park window
+                    # already adopted this verdict in its registration sweep;
+                    # appending again would duplicate it.  If the original
+                    # owner resolved, a reused-id successor must never inherit
+                    # the predecessor's verdict even if cycle ordering changed.
+                    if owner is initial_owner:
+                        owner.pending_verdicts.append(verdict)
+                else:
+                    recent = self._recent_decisions.get(call_id)
+                    if recent is not None:
+                        prior_decision, origin = recent
+                        if (
+                            judge_event is not None
+                            and origin is not None
+                            and origin is not judge_event
+                        ):
+                            # The recorded decision belongs to a
+                            # DIFFERENT generation's round under a
+                            # reused call_id — the round this verdict
+                            # was judging resolved and fell out of
+                            # ``_recent_decisions`` before delivery.
+                            # Stamping it with the other round's
+                            # decision would claim the operator ruled
+                            # on THIS verdict; ``superseded`` is the
+                            # honest terminal state (same vocabulary
+                            # as :meth:`on_superseded_intent_verdict`).
+                            decision = "superseded"
+                        else:
+                            decision = prior_decision
+                            (
+                                decision_resolver_principal_id,
+                                decision_execution_principal_id,
+                            ) = self._recent_decision_principals.get(call_id, ("", ""))
+        if decision:
+            persist_actions.append(
+                functools.partial(
+                    self._persist_verdict_decisions,
+                    [dict(verdict)],
+                    decision,
+                    resolver_principal_id=decision_resolver_principal_id,
+                    execution_principal_id=decision_execution_principal_id,
+                )
+            )
+        return persist_actions
+
+    def on_superseded_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        """Persist (audit-only) a verdict whose judge generation was superseded.
+
+        ``ChatSession._on_verdict`` routes here instead of
+        :meth:`on_intent_verdict` when a newer turn has replaced the
+        daemon's generation.  The live surfaces deliberately stay
+        untouched — no ``_llm_verdicts`` cache write, no SSE enqueue,
+        no ``_verdict_cond`` notify, no ``_pending_verdicts`` park —
+        because the verdict's call_id belongs to an already-resolved
+        batch, and a model that reuses call_ids across turns could
+        ride a stale cached ``approve`` into a wrongful Smart Approval
+        of a *different* call.  Dropping the verdict entirely (the
+        previous behavior) kept that safety property but left a
+        permanent hole in ``intent_verdicts``: the audit table said
+        "the judge never answered" for calls it actually ruled on.
+
+        ``user_decision`` is stamped ``"superseded"`` — no decision was
+        ever taken on THIS verdict; its call's gate resolved before the
+        judge finished.  The stamp only lands on fresh ``tier="llm"``
+        rows: a superseded *fallback* reuses its heuristic row's
+        verdict_id, and ``upsert_intent_verdict`` excludes
+        ``user_decision`` from the on-conflict SET, so the decision
+        already recorded on that row survives the tier upgrade.
+        """
+        row = dict(verdict)
+        row.setdefault("user_decision", "superseded")
+        self._persist_intent_verdict(row)
+
+    def _record_judge_metric(self, verdict: dict[str, Any]) -> None:
+        """Extension point for transport-specific Prometheus metrics.
+
+        ``approve_tools`` calls this for each persisted heuristic
+        verdict. Subclasses override to fan the verdict into their
+        own metrics collector:
+
+        - ``WebUI`` writes to the per-node ``MetricsCollector`` so the
+          node's /metrics endpoint surfaces ``turnstone_judge_verdicts_total``.
+        - ``ConsoleCoordinatorUI`` writes to ``ConsoleMetrics`` so the
+          console's /metrics endpoint surfaces the same metric name —
+          a cluster-wide PromQL query rolls coord and interactive
+          verdicts up uniformly.
+
+        Default no-op covers test fixtures and any future SessionUI
+        impl that doesn't expose a /metrics surface. Mirrors the
+        pattern used for ``_broadcast_state`` / ``_broadcast_activity``.
+        """
+        del verdict  # default impl: no metrics surface
+
+    def _record_llm_judge_metric(self, verdict: dict[str, Any]) -> None:
+        """Extension point for the async LLM-tier verdict metric."""
+        del verdict  # default impl: no metrics surface
+
+    def _persist_intent_verdicts_bulk(
+        self,
+        verdicts: list[dict[str, Any]],
+        *,
+        default_tier: str = "heuristic",
+    ) -> None:
+        """Bulk-insert a list of intent-judge verdicts in one transaction.
+
+        Used by ``approve_tools`` so the per-turn heuristic-verdict
+        persistence doesn't block on N×commit before the approval UI
+        enqueues. Each verdict dict mirrors the keyword args of
+        :meth:`_persist_intent_verdict`; ``ws_id`` is stamped from
+        ``self.ws_id`` and ``evidence`` is JSON-encoded so the row
+        shape matches the per-row path. Storage failure is best-effort
+        (logged at debug) — the verdict cache and UI dispatch run
+        independently of the DB write.
+        """
+        if not verdicts:
+            return
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            rows = [
+                {
+                    "verdict_id": v.get("verdict_id", ""),
+                    "ws_id": self.ws_id,
+                    "call_id": v.get("call_id", ""),
+                    "func_name": v.get("func_name", ""),
+                    "func_args": v.get("func_args", ""),
+                    "intent_summary": v.get("intent_summary", ""),
+                    "risk_level": v.get("risk_level", "medium"),
+                    "confidence": v.get("confidence", 0.5),
+                    "recommendation": v.get("recommendation", "review"),
+                    "reasoning": v.get("reasoning", ""),
+                    "evidence": json.dumps(v.get("evidence", [])),
+                    "tier": v.get("tier", default_tier),
+                    "judge_model": v.get("judge_model", ""),
+                    "latency_ms": v.get("latency_ms", 0),
+                    "user_decision": v.get("user_decision", "pending"),
+                    "resolver_principal_id": v.get("resolver_principal_id", ""),
+                    "execution_principal_id": v.get("execution_principal_id", ""),
+                }
+                for v in verdicts
+            ]
+            # The daemon-judge race where a verdict lands BEFORE this
+            # bulk write IS reachable: ``_evaluate_intent`` (session.py)
+            # spawns the daemon thread before ``approve_tools`` is
+            # called, and the daemon's first emission (heuristic-only
+            # short batch, fast LLM response, or cancel-event
+            # ``_deliver_fallbacks`` from judge.py) can fire
+            # ``_persist_intent_verdict`` first — a fallback UPSERT
+            # plants the very ``verdict_id`` this batch is about to
+            # INSERT.  The bulk site inserts ``ON CONFLICT DO NOTHING``
+            # so that one collision skips only its own row: the rest of
+            # the batch still lands, and the colliding row keeps the
+            # daemon's ``llm_fallback`` tier upgrade instead of being
+            # regressed to the heuristic stamp.  (Plain INSERT here used
+            # to abort the entire statement — and the ``try/except``
+            # below swallowed it — discarding the whole batch's
+            # heuristic rows.)
+            storage.create_intent_verdicts_bulk(rows)
+        except Exception:
+            log.debug("Failed to bulk-persist intent verdicts", exc_info=True)
+
+    def _persist_intent_verdict(
+        self,
+        verdict: dict[str, Any],
+        *,
+        default_tier: str = "llm",
+    ) -> None:
+        """Persist an intent-judge verdict row via UPSERT.
+
+        Used by the async LLM-tier path (``on_intent_verdict``,
+        default tier ``"llm"``).  Routes through ``upsert_intent_verdict``
+        because ``tier="llm_fallback"`` verdicts deliberately reuse the
+        heuristic verdict's ``verdict_id`` (see ``judge.py`` —
+        ``_deliver_fallbacks`` and the in-loop fallback path)
+        so the row gets "upgraded in place" from heuristic →
+        llm_fallback.  A plain INSERT would collide on the PK and the
+        upgrade would be lost to a silently-swallowed exception.
+        ``default_tier`` only matters when the verdict dict doesn't
+        already carry a ``tier`` key — both real producers always set
+        it, but the fallback is the right call-site label so a
+        malformed verdict still lands on the correct row
+        classification.
+        """
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            storage.upsert_intent_verdict(
+                verdict_id=verdict.get("verdict_id", ""),
+                ws_id=self.ws_id,
+                call_id=verdict.get("call_id", ""),
+                func_name=verdict.get("func_name", ""),
+                func_args=verdict.get("func_args", ""),
+                intent_summary=verdict.get("intent_summary", ""),
+                risk_level=verdict.get("risk_level", "medium"),
+                confidence=verdict.get("confidence", 0.5),
+                recommendation=verdict.get("recommendation", "review"),
+                reasoning=verdict.get("reasoning", ""),
+                evidence=json.dumps(verdict.get("evidence", [])),
+                tier=verdict.get("tier", default_tier),
+                judge_model=verdict.get("judge_model", ""),
+                latency_ms=verdict.get("latency_ms", 0),
+                user_decision=verdict.get("user_decision", "pending"),
+                resolver_principal_id=verdict.get("resolver_principal_id", ""),
+                execution_principal_id=verdict.get("execution_principal_id", ""),
+            )
+        except Exception:
+            log.debug("Failed to persist intent verdict", exc_info=True)
+
+    def serialize_pending_approval_details(self) -> list[dict[str, Any]]:
+        """Per-cycle inline-approval payloads, EVERY live cycle, oldest first.
+
+        Merges each cycle's card items with the per-call_id LLM verdict
+        cache so a coordinator's children-tree row can render inline
+        approve/deny buttons + judge-verdict pill without a separate
+        per-child round-trip; one entry per live cycle (parallel task
+        agents each gate their own batch), each addressable by its
+        ``cycle_id``.  Empty when nothing is pending.
+
+        The per-entry shape mirrors the ``approve_request`` SSE event
+        but adds a ``judge_verdict`` sibling per item (looked up from
+        :attr:`_llm_verdicts`, the cache seeded by
+        :meth:`on_intent_verdict`). Heuristic verdicts already carried
+        on items are forwarded as ``heuristic_verdict``.
+
+        Cross-tenant exposure note: this method is read by
+        ``GET /v1/api/dashboard`` (read scope, cross-tenant under the
+        trusted-team posture documented at ``server.py:1119-1120``).
+        Judge ``reasoning`` / ``evidence`` / ``func_args`` therefore
+        cross the same boundary as ``activity`` and ``tokens`` already
+        do — intentional for inline coord approval, not a leak. If
+        the deployment posture ever drops the trusted-team
+        assumption, project the verdict to a safe subset before
+        embedding (or move the field behind ``admin.cluster.inspect``).
+        """
+        with self._ws_lock:
+            cards = [
+                (cycle.cycle_id, cycle.card)
+                for cycle in self._approval_cycles.values()
+                if not cycle.resolved
+            ]
+            # Snapshot verdict references under lock, deepcopy after
+            # release. Writers (``on_intent_verdict`` daemon judge
+            # thread) only ASSIGN entries, never mutate them in place —
+            # so a snapped reference is stable after the lock drops, and
+            # the subsequent deepcopy can run lock-free even though
+            # verdict dicts carry list-typed ``evidence`` that
+            # downstream callers might mutate. This keeps the lock
+            # window O(N items) without paying the deepcopy cost
+            # (O(verdict size)) under contention with the per-token
+            # write path that also holds ``_ws_lock``.
+            verdict_refs = dict(self._llm_verdicts)
+        verdicts: dict[str, dict[str, Any]] = {}
+        details: list[dict[str, Any]] = []
+        for cycle_id, card in cards:
+            items = card.get("items") or []
+            if not items:
+                continue
+            call_ids = [item.get("call_id", "") for item in items]
+            serialized: list[dict[str, Any]] = []
+            for item in items:
+                cid = item.get("call_id", "")
+                if cid in verdict_refs and cid not in verdicts:
+                    verdicts[cid] = copy.deepcopy(verdict_refs[cid])
+                serialized.append(
+                    {
+                        "call_id": cid,
+                        "header": item.get("header", ""),
+                        "preview": item.get("preview", ""),
+                        "func_name": item.get("func_name", ""),
+                        "approval_label": item.get("approval_label", ""),
+                        "needs_approval": item.get("needs_approval", False),
+                        "error": item.get("error"),
+                        # Card items are already wire-shaped by
+                        # ``_serialize_approval_items`` — the heuristic
+                        # verdict rides under ``heuristic_verdict``.
+                        "heuristic_verdict": item.get("heuristic_verdict"),
+                        "judge_verdict": verdicts.get(cid),
+                    }
+                )
+            # Primary call_id = first non-empty in list order (matches the
+            # 409 response shape from ``make_approve_handler`` so the UI
+            # can render the same identifier the server thinks is current).
+            primary = next((cid for cid in call_ids if cid), "")
+            details.append(
+                {
+                    "cycle_id": cycle_id,
+                    "call_id": primary,
+                    "judge_pending": bool(card.get("judge_pending", False)),
+                    "items": serialized,
+                }
+            )
+        return details
+
+    # ---------------------------------------------------------------
+    # Auto-approve visibility — shared by interactive + coord UIs
+    # ---------------------------------------------------------------
+    #
+    # When a tool call gets approved without an explicit operator
+    # click (admin tool policy, skill ``allowed_tools`` allowlist,
+    # blanket ``auto_approve``, or "Approve + Always" memory) the
+    # coord-tree dashboard would otherwise have no surface to show
+    # WHICH tools bypassed the gate or WHY.  These helpers feed two
+    # sinks: per-item annotations on the ``tool_info`` SSE event
+    # (live operator visibility) and a short ring buffer surfaced
+    # via ``/dashboard`` (post-hoc visibility for the coord tree).
+
+    # Cap on the per-ws ring buffer.  Sized for "the operator opens
+    # the row in the next minute" — older entries roll off so the
+    # /dashboard payload stays bounded on long-running skill
+    # workstreams that auto-approve dozens of tool calls per turn.
+    _RECENT_AUTO_APPROVALS_MAX = 10
+
+    # TTL on the call_id → auto_approve_reason map.  Sized to comfortably
+    # cover the LLM judge's worst-case latency (cold start + a slow model
+    # + queue depth).  Pruning happens lazily at write time so the cost
+    # is paid only on the next auto-approve event; a session that goes
+    # quiet after auto-approving never pays the prune cost at all but
+    # the resident-set is also tiny.
+    _AUTO_APPROVE_REASON_TTL = 60.0
+
+    @staticmethod
+    def _serialize_approval_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project each item to the wire shape the SSE event payload uses.
+
+        Single source of truth for both ``approve_request`` and
+        ``tool_info`` payloads — pre-fix the WebUI rebuilt this
+        twice (once eagerly, once after policy evaluation), and
+        adding new fields meant editing both copies in lockstep.
+        Forwards ``auto_approved`` / ``auto_approve_reason`` when
+        the upstream pipeline tagged the item, so the operator can
+        see which path silently approved each call.
+
+        Heuristic verdict surfaces under ``heuristic_verdict`` for
+        consistency with :meth:`serialize_pending_approval_details`
+        and :class:`api.server_schemas.PendingApprovalItem` — pre-
+        fix this method emitted ``verdict`` while the dashboard
+        payload used ``heuristic_verdict``, leaving JS consumers
+        with two code paths for the same field.
+        """
+        out: list[dict[str, Any]] = []
+        for it in items:
+            denied = it.get("denied")
+            entry: dict[str, Any] = {
+                "call_id": it.get("call_id", ""),
+                "header": it.get("header", ""),
+                "preview": it.get("preview", ""),
+                "func_name": it.get("func_name", ""),
+                "approval_label": it.get("approval_label", it.get("func_name", "")),
+                "needs_approval": it.get("needs_approval", False),
+                "error": it.get("denial_msg") if denied else it.get("error"),
+            }
+            if "_heuristic_verdict" in it:
+                entry["heuristic_verdict"] = it["_heuristic_verdict"]
+            if it.get("_llm_verdict"):
+                # The completed LLM verdict that drove a Smart Approval.
+                # Sent so the auto-approved tool row renders the llm-tier
+                # approve/risk that actually cleared the call, instead of the
+                # cautious heuristic carry-over — which reads contradictorily
+                # next to the SMART_APPROVAL pill (e.g. "review/medium" + ✓).
+                entry["judge_verdict"] = it["_llm_verdict"]
+            if it.get("auto_approved"):
+                entry["auto_approved"] = True
+                entry["auto_approve_reason"] = it.get("auto_approve_reason", "")
+            out.append(entry)
+        return out
+
+    def _tag_auto_approved(
+        self,
+        pending: list[dict[str, Any]],
+        reason: str,
+        *,
+        source_map: dict[str, str] | None = None,
+    ) -> None:
+        """Mark each pending item as auto-approved with the given reason.
+
+        Used at the three branch points in ``approve_tools`` (policy
+        ``allow`` / ``auto_approve_tools.issubset`` / blanket
+        ``auto_approve``) so both :class:`turnstone.server.WebUI` and
+        :class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`
+        share the loop body — pre-fix the per-branch tag loops were
+        copy-pasted line-for-line across the two subclasses.
+
+        ``source_map`` is the per-tool source dict
+        (``_auto_approve_tools_source``) populated by the skill
+        template / "Approve + Always" writers.  When provided, each
+        item's reason is looked up by ``approval_label_or_func_name``
+        and falls back to ``reason`` when the entry is missing
+        (legacy / unknown writer).  Pass ``None`` for the policy /
+        blanket branches that don't carry per-tool source.
+        """
+        for it in pending:
+            it["auto_approved"] = True
+            if source_map is not None:
+                name = it.get("approval_label", "") or it.get("func_name", "")
+                it["auto_approve_reason"] = source_map.get(name, reason)
+            else:
+                it["auto_approve_reason"] = reason
+
+    def _persist_auto_approved_heuristic_verdicts(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        deferred: list[Callable[[], None]] | None = None,
+    ) -> None:
+        """Persist heuristic verdicts for items the auto-approve path resolved.
+
+        The manual-approval block at the bottom of ``approve_tools``
+        handles its own verdict persistence (and stamps
+        ``user_decision`` per item — auto-approved items in a
+        mixed-path batch carry their reason, pending items carry
+        ``"pending"``).  The auto-approve early-return branches
+        (policy-allow-with-deny, blanket flag, auto_approve_tools
+        match) used to drop heuristic verdicts on the floor — an
+        operator querying ``user_decision`` for the auto-approve
+        reason would find no row at all, conflating "we auto-approved
+        silently" with "the judge didn't run".  This helper closes
+        that gap: walk ``items``, persist each auto-approved verdict
+        with its reason stamped, and fan a metric row per verdict.
+        Safe to call with empty items.
+        """
+        if not items:
+            return
+        verdicts: list[dict[str, Any]] = []
+        for it in items:
+            if not it.get("auto_approved"):
+                continue
+            hv = it.get("_heuristic_verdict")
+            if not hv:
+                continue
+            hv["user_decision"] = it.get("auto_approve_reason", "") or "pending"
+            row = dict(hv)
+            row["execution_principal_id"] = str(it.get("_principal_id") or "").strip()
+            row.setdefault("resolver_principal_id", "")
+            verdicts.append(row)
+        if not verdicts:
+            return
+
+        def _persist() -> None:
+            for verdict in verdicts:
+                self._record_judge_metric(verdict)
+            self._persist_intent_verdicts_bulk(verdicts, default_tier="heuristic")
+
+        if deferred is None:
+            _persist()
+        else:
+            deferred.append(_persist)
+
+    def _record_auto_approves(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        deferred: list[Callable[[], None]] | None = None,
+    ) -> None:
+        """Append auto-approved items to the per-ws ring buffer + audit log.
+
+        Called from ``approve_tools`` immediately before the
+        ``tool_info`` emit so the /dashboard payload reflects the
+        same set of tools the SSE consumer just saw.  No-op when
+        ``items`` is empty (every item was a "no approval needed"
+        read-only tool, not an auto-approve).
+
+        Also writes one ``tool.auto_approved`` audit row per call so
+        operators have a durable forensic record beyond the SSE
+        stream + ring buffer (both ephemeral).  Audit failure is
+        logged but never raised — visibility is best-effort and
+        must not break the tool-execution path.
+        """
+        if not items:
+            return
+        execution_principal_id = _execution_principal_for_items(items)
+        ts = time.time()
+        appended = [
+            {
+                "call_id": it.get("call_id", ""),
+                "func_name": it.get("func_name", ""),
+                "approval_label": it.get("approval_label", "") or it.get("func_name", ""),
+                "auto_approve_reason": it.get("auto_approve_reason", ""),
+                "ts": ts,
+            }
+            for it in items
+            if it.get("auto_approved")
+        ]
+        if not appended:
+            return
+        with self._ws_lock:
+            self._recent_auto_approvals.extend(appended)
+            overflow = len(self._recent_auto_approvals) - self._RECENT_AUTO_APPROVALS_MAX
+            if overflow > 0:
+                self._recent_auto_approvals = self._recent_auto_approvals[overflow:]
+            # Mirror call_id → reason into the lookup map so a late
+            # ``on_intent_verdict`` (LLM judge tier) can stamp the
+            # right ``user_decision`` instead of leaving the verdict
+            # stuck as ``"pending"`` forever.  Prune expired entries
+            # first (lazy TTL eviction) so a session with the LLM
+            # judge disabled doesn't accumulate entries that will
+            # never be consumed.  Skip the rebuild when the map is
+            # empty or all entries are still fresh — the common case
+            # on a healthy LLM-judge-enabled session where entries
+            # drain via ``on_intent_verdict.pop`` within the TTL.
+            cutoff = ts - self._AUTO_APPROVE_REASON_TTL
+            if self._auto_approve_reasons and any(
+                ins_ts < cutoff for _, ins_ts in self._auto_approve_reasons.values()
+            ):
+                self._auto_approve_reasons = {
+                    cid: (reason, ins_ts)
+                    for cid, (reason, ins_ts) in self._auto_approve_reasons.items()
+                    if ins_ts >= cutoff
+                }
+            for entry in appended:
+                cid = entry["call_id"]
+                if cid:
+                    self._auto_approve_reasons[cid] = (
+                        entry["auto_approve_reason"],
+                        ts,
+                    )
+        # Audit emission — one row per ``approve_tools`` call (not one
+        # per item) keeps the audit table from blowing up on tool-heavy turns
+        # while still capturing every tool name + reason.  The approval gate
+        # may ask us to defer this storage action until after its cancellation
+        # admission lock is released.
+        tools = [
+            {
+                "func_name": entry["func_name"],
+                "approval_label": entry["approval_label"],
+                "reason": entry["auto_approve_reason"],
+                "call_id": entry["call_id"],
+            }
+            for entry in appended
+        ]
+
+        def _persist() -> None:
+            try:
+                from turnstone.core.audit import record_audit
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is None:
+                    return
+                record_audit(
+                    storage,
+                    execution_principal_id or self._user_id,
+                    "tool.auto_approved",
+                    "workstream",
+                    self.ws_id,
+                    {"tools": tools, "count": len(tools)},
+                )
+            except Exception:
+                log.debug("auto_approve.audit_failed ws=%s", self.ws_id, exc_info=True)
+
+        if deferred is None:
+            _persist()
+        else:
+            deferred.append(_persist)
+
+    def _seed_event_id_from_storage(self) -> None:
+        """Reseed :attr:`_event_id` from the persisted high-water mark.
+
+        The per-ws event-id counter (the ``Last-Event-ID`` replay cursor)
+        is in-memory and restarts at 0 on every UI construction — process
+        restart, saved-workstream rehydrate, coord→node click-through.
+        Without reseeding, the new process would re-issue ids the prior
+        one already stamped onto ``conversations.event_id`` rows, so a
+        ``/history`` cursor would point into the wrong generation and the
+        fresh-connect fast-forward would mis-slice the ring buffer.
+
+        Best-effort: any storage error (or no persisted event_id yet)
+        leaves the counter at 0.  No-op without a ``ws_id`` (test
+        fixture).  Called from ``__init__`` before any listener can
+        register, so no lock is needed around the counter write.
+        """
+        if not self.ws_id:
+            return
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            mx = storage.get_max_event_id(self.ws_id)
+            if mx is not None and mx > self._event_id:
+                self._event_id = int(mx)
+        except Exception:
+            log.debug("ui.seed_event_id_failed ws=%s", self.ws_id[:8], exc_info=True)
+
+    def replay_recent_auto_approvals_from_audit(self) -> None:
+        """Seed :attr:`_recent_auto_approvals` from the audit log.
+
+        Without this the dashboard pill vanishes on every UI rebuild
+        — a saved-workstream rehydrate / coord→node click-through /
+        process restart all build a fresh ``WebUI`` whose ring
+        buffer starts empty even though the audit table still holds
+        the bypass history.  Replaying recent ``tool.auto_approved``
+        rows on construction makes the pill survive these
+        transitions; the audit row is the canonical durable
+        record, the ring buffer is just its in-memory mirror.
+
+        Best-effort: any storage / parse error silently leaves the
+        buffer empty — the next live auto-approve will populate it
+        as before.  No-op when ``ws_id`` is unset (test fixture).
+        """
+        if not self.ws_id:
+            return
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            rows = storage.list_audit_events(
+                action="tool.auto_approved",
+                resource_id=self.ws_id,
+                limit=self._RECENT_AUTO_APPROVALS_MAX,
+            )
+        except Exception:
+            log.debug(
+                "auto_approve.replay_from_audit_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+            return
+        appended: list[dict[str, Any]] = []
+        # ``list_audit_events`` returns DESC; reverse so the oldest
+        # row lands first in the buffer (chronological order matches
+        # what live appends produce).
+        for row in reversed(rows or []):
+            try:
+                detail = json.loads(row.get("detail") or "{}")
+            except (TypeError, ValueError):
+                continue
+            tools = detail.get("tools") or []
+            ts = self._parse_audit_timestamp(row.get("timestamp", ""))
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                appended.append(
+                    {
+                        "call_id": t.get("call_id", "") or "",
+                        "func_name": t.get("func_name", "") or "",
+                        "approval_label": (t.get("approval_label") or t.get("func_name", "") or ""),
+                        "auto_approve_reason": t.get("reason", "") or "",
+                        "ts": ts,
+                    }
+                )
+        if not appended:
+            return
+        with self._ws_lock:
+            # Replay merges with whatever the live path may have
+            # appended in the interleaving window between
+            # construction and replay completion: replay rows go
+            # first, then any live entries, and the buffer is
+            # capped from the head.
+            live = list(self._recent_auto_approvals)
+            merged = appended + live
+            self._recent_auto_approvals = merged[-self._RECENT_AUTO_APPROVALS_MAX :]
+
+    @staticmethod
+    def _parse_audit_timestamp(ts_str: str) -> float:
+        """Parse the audit row's ISO-8601 timestamp into epoch seconds.
+
+        Audit rows are written as ``datetime.now(UTC).strftime(...)``
+        without a timezone marker (see ``storage/_sqlite.py:record_audit_event``),
+        so ``datetime.fromisoformat`` returns a *naive* datetime.
+        Calling ``.timestamp()`` on a naive datetime interprets it
+        in the server's local timezone — wrong here, since the
+        source clock is UTC.  Stamp UTC explicitly before
+        converting so a non-UTC server doesn't render pill
+        timestamps off by hours.
+
+        Falls back to ``0.0`` on a missing / malformed timestamp so
+        the buffer entry still surfaces (just with a "no time"
+        indicator the JS pill renderer treats as missing).
+        """
+        if not ts_str:
+            return 0.0
+        try:
+            from datetime import UTC, datetime
+
+            dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return dt.timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    def serialize_recent_auto_approvals(self) -> list[dict[str, Any]]:
+        """Return a snapshot of the recent-auto-approves ring buffer.
+
+        Read by the per-ws ``/dashboard`` payload (and the
+        cross-cluster live-bulk projection on the console) so the
+        coord-tree row can render an "auto-approved by …" pill.
+        Returns a shallow copy under ``_ws_lock`` so the caller
+        can't mutate the buffer mid-iteration.
+        """
+        with self._ws_lock:
+            return [dict(entry) for entry in self._recent_auto_approvals]
+
+    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
+        """Deliver an output-guard warning to the live UI stream.
+
+        Persistence is decoupled: the session calls
+        :meth:`record_output_assessment` directly for each tier
+        (heuristic / llm) so a single tool call's two-tier evaluation
+        produces two rows.  This method only fires the UI event.
+        """
+        self._enqueue({"type": "output_warning", "call_id": call_id, **assessment})
+
+    def record_output_assessment(
+        self,
+        call_id: str,
+        assessment: dict[str, Any],
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
+    ) -> None:
+        """Persist one output-guard assessment row.
+
+        Called by the session once per tier.  A ``"heuristic"`` row is
+        written when the regex stage produced signal (risk!="none" or
+        flags) OR when the heuristic and LLM verdicts disagreed.  When the
+        LLM stage ran it writes one row: ``"llm"`` on success (``reasoning``
+        carries the model's explanation), or ``"llm_error"`` on failure
+        (timeout / parse error / provider error — ``reasoning`` carries the
+        error reason).  The distinct ``"llm_error"`` tier lets audit tell
+        "LLM attempted but failed" from "LLM was never enabled" AND keeps the
+        replay merge from treating a risk="none" failure row as a verdict
+        that could shadow the heuristic finding.
+        """
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is None:
+                return
+            storage.record_output_assessment(
+                assessment_id=uuid.uuid4().hex,
+                ws_id=self.ws_id,
+                call_id=call_id,
+                func_name=assessment.get("func_name", ""),
+                flags=json.dumps(assessment.get("flags", [])),
+                risk_level=assessment.get("risk_level", "none"),
+                annotations=json.dumps(assessment.get("annotations", [])),
+                output_length=assessment.get("output_length", 0),
+                redacted=assessment.get("redacted", False),
+                tier=tier,
+                reasoning=reasoning,
+                judge_model=judge_model,
+                latency_ms=latency_ms,
+                confidence=confidence,
+            )
+        except Exception:
+            log.debug("Failed to persist output assessment", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Streaming + status — lifted from WebUI in the rich ``ws_state``
+    # payload work so coord populates the same per-ws metric fields the
+    # cluster broadcast reads. Subclasses override ``_broadcast_state``
+    # and ``_broadcast_activity`` for kind-specific transport
+    # (interactive: per-node global SSE queue; coord: cluster collector).
+    # ``WebUI`` additionally overrides ``on_status`` / ``on_tool_result``
+    # to layer Prometheus ``_metrics.record_*`` calls (node-only) on top
+    # of the shared writes.
+    # ------------------------------------------------------------------
+
+    def _reset_inflight_buffers_locked(self) -> None:
+        """Clear the per-turn inflight content + reasoning. Caller holds ``_ws_lock``.
+
+        ``_event_id`` is INTENTIONALLY not reset — it must remain
+        monotonically increasing for the lifetime of the UI so a
+        long-lived SSE subscriber's ``snap_seq`` cutoff stays a valid
+        high-water mark across turn boundaries AND a ``Last-Event-ID``
+        replay can still slice the buffer correctly across resets.
+        If we reset to 0 at every turn, turn N+1's first M tokens
+        (M = the snap_seq the subscriber captured mid-turn-N) would
+        all carry ``_seq <= snap_seq`` and get silently dropped by
+        the dedup filter in :func:`make_events_handler`; and a
+        ``Last-Event-ID`` from before the reset would point into the
+        OLD numbering and silently mis-replay.  ``_event_id`` is just
+        an opaque monotonic tag — its absolute value doesn't matter,
+        only that it never decreases for the lifetime of the UI.
+        """
+        self._ws_inflight_content = []
+        self._ws_inflight_content_size = 0
+        self._ws_inflight_reasoning = []
+        self._ws_inflight_reasoning_size = 0
+
+    def on_turn_start(self) -> None:
+        """Reset inflight buffers at the top of each ``send()`` iteration.
+
+        Defensive — covers the FIRST iteration of a fresh ``send()``
+        where a prior ``send()`` may have crashed mid-stream and left
+        stale content in the buffers. Steady-state, the buffers are
+        already empty at this point because :meth:`on_turn_committed`
+        cleared them right after the last assistant message committed.
+
+        A pending token batch here is the same stale-crash residue and
+        is DISCARDED (never emitted) — flushing it would paint the dead
+        ``send()``'s tail into the new turn's bubble.
+        """
+        with self._ws_lock:
+            self._discard_pending_tokens_locked()
+            self._discard_pending_chunks_locked()
+            self._reset_inflight_buffers_locked()
+
+    def on_turn_committed(self) -> None:
+        """Reset inflight buffers right after the assistant message commits.
+
+        The committed message is now in ``session.messages`` (the
+        history source for SSE replay), so leaving the same text in
+        the inflight buffer would double-render it on a refresh during
+        the post-commit tool-execution window — history shows the
+        committed turn AND the ``in_progress_snapshot`` shows the
+        same text again.
+
+        Future cross-turn reasoning persistence (some commercial
+        models want reasoning preserved across user turns, not just
+        within the current send) will override this hook to copy
+        inflight reasoning to a per-message persistence store BEFORE
+        clearing — keeping the `current vs historical` boundary clean.
+
+        A pending token batch here is part of the message that just
+        committed (the worker's ``stream_end`` normally flushed it
+        already), so it FLUSHES — before the reset — keeping the live
+        view and the replay ring complete rather than silently dropping
+        committed text from connected panes.
+        """
+        with self._ws_lock:
+            self._flush_token_batch_locked()
+            self._flush_all_chunk_batches_locked()
+            self._reset_inflight_buffers_locked()
+
+    def on_stream_discarded(self) -> None:
+        """Drop a dead stream attempt's text from every server buffer.
+
+        The mid-stream retry re-issues the turn; the dead attempt's tokens
+        were finalized client-side (``stream_end``) but its batches also
+        landed in ``_ws_turn_content`` — the multi-segment buffer the IDLE
+        payload drains — which :meth:`on_turn_committed` deliberately does
+        NOT clear (earlier segments of a tool-looping turn must survive
+        commits).  Truncating back to the segment watermark removes exactly
+        the dead attempt's contribution.  The pending-batch reset is
+        DEFENSIVE: in the shipped sequence the preceding ``stream_end``
+        already flushed (and broadcast) any pending tail, so the reset
+        no-ops — it matters only for a caller that discards without
+        finalizing first, whose tail genuinely was never displayed.
+        """
+        with self._ws_lock:
+            self._reset_pending_locked()
+            watermark_len, watermark_size = self._turn_content_watermark
+            del self._ws_turn_content[watermark_len:]
+            self._ws_turn_content_size = watermark_size
+            self._reset_inflight_buffers_locked()
+
+    def on_thinking_start(self) -> None:
+        """Track that the model is thinking; broadcast activity + enqueue.
+
+        Inside a compaction window the activity write is skipped —
+        :meth:`on_compaction` owns the pill there ("Compacting context…"
+        must survive the summarize phase's own thinking wrap); the
+        ``thinking_start`` event still flows for the spinner UIs.
+        """
+        with self._ws_lock:
+            # Segment watermark for on_stream_discarded: thinking_start
+            # precedes every stream segment (send start, mid-stream retry,
+            # compaction wrap), and no content batch lands between it and
+            # the segment's first token — so the buffer position here is
+            # the truncation point should the segment that follows be
+            # discarded.
+            self._turn_content_watermark = (
+                len(self._ws_turn_content),
+                self._ws_turn_content_size,
+            )
+            if not self._compaction_activity_live:
+                self._ws_current_activity = "Reasoning…"
+                self._ws_activity_state = "thinking"
+        self._broadcast_activity()
+        self._enqueue({"type": "thinking_start"})
+
+    def on_thinking_stop(self) -> None:
+        self._enqueue({"type": "thinking_stop"})
+
+    def on_reasoning_token(self, text: str) -> None:
+        """Buffer one reasoning fragment into the emit-time batcher.
+
+        Mirrors :meth:`on_content_token`'s shape — see there for the
+        locking rationale and :meth:`_flush_token_batch_locked` for
+        where the (capped) inflight append + single-event enqueue
+        happen.  The inflight cap is a buffer-size limit, NOT a "stop
+        streaming" signal: batches past the cap skip the snapshot
+        buffers but still emit, so the live stream continues (a
+        refresh-after-cap renders the capped snapshot then live tokens
+        past it).
+        """
+        with self._ws_lock:
+            self._buffer_token_locked("reasoning", text)
+
+    def on_content_token(self, text: str) -> None:
+        """Buffer one content fragment into the emit-time batcher.
+
+        Fragments accumulate under ``_ws_lock`` and flush as ONE
+        ``content`` event per batch window (see the ``_TOKEN_BATCH_*``
+        constants) — the event-rate reduction that keeps fast local
+        models (500+ tok/s) from overflowing listener queues.  The
+        flush — inside :meth:`_flush_token_batch_locked`, still under
+        the caller's ``_ws_lock`` — appends the batch to both capped
+        turn-content buffers:
+
+         - ``_ws_turn_content`` (multi-turn, drained at idle/error)
+           — fuels the dashboard's IDLE-piggyback content payload.
+         - ``_ws_inflight_content`` (per-turn, drained at
+           :meth:`on_turn_start`) — fuels the SSE ``in_progress_snapshot``
+           event a reconnecting client sees on mid-stream refresh.
+
+        and enqueues the batched event in the same critical section,
+        so a concurrent :meth:`snapshot_and_consume_state_payload`
+        IDLE/ERROR drain or a concurrent
+        :meth:`register_listener_with_in_progress_snapshot` /
+        :meth:`register_listener_with_replay` sees a consistent
+        ``(inflight_content, _event_id)`` pair — never a pending
+        fragment without its event, never an event without its text.
+        In production this is single-writer-per-ws (the worker
+        thread) but the snapshot reader runs from coord's adapter via
+        ``mgr.set_state``.  Acquisition order ``_ws_lock`` (outer) →
+        ``_listeners_lock`` (inner, via ``_enqueue_direct``) matches
+        the snapshot helpers, so no deadlock.
+        """
+        with self._ws_lock:
+            self._buffer_token_locked("content", text)
+
+    def on_stream_end(self) -> None:
+        with self._ws_lock:
+            # Turn-teardown backstop for the chunk batcher (the token
+            # batch flushes via _enqueue's chokepoint below; chunks
+            # bypass _enqueue, so their backstop lives here).
+            self._flush_all_chunk_batches_locked()
+            self._ws_current_activity = ""
+            self._ws_activity_state = ""
+        self._broadcast_activity()
+        self._enqueue({"type": "stream_end"})
+
+    def on_tool_result(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+        preview: dict[str, Any] | None = None,
+    ) -> None:
+        """Track per-ws tool-call counts + clear activity + enqueue.
+
+        Subclasses can override to add kind-specific bookkeeping (e.g.
+        ``WebUI`` calls :func:`_metrics.record_tool_call` on top of the
+        shared writes); call ``super().on_tool_result(...)`` to keep
+        the per-ws counters consistent.
+
+        ``preview`` is the preview-pane descriptor (``open_preview``) — it
+        rides the live event verbatim, mirrored by the ``/history``
+        projection's ``preview`` field so live and replay render identically.
+        """
+        with self._ws_lock:
+            # Terminal flush of this call's chunk stream BEFORE the
+            # result event goes out — the client removes the streaming
+            # <pre> when it renders the result, so trailing chunks must
+            # precede it on the wire.  (Late leaked-drain chunks are
+            # gated at the producer; see _buffer_chunk_locked.)
+            self._finish_chunk_call_locked(call_id)
+            self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
+            self._ws_turn_tool_calls += 1
+            self._ws_current_activity = ""
+            self._ws_activity_state = ""
+        self._broadcast_activity()
+        event: dict[str, Any] = {
+            "type": "tool_result",
+            "call_id": call_id,
+            "name": name,
+            "output": output,
+        }
+        if is_error:
+            event["is_error"] = True
+        if preview:
+            event["preview"] = preview
+        self._enqueue(event)
+
+    def on_tool_turn_accepted(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+        preview: dict[str, Any] | None = None,
+        effect_status: str | None = None,
+    ) -> int:
+        """Publish the canonical accepted TOOL row without replaying metrics.
+
+        ``on_tool_result`` is the executor receipt: it closes the call's
+        output stream, increments tool metrics, clears activity, and paints a
+        provisional result immediately. Output guards and truncation run
+        afterwards, so the durable row may differ. This second hook carries
+        that final guarded scalar projection to listeners that missed the
+        receipt and lets reducers replace the provisional rendering in place.
+
+        Deliberately no chunk, activity, or metric bookkeeping lives here.
+        Replaying any of it would count one accepted tool twice. Structured
+        image bytes also stay out of the event ring; ``output`` is the same
+        text-only projection persisted for ``/history`` and attachments remain
+        content-addressed in storage.
+        """
+        event: dict[str, Any] = {
+            "type": "tool_result",
+            "accepted": True,
+            "call_id": call_id,
+            "name": name,
+            "output": output,
+        }
+        if is_error:
+            event["is_error"] = True
+        if preview:
+            event["preview"] = preview
+        if effect_status:
+            event["effect_status"] = effect_status
+        return self._enqueue(event)
+
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        """Buffer one tool-output line into the per-call chunk batcher.
+
+        The per-LINE ``_enqueue`` this replaces was the event-storm
+        source under parallel task agents (4 concurrent line-chatty
+        tools ⇒ hundreds-thousands of events/sec past the token
+        batcher, overflowing listener queues), and — because every
+        non-token ``_enqueue`` force-flushes the pending token batch —
+        each line also defeated token batching (the amplifier).
+        Buffered chunks bypass ``_enqueue`` entirely; the batch emits
+        via ``_enqueue_direct`` on window/size, the call's
+        ``tool_result`` (:meth:`on_tool_result`) is the per-call
+        ordering backstop, and turn teardown flushes stragglers.
+        """
+        with self._ws_lock:
+            self._buffer_chunk_locked(call_id, chunk)
+
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
+        """Record per-ws token / context counters + enqueue + persist usage.
+
+        Shared body: writes ``_ws_prompt_tokens`` / ``_ws_completion_tokens``
+        / ``_ws_context_ratio`` under ``_ws_lock``, fans the ``status``
+        event to listener queues, and persists a ``usage_event`` row to
+        storage for governance dashboards. Subclasses (currently
+        :class:`WebUI`) can override to layer node-only Prometheus
+        ``_metrics.record_*`` calls before / after; call
+        ``super().on_status(...)`` to keep the per-ws counters and
+        usage-event row consistent.
+
+        Behaviour change for coord: pre-lift coord's ``on_status`` was a
+        thin enqueue-only stub; the lift turns it into the same writes
+        WebUI does, so the cluster collector's rich ``ws_state``
+        broadcast reads non-zero ``tokens`` / ``context_ratio`` for
+        coord rows, AND coord ``usage_event`` rows now persist to
+        storage (governance gains visibility into coordinator token
+        consumption).
+
+        ``usage`` field access is defensive (``.get(..., 0)``) — pre-
+        lift coord's stub used the same defensive pattern, and a
+        provider-translation bug that produces a partial ``usage``
+        dict shouldn't be surfaced as a worker-thread KeyError.
+        """
+        deferred: list[Callable[[], None]] = []
+        self.on_status_deferred(
+            usage,
+            context_window,
+            effort,
+            deferred_persistence=deferred,
+        )
+        for persist in deferred:
+            persist()
+
+    def on_status_deferred(
+        self,
+        usage: dict[str, Any],
+        context_window: int,
+        effort: str,
+        *,
+        deferred_persistence: list[Callable[[], None]],
+    ) -> None:
+        """Publish live usage state and defer its governance storage row.
+
+        Generation commits call this form while they own the live state lock,
+        then run the returned storage action on the ordered durability lane.
+        The public :meth:`on_status` remains synchronous for direct callers.
+        """
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tok = prompt_tokens + completion_tokens
+        pct = total_tok / context_window * 100 if context_window > 0 else 0
+        cache_creation = usage.get("cache_creation_tokens", 0)
+        cache_read = usage.get("cache_read_tokens", 0)
+        with self._ws_lock:
+            self._ws_prompt_tokens += prompt_tokens
+            self._ws_completion_tokens += completion_tokens
+            self._ws_context_ratio = total_tok / context_window if context_window > 0 else 0.0
+            tool_total = sum(self._ws_tool_calls.values())
+            tool_count = tool_total - self._ws_tool_calls_reported
+            self._ws_tool_calls_reported = tool_total
+            turn_tool_calls = self._ws_turn_tool_calls
+            turn_count = self._ws_messages
+        self._enqueue(
+            {
+                "type": "status",
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tok,
+                "context_window": context_window,
+                "pct": round(pct, 1),
+                "effort": effort,
+                "cache_creation_tokens": cache_creation,
+                "cache_read_tokens": cache_read,
+                "tool_calls_this_turn": turn_tool_calls,
+                "turn_count": turn_count,
+            }
+        )
+        deferred_persistence.append(
+            functools.partial(
+                self._write_usage_row,
+                model=usage.get("model", ""),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                tool_calls_count=tool_count,
+                cache_creation_tokens=cache_creation,
+                cache_read_tokens=cache_read,
+            )
+        )
+
+    def on_aux_usage(self, usage: dict[str, Any]) -> None:
+        """Persist a ``usage_event`` for an auxiliary (non-main-loop) LLM call.
+
+        Title generation, conversation compaction, web-fetch
+        summarisation, and task sub-agents all run through the
+        non-streaming ``model_turn`` seam and never reach
+        :meth:`on_status` — so without this their tokens are invisible to
+        the governance usage dashboard, undercounting real consumption
+        (potentially by a large factor for agent-heavy workstreams).
+
+        Deliberately narrower than :meth:`on_status`: it records ONLY the
+        storage row.  It does NOT enqueue a ``status`` UI event, advance
+        ``_ws_prompt_tokens`` / ``_ws_context_ratio`` (an auxiliary
+        prompt is not the main conversation's live context — folding it
+        in would make the status-bar context gauge lie), or touch the
+        tool-call delta counter.  ``tool_calls_count`` is recorded as 0:
+        any tools a sub-agent or judge calls internally are its own
+        concern, not part of this workstream's surfaced tool tally.
+
+        ``WebUI`` overrides this to also feed the node Prometheus token
+        counters; call ``super().on_aux_usage(...)`` to keep the
+        ``usage_event`` row consistent.
+        """
+        self._write_usage_row(
+            model=usage.get("model", ""),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            tool_calls_count=0,
+            cache_creation_tokens=usage.get("cache_creation_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_tokens", 0),
+        )
+
+    def _write_usage_row(
+        self,
+        *,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        tool_calls_count: int,
+        cache_creation_tokens: int,
+        cache_read_tokens: int,
+    ) -> None:
+        """Persist one ``usage_event`` row, swallowing + logging storage
+        errors so a reporting-sink failure never breaks a live turn.
+
+        Shared by :meth:`on_status` (main-loop turns, real tool-call
+        delta) and :meth:`on_aux_usage` (auxiliary calls, with
+        ``tool_calls_count=0``) so the get-storage / record / except-log
+        shape lives in one place and can't drift if the
+        ``record_usage_event`` signature changes.
+        """
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is not None:
+                storage.record_usage_event(
+                    event_id=uuid.uuid4().hex,
+                    user_id=self._user_id,
+                    ws_id=self.ws_id,
+                    node_id="",
+                    model=model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    tool_calls_count=tool_calls_count,
+                    cache_creation_tokens=cache_creation_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                )
+        except Exception:
+            log.warning("Failed to record usage event", exc_info=True)
+
+    def on_info(self, message: str) -> None:
+        # Inside a task agent (on THIS thread), progress chatter ("[task done] N
+        # chars", a tool's "fetched N chars") carries no call_id, so it can't
+        # nest under the task card — drop it on the web pane rather than let it
+        # escape to the top level.  Per-thread, so a parallel sibling tool's info
+        # still shows.  The card shows the steps + result; the CLI overrides this
+        # method and keeps the lines (no card there).
+        if _agent_scope_var.get() > 0:
+            return
+        self._enqueue({"type": "info", "message": message})
+
+    def on_error(self, message: str) -> None:
+        with self._ws_lock:
+            # Error teardown backstop for the chunk batcher (token
+            # batch flushes via _enqueue below; chunks bypass it).
+            self._flush_all_chunk_batches_locked()
+        self._enqueue({"type": "error", "message": message})
+
+    def on_history_resync(self, reason: str) -> int:
+        """Tell connected panes to refetch the authoritative history view.
+
+        Reserved for exceptional repair paths: older/custom UIs without the
+        typed ``user_turn`` hook, history truncation, or an accepted row that
+        does not reach an unambiguous acknowledgement.
+        """
+        return self._enqueue({"type": "history_resync", "reason": reason})
+
+    def on_user_turn(
+        self,
+        content: str,
+        *,
+        attachments: list[dict[str, Any]],
+        sender: str | None,
+        source: str | None,
+        client_send_ids: list[str],
+    ) -> int:
+        """Publish one accepted user row to every connected pane.
+
+        ``client_send_ids`` correlate this canonical event with optimistic
+        bubbles in the sending browser. They are not idempotency keys; the
+        event's monotonic ``_event_id`` remains the durable row identity.
+        Peer panes render the same event directly, including sender,
+        synthetic-source, and attachment metadata.
+        """
+        event: dict[str, Any] = {
+            "type": "user_turn",
+            "content": content,
+            "client_send_ids": list(client_send_ids),
+        }
+        if attachments:
+            event["attachments"] = [dict(item) for item in attachments]
+        if sender:
+            event["sender"] = sender
+        if source:
+            event["source"] = source
+        return self._enqueue(event)
+
+    def on_system_turn(
+        self, content: str, source: str, meta: dict[str, Any] | None = None
+    ) -> int | None:
+        """Surface a first-class operator-context system turn as its own
+        UI element.
+
+        Operator context (output-guard findings, user interjections,
+        metacognitive nudges, watch results) lives in the conversation
+        trajectory as a real ``{"role": "system", "_source": <kind>, ...}``
+        turn (see ``tool_advisory.make_system_turn``).  This event lets every
+        connected SSE consumer (other browser tabs, CLI mirrors, future
+        channel adapters) render the operator bubble in lockstep with the
+        originating tab's optimistic render.  The history-replay path
+        surfaces the same shape via ``project_history_messages`` (the REST
+        ``/history`` projection) so a tab reconnecting later renders the
+        same bubble.  ``source`` carries the turn's ``_source`` kind so
+        the frontend can label / style the bubble; ``meta`` carries the
+        turn's structured per-kind fields (``watch_triggered``'s
+        ``watch_name`` / command / poll counters) so the frontend can rebuild
+        per-kind rendering (the watch-result card).  ``None`` for kinds with
+        no structured data.
+
+        Returns the SSE ``_event_id`` assigned to the emitted event so the
+        caller persists the row with the matching id (``None`` for UIs
+        without an event stream).
+        """
+        return self._enqueue(
+            {"type": "system_turn", "content": content, "source": source, "meta": meta or None}
+        )
+
+    def on_compaction(self, payload: dict[str, Any]) -> int | None:
+        """Surface one compaction lifecycle event (``phase`` = start/progress/end).
+
+        The transcript affordance for context compaction: ``start`` paints
+        the in-progress card, ``progress`` drives its bar (chunked
+        summarization emits ``part``/``total``/``depth``), and ``end``
+        replaces it with the result card (or the failure notice).  The
+        successful ``end`` event's id is returned so ``_compact_messages``
+        stamps the persisted compaction marker row with the matching
+        resume cursor — the same live-event/history-row alignment
+        :meth:`on_system_turn` provides for operator turns, which is what
+        keeps a ``/history`` repaint and an SSE replay from double-rendering
+        the result card.
+
+        ``target="workstream"`` owns the transcript card, activity latch, and
+        durable marker described above. ``target="task_agent"`` instead
+        carries ``parent_call_id`` and is retained as transient reconnect state
+        for that task card; it never touches the foreground activity pill or
+        becomes conversation history. A missing target is interpreted as
+        ``workstream`` so an event from an older node keeps its established
+        meaning.
+
+        ``superseded`` (stamped by ``ChatSession._compaction_event``) marks
+        events from a force-abandoned compaction whose generation a
+        successor has since claimed.  Its start/progress events are
+        swallowed — animating a card for a dead compaction, or re-creating
+        one via the panes' defensive-create, is pure corruption — but its
+        END flows WITH the flag on the wire: the pane needs the event to
+        retire the card the abandoned compaction painted while it was
+        live, and the flag to know its failure notice would narrate a
+        compaction nobody is waiting on (a superseded OK end still renders
+        the result card — the history swap really happened).  On the latch
+        side a superseded end unlatches (so the live turn's thinking
+        writes resume) without restoring — its saved pair predates the
+        successor turn and would overwrite the live pill.
+        """
+        payload = dict(payload)
+        generation = int(payload.pop("_generation", 0) or 0)
+        target = str(payload.get("target") or "workstream")
+        superseded = bool(payload.pop("superseded", False))
+        if target == "task_agent":
+            return self._on_task_agent_compaction(
+                payload,
+                generation=generation,
+                superseded=superseded,
+            )
+        if _agent_scope_var.get() > 0:
+            return None
+        cid = int(payload.get("compaction_id") or 0)
+        phase = payload.get("phase")
+        if phase == "end":
+            # Ends carry the flag on the wire (typed in both SDKs);
+            # start/progress never do — the live ones are by definition
+            # not superseded and the stale ones are swallowed below.
+            payload["superseded"] = superseded
+        if phase == "start" and not superseded:
+            # The activity pill mirrors on_thinking_start's mechanics but
+            # names the actual work — the summarize calls can run for a
+            # while and "Reasoning…" undersells what the session is doing.
+            # Save the prior pair for the end-side restore, and latch the
+            # window so the impl's own on_thinking_start can't clobber it.
+            with self._ws_lock:
+                if not self._compaction_activity_live:
+                    # A stale (abandoned) compaction may still hold the
+                    # latch — keep ITS saved pair as the restore target
+                    # rather than capturing the "Compacting context…" it
+                    # wrote.
+                    self._pre_compaction_activity = (
+                        self._ws_current_activity,
+                        self._ws_activity_state,
+                    )
+                self._ws_current_activity = "Compacting context…"
+                self._ws_activity_state = "thinking"
+                self._compaction_activity_live = True
+                self._compaction_activity_owner = cid
+            self._broadcast_activity()
+        elif phase == "end":
+            # Restore whatever the pill showed before the compaction — a
+            # mid-turn auto-compaction hands back to the send loop (whose
+            # next thinking/tool write overwrites anyway); a manual bail
+            # returns the idle session's blank pair instead of stranding
+            # "Compacting context…" on an idle workstream.  Owner-gated:
+            # an abandoned compaction's late end must leave a successor's
+            # latch (and pill) alone.
+            changed = False
+            with self._ws_lock:
+                if self._compaction_activity_live and self._compaction_activity_owner == cid:
+                    # A superseded owner-end only unlatches: its saved pair
+                    # predates the successor turn and must not overwrite the
+                    # live pill (the latch itself isn't in the broadcast
+                    # snapshot, so unlatch-only is also broadcast-free).
+                    changed = self._release_compaction_latch_locked(restore=not superseded)
+            if changed:
+                self._broadcast_activity()
+        if superseded and phase != "end":
+            return None
+        return self._enqueue({"type": "compaction", **payload})
+
+    def _on_task_agent_compaction(
+        self,
+        payload: dict[str, Any],
+        *,
+        generation: int,
+        superseded: bool,
+    ) -> int | None:
+        """Reduce one parent-keyed task compaction and retain its live edge."""
+
+        parent_call_id = str(payload.get("parent_call_id") or "")
+        phase = str(payload.get("phase") or "")
+        raw_cid = payload.get("compaction_id")
+        if (
+            not parent_call_id
+            or phase not in {"start", "progress", "end"}
+            or not isinstance(raw_cid, int)
+            or isinstance(raw_cid, bool)
+        ):
+            return None
+        compaction_id = raw_cid
+        if superseded and phase != "end":
+            return None
+        if phase == "end":
+            payload["superseded"] = superseded
+
+        event = {"type": "compaction", **payload}
+        snapshot_event = {**event, "ws_id": self.ws_id}
+        with self._agent_contexts_lock:
+            current = self._agent_compactions.get(parent_call_id)
+            if phase in {"start", "progress"}:
+                if current is not None and (
+                    current[0] > generation
+                    or (current[0] == generation and current[1] > compaction_id)
+                ):
+                    return None
+                # Store before enqueue: a subscriber registering on the next
+                # instruction sees either this snapshot or this live event.
+                self._agent_compactions[parent_call_id] = (
+                    generation,
+                    compaction_id,
+                    snapshot_event,
+                )
+            elif current is not None and current[:2] == (generation, compaction_id):
+                del self._agent_compactions[parent_call_id]
+        return self._enqueue(event)
+
+    def _release_compaction_latch_locked(self, *, restore: bool) -> bool:
+        """Unlatch the compaction pill window; optionally restore the pair.
+
+        The shared release half of the latch invariant — called under
+        ``_ws_lock`` by the owner-gated ``end`` arm of :meth:`on_compaction`
+        (restore unless superseded) and by :meth:`on_generation_claimed`
+        (always restore).  Returns whether the broadcast snapshot — the
+        ``(activity, state)`` pair — actually changed.
+        """
+        self._compaction_activity_live = False
+        if restore:
+            (
+                self._ws_current_activity,
+                self._ws_activity_state,
+            ) = self._pre_compaction_activity
+            return True
+        return False
+
+    def on_generation_claimed(self, generation: int) -> None:
+        """Break a stale compaction activity latch at a new generation claim.
+
+        Called by ``ChatSession._claim_generation`` (getattr-guarded, like
+        ``on_aux_usage``).  The claim is the exact moment any live latch is
+        provably stale — the worker slot serializes turns, so a latch held
+        at claim time belongs to a force-abandoned compaction whose late
+        events may be a full summary call away.  Without this, the whole
+        successor turn's ``on_thinking_start`` writes are suppressed and
+        the pill re-broadcasts "Compacting context…" over a live turn.
+
+        Unlatch AND restore the saved pre-compaction pair: restoring keeps
+        ``_pre_compaction_activity`` coherent for a successor compaction's
+        own start (which saves the CURRENT pair as its restore target — a
+        leftover "Compacting context…" here would get re-stranded on an
+        idle workstream after that successor completes).  A send claimer's
+        first thinking/tool write overwrites the restored pair within
+        milliseconds either way.
+        """
+        changed = False
+        with self._ws_lock:
+            if self._compaction_activity_live and self._compaction_activity_owner != generation:
+                changed = self._release_compaction_latch_locked(restore=True)
+        if changed:
+            self._broadcast_activity()
+
+    # ------------------------------------------------------------------
+    # Broadcast hooks — kind-specific transport.
+    #
+    # Default implementations are no-ops: subclasses override to fan
+    # the snapshot out to their kind's transport (interactive: per-node
+    # global SSE queue; coord: cluster collector). The shared on_* methods
+    # above call these unconditionally so adding broadcast on a future
+    # kind only requires the override.
+    # ------------------------------------------------------------------
+
+    def _broadcast_state(self, state: str) -> None:  # noqa: ARG002 — hook stub
+        """Fan a state-change snapshot out to the kind's transport.
+
+        Default: no-op. Subclasses override.
+        """
+
+    def _broadcast_activity(self) -> None:
+        """Fan a current-activity snapshot out to the kind's transport.
+
+        Default: no-op. Subclasses override.
+        """
+
+    def _broadcast_intent_verdict(self, verdict: dict[str, Any]) -> None:  # noqa: ARG002 — hook stub
+        """Fan an LLM intent-judge verdict out to the kind's transport.
+
+        Default: no-op. ``ConsoleCoordinatorUI`` overrides to push a
+        ``intent_verdict`` event onto the cluster bus so the parent
+        coordinator's tree UI can render the risk pill + verdict
+        result without polling. Stage 3 Step 4: hook only — the
+        cluster-bus event class lands in Step 5.
+        """
+
+    def _broadcast_approval_resolved(
+        self,
+        approved: bool,  # noqa: ARG002 — hook stub
+        feedback: str | None = None,  # noqa: ARG002 — hook stub
+        *,
+        always: bool = False,  # noqa: ARG002 — hook stub
+        cycle_id: str = "",  # noqa: ARG002 — hook stub
+        call_ids: tuple[str, ...] = (),  # noqa: ARG002 — hook stub
+    ) -> None:
+        """Fan an ``approval_resolved`` decision out to the kind's transport.
+
+        Default: no-op. ``ConsoleCoordinatorUI`` overrides to push to
+        the cluster bus so the parent coordinator's tree UI can clear
+        the pending-approval pill in sync with the actual decision.
+        ``cycle_id`` / ``call_ids`` name WHICH cycle resolved — with
+        parallel task agents several are live, and a bare decision
+        would clear the wrong block.
+        """
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:  # noqa: ARG002 — hook stub
+        """Fan an ``approve_request`` payload out to the kind's transport.
+
+        Default: no-op. ``WebUI`` and ``ConsoleCoordinatorUI`` override
+        to push the items list (the same dict that landed in
+        ``_pending_approval``) onto their respective transports. The
+        push path eliminates the bulk-fetch race that otherwise
+        leaves coord rows stuck on a loading placeholder when the
+        bulk fetch lands in the gap between the state transition to
+        ATTENTION and ``_pending_approval`` being set.
+        """
+
+    # ------------------------------------------------------------------
+    # State-broadcast snapshot helper
+    # ------------------------------------------------------------------
+
+    def snapshot_and_consume_state_payload(self, state: str) -> dict[str, Any]:
+        """Return the rich-payload snapshot a state-change broadcast carries.
+
+        Reads under ``_ws_lock`` so the snapshot is internally consistent
+        with concurrent ``on_status`` / ``on_tool_result`` /
+        ``on_content_token`` writes (all of which take the same lock).
+        For terminal states (``"idle"`` / ``"error"``) the turn-content
+        accumulator is also swapped out — IDLE piggybacks the joined
+        content onto the broadcast so the dashboard renders the
+        assistant turn without an extra storage round-trip; ERROR
+        clears without emitting (the broadcast is just for the state
+        transition).
+
+        The IDLE branch swaps the accumulator OUT under the lock and
+        joins the captured list OUTSIDE the lock — keeps the lock
+        hold to microseconds even on a 256 KiB turn, and decouples
+        the join walk from any concurrent ``on_content_token`` racing
+        the swap.
+
+        Returns a dict with keys ``tokens`` / ``context_ratio`` /
+        ``activity`` / ``activity_state`` / ``content``. Callers fan
+        the dict out via their kind's transport
+        (:meth:`_broadcast_state` or, for coord,
+        :meth:`turnstone.console.coordinator_adapter.CoordinatorAdapter.emit_state`).
+        """
+        captured_content: list[str] = []
+        with self._ws_lock:
+            # Deliver any pending token batch first: this is the
+            # cancel/error chokepoint (see the idle-branch comment
+            # below), and the terminal-state payload must carry the
+            # full turn text — a batch stranded in the accumulator
+            # would otherwise vanish from the dashboard payload AND
+            # from connected panes.  Pending chunk batches flush here
+            # for the same reason (cancel/error paths skip stream_end).
+            self._flush_token_batch_locked()
+            self._flush_all_chunk_batches_locked()
+            tokens = self._ws_prompt_tokens + self._ws_completion_tokens
+            ctx = self._ws_context_ratio
+            activity = self._ws_current_activity
+            activity_state = self._ws_activity_state
+            if state == "idle":
+                captured_content = self._ws_turn_content
+                self._ws_turn_content = []
+                self._ws_turn_content_size = 0
+                # Drain the per-turn inflight buffers too so a refresh
+                # post-cancel doesn't double-render against history.
+                # On the success path :meth:`on_turn_committed` already
+                # cleared inflight at ``messages.append`` time, so this
+                # is a no-op there. On cancel/error/exception paths
+                # nothing else clears inflight — this single chokepoint
+                # covers them all.
+                self._reset_inflight_buffers_locked()
+            elif state == "error":
+                self._ws_turn_content = []
+                self._ws_turn_content_size = 0
+                self._reset_inflight_buffers_locked()
+        # Join outside the lock — bounded at _MAX_TURN_CONTENT_CHARS but
+        # still O(n) over the captured fragments, so worth not blocking
+        # concurrent on_content_token writers for the duration.
+        content = "".join(captured_content) if captured_content else ""
+        return {
+            "tokens": tokens,
+            "context_ratio": ctx,
+            "activity": activity,
+            "activity_state": activity_state,
+            "content": content,
+        }
+
+    def snapshot_state_payload_non_consuming(self) -> dict[str, Any]:
+        """Locked counters snapshot for observational operator-row refreshes.
+
+        The non-consuming sibling of :meth:`snapshot_and_consume_state_payload`
+        for hooks that must NOT touch the terminal turn-content accumulator
+        (the persistence refresh reports a journal transition, not a state
+        transition).  Both kinds' ``on_persistence_state_changed`` read
+        through here so the interactive dashboard and the console cluster
+        row cannot silently disagree after the same journal event — a
+        snapshot field added here reaches both surfaces at once.
+        """
+        with self._ws_lock:
+            return {
+                "tokens": self._ws_prompt_tokens + self._ws_completion_tokens,
+                "context_ratio": self._ws_context_ratio,
+                "activity": self._ws_current_activity,
+                "activity_state": self._ws_activity_state,
+            }

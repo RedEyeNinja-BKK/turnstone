@@ -1,0 +1,27 @@
+{
+  "name": "write_file",
+  "description": "Create or overwrite a file. Call this immediately when asked to create, generate, or make a new file — no need to search or read_file first. Write reasonable content right away even if the request is vague. When content is unspecified, generate plausible content from the filename and request — e.g. write_file(path='README.md', content='# Project Name\\nA brief description.'). Prefer this over bash with echo/cat/heredoc for file creation. For modifying existing files, use edit_file instead.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute or relative file path."
+      },
+      "content": {
+        "type": "string",
+        "description": "The full file content to write."
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["overwrite", "append"],
+        "description": "Write mode. 'overwrite' (default) replaces the file. 'append' adds content to the end."
+      }
+    },
+    "required": ["path", "content"]
+  },
+  "task_agent": true,
+  "primary_key": "content",
+  "cwd_note": "Relative paths resolve against {working_dir}.",
+  "workspace_note": "The user's workspace directory is {workspace_dir}."
+}

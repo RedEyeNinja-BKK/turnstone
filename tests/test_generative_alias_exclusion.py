@@ -150,6 +150,24 @@ def test_cli_banner_excludes_typed_aliases() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_console_picker_excludes_typed_aliases() -> None:
+    """Wiring guard for the Console, which does NOT use ModelRegistry.
+
+    ``GET /v1/api/models`` builds the workstream-creation picker straight from
+    ``storage.list_model_definitions()``, so the registry-side filter cannot
+    reach it. The handler must skip a typed-decision row itself, and must skip
+    BEFORE appending.
+    """
+    server = pathlib.Path(__file__).resolve().parents[1] / "turnstone" / "console" / "server.py"
+    src = server.read_text(encoding="utf-8")
+    assert 'is_typed_decision = bool(caps.get("supports_typed_decision"))' in src
+    guard = src.index("if is_typed_decision:")
+    append = src.index("models.append(entry)")
+    assert guard < append, "the typed-decision row must be skipped before it is appended"
+    # The judge display must keep resolving: enabled_aliases still covers every row.
+    assert 'enabled_aliases = {r["alias"] for r in rows}' in src
+
+
 def _bare_judge(**attrs: Any) -> OutputGuardJudge:
     """A judge instance carrying only the attributes ``_error_verdict`` reads."""
     judge = object.__new__(OutputGuardJudge)

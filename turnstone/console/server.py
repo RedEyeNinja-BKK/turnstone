@@ -1652,6 +1652,12 @@ async def list_available_models(request: Request) -> JSONResponse:
             "provider": r["provider"],
             "effort_ladder": [],
         }
+        # A row declaring ``supports_typed_decision`` is a decision backend:
+        # it answers with a typed decision object and generates no assistant
+        # text, so it cannot back a workstream.  It is excluded from this
+        # creation picker only -- it stays in the registry, in the Models admin
+        # tab, and is still executed by the Output Guard's semantic tier.
+        is_typed_decision = False
         try:
             # ``capabilities`` is a JSON string (sa.Text column) with
             # ``server_compat`` namespaced inside — parse it the same way
@@ -1664,6 +1670,7 @@ async def list_available_models(request: Request) -> JSONResponse:
                 parsed = json.loads(raw_caps)
                 if isinstance(parsed, dict):
                     caps = parsed
+                    is_typed_decision = bool(caps.get("supports_typed_decision"))
             server_compat = caps.get("server_compat", {})
             api_surface = (
                 server_compat.get("api_surface", "") if isinstance(server_compat, dict) else ""
@@ -1675,6 +1682,8 @@ async def list_available_models(request: Request) -> JSONResponse:
             # Unknown provider string / malformed capabilities row must
             # not take down the picker — the ladder is an annotation.
             log.debug("models.effort_ladder_failed alias=%s", r.get("alias"), exc_info=True)
+        if is_typed_decision:
+            continue
         models.append(entry)
 
     # Include effective defaults for clients (web UI, channel gateway).

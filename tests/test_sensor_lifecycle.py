@@ -482,7 +482,8 @@ def test_dedupe_survives_a_failing_backend():
     work = pathlib.Path(tempfile.mkdtemp())
     sensor = ShadowSensor(
         store=work / "obs.jsonl",
-        switchyard="http://127.0.0.1:9",  # closed port: every call fails
+        decision_id="tier1-decision",
+        base_url="http://127.0.0.1:9",  # closed port: every call fails
         timeout=1,
     )
     hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
@@ -509,7 +510,7 @@ def test_a_meaningful_change_is_not_deduped_away():
 
     work = pathlib.Path(tempfile.mkdtemp())
     sensor = ShadowSensor(store=work / "obs.jsonl",
-                          switchyard="http://127.0.0.1:9", timeout=1)
+                          decision_id="tier1-decision", base_url="http://127.0.0.1:9", timeout=1)
     hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
 
     hook.observe_event("operator_instruction", {"objective": "first"})
@@ -531,7 +532,7 @@ def test_dedupe_state_is_advanced_by_the_cadence_decision():
     import tempfile
 
     sensor = ShadowSensor(store=pathlib.Path(tempfile.mkdtemp()) / "o.jsonl",
-                          switchyard="http://127.0.0.1:9", timeout=1)
+                          decision_id="tier1-decision", base_url="http://127.0.0.1:9", timeout=1)
     state = {"objective": "unchanged"}
     first, why_first = sensor.should_sense(state, event="operator_instruction")
     second, why_second = sensor.should_sense(state, event="operator_instruction")
@@ -552,7 +553,7 @@ def test_cadence_rows_carry_no_state_text_or_signals():
 
     work = pathlib.Path(tempfile.mkdtemp())
     sensor = ShadowSensor(store=work / "obs.jsonl",
-                          switchyard="http://127.0.0.1:9", timeout=1)
+                          decision_id="tier1-decision", base_url="http://127.0.0.1:9", timeout=1)
     hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
     hook.observe_event(
         "operator_instruction",
@@ -579,7 +580,7 @@ def test_cadence_records_suppressed_events_that_produce_no_observation():
 
     work = pathlib.Path(tempfile.mkdtemp())
     sensor = ShadowSensor(store=work / "obs.jsonl",
-                          switchyard="http://127.0.0.1:9", timeout=1)
+                          decision_id="tier1-decision", base_url="http://127.0.0.1:9", timeout=1)
     hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
     hook.observe_event("operator_instruction", {"objective": "x"})
     hook.observe_event("operator_instruction", {"objective": "x"})
@@ -602,7 +603,7 @@ def test_cadence_report_exposes_calls_per_hour_and_per_workstream():
 
     work = pathlib.Path(tempfile.mkdtemp())
     sensor = ShadowSensor(store=work / "obs.jsonl",
-                          switchyard="http://127.0.0.1:9", timeout=1)
+                          decision_id="tier1-decision", base_url="http://127.0.0.1:9", timeout=1)
     hook = lifecycle.SensorHook(sensor=sensor, cadence_store=work / "cad.jsonl")
     hook.observe_event("operator_instruction", {"objective": "a"}, workstream="ws-1")
     hook.observe_event("tool_failure", {"objective": "a", "blocker": "b"}, workstream="ws-2")

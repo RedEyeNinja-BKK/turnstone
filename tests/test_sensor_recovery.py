@@ -110,7 +110,8 @@ def test_per_workstream_dedupe_survives_a_failing_backend():
     With the transport dead, each workstream's fingerprint must still be
     committed on the admit branch: no retry storm, per workstream.
     """
-    sensor = ShadowSensor(store=None, switchyard="http://127.0.0.1:9", timeout=0.2)
+    sensor = ShadowSensor(store=None, decision_id="tier1-decision",
+                    base_url="http://127.0.0.1:9", timeout=0.2)
     hook = lifecycle.SensorHook(sensor=sensor, cadence_store=None, persist=False)
 
     # Each workstream sees a distinct first state and a repeated second state.
@@ -163,7 +164,12 @@ class _FixedTransport:
 
 
 def _sensor_with(payload, tmp_path):
-    sensor = ShadowSensor(store=tmp_path / "obs.jsonl", timeout=2.5)
+    sensor = ShadowSensor(
+        store=tmp_path / "obs.jsonl",
+        timeout=2.5,
+        decision_id="tier1-decision",
+        base_url="https://switchyard.example.internal",
+    )
     transport = _FixedTransport(payload)
     sensor._post = transport  # type: ignore[method-assign]
     return sensor, transport
@@ -241,7 +247,8 @@ def test_default_timeout_is_short_and_configurable():
 
 def test_timeout_failure_is_recorded_never_raised(tmp_path):
     sensor = ShadowSensor(
-        store=tmp_path / "obs.jsonl", switchyard="http://127.0.0.1:9", timeout=0.2
+        store=tmp_path / "obs.jsonl", decision_id="tier1-decision",
+        base_url="http://127.0.0.1:9", timeout=0.2
     )
     snapshot = sensor.observe(
         {"objective": "a"}, event="operator_instruction", workstream="ws"
@@ -372,17 +379,39 @@ def test_resolve_uses_the_registry_row():
     assert base_url == "https://switchyard.example.internal"
 
 
-def test_resolve_falls_back_without_a_registry():
-    decision_id, base_url = resolve_decision_endpoint(None)
-    assert decision_id == DECISION_CAPABILITY
-    assert base_url  # the module fallback constant
+def test_resolve_without_a_registry_is_unresolved():
+    """2026-10-17 hardening: no fallback URL exists.
+
+    An unresolved pair is what makes the sensor record an explicitly
+    unavailable observation instead of requesting a stale lane or localhost.
+    """
+    assert resolve_decision_endpoint(None) == ("", "")
 
 
-def test_resolve_falls_back_on_a_non_typed_row():
+def test_resolve_on_a_non_typed_row_is_unresolved():
     row = _Row("https://switchyard.example.internal", {})
-    decision_id, base_url = resolve_decision_endpoint(_Registry(row))
-    assert decision_id == DECISION_CAPABILITY
-    assert base_url  # fallback, never a partial resolution
+    assert resolve_decision_endpoint(_Registry(row)) == ("", "")
+
+
+def test_resolve_on_a_blank_base_url_is_unresolved():
+    row = _Row("", {"supports_typed_decision": True})
+    assert resolve_decision_endpoint(_Registry(row)) == ("", "")
+
+
+def test_unresolved_sensor_sends_no_request(tmp_path, monkeypatch):
+    """The invariant behind the removal: no endpoint => no network, ever."""
+    import urllib.request
+
+    def _must_not_be_called(*_a, **_k):
+        raise AssertionError("unresolved sensor attempted a network request")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _must_not_be_called)
+    sensor = ShadowSensor(store=tmp_path / "obs.jsonl", timeout=0.2)
+    snapshot = sensor.observe(
+        {"objective": "x"}, event="operator_instruction", workstream="ws"
+    )
+    assert snapshot.reason == "decision_endpoint_unresolved"
+    assert sensor.metrics.unresolved_endpoint_count == 1
 
 
 # ------------------------------------------------------- wiring invariants
@@ -393,14 +422,21 @@ def test_session_has_exactly_four_sensor_seams():
     tree = ast.parse(source)
     events = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_sensor_observe":
-            assert node.args, "seam must pass the event as its first positional arg"
-            first = node.args[0]
-            assert isinstance(first, ast.Constant)
-            events.append(first.value)
-            assert not any(kw.arg is None for kw in node.keywords), (
-                "no **kwargs at a seam"
-            )
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None)
+        if name == "_sensor_observe_substantive":
+            events.append("operator_instruction")
+            continue
+        if name not in ("_sensor_observe", "_sensor_observe_delegation"):
+            continue
+        assert node.args, "seam must pass the event as its first positional arg"
+        first = node.args[0]
+        assert isinstance(first, ast.Constant)
+        events.append(first.value)
+        assert not any(kw.arg is None for kw in node.keywords), (
+            "no **kwargs at a seam"
+        )
     assert sorted(events) == [
         "delegation_result", "operator_instruction", "retry_transition",
         "task_agent_failure",
@@ -412,7 +448,15 @@ def test_seams_pass_the_workstream_id():
     source = SESSION.read_text()
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_sensor_observe":
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) not in (
+            "_sensor_observe",
+            "_sensor_observe_substantive",
+            "_sensor_observe_delegation",
+        ):
+            continue
+        if True:
             workstream = [kw for kw in node.keywords if kw.arg == "workstream"]
             assert workstream, "every seam must identify its workstream"
             value = workstream[0].value
@@ -441,3 +485,116 @@ def test_seams_add_no_control_flow():
                     # Allowed only inside _publish_success/_publish_error defs,
                     # which are themselves called through _publish_for_generation.
                     assert child.col_offset > node.col_offset
+
+
+# --------------------------------------------------- exception containment
+
+
+class _Exploding:
+    """An object that raises on every protocol the sensor might touch."""
+
+    def __str__(self):
+        raise RuntimeError("boom str")
+
+    def __iter__(self):
+        raise RuntimeError("boom iter")
+
+    def __len__(self):
+        raise RuntimeError("boom len")
+
+
+class _ExplodingDict(dict):
+    def get(self, *a, **k):
+        raise RuntimeError("boom get")
+
+
+def test_substantive_guard_survives_an_exploding_input():
+    """The operator seam's substance check must be inside the boundary."""
+    # Direct lifecycle call raises (documented), but the session wrapper must
+    # not.
+    with pytest.raises(Exception):
+        lifecycle.is_substantive_instruction(_Exploding())  # type: ignore[arg-type]
+    import turnstone.core.session as session_mod
+
+    session_mod._sensor_observe_substantive(_Exploding(), workstream="ws")
+
+
+def test_delegation_wrapper_survives_exploding_items_and_results():
+    """item.get / str(item) / str(result) all happen INSIDE the boundary."""
+    import turnstone.core.session as session_mod
+
+    session_mod._sensor_observe_delegation(
+        "delegation_result", _ExplodingDict(), _Exploding(), workstream="ws"
+    )
+    session_mod._sensor_observe_delegation(
+        "task_agent_failure", _Exploding(), _Exploding(), workstream="ws"
+    )
+    session_mod._sensor_observe_delegation(
+        "delegation_result", {"prompt": "fine"}, "fine result", workstream="ws"
+    )
+
+
+def test_retry_wrapper_survives_exploding_values():
+    import turnstone.core.session as session_mod
+
+    session_mod._sensor_observe(
+        "retry_transition", {"objective": _Exploding()}, workstream="ws"
+    )
+
+
+def test_exploding_sensor_cannot_reach_chat_session_execution(monkeypatch):
+    """With the sensor ENABLED and exploding behind the hook, seams return."""
+    monkeypatch.setattr(lifecycle, "ENABLED", True)
+
+    class _BoomSensor:
+        def should_sense(self, *a, **k):
+            raise RuntimeError("boom")
+
+        def observe(self, *a, **k):
+            raise RuntimeError("boom")
+
+    hook = lifecycle.SensorHook(sensor=_BoomSensor(), persist=False)
+    lifecycle._HOOK = hook
+    try:
+        import turnstone.core.session as session_mod
+
+        session_mod._sensor_observe_substantive("do real work", workstream="ws")
+        session_mod._sensor_observe_delegation(
+            "delegation_result", {"prompt": "p"}, "r", workstream="ws"
+        )
+        session_mod._sensor_observe(
+            "retry_transition", {"objective": "x"}, workstream="ws"
+        )
+    finally:
+        lifecycle._HOOK = None
+    assert hook.counters().get("hook_error", 0) == 3
+
+
+def test_exploding_state_values_are_recorded_unavailable(tmp_path):
+    """A mapping whose VALUES explode is contained at the hook boundary."""
+    sensor = _BoomAtShouldSense()
+    hook = lifecycle.SensorHook(sensor=sensor, persist=False)
+    hook.observe_event("operator_instruction", {"objective": _Exploding()})
+    assert hook.counters().get("hook_error", 0) == 1
+    assert sensor.calls == []
+
+
+class _BoomAtShouldSense:
+    def __init__(self):
+        self.calls = []
+
+    def should_sense(self, *a, **k):
+        self.calls.append(1)
+        return True, "material"
+
+    def observe(self, *a, **k):
+        return None
+
+
+def test_state_construction_happens_inside_the_seam_wrapper():
+    """The delegation seams must NOT build the projection at the call site."""
+    source = SESSION.read_text()
+    assert "item.get(\"prompt\", \"\") if isinstance(item, dict) else str(item)" not in source, (
+        "projection construction moved into the guarded wrapper"
+    )
+    assert "def _sensor_observe_delegation(" in source

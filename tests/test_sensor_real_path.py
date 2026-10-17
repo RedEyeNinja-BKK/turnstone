@@ -58,7 +58,7 @@ def build(tmp_path: pathlib.Path, *, fail: bool = False):
     """Real SensorHook + real ShadowSensor + real cadence/dedupe + real storage."""
     store = tmp_path / "observations.jsonl"
     cadence = tmp_path / "cadence.jsonl"
-    sensor = ShadowSensor(store=store, switchyard="http://127.0.0.1:1")  # never used
+    sensor = ShadowSensor(store=store, decision_id="tier1-decision", base_url="http://127.0.0.1:1")  # never used
     hook = sl.SensorHook(sensor=sensor, cadence_store=cadence)
     transport = CountingTransport(fail=fail)
     # Replace ONLY the network hop. should_sense/observe/serialize/persist are real.
@@ -211,7 +211,8 @@ def test_unwired_trigger_is_admitted_but_never_emitted(tmp_path):
 def test_decided_flag_does_not_bypass_materiality_for_a_direct_caller(tmp_path):
     """`decided=True` must not become a back door around is_material."""
     sensor = ShadowSensor(
-        store=tmp_path / "o.jsonl", switchyard="http://127.0.0.1:1")
+        store=tmp_path / "o.jsonl", decision_id="tier1-decision",
+        base_url="http://127.0.0.1:1")
     transport = CountingTransport()
     sensor._post = transport.post  # type: ignore[method-assign]
 

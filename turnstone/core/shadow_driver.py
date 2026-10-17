@@ -56,12 +56,13 @@ DEFAULT_STORE = pathlib.Path(
     )
 ) / "shadow-observations.jsonl"
 
-#: The live decision surface. The historical constant pointed at a local
-#: Switchyard dev port; 1.8.7 reaches Switchyard through the registry-resolved
-#: base_url of the ``tier1-decision`` row. The constant remains only as the
-#: no-registry fallback so the module stays importable and testable in
-#: isolation.
-SWITCHYARD = "https://switchyard-vm.tailc8ef7b.ts.net"
+#: The live decision surface. There is deliberately NO fallback URL here.
+#: 2026-10-17 hardening: a registry-resolution failure must produce an
+#: explicitly unavailable observation, never a request to a stale historical
+#: lane or a localhost endpoint. The only way this module sends a request is
+#: with a base_url the registry actually resolved (or one a test passes
+#: explicitly). The historical constant and the dev-port fallback are gone.
+SWITCHYARD = ""
 
 #: 2026-10-17 adaptation: the historical 20-second synchronous timeout could
 #: delay a production task for the full budget on a hung backend. Sensing is
@@ -90,6 +91,14 @@ class ShadowMetrics:
     fallback_count: int = 0
     deduplicated_count: int = 0
     suppressed_count: int = 0
+    #: 2026-10-17 hardening: observations skipped because the decision
+    #: endpoint was never resolved by the registry. Distinct from transport
+    #: failures: nothing was sent at all.
+    unresolved_endpoint_count: int = 0
+    #: 2026-10-17 hardening: admitted observations whose record could not be
+    #: persisted. Paired with the hook's cadence ledger so "sensor_call" is
+    #: never an uncorroborated claim.
+    record_failure_count: int = 0
     total_latency_ms: int = 0
     serialized_chars: list[int] = field(default_factory=list)
     serialized_state_tokens: list[int] = field(default_factory=list)
@@ -127,6 +136,8 @@ class ShadowMetrics:
             "fallback_rate": round(self.fallback_rate, 4),
             "deduplicated_count": self.deduplicated_count,
             "suppressed_count": self.suppressed_count,
+            "unresolved_endpoint_count": self.unresolved_endpoint_count,
+            "record_failure_count": self.record_failure_count,
             "mean_latency_ms": round(self.mean_latency_ms, 2),
             "serialized_chars": stats(self.serialized_chars),
             "serialized_state_tokens": stats(self.serialized_state_tokens),
@@ -161,24 +172,30 @@ class ShadowSensor:
         self,
         *,
         store: pathlib.Path = DEFAULT_STORE,
-        switchyard: str = SWITCHYARD,
         timeout: float = REQUEST_TIMEOUT_SECONDS,
         dedupe_capacity: int = DEDUPE_CAPACITY,
         decision_id: str = "",
         base_url: str = "",
+        on_record_failure: Any = None,
     ) -> None:
         self.store = store
         # base_url and decision_id come from the registry-resolved
-        # tier1-decision row when a registry is available; the module constants
-        # are the no-registry fallback so the sensor stays importable and
-        # testable in isolation.
-        self.switchyard = base_url or switchyard
+        # tier1-decision row. An empty pair means UNRESOLVED: the sensor
+        # records an explicitly unavailable observation and sends nothing.
+        # There is no URL fallback of any kind.
+        self.switchyard = base_url
         self.timeout = timeout
         self.metrics = ShadowMetrics()
         self._decision_id = decision_id
+        self._resolved = bool(decision_id.strip() and base_url.strip())
         self._dedupe: OrderedDict[str, list] = OrderedDict()
         self._dedupe_capacity = max(1, int(dedupe_capacity))
         self._dedupe_lock = threading.Lock()
+        # Called with (workstream, fingerprint, reason) when the observation
+        # record could not be persisted. The hook uses this to keep the
+        # cadence ledger honest: every sensor_call row is then paired with
+        # either an observation or an observation_write_failed row.
+        self.on_record_failure = on_record_failure
 
     # -- cadence ---------------------------------------------------------
 
@@ -284,6 +301,19 @@ class ShadowSensor:
         the full dedupe behaviour and the proofs that call it stay honest.
         """
         fingerprint = state_fingerprint(state)
+        if not self._resolved:
+            # 2026-10-17 hardening: an unresolved decision endpoint is an
+            # explicitly unavailable observation, and NO network request is
+            # made — not to a historical lane alias, not to localhost, not
+            # anywhere. Silence about an unresolved lane would be the same
+            # dishonesty as a fabricated reading.
+            self.metrics.unresolved_endpoint_count += 1
+            return unavailable(
+                trigger=Trigger.MATERIAL,
+                fingerprint=fingerprint,
+                serializer_version=SERIALIZER_VERSION,
+                reason="decision_endpoint_unresolved",
+            )
         if decided:
             # The caller owns cadence and already committed the fingerprint.
             # Re-gating here is exactly the double-gate defect.
@@ -482,7 +512,17 @@ class ShadowSensor:
             with self.store.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(snapshot.to_dict()) + "\n")
         except Exception:  # noqa: BLE001 - storage failure must not fail a task
-            pass
+            # 2026-10-17 hardening: a storage failure is counted, not silent.
+            # The admitted call still produced its ATTEMPTED observation, but
+            # the record is lost — the hook's cadence ledger is told so the
+            # sensor_call row is never an uncorroborated claim.
+            self.metrics.record_failure_count += 1
+            callback = self.on_record_failure
+            if callback is not None:
+                try:
+                    callback(snapshot.state_fingerprint, snapshot.reason or "")
+                except Exception:  # noqa: BLE001 - the callback must not raise
+                    pass
         return snapshot
 
 
@@ -491,26 +531,29 @@ def resolve_decision_endpoint(registry: Any = None) -> tuple[str, str]:
 
     2026-10-17 adaptation. The historical sensor hardcoded the lane name; the
     live surface is the ``tier1-decision`` registry row, the same row the
-    Output Guard's typed path resolves - so the sensor follows the row rather
+    Output Guard's typed path resolves — so the sensor follows the row rather
     than a constant, and a Switchyard-side change to the lane is picked up
     without a sensor code change.
 
     Reads ONLY the row's identity and typed-decision capabilities. It never
     reads or writes a routing, permission, approval or Output Guard value, and
-    the result is used to send the sensor's own five graded-noul questions -
+    the result is used to send the sensor's own five graded-noul questions —
     not the guard's categorical risk question, whose contract stays untouched.
 
-    ``registry`` may be None (tests, no registry available): the module's
-    fallback constants apply. Any registry failure is a fallback, not an
-    error: an advisory sensor must not make registry health its problem.
+    2026-10-17 hardening: there is NO fallback URL. Any resolution failure
+    (no registry, unusable accessor, missing row, non-typed row, blank
+    base_url) returns ``("", "")``. The sensor treats an empty pair as
+    unresolved and records an explicitly unavailable observation without
+    sending anything. It can never silently request a stale historical lane
+    or a localhost endpoint.
     """
     alias = DECISION_CAPABILITY
     try:
         if registry is None:
             raise LookupError("no registry")
         # Mirror the Output Guard's accessors: identity and capabilities both
-        # come off the row via get_config. An unusable registry falls back
-        # exactly like a missing one.
+        # come off the row via get_config. An unusable registry resolves to
+        # unresolved, exactly like a missing one.
         get_config = getattr(registry, "get_config", None)
         if get_config is None:
             raise LookupError("registry exposes no get_config")
@@ -522,5 +565,5 @@ def resolve_decision_endpoint(registry: Any = None) -> tuple[str, str]:
         if not base_url:
             raise LookupError(f"{alias!r} carries no base_url")
         return alias, base_url
-    except Exception:  # noqa: BLE001 - fail back to constants, never raise
-        return alias, SWITCHYARD
+    except Exception:  # noqa: BLE001 - resolve to UNRESOLVED, never raise
+        return "", ""

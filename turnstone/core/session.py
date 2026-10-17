@@ -101,6 +101,67 @@ def _sensor_observe(event: str, state: dict, *, workstream: str = "") -> None:
         pass
 
 
+def _sensor_observe_delegation(
+    event: str,
+    item: object,
+    result: object,
+    *,
+    workstream: str = "",
+) -> None:
+    """The delegation seams, wholly inside the fail-open boundary.
+
+    State construction (``item.get("prompt")``, ``str(result)``) happens
+    HERE, inside the guarded block — 2026-10-17 hardening. The historical
+    wiring built the projection dict at the call site, so an exploding
+    mapping or an object whose ``__str__`` raises could escape into the
+    generation-owned publish and fail the delegation path.
+    """
+    if _sensor_lifecycle is None:
+        return
+    try:
+        if isinstance(item, dict):
+            objective = item.get("prompt", "")
+        else:
+            objective = str(item)
+        if event == "delegation_result":
+            state = {"objective": objective, "phase": "delegation", "history": result}
+        else:
+            state = {
+                "objective": objective,
+                "phase": "delegation",
+                "blocker": str(result),
+            }
+        _sensor_lifecycle.observe_event(event, state, workstream=workstream)
+    except Exception:  # noqa: BLE001 - a sensor must never fail a task
+        pass
+
+
+def _sensor_observe_substantive(user_input: object, *, workstream: str = "") -> None:
+    """The operator_instruction seam, wholly inside the fail-open boundary.
+
+    The substance check AND the state construction AND the observe call all
+    sit inside one guarded block: an input object that raises on str/len/iter
+    must cost the task nothing. 2026-10-17 hardening: the historical wiring
+    evaluated ``is_substantive_instruction(user_input)`` OUTSIDE the guarded
+    wrapper, so an exotic object could raise into send().
+    """
+    if _sensor_lifecycle is None:
+        return
+    try:
+        if not _sensor_lifecycle.is_substantive_instruction(user_input):  # type: ignore[arg-type]
+            return
+        _sensor_lifecycle.observe_event(
+            "operator_instruction",
+            {
+                "objective": user_input,
+                "phase": "operator_instruction",
+            },
+            workstream=workstream,
+        )
+    except Exception:  # noqa: BLE001 - a sensor must never fail a task
+        pass
+
+
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
     UNOBSERVED_OUTCOME_CLAUSE,
@@ -12678,15 +12739,11 @@ class ChatSession:
             # substantive instruction, never for a wake or an acknowledgement, and
             # the call cannot raise or return anything into this path. Disabled
             # by default (sensor_lifecycle.ENABLED) — a no-op until activated.
-            if not from_wake and _sensor_lifecycle is not None and (
-                _sensor_lifecycle.is_substantive_instruction(user_input)
-            ):
-                _sensor_observe(
-                    "operator_instruction",
-                    {
-                        "objective": user_input,
-                        "phase": "operator_instruction",
-                    },
+            # The substance guard is INSIDE the wrapper's fail-open boundary:
+            # an exploding user_input object must not raise into send().
+            if not from_wake:
+                _sensor_observe_substantive(
+                    user_input,
                     workstream=getattr(self, "_ws_id", ""),
                 )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
@@ -26548,13 +26605,10 @@ class ChatSession:
                 # Inside the generation-owned success publish, so only a live
                 # generation is observed. Cannot raise; result is discarded.
                 # Disabled by default.
-                _sensor_observe(
+                _sensor_observe_delegation(
                     "delegation_result",
-                    {
-                        "objective": item.get("prompt", "") if isinstance(item, dict) else str(item),
-                        "phase": "delegation",
-                        "history": result,
-                    },
+                    item,
+                    result,
                     workstream=getattr(self, "_ws_id", ""),
                 )
 
@@ -26639,13 +26693,10 @@ class ChatSession:
                 # Inside the generation-owned publish, so a superseded generation
                 # never reaches it. Cannot raise; result is discarded.
                 # Disabled by default.
-                _sensor_observe(
+                _sensor_observe_delegation(
                     "task_agent_failure",
-                    {
-                        "objective": item.get("prompt", "") if isinstance(item, dict) else str(item),
-                        "phase": "delegation",
-                        "blocker": msg,
-                    },
+                    item,
+                    msg,
                     workstream=getattr(self, "_ws_id", ""),
                 )
 

@@ -392,10 +392,13 @@ def hook() -> SensorHook:
     if _HOOK is None:
         with _HOOK_LOCK:
             if _HOOK is None:
-                # 2026-10-17: resolve the decision endpoint from the live
-                # registry (tier1-decision row) at hook construction. Failure
-                # falls back to module constants; never raises.
-                from .shadow_driver import resolve_decision_endpoint
+                # 2026-10-17 hardening: resolve the decision endpoint from the
+                # live registry (tier1-decision row) at hook construction. A
+                # failed resolution yields ("", "") — an UNRESOLVED sensor
+                # whose observations are explicitly unavailable with no
+                # network request of any kind. There is deliberately no
+                # fallback URL here: silence would be the dishonest option.
+                from .shadow_driver import ShadowSensor, resolve_decision_endpoint
 
                 decision_id, base_url = resolve_decision_endpoint()
                 _HOOK = SensorHook(

@@ -281,7 +281,8 @@ def test_changed_material_state_is_sensed():
 
 
 def test_switchyard_failure_fails_open(tmp_path):
-    sensor = ShadowSensor(store=tmp_path / "o.jsonl", switchyard="http://127.0.0.1:9")
+    sensor = ShadowSensor(store=tmp_path / "o.jsonl", decision_id="tier1-decision",
+                  base_url="http://127.0.0.1:9")
     snapshot = sensor.observe({"objective": "a"}, event=None)
     assert snapshot.reason and snapshot.reason.startswith("transport")
     assert all(s.available is False for s in snapshot.signals)
@@ -290,26 +291,36 @@ def test_switchyard_failure_fails_open(tmp_path):
 
 
 def test_serializer_failure_fails_open(tmp_path):
-    sensor = ShadowSensor(store=tmp_path / "o.jsonl")
+    sensor = ShadowSensor(
+        store=tmp_path / "o.jsonl",
+        decision_id="tier1-decision",
+        base_url="http://127.0.0.1:9",
+    )
     snapshot = sensor.observe({"transcript": {"messages": ["secret"]}}, event=None)
     assert snapshot.reason and snapshot.reason.startswith("serializer_error")
 
 
 def test_storage_failure_does_not_propagate(tmp_path):
-    sensor = ShadowSensor(store=tmp_path / "nodir" / "x" / "\0bad")
+    sensor = ShadowSensor(
+        store=tmp_path / "nodir" / "x" / "\0bad",
+        decision_id="tier1-decision",
+        base_url="http://127.0.0.1:9",
+    )
     snapshot = sensor.observe({"objective": "a"}, event=None)
     assert snapshot is not None  # returned, not raised
 
 
 def test_no_retry_storm_on_failure(tmp_path):
     """One observe() call means at most one HTTP attempt."""
-    sensor = ShadowSensor(store=tmp_path / "o.jsonl", switchyard="http://127.0.0.1:9")
+    sensor = ShadowSensor(store=tmp_path / "o.jsonl", decision_id="tier1-decision",
+                  base_url="http://127.0.0.1:9")
     snapshot = sensor.observe({"objective": "a"}, event=None)
     assert snapshot.latency_ms < 5000, "a failed call must not retry internally"
 
 
 def test_metrics_report_truncation_rate(tmp_path):
-    sensor = ShadowSensor(store=tmp_path / "o.jsonl", switchyard="http://127.0.0.1:9")
+    sensor = ShadowSensor(store=tmp_path / "o.jsonl", decision_id="tier1-decision",
+                  base_url="http://127.0.0.1:9")
     for i in range(4):
         sensor.observe(
             {"objective": f"task {i}", "history": "x " * 400},

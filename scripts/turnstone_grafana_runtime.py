@@ -509,12 +509,17 @@ def summarize_query(body: Any) -> dict[str, Any] | None:
     return out
 
 
-def parse_dashboard_request(raw: bytes) -> str:
-    """Validate a dashboard request and return its uid.
+def parse_dashboard_request(raw: bytes) -> dict[str, Any]:
+    """Validate a dashboard read request.
 
     Same contract as query: one bounded JSON object on stdin, no free-form
     path. The uid grammar is the same one datasource uids already use, so a
     traversal or query-string injection cannot survive validation.
+
+    ``raw`` asks for the full document instead of the operator projection.
+    That is what makes an edit round-trip safe: a write replaces the whole
+    document, so reconstructing one from the projection would discard panel
+    geometry, field configuration and every option the projection never names.
     """
     if not raw:
         raise GrafanaError("dashboard request is empty")
@@ -526,13 +531,16 @@ def parse_dashboard_request(raw: bytes) -> str:
         raise GrafanaError("dashboard request is not valid JSON") from None
     if not isinstance(data, dict):
         raise GrafanaError("dashboard request must be a JSON object")
-    unknown = set(data) - {"uid"}
+    unknown = set(data) - {"uid", "raw"}
     if unknown:
         raise GrafanaError("unsupported dashboard field(s): " + ", ".join(sorted(unknown)))
     uid = data.get("uid")
     if not isinstance(uid, str) or not _UID_RE.match(uid):
         raise GrafanaError("uid must be 1-40 characters of [A-Za-z0-9_-]")
-    return uid
+    want_raw = data.get("raw", False)
+    if not isinstance(want_raw, bool):
+        raise GrafanaError("raw must be a boolean")
+    return {"uid": uid, "raw": want_raw}
 
 
 def _panel_targets(panel: dict[str, Any]) -> list[str]:
@@ -616,9 +624,17 @@ def summarize_dashboard(body: Any) -> dict[str, Any] | None:
     }
 
 
-def run_dashboard(token: str, uid: str) -> dict[str, Any]:
-    """Fetch one dashboard by uid and project it."""
+def run_dashboard(token: str, uid: str, *, raw: bool = False) -> dict[str, Any]:
+    """Fetch one dashboard by uid.
+
+    Default is the operator projection. ``raw`` returns the document exactly as
+    Grafana holds it, which is the only safe input to an update.
+    """
     status, body = get_json(f"/api/dashboards/uid/{uid}", token)
+    if raw:
+        document = body.get("dashboard") if isinstance(body, dict) else None
+        meta = body.get("meta") if isinstance(body, dict) else None
+        return {"status": status, "document": document, "meta": meta}
     return {"status": status, "dashboard": summarize_dashboard(body)}
 
 
@@ -743,6 +759,14 @@ def _backup_dashboard(uid: str, version: Any, body: Any) -> str | None:
         os.makedirs(directory, mode=0o750, exist_ok=True)
     except OSError as exc:
         raise GrafanaError(f"backup directory unavailable ({type(exc).__name__})") from None
+    # The launcher runs under umask 077, which strips the requested mode, and a
+    # root-created directory inherits root's group. Without this the backups
+    # exist but the service identity cannot read them -- which defeats the point
+    # of keeping them. Follow the parent's group, like the audit file does.
+    if os.geteuid() == 0:
+        with contextlib.suppress(OSError):
+            os.chmod(directory, 0o750)
+            os.chown(directory, -1, os.stat(os.path.dirname(directory)).st_gid)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     path = os.path.join(directory, f"{uid}-v{version}-{stamp}.json")
     payload = json.dumps(body, indent=2, sort_keys=True).encode("utf-8")
@@ -797,6 +821,10 @@ def run_dashboard_write(token: str, request: dict[str, Any]) -> tuple[dict[str, 
 
     document = dict(request["dashboard"])
     document["uid"] = uid
+    # The numeric id is Grafana's internal row id and is derived from the uid.
+    # Sending a stale one back is the classic cause of a spurious 412 on an
+    # otherwise correct round-trip, so it is dropped rather than trusted.
+    document.pop("id", None)
     if op == "update":
         document["version"] = request["expected_version"]
     payload: dict[str, Any] = {
@@ -1054,13 +1082,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "dashboard":
         try:
-            dash_uid = parse_dashboard_request(raw)
+            dash_request = parse_dashboard_request(raw)
         except GrafanaError as exc:
             finish("refused", [], {"error": type(exc).__name__})
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 3
+        dash_uid = dash_request["uid"]
         try:
-            out = run_dashboard(token, dash_uid)
+            out = run_dashboard(token, dash_uid, raw=dash_request["raw"])
         except GrafanaError as exc:
             finish("error", [], {"dashboard_uid": dash_uid, "error": type(exc).__name__})
             print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True))
@@ -1068,7 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
         finish(
             "ok" if out["status"] == 200 else "upstream_error",
             [out["status"]],
-            {"dashboard_uid": dash_uid},
+            {"dashboard_uid": dash_uid, "raw": dash_request["raw"]},
         )
         print(json.dumps(out, indent=2, sort_keys=True))
         return 0 if out["status"] == 200 else 4

@@ -857,9 +857,128 @@ def test_launcher_and_installer_parse() -> None:
 
 
 def test_dashboard_request_accepts_a_valid_uid() -> None:
-    assert grafana.parse_dashboard_request(b'{"uid":"switchyard-dashboard-v6"}') == (
-        "switchyard-dashboard-v6"
-    )
+    assert grafana.parse_dashboard_request(b'{"uid":"switchyard-dashboard-v6"}') == {
+        "uid": "switchyard-dashboard-v6",
+        "raw": False,
+    }
+
+
+def test_dashboard_request_accepts_raw() -> None:
+    assert grafana.parse_dashboard_request(b'{"uid":"x","raw":true}') == {
+        "uid": "x",
+        "raw": True,
+    }
+
+
+def test_dashboard_request_refuses_a_non_boolean_raw() -> None:
+    try:
+        grafana.parse_dashboard_request(b'{"uid":"x","raw":"yes"}')
+    except grafana.GrafanaError as exc:
+        assert "boolean" in str(exc)
+    else:
+        raise AssertionError("raw must be a boolean")
+
+
+def test_raw_read_returns_the_document_not_a_projection() -> None:
+    original = grafana.get_json
+
+    def fake(path: str, token: str, *, timeout: int = 12):  # noqa: ANN001
+        return 200, {
+            "dashboard": {
+                "uid": "u",
+                "id": 42,
+                "title": "T",
+                "version": 3,
+                "panels": [{"gridPos": {"h": 8, "w": 24}, "fieldConfig": {"defaults": {}}}],
+            },
+            "meta": {"folderTitle": "Ops"},
+        }
+
+    grafana.get_json = fake  # type: ignore[assignment]
+    try:
+        out = grafana.run_dashboard("tok", "u", raw=True)
+    finally:
+        grafana.get_json = original
+    assert out["document"]["panels"][0]["gridPos"] == {"h": 8, "w": 24}
+    assert out["document"]["panels"][0]["fieldConfig"] == {"defaults": {}}
+    assert out["meta"]["folderTitle"] == "Ops"
+
+
+def test_projection_omits_layout_which_is_why_raw_exists() -> None:
+    body = {
+        "dashboard": {
+            "title": "T",
+            "uid": "u",
+            "version": 1,
+            "panels": [
+                {
+                    "title": "p",
+                    "type": "stat",
+                    "gridPos": {"h": 8, "w": 24},
+                    "fieldConfig": {"defaults": {}},
+                    "targets": [],
+                }
+            ],
+        }
+    }
+    projected = grafana.summarize_dashboard(body)
+    assert projected is not None
+    assert "gridPos" not in projected["panels"][0]
+    assert "fieldConfig" not in projected["panels"][0]
+
+
+def test_backup_directory_follows_the_parent_group() -> None:
+    import os
+    import stat
+    import tempfile
+
+    if os.geteuid() == 0:
+        return  # ownership cannot be isolated as root
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
+        os.environ["GRAFANA_BACKUP_DIR"] = os.path.join(tmp, "backups")
+        try:
+            path = grafana._backup_dashboard("turnstone-x", 1, {"dashboard": {}})
+        finally:
+            os.environ.pop("GRAFANA_BACKUP_DIR", None)
+        assert path is not None and os.path.isfile(path)
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+
+
+def test_write_strips_the_numeric_id_before_saving() -> None:
+    original_get, original_post = grafana.get_json, grafana.post_json
+    sent: list[dict] = []
+
+    def fake_get(path: str, token: str, *, timeout: int = 12):  # noqa: ANN001
+        return 200, {"dashboard": {"uid": "turnstone-p", "version": 4, "id": 9}}
+
+    def fake_post(path: str, token: str, payload: dict, *, timeout: int = 20):  # noqa: ANN001
+        sent.append(payload)
+        return 200, {"version": 5, "status": "success"}
+
+    grafana.get_json, grafana.post_json = fake_get, fake_post  # type: ignore[assignment]
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
+        os.environ["GRAFANA_BACKUP_DIR"] = tmp
+        try:
+            req = _write(
+                json.dumps(
+                    {
+                        "op": "update",
+                        "uid": "turnstone-p",
+                        "message": "m",
+                        "expected_version": 4,
+                        "dashboard": {"title": "T", "id": 9, "panels": []},
+                    }
+                ).encode()
+            )
+            grafana.run_dashboard_write("tok", req)
+        finally:
+            os.environ.pop("GRAFANA_BACKUP_DIR", None)
+            grafana.get_json, grafana.post_json = original_get, original_post
+    assert "id" not in sent[0]["dashboard"]
+    assert sent[0]["dashboard"]["version"] == 4
 
 
 def test_dashboard_request_refuses_traversal_and_extra_fields() -> None:

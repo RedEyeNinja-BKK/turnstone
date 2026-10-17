@@ -9,6 +9,7 @@ pinned tokenizer is absent.
 from __future__ import annotations
 
 import ast
+import collections
 import json
 import pathlib
 import urllib.request  # noqa: F401 - imported by the driver under test
@@ -417,7 +418,17 @@ def test_unresolved_sensor_sends_no_request(tmp_path, monkeypatch):
 # ------------------------------------------------------- wiring invariants
 
 
-def test_session_has_exactly_four_sensor_seams():
+def test_session_has_exactly_six_sensor_seams():
+    """The reviewed seam set, with the operator event's entry points pinned.
+
+    2026-10-18: `operator_instruction` grew from one call site to three. The
+    send seam was the only one, so every mid-turn interjection (folded into a
+    tool-result system turn or drained into a trailing USER row) went
+    unobserved — measured in production as 2 substantive operator messages
+    and 1 observation. The count is a multiset on purpose: the material
+    events must each appear exactly once, and the operator event exactly as
+    many times as it has reviewed entry points.
+    """
     source = SESSION.read_text()
     tree = ast.parse(source)
     events = []
@@ -437,11 +448,15 @@ def test_session_has_exactly_four_sensor_seams():
         assert not any(kw.arg is None for kw in node.keywords), (
             "no **kwargs at a seam"
         )
-    assert sorted(events) == [
-        "delegation_result", "operator_instruction", "retry_transition",
-        "task_agent_failure",
-    ]
-    assert len(set(events)) == 4
+    counts = collections.Counter(events)
+    assert len(events) == 6, f"expected six seams, found {sorted(events)}"
+    assert counts.pop("operator_instruction") == 3, (
+        "operator_instruction must have exactly three entry points: "
+        "send(), the queued flush, and the tool-result advisory"
+    )
+    assert counts == collections.Counter(
+        {"delegation_result": 1, "retry_transition": 1, "task_agent_failure": 1}
+    ), f"material events must appear exactly once: {counts}"
 
 
 def test_seams_pass_the_workstream_id():
@@ -1069,7 +1084,11 @@ def test_real_session_registry_reaches_the_sensor(tmp_path, monkeypatch):
 
 
 def test_every_session_seam_passes_the_sessions_own_registry():
-    """The four call sites must inject `self._registry`, not a constant."""
+    """Every call site must inject `self._registry`, not a constant.
+
+    Six as of 2026-10-18: the four material events plus the two mid-turn
+    operator entry points (queued flush, tool-result advisory).
+    """
     tree = ast.parse(SESSION.read_text())
     sites = []
     for node in ast.walk(tree):
@@ -1094,7 +1113,7 @@ def test_every_session_seam_passes_the_sessions_own_registry():
             assert kw.value.args[1].value == "_registry"
             assert kw.value.args[2].value is None
             sites.append(node.lineno)
-    assert len(sites) == 4, f"expected 4 seams, found {sites}"
+    assert len(sites) == 6, f"expected 6 seams, found {sites}"
 
 
 def test_separate_sessions_do_not_contaminate_each_other(tmp_path, monkeypatch):

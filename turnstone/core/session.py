@@ -13749,6 +13749,16 @@ class ChatSession:
                             deferred_persistence=durable,
                             **meta,
                         )
+                        # Seam 1 folds a queued mid-turn interjection in as
+                        # a system turn: the model sees it without any new
+                        # send(). Observe the RAW operator words the meta
+                        # carries, not the model-facing framing in `content`.
+                        if source == "user_interjection":
+                            _sensor_observe_substantive(
+                                meta.get("message", ""),
+                                workstream=getattr(self, "_ws_id", ""),
+                                registry=getattr(self, "_registry", None),
+                            )
                     # Seam 2: fold approval feedback into one trailing USER
                     # turn. Queued interjections present at admission ride the
                     # system advisory seam immediately above; later arrivals
@@ -18289,6 +18299,20 @@ class ChatSession:
             (),
             deferred_persistence=deferred_persistence,
             client_send_ids=self._client_send_ids_from_queued(matched),
+        )
+        # Advisory shadow sensing on operator text that reached the
+        # conversation WITHOUT a fresh send(): a mid-turn interjection is
+        # drained into a real USER row here and the send loop simply
+        # continues (no new send() call, so the send seam never sees it).
+        # Observed on ``content`` — prefix plus rendered queued items —
+        # because that is the whole request the model received. A turn that
+        # folded two messages in is ONE unit of work, not two. The enabled
+        # gate, substance filter and exception containment all live inside
+        # the wrapper.
+        _sensor_observe_substantive(
+            content,
+            workstream=getattr(self, "_ws_id", ""),
+            registry=getattr(self, "_registry", None),
         )
         return True
 

@@ -9,6 +9,7 @@ control surface is touched, and that the sensor's return value goes nowhere.
 from __future__ import annotations
 
 import ast
+import collections
 import inspect
 import pathlib
 import sys
@@ -154,13 +155,24 @@ def test_session_wiring_changes_no_control_flow():
             f"line {node.lineno}: **kwargs at a seam could carry a control key"
         )
 
-    assert len(events) == 4, f"expected four sensor call sites, found {len(events)}"
-    assert sorted(events) == [
-        "delegation_result", "operator_instruction", "retry_transition",
-        "task_agent_failure",
-    ], f"seam/event pairing is wrong: {sorted(events)}"
-    # A relabelled seam shows up as a duplicate event name.
-    assert len(set(events)) == 4, f"duplicate event across seams: {events}"
+    # 2026-10-18: `operator_instruction` has three reviewed entry points —
+    # send(), the queued flush and the tool-result advisory. The material
+    # events stay single-instance. Counting a multiset keeps the real
+    # invariant (no relabelling, no duplicate material event) while allowing
+    # the operator event to be observed wherever operator text actually
+    # enters the conversation.
+    assert len(events) == 6, f"expected six sensor call sites, found {len(events)}"
+    counts = collections.Counter(events)
+    assert counts.pop("operator_instruction", 0) == 3, (
+        f"expected three operator entry points, found {sorted(events)}"
+    )
+    assert counts == collections.Counter(
+        {
+            "delegation_result": 1,
+            "retry_transition": 1,
+            "task_agent_failure": 1,
+        }
+    ), f"seam/event pairing is wrong: {sorted(events)}"
 
     # Every seam must identify its workstream, or per-workstream cadence is
     # unmeasurable. A seam that dropped the argument would still pass every
@@ -261,30 +273,41 @@ def test_sensor_imports_are_aliased_and_minimal():
 
 
 def test_operator_instruction_seam_requires_substance_and_not_wake():
-    """The send seam is guarded, so an ack or a wake cannot trigger a call."""
+    """The SEND seam is guarded, so an ack or a wake cannot trigger a call.
+
+    2026-10-18: the operator event now has three entry points, and only the
+    send seam is wake-guarded (a mid-turn interjection is a real operator
+    turn, not a synthetic wake). The assertion is therefore pinned to the
+    call that observes ``user_input`` rather than to any ``if`` that happens
+    to contain an observe call.
+    """
     source = SESSION.read_text()
     # 2026-10-17 hardening moved the substance guard INSIDE the wrapper so an
     # exploding user_input object cannot raise into send().
     assert "_sensor_observe_substantive(" in source
     assert "if not _sensor_lifecycle.is_substantive_instruction(user_input)" in source
     assert "def _sensor_observe_substantive(" in source
-    # The wake guard must wrap the operator seam call.
+    # The wake guard must wrap the send seam's call, which is the one that
+    # observes ``user_input``.
     tree = ast.parse(source)
     found = False
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
-        names = {
-            getattr(n.value.func, "id", None)
+        observes_user_input = any(
+            isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "_sensor_observe_substantive"
+            and n.args
+            and isinstance(n.args[0], ast.Name)
+            and n.args[0].id == "user_input"
             for n in ast.walk(node)
-            if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
-        }
-        if "_sensor_observe_substantive" in names:
+        )
+        if observes_user_input:
             found = True
             assert "from_wake" in ast.dump(node.test), (
                 "the send seam must be guarded on from_wake"
             )
-    assert found, "the operator seam is not wired"
+    assert found, "the send seam is not wired"
     # Substance is asserted inside the wrapper, where it is exception-contained.
     assert "is_substantive_instruction" in source
 

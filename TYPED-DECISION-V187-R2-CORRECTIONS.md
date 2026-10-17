@@ -130,3 +130,102 @@ generative choices while still present in `list_aliases()` and still resolvable 
 
 The r2 workstream must not block the approved native OpenAI OAuth implementation. r2 is staged and
 awaiting an operator activation decision; LC-RD-007 continues in parallel.
+
+---
+
+# Revision 2 - staging record (measured 2026-10-17)
+
+## Console decision (measured, not assumed)
+
+`turnstone-console.service` sets **no** `PYTHONPATH`, so it runs pristine 1.8.7.
+It imports **neither** `ChatSession` nor `cli` (`grep -nE '^from turnstone\.(core\.session|cli)' console/server.py` → none)
+and calls `list_aliases()` **0** times.
+
+However its `GET /v1/api/models` builds the workstream-creation picker straight
+from `storage.list_model_definitions(enabled_only=True)`, bypassing
+`ModelRegistry` entirely - so the registry-side `list_generative_aliases()`
+filter **cannot reach it**, and `tier1-decision` was still offered for workstream
+creation. **Conclusion: the Console does need an override**, but only for that
+one handler line, not the whole typed-decision lane.
+
+`enabled_aliases` in that handler is deliberately left built from the
+**unfiltered** rows: it feeds coordinator/judge default resolution, and the
+judge's configured model *is* `tier1-decision`. Filtering it would blank the
+judge display.
+
+Because a `PYTHONPATH` overlay shadows the entire package, the Console must
+point at a complete package tree and therefore shares the R2 slot.
+
+## Staged candidate - real 1.8.7 bytes
+
+Built by `scripts/stage_typed_decision_v187_r2.sh` from the installed 1.8.7
+package (resolved with `python -I` plus a `site-packages` path assertion -
+without `-I`, CWD put this repository on `sys.path` and the candidate would have
+been built from the wrong tree).
+
+Exact delta versus the active overlay (6 files, nothing else):
+
+| File | Treatment | Reason |
+|---|---|---|
+| `core/model_registry.py` | whole file | base ≡ overlay ≡ pristine |
+| `core/output_guard_judge.py` | whole file | base ≡ **overlay** (carries the typed-decision patch); ≠ pristine |
+| `cli.py` | whole file | base ≡ overlay ≡ pristine |
+| `console/server.py` | whole file | base ≡ overlay ≡ pristine |
+| `core/providers/_openai_responses.py` | **line patch** | base is divergent; anchor is identical in both trees |
+| `core/session.py` | **line patch, 3 variants** | repository copy is 1.8.4; never copied over 1.8.7 |
+
+`session.py` patch asserts `2 + 2 + 1 = 5` call sites by exact textual variant
+and that **0** occurrences of `self._registry.list_aliases()` remain.
+
+Verification output (sandbox build at the same code path as production):
+
+```
+file integrity: OK
+import provenance: all modules from <slot>/turnstone
+    13 passed, 0 failed, 13 total  [test_generative_alias_exclusion]
+    34 passed, 0 failed, 34 total  [test_output_guard_typed_decision]
+     7 passed, 0 failed,  7 total  [test_direct_oauth_request_profile]
+VERIFY OK
+```
+
+The suites are copied under the candidate before running, because each inserts
+`parents[1]` at `sys.path[0]`; running them in place would import the repository
+and silently test the wrong bytes. Import provenance is asserted separately.
+
+The OAuth token store is **not** in this candidate - it is LC-RD-007, a separate
+revision. Its suite is deliberately absent from the R2 acceptance set.
+
+## Activation (operator-gated - NOT run)
+
+```bash
+sudo bash scripts/stage_typed_decision_v187_r2.sh stage      # root; new slot
+sudo bash scripts/stage_typed_decision_v187_r2.sh verify
+# --- approval boundary ---
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system/turnstone-node@.service.d
+printf '[Service]\nEnvironment="PYTHONPATH=/opt/turnstone-overlays/typed-decision-v187-r2"\n' \
+  | sudo tee /etc/systemd/system/turnstone-server.service.d/92-typed-decision-v187-r2.conf
+printf '[Service]\nEnvironment="PYTHONPATH=/opt/turnstone-overlays/typed-decision-v187-r2"\n' \
+  | sudo tee /etc/systemd/system/turnstone-node@.service.d/92-typed-decision-v187-r2.conf
+printf '[Service]\nEnvironment="PYTHONPATH=/opt/turnstone-overlays/typed-decision-v187-r2"\n' \
+  | sudo tee /etc/systemd/system/turnstone-console.service.d/92-typed-decision-v187-r2.conf
+sudo systemctl daemon-reload
+sudo systemctl restart turnstone-server.service turnstone-node@2 turnstone-node@3 \
+     turnstone-node@4 turnstone-node@5 turnstone-console.service
+```
+
+Post-activation checks: each of the three units' `MainPID` environ reports the R2
+slot; `curl -fsS http://127.0.0.1:8080/health`; the live alias-exposure probe
+shows `tier1-decision` absent from generative choices yet present in
+`list_aliases()`; `execute_decision` against `tier1-decision` still succeeds with
+unchanged routing.
+
+**Rollback** - remove only the three `92-` drop-ins, `daemon-reload`, restart the
+same units. The `90-`/`91-` anchors restore `-finish`. No model row, credential,
+DB record or admin right is touched.
+
+**Anchors preserved:** `/opt/turnstone-overlays/typed-decision-v187` (first pass)
+and `/opt/turnstone-overlays/typed-decision-v187-finish` (second pass, currently
+active). The live overlay was not modified; its four files hash to
+`session.py 386626fc…`, `output_guard_judge.py d325d5dd…`,
+`tool_advisory.py cb77e8e7…`, `typed_decision.py 5e9f5ae9…`.

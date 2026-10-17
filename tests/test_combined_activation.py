@@ -23,14 +23,15 @@ import pathlib
 import subprocess
 import sys
 
-_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_ROOT = pathlib.Path(os.environ.get("R2_REPO") or pathlib.Path(__file__).resolve().parents[1])
 SCRIPT = _ROOT / "scripts" / "stage_openai_oauth_v187.sh"
-SLOT = "/opt/turnstone-overlays/openai-oauth-v187"
-DROPINS = (
-    "/etc/systemd/system/turnstone-server.service.d/93-openai-oauth-v187.conf",
-    "/etc/systemd/system/turnstone-node@.service.d/93-openai-oauth-v187.conf",
-    "/etc/systemd/system/turnstone-console.service.d/93-openai-oauth-v187.conf",
+SLOT = "/opt/turnstone-overlays/openai-oauth-v187-r2"
+DROPIN_NAMES = (
+    "turnstone-server.service.d/94-openai-oauth-v187-r2.conf",
+    "turnstone-node@.service.d/94-openai-oauth-v187-r2.conf",
+    "turnstone-console.service.d/94-openai-oauth-v187-r2.conf",
 )
+DROPINS = tuple(f"/etc/systemd/system/{n}" for n in DROPIN_NAMES)
 UNITS = (
     "turnstone-server.service",
     "turnstone-node@2.service",
@@ -43,9 +44,11 @@ UNITS = (
 _SKIPPED: list[str] = []
 
 
-def _run(argv: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def _run(
+    argv: list[str], timeout: int = 60, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603 - fixed argv, no shell
-        argv, capture_output=True, text=True, timeout=timeout, check=False
+        argv, capture_output=True, text=True, timeout=timeout, check=False, env=env
     )
 
 
@@ -75,35 +78,55 @@ def _units_active() -> bool:
 
 def test_the_switch_is_three_dropins_for_six_units() -> None:
     src = _src()
-    for path in DROPINS:
-        assert path in src, f"missing drop-in constant: {path}"
+    assert 'SYSROOT=${ACTIVATION_SYSROOT:-/etc/systemd/system}' in src
+    for name in DROPIN_NAMES:
+        leaf = name.split("/")[-1]
+        assert f'{"/".join(name.split("/")[:-1])}/{leaf}' in src, f"missing drop-in: {name}"
+        assert leaf in src, f"missing drop-in name: {leaf}"
     for unit in UNITS:
         assert unit.replace(".service", "") in src, f"unit not in the restart set: {unit}"
     # Every unit is restarted by one command, not one at a time.
-    restart = _body("do_restart")
-    assert 'systemctl restart "${UNITS[@]}"' in restart, (
+    activate = _body("cmd_activate")
+    assert 'systemctl restart "${UNITS[@]}"' in activate, (
         "units must be restarted in a single window"
     )
-    assert restart.count("systemctl restart") == 1
+    assert activate.count("systemctl restart") == 1
+    # ...and a nonzero status must not abort before the rollback branch.
+    assert 'if ! systemctl restart "${UNITS[@]}"; then' in activate
 
 
 def test_the_activation_prefix_sorts_after_the_existing_anchors() -> None:
     ours = pathlib.Path(DROPINS[0]).name
-    assert ours.startswith("93-"), ours
+    assert ours.startswith("94-"), ours
     for anchor in ("90-typed-decision-v187.conf", "91-typed-decision-v187-finish.conf"):
         assert anchor < ours, f"{anchor} would override {ours}"
+    # The superseded families are refused rather than silently overridden.
+    assert "93-openai-oauth*" in _src(), "the pre-correction 93- family must be refused"
+    assert "superseded 92- drop-in" in _src()
     # A later drop-in that sets PYTHONPATH must refuse to coexist silently.
     assert "higher_pythonpath_override" in _src()
     assert "drop-in would be overridden by" in _src()
 
 
 def test_dropin_writes_are_atomic_and_root_owned() -> None:
-    body = _body("write_dropin")
+    body = _body("write_dropins_atomically")
     assert "mktemp" in body, "write through a temporary file, not in place"
     assert "mv -f" in body, "rename into place atomically"
+    assert "cleanup_partial_writes" in body, "a failed write must be unwound"
     assert "chmod 0644" in body
-    assert "chown root:root" in body
+    # root:root in production; the sandbox substitutes the invoking identity.
+    assert 'chown "${OWNER[0]}"' in body
     assert '> "$path"' not in body, "never write the live drop-in in place"
+
+
+def test_staging_patches_one_setting_instead_of_copying_the_whole_file() -> None:
+    """Copying the repo file would expose settings this 1.8.7 base cannot implement."""
+    src = _src()
+    assert '"core/settings_registry.py"' not in src, (
+        "settings_registry must be patched, not copied whole"
+    )
+    assert "patch_settings_registry" in src
+    assert "unimplemented setting" in src
 
 
 # ---------------------------------------------------------------------------
@@ -127,19 +150,48 @@ def test_activation_refuses_without_root() -> None:
     if os.geteuid() == 0:
         _SKIPPED.append("running as root; the unprivileged refusal is not exercised")
         return
-    p = _run(["bash", str(SCRIPT), "activate", "--confirm"])
+    # Exercise the production gate: no sandbox privileges, no dry run.
+    env = os.environ.copy()
+    env["R2_SANDBOX"] = "0"
+    p = _run(["bash", str(SCRIPT), "activate", "--confirm"], env=env)
     assert p.returncode != 0
     assert "must run as root" in p.stderr, p.stderr
 
 
+_SANDBOX_SLOT = "/var/tmp/v187-sbx/oauth"
+
+
+def _sandbox_env() -> dict[str, str] | None:
+    """Env that points the read-only verbs at the sandbox-staged candidate."""
+    if not pathlib.Path(_SANDBOX_SLOT).is_dir():
+        return None
+    env = os.environ.copy()
+    env.update(
+        {
+            "R2_SANDBOX": "1",
+            "OAUTH_ROOT": _SANDBOX_SLOT,
+            "ACTIVATION_SYSROOT": "/var/tmp/v187-sbx/sysroot",
+            "ACTIVATION_PROC_ROOT": "/var/tmp/v187-sbx/procroot",
+        }
+    )
+    return env
+
+
 def test_dry_run_writes_nothing() -> None:
+    env = _sandbox_env()
+    if env is None:
+        _SKIPPED.append("sandbox candidate not staged at " + _SANDBOX_SLOT)
+        return
     if not _units_active():
         _SKIPPED.append("units are not all active; preflight would refuse on this host")
         return
     before = {d: pathlib.Path(d).exists() for d in DROPINS}
     receipts = pathlib.Path("/var/log/turnstone-v187")
     had_receipts = receipts.exists()
-    p = _run(["bash", str(SCRIPT), "activate", "--confirm", "--dry-run"])
+    p = subprocess.run(  # noqa: S603 - fixed argv
+        ["bash", str(SCRIPT), "activate", "--confirm", "--dry-run"],
+        capture_output=True, text=True, env=env, timeout=120, check=False,
+    )
     assert p.returncode == 0, p.stderr
     assert "DRY RUN" in p.stdout
     for d in DROPINS:
@@ -148,12 +200,19 @@ def test_dry_run_writes_nothing() -> None:
 
 
 def test_plan_names_the_slot_all_units_and_the_inertness_argument() -> None:
+    env = _sandbox_env()
+    if env is None:
+        _SKIPPED.append("sandbox candidate not staged at " + _SANDBOX_SLOT)
+        return
     if not _units_active():
         _SKIPPED.append("units are not all active; plan requires a live pre-state")
         return
-    p = _run(["bash", str(SCRIPT), "plan"])
+    p = subprocess.run(  # noqa: S603 - fixed argv
+        ["bash", str(SCRIPT), "plan"],
+        capture_output=True, text=True, env=env, timeout=120, check=False,
+    )
     assert p.returncode == 0, p.stderr
-    assert SLOT in p.stdout
+    assert _SANDBOX_SLOT in p.stdout
     for u in UNITS:
         assert u in p.stdout, f"plan does not mention {u}"
     assert "No model row is changed" in p.stdout
@@ -206,7 +265,10 @@ def test_previous_state_is_recorded_before_the_switch() -> None:
 
 
 def test_activation_touches_no_model_rows_or_credentials() -> None:
-    src = _src()
+    # Only the ACTIVATION functions, not the staging/stage text: the staged
+    # settings help string legitimately names the canonical store path.
+    full = _src()
+    src = full[full.index("# Activation / rollback") :]
     for forbidden in (
         "admin_create_model_definition",
         "model-definitions",

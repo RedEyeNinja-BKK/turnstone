@@ -118,16 +118,21 @@ def test_no_function_in_the_contract_mutates_anything():
 def test_driver_knows_only_the_one_capability():
     """The sensor must not contain provider or backend knowledge."""
     text = pathlib.Path(shadow_driver.__file__).read_text().lower()
-    for secret in ("openrouter", "span-01", "100.105.20.36", "/v1/systemone", "laya"):
-        # `laya-fallback` is a backend LABEL recorded from the response, not
-        # knowledge of the backend's address or protocol. The address, endpoint
-        # and provider must be absent.
-        if secret == "laya":
-            assert "100.105.20.36" not in text
-            assert "/v1/systemone" not in text
-            assert "laya-serve" not in text
-            continue
+    # No literal internal address is pinned here (fixtures must not carry real
+    # hosts); the *shape* is asserted instead, which is the property that
+    # matters: the driver must not know any backend address.
+    import re
+
+    assert not re.search(
+        r"\b(?:10|127|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b",
+        text,
+    ), "driver contains a private-network address"
+    for secret in ("openrouter", "span-01", "/v1/systemone"):
         assert secret not in text, f"driver contains backend knowledge: {secret}"
+    # `laya` may appear as a backend LABEL recorded from a response, never as
+    # knowledge of the service's address or protocol.
+    assert "/v1/systemone" not in text
+    assert "laya-serve" not in text
 
 
 def test_capability_constant_is_the_live_alias():

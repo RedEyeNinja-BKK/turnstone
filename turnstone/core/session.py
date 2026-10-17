@@ -81,6 +81,26 @@ from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
+
+# Advisory shadow sensing (disabled by default; see sensor_lifecycle.ENABLED).
+# The guarded import keeps the seams inert even if the modules are absent; the
+# module-level ENABLED gate keeps a present-but-disabled sensor free.
+try:
+    from turnstone.core import sensor_lifecycle as _sensor_lifecycle
+except Exception:  # noqa: BLE001 - an absent sensor must never block the session
+    _sensor_lifecycle = None
+
+
+def _sensor_observe(event: str, state: dict, *, workstream: str = "") -> None:
+    """Advisory shadow-sensing seam. Cannot raise; discards the result."""
+    if _sensor_lifecycle is None:
+        return
+    try:
+        _sensor_lifecycle.observe_event(event, state, workstream=workstream)
+    except Exception:  # noqa: BLE001 - a sensor must never fail a task
+        pass
+
+
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
     UNOBSERVED_OUTCOME_CLAUSE,
@@ -12654,6 +12674,21 @@ class ChatSession:
                 client_send_ids=client_send_ids,
                 wire_part_cache=wire_part_cache,
             )
+            # Advisory shadow sensing on an ACCEPTED user turn. Fires only for a
+            # substantive instruction, never for a wake or an acknowledgement, and
+            # the call cannot raise or return anything into this path. Disabled
+            # by default (sensor_lifecycle.ENABLED) — a no-op until activated.
+            if not from_wake and _sensor_lifecycle is not None and (
+                _sensor_lifecycle.is_substantive_instruction(user_input)
+            ):
+                _sensor_observe(
+                    "operator_instruction",
+                    {
+                        "objective": user_input,
+                        "phase": "operator_instruction",
+                    },
+                    workstream=getattr(self, "_ws_id", ""),
+                )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
             # can mutate history.  The old code's first in-try act was the loop-top
             # _check_cancelled(my_generation); the new pre-send layer sits ahead of
@@ -14932,6 +14967,19 @@ class ChatSession:
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
                     attempt += 1
                     cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
+                    # Advisory shadow sensing on a REAL retry: placed after the
+                    # attempt increment, so a normal turn never reaches it. The
+                    # attempt number is deliberately NOT part of the projection —
+                    # a volatile field would defeat dedupe. Disabled by default.
+                    _sensor_observe(
+                        "retry_transition",
+                        {
+                            "objective": cause,
+                            "phase": "retry",
+                            "blocker": cause,
+                        },
+                        workstream=getattr(self, "_ws_id", ""),
+                    )
                     log.warning(
                         "stream.retry",
                         error_type=cause,
@@ -26496,6 +26544,19 @@ class ChatSession:
                 # synthetic active reading after the terminal replay.
                 self._clear_agent_transients(call_id, generation=origin_generation)
                 self._report_tool_result(call_id, "task_agent", result)
+                # Advisory shadow sensing on a PUBLISHED delegation result.
+                # Inside the generation-owned success publish, so only a live
+                # generation is observed. Cannot raise; result is discarded.
+                # Disabled by default.
+                _sensor_observe(
+                    "delegation_result",
+                    {
+                        "objective": item.get("prompt", "") if isinstance(item, dict) else str(item),
+                        "phase": "delegation",
+                        "history": result,
+                    },
+                    workstream=getattr(self, "_ws_id", ""),
+                )
 
             if not self._publish_for_generation(
                 origin_generation,
@@ -26574,6 +26635,19 @@ class ChatSession:
             def _publish_error() -> None:
                 self._clear_agent_transients(call_id, generation=origin_generation)
                 self._report_tool_result(call_id, "task_agent", msg, is_error=True)
+                # Advisory shadow sensing on a PUBLISHED delegation failure.
+                # Inside the generation-owned publish, so a superseded generation
+                # never reaches it. Cannot raise; result is discarded.
+                # Disabled by default.
+                _sensor_observe(
+                    "task_agent_failure",
+                    {
+                        "objective": item.get("prompt", "") if isinstance(item, dict) else str(item),
+                        "phase": "delegation",
+                        "blocker": msg,
+                    },
+                    workstream=getattr(self, "_ws_id", ""),
+                )
 
             self._publish_for_generation(
                 origin_generation,

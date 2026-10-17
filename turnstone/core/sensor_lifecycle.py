@@ -34,6 +34,7 @@ fingerprints identically and dedupe can suppress the call.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import threading
 import time
@@ -45,10 +46,24 @@ from .shadow_observation import is_material, state_fingerprint
 #: Cadence rows go here, deliberately separate from the observation store. A
 #: suppressed event writes no observation, so counting the calls that did NOT
 #: happen is only possible in its own log.
+#:
+#: 2026-10-17 adaptation: service-writable location, env-overridable, aligned
+#: with shadow_driver.DEFAULT_STORE so observations and cadence share a root.
 DEFAULT_CADENCE_STORE = pathlib.Path(
-    "/home/vincent/shared-workspace/operations/switchyard-sensor-layer-20260929/"
-    "shadow-cadence.jsonl"
-)
+    os.environ.get("TURNSTONE_SENSOR_STORE_DIR", "/var/lib/turnstone/sensor")
+) / "shadow-cadence.jsonl"
+
+#: 2026-10-17 adaptation: DISABLED BY DEFAULT.
+#:
+#: The sensor is recovery-stage software. Until an operator activates it, every
+#: seam must be a no-op that costs nothing and emits nothing: no decision call,
+#: no fingerprint commit, no telemetry file. The gate is read once per hook
+#: construction (not per event) so a disabled sensor has zero per-event cost.
+#: Activation is an explicit operator decision — see the recovery report's
+#: privacy boundary: enabling this sends bounded operator/task text off-box.
+ENABLED = os.environ.get("TURNSTONE_SENSOR_ENABLED", "0") not in {
+    "", "0", "false", "False", "no", "off",
+}
 
 #: Triggers in the sensor's whitelist that have NO honest source in Turnstone's
 #: current lifecycle, and are therefore deliberately not emitted:
@@ -321,7 +336,15 @@ class SensorHook:
         force: bool = False,
         workstream: str = "",
     ) -> None:
-        """Observe one material event. Never raises; the result is discarded."""
+        """Observe one material event. Never raises; the result is discarded.
+
+        2026-10-17: when the sensor is disabled (module default), this is a
+        no-op before any gate runs — no cadence row, no fingerprint commit, no
+        file I/O. An enabled-then-disabled transition (via env) is picked up
+        at the next hook construction.
+        """
+        if not ENABLED:
+            return
         try:
             with self._lock:
                 fingerprint = state_fingerprint(state) if state else ""
@@ -332,7 +355,9 @@ class SensorHook:
             # mapping into the sensor, where a different layer would have to
             # catch it; materialising here keeps containment in this function.
             projection = {str(name): value for name, value in dict(state or {}).items()}
-            allowed, _why = self._sensor.should_sense(projection, event=event, force=force)
+            allowed, _why = self._sensor.should_sense(
+                projection, event=event, force=force, workstream=workstream
+            )
             if not allowed:
                 self._record_cadence(event, "dedupe_suppressed", workstream, fingerprint)
                 return
@@ -351,7 +376,12 @@ class SensorHook:
             # decision, which is the actual defect. force would have hidden it
             # while leaving the double gate in place.
             # Cadence belongs to the hook, not to the network-facing call.
-            self._sensor.observe(projection, event=event, decided=True)
+            # 2026-10-17: the workstream id is passed through so dedupe (and
+            # the observation's own workstream attribution) is per workstream,
+            # not per process.
+            self._sensor.observe(
+                projection, event=event, decided=True, workstream=workstream
+            )
         except Exception:  # noqa: BLE001 - a sensor must never fail a task
             try:
                 self._record_cadence(event, "hook_error", workstream, "")
@@ -370,7 +400,15 @@ def hook() -> SensorHook:
     if _HOOK is None:
         with _HOOK_LOCK:
             if _HOOK is None:
-                _HOOK = SensorHook()
+                # 2026-10-17: resolve the decision endpoint from the live
+                # registry (tier1-decision row) at hook construction. Failure
+                # falls back to module constants; never raises.
+                from .shadow_driver import resolve_decision_endpoint
+
+                decision_id, base_url = resolve_decision_endpoint()
+                _HOOK = SensorHook(
+                    ShadowSensor(decision_id=decision_id, base_url=base_url)
+                )
     return _HOOK
 
 

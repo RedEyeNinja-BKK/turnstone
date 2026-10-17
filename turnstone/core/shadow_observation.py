@@ -31,21 +31,31 @@ from typing import Any, Mapping
 
 SENSOR_VERSION = "turnstone-sensor-shadow:v1"
 
-#: The one capability this module may name. It deliberately knows nothing about
-#: OpenRouter, Span, the HTPC address, Laya, the fallback rule, or any
-#: credential: failover is Switchyard's concern, not the sensor's.
+#: The one capability this module may name by default. It deliberately knows
+#: nothing about OpenRouter, Span, the HTPC address, Laya, the fallback rule, or
+#: any credential: failover is Switchyard's concern, not the sensor's.
 #:
-#: This is the RESILIENT lane: Span R1 with a one-hop Laya R2. Naming the
-#: resilient lane is what keeps the sensor resilient to a Span outage without
-#: the sensor holding any failover knowledge.
+#: 2026-10-17 adaptation (Turnstone 1.8.7): the historical lane
+#: ``switchyard-smart-aux-turnstone`` no longer exists in Switchyard's config.
+#: The live decision surface is the registry alias ``tier1-decision``, a
+#: composition lane (smartfree + smartlocal families) whose R1 target is still
+#: ``respan/span-01-lite``. The live port resolves the decision id through the
+#: model registry (see shadow_driver.resolve_decision_id); the historical
+#: constant is replaced by the live alias as the no-registry fallback.
+DECISION_CAPABILITY = "tier1-decision"
+
+#: Backends whose graded answers are BELIEVED. Only backends the five graded
+#: noul questions were qualified against appear here. A leg added to the
+#: composition lane later does not qualify by existing in the config — it
+#: qualifies by a measured five-question qualification run recorded here.
 #:
-#: Operator ruling 2026-10-01 fixes the aux topology as:
-#:   switchyard-smartlocal-aux-turnstone = Laya only
-#:   switchyard-smartfree-aux-turnstone  = Span only (no fallback leg)
-#:   switchyard-smart-aux-turnstone      = Span R1, failover to Laya R2
-#: and names switchyard-smart-aux-turnstone the operational live lane, which is
-#: why the sensor and the Output Guard both resolve here.
-DECISION_CAPABILITY = "switchyard-smart-aux-turnstone"
+#: Measured 2026-10-17: the composition lane's other legs
+#: (``direct-openrouter-mercury-decide-free``, ``direct-htpc-jev-style``)
+#: answer graded noul on the wire but were never qualified for these five
+#: questions; ``direct-htpc-laya`` is not addressable via /v1/decisions at all
+#: (HTTP 404 NotEligible). Unqualified output is recorded unavailable, never
+#: synthesized.
+QUALIFIED_BACKENDS = frozenset({"direct-openrouter-span-01-lite"})
 
 #: Signals requested on every observation. `local_suitability` is absent by
 #: design — the fallback backend is not qualified for it and inferring it is
@@ -270,32 +280,54 @@ def build_snapshot(
     dropped_field_count: int,
     evicted_by_tier: bool = False,
     overflowed_budget: bool = False,
+    qualified: bool = True,
+    unqualified_raw: dict[str, Any] | None = None,
 ) -> SensorSnapshot:
     """Build a successful observation from a decision response.
 
     `local_suitability` is never derived from the other signals, never carried
     forward, and never proxied. It is recorded unavailable with the fixed
     reason, so its absence is visible rather than implied.
+
+    ``qualified=False`` marks a response from a backend the five questions were
+    never qualified against. Its readings are kept verbatim in
+    ``unqualified_raw`` (telemetry only) while every signal is recorded
+    UNAVAILABLE with ``backend_not_qualified_for_signal``: a number from an
+    unqualified grader is not a measurement, and reporting it as one would be
+    the same dishonesty as fabricating a value.
     """
     signals: list[Signal] = []
-    for name in REQUESTED_SIGNALS:
-        raw = answers.get(name)
-        value = None
-        if isinstance(raw, Mapping):
-            for key in ("noul", "score", "value"):
-                if isinstance(raw.get(key), (int, float)):
-                    value = float(raw[key])
-                    break
-        signals.append(
-            Signal(
-                name=name,
-                available=value is not None,
-                value=value,
-                backend=backend,
-                reason=None if value is not None else "signal_absent_from_response",
-                observability=Observability.UNKNOWN,
+    if qualified:
+        for name in REQUESTED_SIGNALS:
+            raw = answers.get(name)
+            value = None
+            if isinstance(raw, Mapping):
+                for key in ("noul", "score", "value"):
+                    if isinstance(raw.get(key), (int, float)):
+                        value = float(raw[key])
+                        break
+            signals.append(
+                Signal(
+                    name=name,
+                    available=value is not None,
+                    value=value,
+                    backend=backend,
+                    reason=None if value is not None else "signal_absent_from_response",
+                    observability=Observability.UNKNOWN,
+                )
             )
-        )
+    else:
+        for name in REQUESTED_SIGNALS:
+            signals.append(
+                Signal(
+                    name=name,
+                    available=False,
+                    value=None,
+                    backend=backend,
+                    reason="backend_not_qualified_for_signal",
+                    observability=Observability.UNKNOWN,
+                )
+            )
     signals.append(
         Signal(
             name=UNSUPPORTED_ON_FALLBACK,
@@ -322,6 +354,7 @@ def build_snapshot(
         serialized_state_tokens=serialized_state_tokens,
         dropped_field_count=dropped_field_count,
         signals=tuple(signals),
+        extra=(dict(unqualified_raw) if unqualified_raw else {}),
     )
     _assert_advisory(snapshot.to_dict())
     return snapshot

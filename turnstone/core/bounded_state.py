@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping
 
 #: Version of the bounded reduction policy. Recorded on every observation so a
 #: stored snapshot can be interpreted against the policy that produced it.

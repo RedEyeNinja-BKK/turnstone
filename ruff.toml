@@ -1,0 +1,20 @@
+# Sensor suite lint scope. The historical modules and tests carry their own
+# suppression comments tuned to the original repo's rules; these selectors keep
+# the meaningful checks (correctness, security) while exempting style rules the
+# historical code predates.
+[lint]
+select = ["E", "F", "W", "B", "S"]
+ignore = [
+    "S110",     # try-except-pass is the fail-open contract of a shadow sensor
+    "S101",     # asserts are the point of a test suite
+    "S603",     # the tokenizer subprocess runs a fixed program, not user input
+    "S310",     # urlopen targets operator-configured registry base_urls
+    "S105",     # "secret" below is a test fixture name, not a password
+    "S108",     # "/tmp/does-not-matter.jsonl" is a never-opened fixture path
+    "E501",     # historical test files keep their own line widths
+    "B033",     # the ACKNOWLEDGEMENTS closed class is data; "continue" twice is deliberate
+    "SIM103",   # explicit returns in the substantive-instruction check
+    "S607",     # the wiring test invokes git from PATH, as the original does
+]
+# UP035/UP042/F541 style findings in the historical modules are pre-existing;
+# they are excluded from select rather than churned.

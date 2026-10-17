@@ -38,7 +38,8 @@ import os
 import pathlib
 import threading
 import time
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from .shadow_driver import ShadowSensor
 from .shadow_observation import is_material, state_fingerprint
@@ -189,8 +190,7 @@ ACKNOWLEDGEMENTS = frozenset({
     # continuation nudges: the operator wants the current work to proceed, which
     # carries no new state of its own. The whitelist has a separate
     # `escalation_transition` trigger for a real transition.
-    "continue", "go", "proceed", "carry on", "go on", "keep going", "continue",
-    "next", "resume", "carryon",
+    "continue", "go", "proceed", "carry on", "go on", "keep going", "next", "resume", "carryon",
 })
 
 
@@ -336,15 +336,7 @@ class SensorHook:
         force: bool = False,
         workstream: str = "",
     ) -> None:
-        """Observe one material event. Never raises; the result is discarded.
-
-        2026-10-17: when the sensor is disabled (module default), this is a
-        no-op before any gate runs — no cadence row, no fingerprint commit, no
-        file I/O. An enabled-then-disabled transition (via env) is picked up
-        at the next hook construction.
-        """
-        if not ENABLED:
-            return
+        """Observe one material event. Never raises; the result is discarded."""
         try:
             with self._lock:
                 fingerprint = state_fingerprint(state) if state else ""
@@ -419,5 +411,14 @@ def observe_event(
     force: bool = False,
     workstream: str = "",
 ) -> None:
-    """Module-level convenience wrapper around :func:`hook`."""
+    """Module-level convenience wrapper around :func:`hook`.
+
+    This is the seam production code calls, so the disabled-by-default gate
+    lives HERE: when ENABLED is False (the default) it is a no-op before any
+    gate runs — no cadence row, no fingerprint commit, no file I/O. The
+    SensorHook method above stays ungated so the suite can exercise the hook
+    logic directly.
+    """
+    if not ENABLED:
+        return
     hook().observe_event(event, state, force=force, workstream=workstream)

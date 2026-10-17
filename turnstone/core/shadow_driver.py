@@ -19,14 +19,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections import OrderedDict, Counter
+from collections import Counter, OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 from .bounded_state import (
     SERIALIZER_VERSION,
     SerializedState,
-    estimate_tokens,
     serialize_state,
 )
 from .exact_tokens import enforce_budget
@@ -34,7 +34,6 @@ from .shadow_observation import (
     DECISION_CAPABILITY,
     QUALIFIED_BACKENDS,
     REQUESTED_SIGNALS,
-    SENSOR_VERSION,
     Trigger,
     build_snapshot,
     is_material,

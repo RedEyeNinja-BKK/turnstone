@@ -71,10 +71,102 @@ def panel_texts(panel: dict[str, Any]) -> dict[str, str]:
 
 
 def _cells(line: str) -> list[str]:
+    """Split a table line on literal pipes.
+
+    Cell text is generated from manifest ids and route names. An id containing
+    ``|`` or a backtick would not round-trip, so the shape and id checks reject
+    such a table instead of publishing a mangled one -- failing closed is the
+    intended behaviour, not a parsing limitation to work around.
+    """
     stripped = line.strip()
     if not stripped.startswith("|"):
         return []
     return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+
+def _is_rule(cells: list[str]) -> bool:
+    """A GFM separator row: every cell is dashes/colons, at least one dash."""
+    return (
+        bool(cells)
+        and all(cell and set(cell) <= {"-", ":", " "} for cell in cells)
+        and any("-" in cell for cell in cells)
+    )
+
+
+def _table_blocks(markdown: str) -> list[tuple[int, list[str]]]:
+    """Every run of consecutive table lines, with the line number it starts on."""
+    blocks: list[tuple[int, list[str]]] = []
+    current: list[str] = []
+    start = 0
+    for index, line in enumerate(markdown.splitlines()):
+        if _cells(line):
+            if not current:
+                start = index
+            current.append(line)
+        elif current:
+            blocks.append((start, current))
+            current = []
+    if current:
+        blocks.append((start, current))
+    return blocks
+
+
+def table_shape_problems(markdown: str) -> list[str]:
+    """Structural defects that make a table render or parse wrongly.
+
+    A table without a separator rule is a paragraph in GFM; a row with more
+    cells than the header loses the extras silently, and a row with fewer makes
+    ``_cell`` return ``""`` -- which reads as "not declared" and can pass a
+    comparison against an empty manifest value. Neither is a content drift, so
+    neither is caught by comparing cells: they need their own check.
+
+    Every table in the panel is checked, not just the one that ``parse_table``
+    reads: a malformed secondary table still renders as prose.
+    """
+    blocks = _table_blocks(markdown)
+    if not blocks:
+        return ["no markdown table"]
+    problems: list[str] = []
+    for start, block in blocks:
+        problems.extend(_table_block_problems(block, start))
+    return problems
+
+
+def _table_block_problems(block: list[str], start: int) -> list[str]:
+    header = _cells(block[0])
+    problems: list[str] = []
+    if len(block) < 2 or not _is_rule(_cells(block[1])):
+        problems.append(
+            f"line {start + 1}: header row is not followed by a separator rule, "
+            "so it will not render as a table"
+        )
+        position = 1
+    else:
+        rule = _cells(block[1])
+        if len(rule) != len(header):
+            problems.append(
+                f"line {start + 2}: separator has {len(rule)} column(s), "
+                f"header has {len(header)}"
+            )
+        position = 2
+    for offset in range(position, len(block)):
+        cells = _cells(block[offset])
+        if _is_rule(cells):
+            problems.append(f"line {start + offset + 1} is a second separator inside the table")
+        elif len(cells) != len(header):
+            problems.append(
+                f"line {start + offset + 1} has {len(cells)} cell(s), "
+                f"header has {len(header)}"
+            )
+    return problems
+
+
+def check_table_shape(markdown: str, label: str, v: list[str]) -> bool:
+    """Append shape violations; return False when the table cannot be trusted."""
+    problems = table_shape_problems(markdown)
+    for problem in problems:
+        v.append(f"{label}: {problem}")
+    return not problems
 
 
 def parse_table(markdown: str) -> list[list[str]]:
@@ -171,6 +263,8 @@ def check_route_rows(
 ) -> None:
     """1-6: every route once, correct order, correct fields, sequential numbering."""
     expected = inventory["routes"]
+    if not check_table_shape(lineup, "ROUTE LINEUP", v):
+        return
     header, rows = parse_table_with_header(lineup)
     required = [
         "#",
@@ -200,6 +294,8 @@ def check_route_rows(
             continue
         numbers.append(int(raw))
         names.append(_unquote(_cell(row, header, "Route")))
+
+    check_lineup_footer(rows, header, lineup, v)
 
     if numbers != list(range(1, len(numbers) + 1)):
         v.append(f"ROUTE LINEUP numbering is not sequential 1..N: {numbers}")
@@ -262,6 +358,74 @@ def check_route_rows(
         v.append(f"ROUTE LINEUP is missing primitive route(s): {missing_primitives}")
 
 
+FOOTER_DIRECT_RE = re.compile(r"(\d+)\s+direct\s+\(rows\s+(\d+)[–-](\d+)\)")
+FOOTER_PRIMITIVE_RE = re.compile(r"(\d+)\s+primitive\s+\(rows\s+(\d+)[–-](\d+)\)")
+FOOTER_TOTAL_RE = re.compile(r"(\d+)\s+total\b")
+
+
+def check_lineup_footer(
+    rows: list[list[str]], header: list[str], lineup: str, v: list[str]
+) -> None:
+    """The footer restates the counts of the rows it sits under -- verify it.
+
+    The footer is the line a reader trusts at a glance, and it is hand-placed
+    prose, so it can disagree with the table it summarises without any cell
+    comparison noticing.
+    """
+    footer_lines = [
+        line
+        for line in lineup.splitlines()
+        if line.lstrip().startswith("<sub>") and FOOTER_TOTAL_RE.search(line)
+    ]
+    if not footer_lines:
+        v.append("ROUTE LINEUP has no <sub> footer stating its row counts")
+        return
+    if len(footer_lines) > 1:
+        v.append(f"ROUTE LINEUP states its row counts in {len(footer_lines)} footers")
+    footer = footer_lines[0]
+    kinds = [_cell(row, header, "Type").strip().lower() for row in rows]
+    direct_rows = kinds.count("direct")
+    primitive_rows = kinds.count("primitive")
+    claims = (
+        (FOOTER_DIRECT_RE, "direct", direct_rows, 1, direct_rows),
+        (FOOTER_PRIMITIVE_RE, "primitive", primitive_rows, direct_rows + 1, len(rows)),
+    )
+    stated: dict[str, int] = {}
+    for pattern, label, actual, first_row, last_row in claims:
+        matches = pattern.findall(footer)
+        if not matches:
+            v.append(f"ROUTE LINEUP footer does not state a {label} count")
+            continue
+        if len(matches) > 1:
+            v.append(f"ROUTE LINEUP footer states the {label} count {len(matches)} times")
+        stated[label] = int(matches[0][0])
+        if stated[label] != actual:
+            v.append(
+                f"ROUTE LINEUP footer says {stated[label]} {label}, the table has {actual}"
+            )
+        published_range = (int(matches[0][1]), int(matches[0][2]))
+        if published_range != (first_row, last_row):
+            v.append(
+                f"ROUTE LINEUP footer {label} rows "
+                f"{published_range[0]}–{published_range[1]}, the table has "
+                f"{first_row}–{last_row}"
+            )
+    totals = FOOTER_TOTAL_RE.findall(footer)
+    if not totals:
+        v.append("ROUTE LINEUP footer does not state a total")
+        return
+    if len(totals) > 1:
+        v.append(f"ROUTE LINEUP footer states the total {len(totals)} times")
+    stated_total = int(totals[0])
+    if stated_total != len(rows):
+        v.append(f"ROUTE LINEUP footer says {stated_total} total, the table has {len(rows)} rows")
+    if len(stated) == len(claims) and sum(stated.values()) != stated_total:
+        v.append(
+            f"ROUTE LINEUP footer components sum to {sum(stated.values())}, "
+            f"not its stated total {stated_total}"
+        )
+
+
 def _first_diff(got: list[str], want: list[str]) -> str:
     for index, (a, b) in enumerate(zip(got, want, strict=False), start=1):
         if a != b:
@@ -300,6 +464,8 @@ def check_summary(inventory: dict[str, Any], summary: str, lineup_rows: list[lis
 
 def check_tiers(inventory: dict[str, Any], tiers: str, v: list[str]) -> None:
     """5: composite children and their order match the manifest."""
+    if not check_table_shape(tiers, "TIERS", v):
+        return
     header, rows = parse_table_with_header(tiers)
     required = ["#", "Tier", "Child 1", "Child 2", "Context"]
     missing_columns = [name for name in required if _index(header, name) is None]
@@ -354,6 +520,8 @@ def check_capabilities(inventory: dict[str, Any], tiers: str, v: list[str]) -> N
 
 def check_providers(inventory: dict[str, Any], providers: str, v: list[str]) -> None:
     """11: provider route counts reconcile with the inventory."""
+    if not check_table_shape(providers, "PROVIDER ACCESS", v):
+        return
     header, rows = parse_table_with_header(providers)
     required = ["#", "Provider", "Endpoint", "Format", "Routes", "Upstream IDs"]
     missing_columns = [name for name in required if _index(header, name) is None]
@@ -375,9 +543,22 @@ def check_providers(inventory: dict[str, Any], providers: str, v: list[str]) -> 
                 f"PROVIDER ACCESS {name}: published {published} routes, "
                 f"inventory {provider['route_count']}"
             )
-        for model_id in provider["primary_ids"]:
-            if f"`{model_id}`" not in providers:
-                v.append(f"PROVIDER ACCESS {name} omits primary id {model_id!r}")
+        # Row-scoped: the ids must be in this provider's own cell. A panel-wide
+        # substring search passes when an id drifted into a neighbouring row.
+        upstream_cell = _cell(row, header, "Upstream IDs")
+        published_primary, _, published_fallback = upstream_cell.partition(" · fallback: ")
+        published_primary_ids = re.findall(r"`([^`]+)`", published_primary)
+        published_candidate_ids = re.findall(r"`([^`]+)`", published_fallback)
+        if published_primary_ids != provider["primary_ids"]:
+            v.append(
+                f"PROVIDER ACCESS {name} upstream ids: published "
+                f"{published_primary_ids}, inventory {provider['primary_ids']}"
+            )
+        if published_candidate_ids != provider["candidate_only_ids"]:
+            v.append(
+                f"PROVIDER ACCESS {name} fallback ids: published "
+                f"{published_candidate_ids}, inventory {provider['candidate_only_ids']}"
+            )
     total = sum(p["route_count"] for p in inventory["providers"])
     if total != inventory["counts"]["routes"]:
         v.append(

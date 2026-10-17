@@ -326,6 +326,34 @@ def test_summary_count_mismatch_is_rejected() -> None:
     assert any("CATALOG SUMMARY says 5" in item for item in found), found
 
 
+def _edit_provider_row(text: str, provider: str, edit) -> str:
+    lines = []
+    for line in text.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) == 7 and cells[1].strip("*") == provider:
+            edit(cells)
+            line = "| " + " | ".join(cells) + " |"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def test_provider_upstream_ids_must_be_in_their_own_row() -> None:
+    """An id that drifted into a neighbouring row must not satisfy a search."""
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9005)
+    text = _edit_provider_row(
+        panel["content"], "openai", lambda cells: cells.__setitem__(5, "—")
+    )
+    text = _edit_provider_row(
+        text, "openrouter", lambda cells: cells.__setitem__(5, cells[5] + ", `gpt-x`")
+    )
+    assert "`gpt-x`" in text, "the id must still be present in the panel"
+    _set_both(panel, text)
+    found = violations(inv, document)
+    assert any("openai" in item and "upstream ids" in item for item in found), found
+
+
 def test_provider_route_count_mismatch_is_rejected() -> None:
     inv = build()
     document = dashboard_for(inv)
@@ -340,6 +368,98 @@ def test_provider_route_count_mismatch_is_rejected() -> None:
     _set_both(panel, "\n".join(lines))
     found = violations(inv, document)
     assert any("openrouter" in item and "routes" in item for item in found), found
+
+
+def test_footer_count_mismatch_is_rejected() -> None:
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9007)
+    _set_both(panel, panel["content"].replace("· 4 total.", "· 3 total."))
+    found = violations(inv, document)
+    assert any("footer says 3 total" in item for item in found), found
+
+
+def test_footer_row_range_mismatch_is_rejected() -> None:
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9007)
+    _set_both(panel, panel["content"].replace("(rows 1–2)", "(rows 1–1)"))
+    found = violations(inv, document)
+    assert any("footer direct rows" in item for item in found), found
+
+
+def test_missing_footer_is_rejected() -> None:
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9007)
+    kept = [ln for ln in panel["content"].splitlines() if not ln.lstrip().startswith("<sub>")]
+    _set_both(panel, "\n".join(kept))
+    found = violations(inv, document)
+    assert any("no <sub> footer" in item for item in found), found
+
+
+def test_duplicate_footer_is_rejected() -> None:
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9007)
+    footer = next(ln for ln in panel["content"].splitlines() if ln.lstrip().startswith("<sub>"))
+    _set_both(panel, footer + "\n" + panel["content"])
+    found = violations(inv, document)
+    assert any("2 footers" in item for item in found), found
+
+
+def test_zero_category_range_is_checked() -> None:
+    """A zero-count category still has to name the empty range it generated."""
+    header = ["Type"]
+    rows = [["direct"]]
+    good = "<sub>1 direct (rows 1–1) · 0 primitive (rows 2–1) · 1 total.</sub>"
+    bad = "<sub>1 direct (rows 1–1) · 0 primitive (rows 2–9) · 1 total.</sub>"
+    found: list[str] = []
+    val.check_lineup_footer(rows, header, good, found)
+    assert found == [], found
+    val.check_lineup_footer(rows, header, bad, found)
+    assert any("primitive rows 2–9" in item for item in found), found
+
+
+def test_ragged_table_row_is_rejected() -> None:
+    """A short row reads as 'not declared' and can pass an empty-field compare."""
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9007)
+    _set_both(
+        panel,
+        panel["content"].replace(
+            "| 1 | `direct-openai-a` | direct | openai | `gpt-x` | 1,000,000 | y | y | — | — |",
+            "| 1 | `direct-openai-a` | direct | openai | `gpt-x` | 1,000,000 | y | y | — |",
+        ),
+    )
+    found = violations(inv, document)
+    assert any("cell(s), header has" in item for item in found), found
+
+
+def test_missing_table_separator_is_rejected() -> None:
+    """Without a separator rule the panel renders as prose, not as a table."""
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9007)
+    _set_both(panel, panel["content"].replace("|---|---|---|---|---|---|---|---|---|---|\n", "", 1))
+    found = violations(inv, document)
+    assert any("separator rule" in item for item in found), found
+
+
+def test_malformed_secondary_table_is_rejected() -> None:
+    """9008 holds three tables; the one parse_table never reads must still render."""
+    inv = build()
+    document = dashboard_for(inv)
+    panel = _panel(document, 9008)
+    text = panel["content"].replace(
+        "| # | id | target | contract / limits |\n|---|---|---|---|\n",
+        "| # | id | target | contract / limits |\n",
+    )
+    assert text != panel["content"]
+    _set_both(panel, text)
+    found = violations(inv, document)
+    assert any("separator rule" in item for item in found), found
 
 
 def test_selector_missing_a_live_model_is_rejected() -> None:

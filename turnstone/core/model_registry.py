@@ -60,7 +60,9 @@ def _deferred_close_actions(actions: list[Callable[[], None]]) -> Iterator[None]
                 log.warning("rerank.deferred_close_failed", exc_info=True)
 
 
-MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"})
+MODEL_AUTH_MODES = frozenset(
+    {"static", "entra_obo", "entra_app", "rfc8693_obo", "openai_oauth"}
+)
 
 # One bound for the backend-auth text columns (obo_audience, obo_scopes),
 # shared with the console write path's cleaner so the two layers cannot
@@ -108,6 +110,18 @@ MODEL_AUTH_MODE_PROFILES: Mapping[str, str] = MappingProxyType(
         "rfc8693_obo": "rfc8693",
     }
 )
+
+#: Dynamic modes whose credential comes from a LOCAL rotating-token store
+#: instead of an OIDC token-exchange exchange leg.
+#:
+#: These are deliberately excluded from :data:`MODEL_AUTH_MODE_PROFILES`: that
+#: map pairs a mode with an ``OBO_GRANT_PROFILES`` mint leg
+#: (``entra``/``rfc8693``), and a direct-account OAuth refresh is not an Entra
+#: exchange - inventing a leg for it would put a non-OBO credential in the OBO
+#: cache, keyed and invalidated under rules that do not describe it. The
+#: invariant enforced by test is therefore "every dynamic mode that is NOT
+#: direct-OAuth names a real mint leg", which is the strongest true statement.
+DIRECT_OAUTH_MODEL_AUTH_MODES = frozenset({"openai_oauth"})
 
 
 def _is_dynamic_auth_mode(mode: str) -> bool:
@@ -421,7 +435,8 @@ def _normalize_auth_mode(
         )
     if normalized_mode != "static" and not normalized_audience:
         raise ModelAuthConfigError(
-            f"Model '{alias}' requires obo_audience when auth_mode is {normalized_mode!r}"
+            f"Model '{alias}' requires obo_audience (the credential audience or "
+            f"resource) when auth_mode is {normalized_mode!r}"
         )
     _check_auth_text(alias, "obo_audience", normalized_audience)
     # The guard sees the separator-tolerated spelling, NOT the sanitized

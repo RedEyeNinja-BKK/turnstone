@@ -4491,7 +4491,14 @@ def test_model_auth_mode_profile_map_matches_mint_legs() -> None:
     # Every dynamic mode names its required profile — a mode missing here is
     # never posture-approvable and never mints, which is fail-closed but
     # must be a deliberate state, not an oversight.
-    assert set(mr_module.MODEL_AUTH_MODE_PROFILES) == set(mr_module.DYNAMIC_MODEL_AUTH_MODES)
+    # Direct-OAuth modes are excluded because they do not mint through an OBO
+    # exchange leg at all: their credential is a locally stored rotating token.
+    # Forcing them into this map would put a non-Entra credential into the OBO
+    # cache, keyed and invalidated under rules that do not describe it. The
+    # invariant therefore covers every dynamic mode that IS an exchange mode.
+    assert set(mr_module.MODEL_AUTH_MODE_PROFILES) == (
+        set(mr_module.DYNAMIC_MODEL_AUTH_MODES) - set(mr_module.DIRECT_OAUTH_MODEL_AUTH_MODES)
+    )
     # And every named profile has a real mint leg.
     assert set(mr_module.MODEL_AUTH_MODE_PROFILES.values()) <= OBO_GRANT_PROFILES
 

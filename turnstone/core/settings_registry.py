@@ -78,6 +78,18 @@ def _build_registry() -> dict[str, SettingDef]:
             "matching is performed.",
         ),
         SettingDef(
+            "model.openai_oauth_store",
+            "str",
+            "",
+            "Credential store for direct-account OpenAI OAuth model aliases",
+            "model",
+            help="Directory holding the coordinated OAuth refresh-token store used by "
+            "auth_mode=openai_oauth model definitions. Empty uses the canonical "
+            "service-runtime path /srv/turnstone/credentials/runtime/openai-siwc. "
+            "One store owns the only refresh token for the account; pointing two "
+            "aliases at different stores would race the provider into revoking it.",
+        ),
+        SettingDef(
             "model.auth_fail_closed",
             "bool",
             False,

@@ -941,3 +941,28 @@ def test_sanitized_catches_padded_base64_runs():
     blob = "QWxhZGRpbjpvcGVuIHNlc2FtZVF3aGljaGlzYmFzZTY0cGFkZGVk" + "=="
     cleaned = lifecycle.project_value("objective", blob, mode="sanitized")
     assert blob[:40] not in cleaned
+
+
+def test_sanitized_redacts_concatenated_base64_with_internal_padding():
+    # S4 battery residual: two base64 values concatenated. The '=' padding sits
+    # in the middle, so a "one long run, padding at the end" rule misses both.
+    left = "QWxhZGRpbjpvcGVuIHNlc2FtZQ"
+    right = "QWxhZGRpbjpvcGVuIHNlc2FtZQ"
+    blob = f"{left}=={right}=="
+    cleaned = lifecycle.project_value("objective", f"use {blob} please", mode="sanitized")
+    assert left not in cleaned
+    assert right not in cleaned
+    assert "[redacted]" in cleaned
+
+
+def test_sanitized_redacts_assignment_with_diacritic_keyword():
+    # S4 battery residual: 'pässwörd' does not contain the literal 'password',
+    # so the keyword rule never fires. Folding is index-preserving, so the
+    # redaction span still covers the original (non-folded) characters.
+    text = "pässwörd=Ünïcødé-S3cret-値"
+    cleaned = lifecycle.project_value("objective", f"rotate {text} now", mode="sanitized")
+    assert "Ünïcødé-S3cret" not in cleaned
+    assert "[redacted]" in cleaned
+    # The non-secret parts of the sentence survive sanitized mode.
+    assert "rotate" in cleaned
+    assert "now" in cleaned

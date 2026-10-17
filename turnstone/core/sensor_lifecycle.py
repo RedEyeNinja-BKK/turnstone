@@ -38,6 +38,7 @@ import os
 import pathlib
 import re
 import threading
+import unicodedata
 import time
 import uuid
 from collections.abc import Mapping
@@ -117,27 +118,77 @@ _SECRET_PATTERNS = (
     # JWTs: three base64url segments. Without this the header segment survives
     # the long-token rule (dots split it) - measured in the S4 battery.
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-    # NAME=value assignments whose NAME carries a secret word. The leading
-    # character class is deliberate: a plain \b fails on OPENAI_API_KEY=...,
-    # because "_" is a word character, which let the value through in the S4
-    # battery. This matches the whole assignment, including the prefix.
-    re.compile(
-        r"[\w.-]*(?:key|token|secret|password|passwd|credential)[\w.-]*"
-        r"\s*[:=]\s*\S+",
-        re.I,
-    ),
     re.compile(r"\b(?:bearer)\s+\S+", re.I),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    # Concatenated base64 values: '=' padding in the middle splits a single
+    # long-run rule into two short runs, so neither is long enough to match.
+    # Each run is bounded so a pathological input stays linear.
+    re.compile(r"(?:[A-Za-z0-9+/]{16,512}={1,2}){2,}"),
     re.compile(r"[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])"),
 )
+
+#: NAME=value assignments whose NAME carries a secret word. The leading
+#: character class is deliberate: a plain \b fails on OPENAI_API_KEY=...
+#: because "_" is a word character, which let the value through in the S4
+#: battery. This matches the whole assignment, including the prefix.
+#:
+#: It is applied to a character-folded copy of the text, because a literal
+#: keyword misses a diacritic spelling ("pässwörd") - the second S4 residual.
+_ASSIGNMENT = re.compile(
+    r"[\w.-]*(?:key|token|secret|password|passwd|credential)[\w.-]*"
+    r"\s*[:=]\s*\S+",
+    re.I,
+)
+
+#: Single-character fallback for letters NFKD does not decompose. Every entry
+#: maps to exactly one character so folded offsets stay aligned with the input.
+_FOLD_SINGLE = str.maketrans({
+    "\u00df": "s", "\u00f8": "o", "\u00e6": "a", "\u0111": "d",
+    "\u0142": "l", "\u00fe": "t", "\u00f0": "d",
+})
 _URL_USERINFO = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@", re.I)
 _EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _ABS_PATH = re.compile(r"(?<![\w/])/(?:[\w.@+-]+/)+[\w.@+-]+")
 
 _ERROR_PREFIX = re.compile(r"^\s*Task error:\s*([A-Za-z_][\w.]*)")
+
+
+def _fold_for_keywords(text: str) -> str:
+    """One-character-per-input-character ASCII fold for keyword matching.
+
+    Index preserving by construction: every character maps to exactly one
+    character, so a match span on the folded string is a valid span on the
+    original. Non-decomposable non-ASCII characters pass through unchanged;
+    they simply cannot contribute to an ASCII keyword.
+    """
+    out = []
+    for char in text:
+        if char.isascii():
+            out.append(char)
+            continue
+        base = "".join(
+            c for c in unicodedata.normalize("NFKD", char)
+            if not unicodedata.combining(c)
+        )
+        if len(base) == 1:
+            out.append(base.translate(_FOLD_SINGLE))
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _redact_assignments(text: str) -> str:
+    """Redact secret-word assignments, tolerating diacritic keyword spellings."""
+    spans = [m.span() for m in _ASSIGNMENT.finditer(_fold_for_keywords(text))]
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in reversed(spans):
+        chars[start:end] = "[redacted]"
+    return "".join(chars)
 
 
 def _sanitize_text(text: str) -> str:
@@ -146,6 +197,7 @@ def _sanitize_text(text: str) -> str:
     cleaned = _URL_USERINFO.sub(r"\1[redacted]@", cleaned)
     for pattern in _SECRET_PATTERNS:
         cleaned = pattern.sub("[redacted]", cleaned)
+    cleaned = _redact_assignments(cleaned)
     cleaned = _EMAIL.sub("[email]", cleaned)
     cleaned = _ABS_PATH.sub("[path]", cleaned)
     return cleaned

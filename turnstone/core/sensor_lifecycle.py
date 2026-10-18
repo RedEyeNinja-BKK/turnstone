@@ -461,7 +461,7 @@ def _attachment_facts(attachments: Any) -> _AttachmentFacts:
             if not isinstance(raw, (bytes, bytearray)):
                 continue
             size = len(raw)
-        except Exception:  # noqa: BLE001 - one bad attachment must not poison the rest
+        except Exception:  # noqa: BLE001, S112 - one bad attachment must not poison the rest
             continue
         if size <= 0:
             continue
@@ -520,7 +520,17 @@ def attachment_work_basis(user_input: str, attachments: Any = None) -> str:
     projection carries structure, not the document.
     """
     text = " ".join((user_input or "").split())
-    facts = _attachment_facts(attachments)
+    return _basis_from_facts(text, _attachment_facts(attachments))
+
+
+def _basis_from_facts(text: str, facts: "_AttachmentFacts") -> str:
+    """The basis rule, over already-computed facts.
+
+    Split out so a caller that needs BOTH the projection and the basis inspects
+    the attachment bytes once. Decoding a document is the expensive part of
+    this seam (measured: 0.14 ms at 6 KB, 25 ms at 1 MB, 200 ms at 8 MB), and
+    the observation path runs it on the operator's send() thread.
+    """
     usable = bool(facts.inline_text_verified or facts.deferred)
     if text and _text_is_substantive(text):
         return "text_plus_attachments" if usable else "text"
@@ -548,7 +558,8 @@ def attachment_projection(
         "deferred": facts.deferred,
     }
     if user_input is not None:
-        projection["basis"] = attachment_work_basis(user_input, attachments)
+        text = " ".join((user_input or "").split())
+        projection["basis"] = _basis_from_facts(text, facts)
     return projection
 
 

@@ -174,6 +174,13 @@ def _sensor_observe_substantive(
     if _sensor_lifecycle is None:
         return
     try:
+        # A disabled sensor must cost NOTHING (the module's stated invariant:
+        # "every seam must be a no-op that costs nothing"). The attachment
+        # substance test decodes document bytes, so it is gated here as well as
+        # inside observe_event -- otherwise every operator who attaches a file
+        # pays for a feature nobody activated.
+        if not _sensor_lifecycle.ENABLED:
+            return
         if not _sensor_lifecycle.is_substantive_instruction(  # type: ignore[arg-type]
             user_input, attachments=attachments
         ):

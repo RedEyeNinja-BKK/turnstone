@@ -90,6 +90,10 @@ def test_session_wiring_changes_no_control_flow():
             or ("registry=registry" in body)
             or ("registry=getattr(self, \"_registry\", None)" in body)
             or ("workstream=workstream" in body)
+            # 2026-10-18: the operator seam now forwards `attachments=`, a
+            # one-line addition whose comment block explains the coverage fix.
+            or ("attachments=attachments" in body)
+            or ("2026-10-18: attachments are passed" in body)
         )
         # Locality: a change outside a sensor region would not mention it.
         assert is_seam_hunk, (
@@ -285,7 +289,24 @@ def test_operator_instruction_seam_requires_substance_and_not_wake():
     # 2026-10-17 hardening moved the substance guard INSIDE the wrapper so an
     # exploding user_input object cannot raise into send().
     assert "_sensor_observe_substantive(" in source
-    assert "if not _sensor_lifecycle.is_substantive_instruction(user_input)" in source
+    # 2026-10-18: the guard gained an `attachments=` argument (multi-line), so
+    # the literal-string check became an AST check. The invariant is unchanged:
+    # the substance guard must be evaluated INSIDE the wrapper.
+    guard_found = False
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If):
+            continue
+        for inner in ast.walk(node.test):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "is_substantive_instruction"
+                and inner.args
+                and isinstance(inner.args[0], ast.Name)
+                and inner.args[0].id == "user_input"
+            ):
+                guard_found = True
+    assert guard_found, "the wrapper must guard on is_substantive_instruction(user_input)"
     assert "def _sensor_observe_substantive(" in source
     # The wake guard must wrap the send seam's call, which is the one that
     # observes ``user_input``.
@@ -401,7 +422,15 @@ def test_hook_signature_accepts_no_control_inputs():
     """
     signature = inspect.signature(lifecycle.observe_event)
     parameters = set(signature.parameters)
-    assert parameters == {"event", "state", "force", "workstream", "registry"}
+    # `content_basis` (2026-10-18) is a measurement dimension, not a control
+    # value: a closed-class label of what grounded the observation
+    # ("text" / "text_plus_attachments" / "attachments_only"). It cannot express
+    # a route, a provider, a permission or a guard setting, and it is recorded
+    # rather than acted on. The forbidden-name loop below is the part that
+    # protects routing and stays unchanged.
+    assert parameters == {
+        "event", "state", "force", "workstream", "registry", "content_basis",
+    }
     for forbidden in ("model", "provider", "route", "lane", "effort", "tools", "guard",
                       "model_alias", "client", "model_binding"):
         assert forbidden not in parameters

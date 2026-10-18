@@ -315,6 +315,7 @@ class ShadowSensor:
         workstream: str = "",
         event_id: str = "",
         content_mode: str = "",
+        content_basis: str = "text",
     ):
         """Take one advisory observation, or record why none was taken.
 
@@ -364,6 +365,7 @@ class ShadowSensor:
                 event_id=event_id,
                 workstream=workstream,
                 content_mode=content_mode,
+                content_basis=content_basis,
             ))
         if decided:
             # The caller owns cadence and already committed the fingerprint.
@@ -386,6 +388,7 @@ class ShadowSensor:
                 event_id=event_id,
                 workstream=workstream,
                 content_mode=content_mode,
+                content_basis=content_basis,
             )
 
         serialised: SerializedState | None = None
@@ -427,6 +430,7 @@ class ShadowSensor:
                 event_id=event_id,
                 workstream=workstream,
                 content_mode=content_mode,
+                content_basis=content_basis,
             )
             return self._record(snapshot)
 
@@ -520,6 +524,7 @@ class ShadowSensor:
             event_id=event_id,
             workstream=workstream,
             content_mode=content_mode,
+            content_basis=content_basis,
         )
         return self._record(snapshot)
 

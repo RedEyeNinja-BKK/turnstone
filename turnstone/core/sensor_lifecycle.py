@@ -304,6 +304,7 @@ def build_state(
     tools: Any = "",
     agent: str = "",
     history: Any = "",
+    attachments: Any = "",
     content_mode: str | None = None,
     **extra: Any,
 ) -> dict[str, str]:
@@ -320,6 +321,7 @@ def build_state(
         "tool": tools,
         "agent": agent,
         "history": history,
+        "attachments": attachments,
         **extra,
     }
     state: dict[str, str] = {}
@@ -347,7 +349,11 @@ ACKNOWLEDGEMENTS = frozenset({
 })
 
 
-def is_substantive_instruction(user_input: str) -> bool:
+def is_substantive_instruction(
+    user_input: str,
+    *,
+    attachments: Any = None,
+) -> bool:
     """Whether an operator message carries real work.
 
     Deliberately conservative. An acknowledgement, a greeting, a single
@@ -357,6 +363,19 @@ def is_substantive_instruction(user_input: str) -> bool:
     The threshold is on *content*, not length alone.
     """
     text = " ".join((user_input or "").split())
+    if _text_is_substantive(text):
+        return True
+    # 2026-10-18: an operator turn whose visible text is "." can still carry a
+    # real instruction in an attachment. Judging only the text silently dropped
+    # every such turn from measurement (51.4% of substantive operator turns in
+    # the 2026-10-18 audit). The attachment is judged on its OWN merit, locally:
+    # for text attachments the decoded words are examined here and discarded;
+    # nothing but bounded structure ever reaches the projection.
+    return _has_usable_attachment(attachments)
+
+
+def _text_is_substantive(text: str) -> bool:
+    """The original text-only rule, unchanged and reusable."""
     if not text:
         return False
     bare = text.strip(" .!?…").casefold()
@@ -368,6 +387,190 @@ def is_substantive_instruction(user_input: str) -> bool:
     if letters / max(1, len(text)) < 0.25:
         return False
     return True
+
+
+# ---------------------------------------------------------------- attachments
+#
+# An operator turn can deliver its real content as an attachment: the visible
+# text is "." and the document carries the instruction. The sensor must count
+# that as operator work WITHOUT letting any of that content leave the process.
+#
+# The privacy line is drawn here, in one place:
+#   * the attachment BYTES are read locally, only to decide whether the turn is
+#     substantive (a text attachment is substantive when its decoded words are);
+#   * nothing derived from those bytes is transmitted except bounded COUNTS,
+#     closed-class KINDS, a coarse SIZE BUCKET, and two verification counts;
+#   * filenames, paths, mime types, attachment ids (content hashes), excerpts
+#     and bodies are never part of a projection. Ids are content hashes, so
+#     transmitting one would leak a hash of the document.
+
+#: Closed-class attachment kinds. Anything else is counted as `other` and treated
+#: as deferred: an unknown kind's wire form cannot be predicted here.
+ATTACHMENT_KINDS = frozenset({"text", "pdf", "image", "audio"})
+
+#: Below this, an attachment is not an instruction. A 3-byte note is noise, and
+#: counting it would make every stray upload look like work.
+ATTACHMENT_MIN_BYTES = 64
+
+#: Coarse size buckets. An exact byte count is a weak fingerprint of the
+#: document, so the projection reports the bucket only.
+_ATTACHMENT_SIZE_BUCKETS: tuple[tuple[int, str], ...] = (
+    (1_024, "<1KB"),
+    (4_096, "1-4KB"),
+    (16_384, "4-16KB"),
+    (65_536, "16-64KB"),
+    (262_144, "64-256KB"),
+)
+_ATTACHMENT_SIZE_OVERFLOW = ">256KB"
+
+
+class _AttachmentFacts:
+    """Locally derived facts about one operator turn's attachments.
+
+    Never leaves this module: the projection built from it carries only the
+    aggregate counts.
+    """
+
+    __slots__ = ("count", "kinds", "bytes", "inline_text_verified", "deferred")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.kinds: dict[str, int] = {}
+        self.bytes = 0
+        self.inline_text_verified = 0
+        self.deferred = 0
+
+
+def _attachment_facts(attachments: Any) -> _AttachmentFacts:
+    """Read attachment structure, tolerating any hostile object.
+
+    Every attribute access is guarded: an attachment whose ``content`` property
+    raises must cost the task nothing and must not be admitted as work.
+    """
+    facts = _AttachmentFacts()
+    if not attachments:
+        return facts
+    try:
+        items = list(attachments)
+    except Exception:  # noqa: BLE001 - a non-iterable is simply "no attachments"
+        return facts
+    for item in items:
+        try:
+            kind = str(getattr(item, "kind", "") or "").strip().lower()
+            raw = getattr(item, "content", b"")
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            size = len(raw)
+        except Exception:  # noqa: BLE001 - one bad attachment must not poison the rest
+            continue
+        if size <= 0:
+            continue
+        facts.count += 1
+        facts.bytes += size
+        bucket = kind if kind in ATTACHMENT_KINDS else "other"
+        facts.kinds[bucket] = facts.kinds.get(bucket, 0) + 1
+        if bucket == "text":
+            # A text attachment has NO extraction step at wire time: the stored
+            # bytes are UTF-8 decoded and inlined verbatim
+            # (storage/_utils.attachment_to_content_part). Its only wire-side
+            # failure is a decode error, which is decidable here. So a text
+            # attachment whose decoded words are substantive is verifiably
+            # model-visible content, not merely a reference.
+            try:
+                decoded = bytes(raw).decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if size >= ATTACHMENT_MIN_BYTES and _text_is_substantive(
+                " ".join(decoded.split())
+            ):
+                facts.inline_text_verified += 1
+        else:
+            # pdf/image/audio materialize against the TARGET model's caps at the
+            # wire boundary (extraction, rasterization, transcription). That is
+            # not decidable at admission, so it is recorded as deferred and is
+            # never claimed as verified content.
+            if size >= ATTACHMENT_MIN_BYTES:
+                facts.deferred += 1
+    return facts
+
+
+def _has_usable_attachment(attachments: Any) -> bool:
+    """Whether any attachment makes this turn real work."""
+    facts = _attachment_facts(attachments)
+    return bool(facts.inline_text_verified or facts.deferred)
+
+
+def _size_bucket(total_bytes: int) -> str:
+    for limit, label in _ATTACHMENT_SIZE_BUCKETS:
+        if total_bytes <= limit:
+            return label
+    return _ATTACHMENT_SIZE_OVERFLOW
+
+
+def attachment_work_basis(user_input: str, attachments: Any = None) -> str:
+    """Which content actually grounded this observation.
+
+    ``text``                  the operator's words alone (the historical case)
+    ``text_plus_attachments`` real text AND at least one usable attachment
+    ``attachments_only``      the words were not substantive; the attachment is
+                              the instruction (the case the audit found missing)
+
+    ``attachments_only`` is the basis that must NOT be counted as a graded
+    five-signal measurement: the backend grades the projection, and the
+    projection carries structure, not the document.
+    """
+    text = " ".join((user_input or "").split())
+    facts = _attachment_facts(attachments)
+    usable = bool(facts.inline_text_verified or facts.deferred)
+    if text and _text_is_substantive(text):
+        return "text_plus_attachments" if usable else "text"
+    return "attachments_only" if usable else "text"
+
+
+def attachment_projection(
+    attachments: Any,
+    *,
+    user_input: str | None = None,
+) -> dict[str, Any]:
+    """Bounded, non-content structural descriptor for one operator turn.
+
+    Deliberately contains no body, excerpt, filename, path, mime type or
+    attachment id. ``user_input`` is optional and used only to label the basis.
+    """
+    facts = _attachment_facts(attachments)
+    projection: dict[str, Any] = {
+        "count": facts.count,
+        "kinds": ",".join(
+            f"{kind}={count}" for kind, count in sorted(facts.kinds.items())
+        ),
+        "bytes": _size_bucket(facts.bytes) if facts.count else "",
+        "inline_text_verified": facts.inline_text_verified,
+        "deferred": facts.deferred,
+    }
+    if user_input is not None:
+        projection["basis"] = attachment_work_basis(user_input, attachments)
+    return projection
+
+
+def render_attachment_state(projection: Any) -> str:
+    """Render :func:`attachment_projection` as bounded single-line state.
+
+    Empty when the turn carried no usable attachment, so the field drops out of
+    the projection entirely and a plain-text turn is byte-identical to before.
+    """
+    if not isinstance(projection, dict) or not projection.get("count"):
+        return ""
+    if not (projection.get("inline_text_verified") or projection.get("deferred")):
+        return ""
+    parts = [
+        f"count={projection.get('count', 0)}",
+        f"kinds={projection.get('kinds', '')}",
+        f"bytes={projection.get('bytes', '')}",
+        f"inline_text_verified={projection.get('inline_text_verified', 0)}",
+        f"deferred={projection.get('deferred', 0)}",
+        f"basis={projection.get('basis', 'text')}",
+    ]
+    return " ".join(parts)
 
 
 class SensorHook:
@@ -508,6 +711,7 @@ class SensorHook:
         *,
         force: bool = False,
         workstream: str = "",
+        content_basis: str = "text",
     ) -> None:
         """Observe one material event. Never raises; the result is discarded."""
         # One id per admitted event, minted before anything can fail. It is the
@@ -560,6 +764,7 @@ class SensorHook:
                 workstream=workstream,
                 event_id=event_id,
                 content_mode=CONTENT_MODE,
+                content_basis=content_basis,
             )
         except Exception:  # noqa: BLE001 - a sensor must never fail a task
             try:
@@ -683,6 +888,7 @@ def observe_event(
     force: bool = False,
     workstream: str = "",
     registry: Any = None,
+    content_basis: str = "text",
 ) -> None:
     """Module-level convenience wrapper around :func:`hook`.
 
@@ -698,7 +904,9 @@ def observe_event(
     """
     if not ENABLED:
         return
-    hook(registry).observe_event(event, state, force=force, workstream=workstream)
+    hook(registry).observe_event(
+        event, state, force=force, workstream=workstream, content_basis=content_basis
+    )
 
 
 def verify_correlation(

@@ -51,7 +51,8 @@ class _RecordingSensor:
         return True, Trigger.MATERIAL.value
 
     def observe(self, state, *, event=None, force=False, decided=False,
-                workstream="", event_id="", content_mode=""):
+                workstream="", event_id="", content_mode="",
+                content_basis="text"):
         # `decided` mirrors the real ShadowSensor signature. Without it the hook's
         # `decided=True` call raised TypeError, which the fail-open boundary
         # swallowed -- so this stub silently recorded ZERO calls and the suite
@@ -60,7 +61,12 @@ class _RecordingSensor:
         # the class of bug the real-path test exists to catch.
         # `workstream` joined the signature in the 2026-10-17 port: per-
         # workstream dedupe makes the id part of the call contract.
-        self.calls.append((dict(state), event, force, decided))
+        # `content_basis` (2026-10-18) is the second measurement dimension:
+        # what grounded the observation. A double that drops it makes the
+        # hook's call raise TypeError, which the fail-open boundary swallows -
+        # the exact phantom-zero-calls failure this docstring already warns
+        # about. Recorded so the hook's propagation is testable.
+        self.calls.append((dict(state), event, force, decided, content_basis))
         self._last = dict(state)
         return unavailable(
             trigger=Trigger.MATERIAL,
@@ -326,7 +332,7 @@ def test_hook_tells_the_sensor_the_decision_is_already_made():
     hook.observe_event("operator_instruction", {"objective": "x"})
 
     assert len(sensor.calls) == 1
-    _state, _event, force, decided = sensor.calls[0]
+    _state, _event, force, decided, _basis = sensor.calls[0]
     assert decided is True, "the hook must tell the sensor the decision is made"
     assert force is False, (
         "force must stay False here: it would bypass is_material() and re-admit "

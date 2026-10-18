@@ -190,6 +190,11 @@ class SensorSnapshot:
     process_id: str = ""
     #: Which content-minimization mode produced the projected state.
     content_mode: str = ""
+    #: What grounded this observation: "text", "text_plus_attachments", or
+    #: "attachments_only". The last one is structural metadata only - the
+    #: backend graded a descriptor, not the document - so it must never be
+    #: counted as a qualified five-signal measurement.
+    content_basis: str = "text"
     #: Version of the projection schema (see PROJECTION_SCHEMA).
     projection_schema: str = PROJECTION_SCHEMA
     #: Dropped because a higher tier was present, or the low-tier reserve had to
@@ -222,6 +227,7 @@ class SensorSnapshot:
             "workstream": self.workstream,
             "process_id": self.process_id,
             "content_mode": self.content_mode,
+            "content_basis": self.content_basis,
             "projection_schema": self.projection_schema,
             "signals": [s.to_dict() for s in self.signals],
             "reason": self.reason,
@@ -262,6 +268,7 @@ def unavailable(
     workstream: str = "",
     process_id: str = "",
     content_mode: str = "",
+    content_basis: str = "text",
 ) -> SensorSnapshot:
     """The fail-open snapshot. A task must never fail because sensing did.
 
@@ -308,6 +315,7 @@ def unavailable(
         workstream=workstream,
         process_id=process_id or PROCESS_ID,
         content_mode=content_mode,
+        content_basis=content_basis,
         signals=signals,
         reason=reason,
     )
@@ -334,6 +342,7 @@ def build_snapshot(
     workstream: str = "",
     process_id: str = "",
     content_mode: str = "",
+    content_basis: str = "text",
 ) -> SensorSnapshot:
     """Build a successful observation from a decision response.
 
@@ -409,6 +418,7 @@ def build_snapshot(
         workstream=workstream,
         process_id=process_id or PROCESS_ID,
         content_mode=content_mode,
+        content_basis=content_basis,
         signals=tuple(signals),
         extra=(dict(unqualified_raw) if unqualified_raw else {}),
     )

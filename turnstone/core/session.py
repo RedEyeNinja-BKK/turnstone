@@ -150,7 +150,11 @@ def _sensor_observe_delegation(
 
 
 def _sensor_observe_substantive(
-    user_input: object, *, workstream: str = "", registry: object = None
+    user_input: object,
+    *,
+    workstream: str = "",
+    registry: object = None,
+    attachments: object = None,
 ) -> None:
     """The operator_instruction seam, wholly inside the fail-open boundary.
 
@@ -159,20 +163,40 @@ def _sensor_observe_substantive(
     must cost the task nothing. 2026-10-17 hardening: the historical wiring
     evaluated ``is_substantive_instruction(user_input)`` OUTSIDE the guarded
     wrapper, so an exotic object could raise into send().
+
+    2026-10-18 (attachment coverage): an operator turn can carry its real
+    instruction in an attachment while the visible text is just ``"."``. The
+    turn is judged on text OR attachments, and the projection gains a bounded
+    structural descriptor. No attachment body, excerpt, filename, path, mime
+    type or attachment id is ever placed in the state — see
+    ``sensor_lifecycle.attachment_projection``.
     """
     if _sensor_lifecycle is None:
         return
     try:
-        if not _sensor_lifecycle.is_substantive_instruction(user_input):  # type: ignore[arg-type]
+        if not _sensor_lifecycle.is_substantive_instruction(  # type: ignore[arg-type]
+            user_input, attachments=attachments
+        ):
             return
+        state = {
+            "objective": user_input,
+            "phase": "operator_instruction",
+        }
+        basis = "text"
+        if attachments:
+            projection = _sensor_lifecycle.attachment_projection(
+                attachments, user_input=user_input
+            )
+            rendered = _sensor_lifecycle.render_attachment_state(projection)
+            if rendered:
+                state["attachments"] = rendered
+                basis = str(projection.get("basis") or "text")
         _sensor_lifecycle.observe_event(
             "operator_instruction",
-            {
-                "objective": user_input,
-                "phase": "operator_instruction",
-            },
+            state,
             workstream=workstream,
             registry=registry,
+            content_basis=basis,
         )
     except Exception:  # noqa: BLE001 - a sensor must never fail a task
         pass
@@ -12791,11 +12815,16 @@ class ChatSession:
             # by default (sensor_lifecycle.ENABLED) — a no-op until activated.
             # The substance guard is INSIDE the wrapper's fail-open boundary:
             # an exploding user_input object must not raise into send().
+            #
+            # 2026-10-18: attachments are passed so a turn whose visible text is
+            # "." but which carries a document is still recognised as operator
+            # work. It is ONE call, so text+attachment turns stay one event.
             if not from_wake:
                 _sensor_observe_substantive(
                     user_input,
                     workstream=getattr(self, "_ws_id", ""),
                     registry=getattr(self, "_registry", None),
+                    attachments=attachments,
                 )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
             # can mutate history.  The old code's first in-try act was the loop-top

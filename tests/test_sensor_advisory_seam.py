@@ -70,9 +70,11 @@ def observed(monkeypatch):
     calls: list[tuple[str, str]] = []
     real = lifecycle.observe_event
 
-    def _record(event, state=None, *, force=False, workstream="", registry=None):
+    def _record(event, state=None, *, force=False, workstream="", registry=None,
+                content_basis="text"):
         calls.append((event, str((state or {}).get("objective", ""))))
-        return real(event, state, force=force, workstream=workstream, registry=registry)
+        return real(event, state, force=force, workstream=workstream,
+                    registry=registry, content_basis=content_basis)
 
     monkeypatch.setattr(lifecycle, "observe_event", _record)
     monkeypatch.setattr(lifecycle, "ENABLED", True)

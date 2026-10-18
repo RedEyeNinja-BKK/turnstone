@@ -656,6 +656,57 @@ def check_no_stale_text(texts: dict[str, str], v: list[str]) -> None:
                     )
 
 
+def check_provider_selectors_disjoint(
+    inventory: dict[str, Any], dashboard: dict[str, Any], v: list[str]
+) -> None:
+    """The provider panel's series must partition the live ids, not overlap.
+
+    ``check_selectors`` proves coverage: every live id is selected somewhere.
+    That is compatible with two selectors claiming the SAME id, which is how
+    the panel double-counted traffic before: a fallback candidate sat in both
+    its own provider's list and its route's primary provider's list. Coverage
+    alone cannot see it, so this check asserts the other half -- one id, one
+    series.
+
+    Attribution here is judged against the id's own target, read from the
+    inventory the generator already resolved, so the check does not restate
+    the generator's grouping logic; it only verifies the emitted result.
+    """
+    panel = next(
+        (p for p in dashboard.get("panels") or [] if p.get("title") == "REQUESTS BY PROVIDER"),
+        None,
+    )
+    if panel is None:
+        v.append("dashboard is missing the REQUESTS BY PROVIDER panel")
+        return
+
+    owner: dict[str, str] = {}
+    for record in inventory["routes"]:
+        if record.get("primary_id"):
+            owner.setdefault(record["primary_id"], str(record.get("provider") or ""))
+        for candidate in record["candidates"]:
+            if candidate.get("id"):
+                owner.setdefault(candidate["id"], str(candidate.get("provider") or ""))
+
+    live_ids = sorted(owner)
+    seen: dict[str, set[str]] = {}
+    for target in panel.get("targets") or []:
+        label = str(target.get("legendFormat") or "")
+        expr = target.get("expr") or ""
+        for pattern in re.findall(r'model=~"([^"]+)"', expr):
+            regex = re.compile(pattern)
+            for model_id in live_ids:
+                if regex.fullmatch(model_id):
+                    seen.setdefault(model_id, set()).add(label)
+
+    for model_id, labels in sorted(seen.items()):
+        if len(labels) > 1:
+            v.append(
+                f"model id {model_id!r} is counted by {len(labels)} provider series "
+                f"({', '.join(sorted(labels))}); provider selectors must be disjoint"
+            )
+
+
 def check_content_fields(dashboard: dict[str, Any], egress_ok: bool, v: list[str]) -> None:
     """16: every text panel must carry the same markdown in both content fields.
 
@@ -720,6 +771,7 @@ def check_dashboard(
     check_static_agreement(texts, violations)
     check_route_lineup_vs_free_ladder(inventory, texts, violations)
     check_selectors(inventory, dashboard, violations)
+    check_provider_selectors_disjoint(inventory, dashboard, violations)
     check_no_stale_text(texts, violations)
     check_content_fields(dashboard, egress_ok, violations)
     return violations

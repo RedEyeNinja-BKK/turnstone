@@ -491,24 +491,51 @@ def panel_content(
 def provider_queries(inventory: dict[str, Any]) -> list[tuple[str, str]]:
     """One PromQL series per provider, selecting the live model ids it serves.
 
-    ``openai`` and ``openai_nt`` share ``gpt-6-luna``, so they are emitted as a
-    single series rather than split on a label that cannot distinguish them.
+    Attribution follows the TARGET that declares an id, never the route that
+    happens to use it. A route's ordered candidate routinely lives on another
+    provider -- ``smart`` targets deepseek and falls back to openrouter,
+    ``smart-bounded`` targets openai and falls back to openrouter -- so
+    grouping a candidate under the route's primary provider credits one client
+    with traffic another client served. That is exactly the double-counting
+    this function used to produce.
+
+    Keying on the id's own target makes the selectors disjoint by
+    construction: an id belongs to exactly one target, and a target names
+    exactly one ``llm_client``.
+
+    The one unavoidable exception is a SHARED upstream id: ``openai`` and
+    ``openai_nt`` both serve ``gpt-6-luna``, so the ``model`` label cannot
+    separate them. They are emitted as one merged series rather than split on
+    a label that cannot distinguish them, and the panel says so instead of
+    implying a split the metrics cannot support.
     """
     grouped: dict[str, set[str]] = {}
     for record in inventory["routes"]:
-        ids = grouped.setdefault(record["provider"], set())
-        if record["primary_id"]:
-            ids.add(record["primary_id"])
+        primary_provider = str(record.get("provider") or "")
+        primary_id = str(record.get("primary_id") or "")
+        if primary_provider and primary_id:
+            grouped.setdefault(primary_provider, set()).add(primary_id)
         for candidate in record["candidates"]:
-            if candidate["id"]:
-                ids.add(candidate["id"])
+            # The candidate's OWN provider, not the route's. An id with no
+            # resolved provider (a target absent from the manifest) stays
+            # unselected rather than being attributed to whichever route
+            # happened to name it.
+            provider = str(candidate.get("provider") or "")
+            candidate_id = str(candidate.get("id") or "")
+            if provider and candidate_id:
+                grouped.setdefault(provider, set()).add(candidate_id)
 
     shared = {"openai", "openai_nt"}
+    # Only providers that actually contribute an id take part in the merge.
+    # Merging unconditionally would label a lone `openai` series
+    # "openai/openai_nt" and imply a split the metrics never had to make.
+    shared_present = sorted(p for p in grouped if p in shared and grouped[p])
     merged_ids: set[str] = set()
+    for provider in shared_present:
+        merged_ids |= grouped[provider]
     queries: list[tuple[str, str]] = []
     for provider in sorted(grouped):
         if provider in shared:
-            merged_ids |= grouped[provider]
             continue
         ids = sorted(grouped[provider])
         if not ids:
@@ -522,9 +549,12 @@ def provider_queries(inventory: dict[str, Any]) -> list[tuple[str, str]]:
         )
     if merged_ids:
         pattern = "|".join(_promql_escape(i) for i in sorted(merged_ids))
+        label = (
+            "openai/openai_nt (gpt-6-luna shared)" if len(shared_present) > 1 else shared_present[0]
+        )
         queries.append(
             (
-                "openai/openai_nt (gpt-6-luna shared)",
+                label,
                 f'sum(rate(switchyard_requests_total{{job="switchyard-v7", model=~"{pattern}"}}[5m]))',
             )
         )
@@ -578,6 +608,45 @@ def normalize_text_panels(document: dict[str, Any]) -> list[int]:
     return changed
 
 
+PROVIDER_PANEL_TITLE = "REQUESTS BY PROVIDER"
+
+
+def apply_provider_queries(document: dict[str, Any], inventory: dict[str, Any]) -> None:
+    """Rewrite the provider panel's series from the current inventory.
+
+    Why this is not optional: the panel's description promises selectors
+    generated from the manifest. Before this, nothing regenerated them -- the
+    static text panels were rewritten and the provider series kept whatever
+    ids the last author typed. A manifest change therefore left a selector
+    naming a retired id (silently counting zero) and omitted a new one
+    (silently counting nothing). Failing loudly when the panel is absent is
+    the same posture the static panels already take.
+
+    Only ``targets`` is replaced: the panel's type, layout, datasource and
+    operator-authored description survive, so this stays a data correction
+    rather than a panel rebuild.
+    """
+    panel = next(
+        (p for p in document.get("panels") or [] if p.get("title") == PROVIDER_PANEL_TITLE),
+        None,
+    )
+    if panel is None:
+        raise SystemExit(f"panel titled {PROVIDER_PANEL_TITLE!r} is not in the document")
+    existing = panel.get("targets") or []
+    datasource = existing[0].get("datasource") if existing else None
+    targets: list[dict[str, Any]] = []
+    for index, (label, expr) in enumerate(provider_queries(inventory)):
+        target: dict[str, Any] = {
+            "expr": expr,
+            "legendFormat": label,
+            "refId": chr(ord("A") + index),
+        }
+        if datasource is not None:
+            target["datasource"] = datasource
+        targets.append(target)
+    panel["targets"] = targets
+
+
 def apply_to_dashboard(
     document: dict[str, Any],
     inventory: dict[str, Any],
@@ -585,7 +654,7 @@ def apply_to_dashboard(
     title: str,
     egress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Rewrite every static panel from the inventory. Fails if one is missing."""
+    """Rewrite every generated panel from the inventory. Fails if one is missing."""
     content = panel_content(inventory, egress)
     present = {p.get("id"): p for p in document.get("panels") or []}
     for panel_id, expected_title in STATIC_PANEL_IDS.items():
@@ -607,6 +676,7 @@ def apply_to_dashboard(
             if isinstance(original, dict) and "content" in original:
                 original["content"] = text
     document["title"] = title
+    apply_provider_queries(document, inventory)
     for key in ("id", "version"):
         document.pop(key, None)
     return document

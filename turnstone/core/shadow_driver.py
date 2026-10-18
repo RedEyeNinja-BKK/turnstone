@@ -418,6 +418,7 @@ class ShadowSensor:
                     serialized_chars=serialised.serialized_chars,
                     serialized_state_tokens=exact_tokens,
                     dropped_field_count=len(serialised.fields_dropped),
+                    content_basis=content_basis,
                 )
                 return self._record(snapshot)
         except Exception as error:  # noqa: BLE001 - fail open, by design
@@ -458,6 +459,7 @@ class ShadowSensor:
                 serialized_chars=serialised.serialized_chars,
                 serialized_state_tokens=exact_tokens,
                 dropped_field_count=len(serialised.fields_dropped),
+                content_basis=content_basis,
             )
             return self._record(snapshot)
 
@@ -478,6 +480,7 @@ class ShadowSensor:
                 serialized_chars=serialised.serialized_chars,
                 serialized_state_tokens=exact_tokens,
                 dropped_field_count=len(serialised.fields_dropped),
+                content_basis=content_basis,
             )
             return self._record(snapshot)
 

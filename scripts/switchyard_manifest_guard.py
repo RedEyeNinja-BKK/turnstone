@@ -32,16 +32,41 @@ SCOPE
 
 RUNTIME INTERFACE
       python switchyard_manifest_guard.py check /etc/switchyard/routes.toml
+      python switchyard_manifest_guard.py check - --json < candidate.toml
       python switchyard_manifest_guard.py plan --lanes smartfree-decision
 
-  ``check`` exits 0 when clean and 1 with one line per violation. ``plan``
-  prints the exact root lines a generator should emit, or exits 1 explaining
-  why the requested lane cannot be a default.
+  ``check`` exits 0 when clean and 1 with one line per violation. ``-`` reads
+  stdin; ``--json`` emits ``{"ok": bool, "violations": [...]}`` so a deploy
+  script can gate on it without parsing prose. ``plan`` prints the exact root
+  lines a generator should emit, or exits 1 explaining why the requested lane
+  cannot be a default.
+
+MANDATORY PRE-DEPLOYMENT GATE
+  Run BOTH gates against the candidate file before it is installed. Neither
+  alone is sufficient: this module reads the document, the binary reads the
+  document *and* the environment its credentials resolve from.
+
+      1. python scripts/switchyard_manifest_guard.py check <candidate>
+      2. sudo -n /opt/switchyard/bin/switchyard-server \
+             --config <candidate> --dry-run      # with the unit's env files
+
+  On switchyard-vm.example.invalid gate 2 is wrapped by
+  ``scripts/turnstone_switchyard_runtime.py validate`` (it sources the unit's
+  ``EnvironmentFile``s); point it at the deployed path only after gate 1 passes
+  on the candidate. A non-zero exit from either gate means DO NOT INSTALL:
+  the loader rejects the file at startup, and startup is a restart of the
+  routing endpoint.
+
+  This module deliberately does not run the binary itself: that needs the
+  deployment's credential environment, which this process is not entitled to
+  read. Keeping the two gates separate keeps each one honest about what it
+  proved.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tomllib
 from typing import Any
@@ -162,8 +187,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    check = sub.add_parser("check", help="lint a manifest file")
+    check = sub.add_parser("check", help="lint a manifest file, or '-' for stdin")
     check.add_argument("path")
+    check.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit one JSON object instead of prose (for a deploy gate)",
+    )
 
     plan = sub.add_parser("plan", help="print the root lines for a desired default lane")
     plan.add_argument("--manifest", required=True)
@@ -175,8 +206,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "check":
-        with open(args.path, encoding="utf-8") as handle:
-            violations = lint_manifest_text(handle.read())
+        if args.path == "-":
+            text = sys.stdin.read()
+        else:
+            with open(args.path, encoding="utf-8") as handle:
+                text = handle.read()
+        violations = lint_manifest_text(text)
+        if args.as_json:
+            print(json.dumps({"ok": not violations, "violations": violations}))
+            return 0 if not violations else 1
         if violations:
             print(f"FAIL — {len(violations)} violation(s):")
             for item in violations:

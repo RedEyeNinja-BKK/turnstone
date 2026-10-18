@@ -80,6 +80,7 @@ from turnstone.core.config import get_searxng_engines, get_searxng_url, get_work
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.ip_classify import AddressLane
+from turnstone.core import correlation
 from turnstone.core.log import get_logger
 
 # Advisory shadow sensing (disabled by default; see sensor_lifecycle.ENABLED).
@@ -12785,6 +12786,11 @@ class ChatSession:
                 client_send_ids=client_send_ids,
                 wire_part_cache=wire_part_cache,
             )
+            # Correlation identity for gateway-hosted lanes. Opaque, and emitted
+            # only to hosts an operator has named: see core/correlation.py. Both
+            # calls are cheap assignments and never raise.
+            correlation.start_session(getattr(self, "_ws_id", ""))
+            correlation.start_turn()
             # Advisory shadow sensing on an ACCEPTED user turn. Fires only for a
             # substantive instruction, never for a wake or an acknowledgement, and
             # the call cannot raise or return anything into this path. Disabled

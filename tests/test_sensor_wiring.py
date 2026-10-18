@@ -84,12 +84,18 @@ def test_session_wiring_changes_no_control_flow():
         # A hunk made only of a seam call's argument list mentions neither the
         # module name nor _ws_id; `registry=registry` (2026-10-17, S6) is one
         # such argument. It is a seam marker in its own right.
+        # 2026-10-18: a second, independent seam now lives in send() - the
+        # correlation identity handed to gateway-hosted lanes. It is named here
+        # for the same reason the sensor seam is: the invariant is that EVERY
+        # uncommitted change to this file is inside a recognised seam, so a
+        # feature that silently edits control flow still fails this test.
         is_seam_hunk = (
             ("sensor" in body)
             or ("_ws_id" in body)
             or ("registry=registry" in body)
             or ("registry=getattr(self, \"_registry\", None)" in body)
             or ("workstream=workstream" in body)
+            or ("correlation" in body)
         )
         # Locality: a change outside a sensor region would not mention it.
         assert is_seam_hunk, (

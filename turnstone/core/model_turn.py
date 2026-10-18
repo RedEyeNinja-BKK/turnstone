@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
+from turnstone.core import correlation
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
@@ -575,9 +576,30 @@ def lane_diagnostics(lane: ModelLane) -> ModelLaneDiagnostics:
     )
 
 
+#: Statuses a gateway uses to say "no usable response was produced". The OpenAI
+#: SDK folds every 5xx into ``InternalServerError``, so the class alone cannot
+#: distinguish these from a deterministic provider 500 - the status can.
+_TRANSIENT_GATEWAY_STATUSES = frozenset({502, 503, 504})
+
+#: Error classes that may carry a 5xx status. Deliberately narrow: only the
+#: generic upstream-error class is re-examined, so a class that already means
+#: something specific (rate limit, timeout, connection) keeps its own policy.
+_STATUS_BEARING_ERROR_NAMES = frozenset({"InternalServerError"})
+
+
 def lane_error_is_retryable(lane: ModelLane, exc: BaseException) -> bool:
-    """Whether *exc* is retryable according to the lane that raised it."""
-    return type(exc).__name__ in lane.provider.retryable_error_names
+    """Whether *exc* is retryable according to the lane that raised it.
+
+    The provider's declared retryable classes decide first. Beyond those, a
+    gateway-transient 5xx (502/503/504) is retried because it means the request
+    produced no output at all - there is nothing to duplicate by re-sending it.
+    A provider 500 is NOT retried: it may be deterministic for the same body.
+    """
+    if type(exc).__name__ in lane.provider.retryable_error_names:
+        return True
+    if type(exc).__name__ not in _STATUS_BEARING_ERROR_NAMES:
+        return False
+    return getattr(exc, "status_code", None) in _TRANSIENT_GATEWAY_STATUSES
 
 
 def same_model_lane_binding(left: ModelLane, right: ModelLane) -> bool:
@@ -1400,6 +1422,10 @@ def model_turn(
     # A partially-surfaced stream is never silently re-issued — the
     # streaming caller owns re-issue.
     drain_retries = 0 if on_chunk is not None else _DRAIN_RETRIES
+    # One logical provider operation: the ids are resolved once, so every retry
+    # below carries the same provenance instead of looking like new work.
+    correlation.start_operation()
+    correlation_headers = correlation.headers_for(lane_diagnostics(lane).base_url)
     attempt = 0
     request_metrics: list[ProviderRequestMetrics] = []
     while True:
@@ -1456,6 +1482,7 @@ def model_turn(
                 replay_reasoning_to_model=resolve_replay_reasoning_to_model(
                     lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
                 ),
+                extra_headers=correlation_headers,
                 # Already materialized above after request admission; provider
                 # translators retain their no-op fallback for direct callers.
                 resolve_attachments=None,

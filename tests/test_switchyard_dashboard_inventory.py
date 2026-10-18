@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import pathlib
+import re
 import sys
 from typing import TYPE_CHECKING, Any
 
@@ -227,6 +228,159 @@ def test_provider_queries_select_live_ids_only() -> None:
     assert "vendor/free-vl:free" in joined
     assert "vendor/text:free" in joined
     assert "gpt-x" in joined
+
+
+# --------------------------------------------------------------------------
+# provider attribution (D1/D2): a candidate belongs to ITS provider
+# --------------------------------------------------------------------------
+
+# Inventory shaped like the live ``smart-bounded`` route: an openai primary
+# with an openrouter candidate. The route's provider and the candidate's
+# provider differ, which is the case the old grouping got wrong.
+CROSS_PROVIDER_INVENTORY: dict[str, Any] = {
+    "routes": [
+        {
+            "name": "smart-bounded",
+            "provider": "openai",
+            "primary_target": "oa-a",
+            "primary_id": "gpt-x",
+            "candidates": [
+                {"target": "or-text", "id": "vendor/text:free",
+                 "provider": "openrouter", "vision": False},
+            ],
+        },
+        {
+            "name": "direct-openrouter-free",
+            "provider": "openrouter",
+            "primary_target": "or-free",
+            "primary_id": "vendor/free-vl:free",
+            "candidates": [],
+        },
+    ],
+    "composites": [],
+    "providers": [],
+    "counts": {"routes": 2},
+}
+
+
+def _live_ids(inventory: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for record in inventory["routes"]:
+        if record.get("primary_id"):
+            ids.add(record["primary_id"])
+        for candidate in record["candidates"]:
+            if candidate.get("id"):
+                ids.add(candidate["id"])
+    return ids
+
+
+def _selected(inventory: dict[str, Any], label: str) -> set[str]:
+    """Live ids a named series' selector matches."""
+    expr = dict(dash.provider_queries(inventory))[label]
+    match = re.search(r'model=~"([^"]+)"', expr)
+    assert match, expr
+    compiled = re.compile(match.group(1))
+    return {i for i in _live_ids(inventory) if compiled.fullmatch(i)}
+
+
+def test_candidate_is_attributed_to_its_own_provider() -> None:
+    """A fallback on another client must not be credited to the primary's."""
+    assert _selected(CROSS_PROVIDER_INVENTORY, "openrouter") == {
+        "vendor/text:free",
+        "vendor/free-vl:free",
+    }
+    assert _selected(CROSS_PROVIDER_INVENTORY, "openai") == {"gpt-x"}
+
+
+def test_provider_selectors_are_pairwise_disjoint() -> None:
+    queries = dash.provider_queries(CROSS_PROVIDER_INVENTORY)
+    seen: dict[str, str] = {}
+    for label, _ in queries:
+        for model_id in _selected(CROSS_PROVIDER_INVENTORY, label):
+            assert model_id not in seen, f"{model_id} counted by {seen[model_id]} and {label}"
+            seen[model_id] = label
+    assert len(seen) == 3
+
+
+def test_apply_regenerates_the_provider_panel() -> None:
+    """The panel must follow the manifest, not the last author's typing."""
+    inv = build()
+    document = dashboard_for(inv)
+    provider = next(p for p in document["panels"] if p["title"] == "REQUESTS BY PROVIDER")
+    provider["targets"] = [{"expr": 'model=~"retired/old-id"', "legendFormat": "stale"}]
+    provider["description"] = "operator wording"
+    provider["datasource"] = {"uid": "prom", "type": "prometheus"}
+
+    dash.apply_to_dashboard(document, inv, title="T")
+
+    provider = next(p for p in document["panels"] if p["title"] == "REQUESTS BY PROVIDER")
+    assert [(t["legendFormat"], t["expr"]) for t in provider["targets"]] == [
+        (label, expr) for label, expr in dash.provider_queries(inv)
+    ]
+    assert "retired/old-id" not in str(provider["targets"])
+    # Datasource and operator prose are preserved: this is a data fix.
+    assert provider["datasource"] == {"uid": "prom", "type": "prometheus"}
+    assert provider["description"] == "operator wording"
+    assert [t["refId"] for t in provider["targets"]] == [
+        chr(65 + i) for i in range(len(provider["targets"]))
+    ]
+
+
+def test_apply_requires_the_provider_panel() -> None:
+    inv = build()
+    document = dashboard_for(inv)
+    document["panels"] = [
+        p for p in document["panels"] if p["title"] != "REQUESTS BY PROVIDER"
+    ]
+    try:
+        dash.apply_to_dashboard(document, inv, title="T")
+    except SystemExit as exc:
+        assert "REQUESTS BY PROVIDER" in str(exc)
+    else:  # pragma: no cover - the assertion below is the point
+        raise AssertionError("a missing provider panel must fail loudly")
+
+
+def test_overlapping_provider_selector_is_rejected() -> None:
+    """Two series matching one id is the double-count the panel shipped with."""
+    inv = CROSS_PROVIDER_INVENTORY
+    graph = copy.deepcopy(provider_panel_doc(inv))
+    provider = next(p for p in graph["panels"] if p["title"] == "REQUESTS BY PROVIDER")
+    provider["targets"].append(
+        {
+            "expr": 'sum(rate(switchyard_requests_total{job="switchyard-v7", '
+                    'model=~"vendor/text:free"}[5m]))',
+            "legendFormat": "openai",
+            "refId": "Z",
+        }
+    )
+    found: list[str] = []
+    val.check_provider_selectors_disjoint(inv, graph, found)
+    assert any("counted by 2 provider series" in item for item in found), found
+
+
+def test_corrected_selectors_pass_the_disjoint_check() -> None:
+    inv = CROSS_PROVIDER_INVENTORY
+    graph = copy.deepcopy(provider_panel_doc(inv))
+    found: list[str] = []
+    val.check_provider_selectors_disjoint(inv, graph, found)
+    assert found == [], found
+
+
+def provider_panel_doc(inventory: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": "T",
+        "panels": [
+            {
+                "id": 9006,
+                "type": "timeseries",
+                "title": "REQUESTS BY PROVIDER",
+                "targets": [
+                    {"expr": expr, "legendFormat": label, "refId": chr(65 + i)}
+                    for i, (label, expr) in enumerate(dash.provider_queries(inventory))
+                ],
+            }
+        ],
+    }
 
 
 # --------------------------------------------------------------------------

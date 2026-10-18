@@ -204,6 +204,72 @@ def test_repair_keeps_every_other_supported_type() -> None:
 
 
 # --------------------------------------------------------------------------
+# deploy-gate CLI
+# --------------------------------------------------------------------------
+
+
+def test_cli_check_on_a_file_exits_zero_when_clean(tmp_path=None) -> None:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+        handle.write(MANIFEST)
+        path = handle.name
+    import contextlib
+    import io
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert guard.main(["check", path]) == 0
+
+
+def test_cli_check_exits_one_and_names_the_nested_table(tmp_path=None) -> None:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+        handle.write(NESTED)
+        path = handle.name
+    import contextlib
+    import io
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert guard.main(["check", path]) == 1
+
+
+def test_cli_json_reports_ok_false_and_the_violations() -> None:
+    import contextlib
+    import io
+    import json
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+        handle.write(NESTED)
+        path = handle.name
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = guard.main(["check", path, "--json"])
+    payload = json.loads(buffer.getvalue())
+    assert code == 1
+    assert payload["ok"] is False
+    assert any("supported_types" in item for item in payload["violations"])
+
+
+def test_cli_json_reports_ok_true_for_the_omitted_candidate() -> None:
+    import contextlib
+    import io
+    import json
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+        handle.write(NESTED.replace('default_decision_lane = "tier1-decision"\n', ""))
+        path = handle.name
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = guard.main(["check", path, "--json"])
+    payload = json.loads(buffer.getvalue())
+    assert code == 0
+    assert payload == {"ok": True, "violations": []}
+
+
+# --------------------------------------------------------------------------
 # runner
 # --------------------------------------------------------------------------
 

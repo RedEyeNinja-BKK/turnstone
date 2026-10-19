@@ -26,8 +26,9 @@ USAGE
       --egress egress.json --out inventory.json
 
   # rewrite the static panels of an existing dashboard document
+  # (--title overrides the published title the generator owns)
   python switchyard_dashboard.py apply \\
-      --dashboard dashboard.json --inventory inventory.json --title "..." --out next.json
+      --dashboard dashboard.json --inventory inventory.json --out next.json
 """
 
 from __future__ import annotations
@@ -49,6 +50,24 @@ STATIC_PANEL_IDS: dict[int, str] = {
 }
 
 INVENTORY_SCHEMA = "switchyard-inventory/v1"
+
+# The dashboard's PUBLISHED identity.
+#
+# The title carries the published revision (the revision convention in
+# LC-RD-008 §7.2) and the uid is fixed for the life of the dashboard.
+#
+# The title used to live only in the operator's argv: the generator took
+# `--title`, and every regeneration had to be handed the current title
+# again, so a regeneration that forgot it silently reverted the published
+# title to whatever the caller passed. The generator therefore owns the
+# title, and the CLI argument is an override for a revision being prepared
+# -- not the way the current title is kept.
+#
+# The uid was never a generator argument: the write path carries it in the
+# request envelope, and the document's own uid is what Grafana matches on.
+# It is recorded here so the published identity lives in one place.
+DASHBOARD_TITLE = "SWITCHYARD DASHBOARD V7.11"
+DASHBOARD_UID = "turnstone-switchyard-v7"
 
 
 # --------------------------------------------------------------------------
@@ -717,10 +736,15 @@ def apply_to_dashboard(
     document: dict[str, Any],
     inventory: dict[str, Any],
     *,
-    title: str,
+    title: str | None = None,
     egress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Rewrite every generated panel from the inventory. Fails if one is missing."""
+    """Rewrite every generated panel from the inventory. Fails if one is missing.
+
+    *title* defaults to :data:`DASHBOARD_TITLE`, so a regeneration that does
+    not name a title keeps the published one instead of reverting it to an
+    arbitrary value.
+    """
     content = panel_content(inventory, egress)
     present = {p.get("id"): p for p in document.get("panels") or []}
     for panel_id, expected_title in STATIC_PANEL_IDS.items():
@@ -741,7 +765,7 @@ def apply_to_dashboard(
             original = legacy.get("originalOptions")
             if isinstance(original, dict) and "content" in original:
                 original["content"] = text
-    document["title"] = title
+    document["title"] = title or DASHBOARD_TITLE
     apply_provider_queries(document, inventory)
     for key in ("id", "version"):
         document.pop(key, None)
@@ -774,7 +798,14 @@ def main(argv: list[str] | None = None) -> int:
     apply_cmd.add_argument("--dashboard", required=True)
     apply_cmd.add_argument("--inventory", required=True)
     apply_cmd.add_argument("--egress")
-    apply_cmd.add_argument("--title", required=True)
+    apply_cmd.add_argument(
+        "--title",
+        default=None,
+        help=(
+            "override the dashboard title; defaults to the published title the "
+            f"generator owns ({DASHBOARD_TITLE!r})"
+        ),
+    )
     apply_cmd.add_argument("--out", required=True)
 
     args = parser.parse_args(argv)

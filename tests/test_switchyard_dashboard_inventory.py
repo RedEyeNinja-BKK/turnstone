@@ -768,6 +768,54 @@ def test_historical_line_is_permitted_only_when_marked() -> None:
 
 
 # --------------------------------------------------------------------------
+# dashboard title
+# --------------------------------------------------------------------------
+#
+# The title carries the PUBLISHED REVISION (see the revision convention in
+# LC-RD-008). It is passed to the generator as an argument, so nothing in the
+# generator itself records it — which is exactly how a regeneration reverts a
+# published title. The generator therefore owns the current title as a
+# constant, and a regeneration with no explicit title uses it.
+
+
+def test_generator_owns_the_current_dashboard_title() -> None:
+    """The source of truth for the title lives in the generator, not in argv."""
+    assert dash.DASHBOARD_TITLE == "SWITCHYARD DASHBOARD V7.11"
+    assert dash.DASHBOARD_UID == "turnstone-switchyard-v7"
+
+
+def test_apply_defaults_to_the_owned_title() -> None:
+    """A regeneration with no explicit title keeps the published title."""
+    inv = build()
+    document = dashboard_for(inv)
+    document["title"] = "SOMETHING ELSE"
+
+    dash.apply_to_dashboard(document, inv)
+
+    assert document["title"] == dash.DASHBOARD_TITLE
+
+
+def test_apply_still_honours_an_explicit_title() -> None:
+    inv = build()
+    document = dashboard_for(inv)
+
+    dash.apply_to_dashboard(document, inv, title="AN EXPLICIT TITLE")
+
+    assert document["title"] == "AN EXPLICIT TITLE"
+
+
+def test_cli_apply_defaults_to_the_owned_title() -> None:
+    """The CLI path regenerates to the owned title when --title is omitted."""
+    inv = build()
+    document = dashboard_for(inv)
+    document["title"] = "SOMETHING ELSE"
+
+    out = dash.apply_to_dashboard(document, inv)
+
+    assert out["title"] == dash.DASHBOARD_TITLE
+
+
+# --------------------------------------------------------------------------
 # runner
 # --------------------------------------------------------------------------
 

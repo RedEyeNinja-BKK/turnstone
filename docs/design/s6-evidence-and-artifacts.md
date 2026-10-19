@@ -94,11 +94,14 @@ sudo -u turnstone /opt/turnstone-venv/bin/python \
 | `tools/s6/proofs/provenance_proof.py` | 35 | the provenance classification |
 | `tools/s6/proofs/gate_provenance_proof.py` | 20 | the gate cannot silently fall back to raw rows |
 | `tools/s6/proofs/boundary_marker_proof.py` | 36 | the boundary is written once, never overwritten |
+| `tools/s6/proofs/rate_basis_proof.py` | 25 | the rate, the ETA and the labels key on the gate's count |
+| `tools/s6/proofs/handoff_digest_proof.py` | 33 | every digest the handoff states describes the bytes on disk |
+| `tools/s6/proofs/staleness_control.py` | 25 | the two proofs above **fail** against a mutated tree |
 | `tools/s6/driver/script-tests-execute.sh` | 40 | the driver's step order, exit codes, read-only proof |
 | `tools/s6/driver/script-tests-execute-chain.sh` | 13 | the hash chain's **negative control** |
-| **total** | **439** | |
+| **total** | **522** | |
 
-Plus the sensor suite (`363 passed, 1 skipped`) and the red-first proof,
+Plus the sensor suite (`362 passed, 2 skipped`) and the red-first proof,
 which shows the new tests **fail** against the pre-fix code.
 
 ## 7. The red-first evidence

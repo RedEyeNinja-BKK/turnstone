@@ -495,6 +495,29 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
     cross_service_ids = [k for k, v in event_services.items() if len(v) > 1]
     buckets_over_one = sum(1 for v in fingerprint_procs.values() if len(v) > 1)
 
+    # ONE derivation of the gate's numerator. The gate, the rate and the ETA
+    # must all count the SAME events: attributable operator events, not raw
+    # observation rows. A raw row that cannot be attributed to an operator turn
+    # can never certify the campaign, so it cannot count toward the forecast
+    # of how long the campaign will take either. (This is the same defect as
+    # the third reporting defect, in the two surfaces that fix did not reach:
+    # the rate/ETA and the human-readable labels.)
+    #
+    # An EMPTY reconciliation carries no bucket counts, so it cannot support an
+    # attributable count. It is treated as NO reconciliation - the same
+    # fallback, and the same explicit "raw basis" marking - so the basis
+    # label and `provenance_available` can never disagree.
+    has_provenance = bool(provenance)
+    if has_provenance:
+        attributable_observations = (
+            provenance.get("B_verified_operator", 0)
+            + provenance.get("B2_verified_operator_audit", 0)
+        )
+        rate_basis = "attributable"
+    else:
+        attributable_observations = unique_observations
+        rate_basis = "raw"
+
     admitted_total = sum(v["acceptance_admitted"] for v in per_service.values())
     suppressed_total = sum(v["suppressed"] for v in per_service.values())
     missing_observation = sum(v["unmatched_admitted"] for v in per_service.values())
@@ -513,10 +536,10 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
     rateable = bool(
         elapsed_h is not None
         and elapsed_h >= MIN_RATE_HOURS
-        and unique_observations >= MIN_RATE_SAMPLE
+        and attributable_observations >= MIN_RATE_SAMPLE
     )
-    obs_per_hour = (unique_observations / elapsed_h) if rateable else None
-    remaining = max(0, GATE_OBSERVATIONS - unique_observations)
+    obs_per_hour = ((attributable_observations / elapsed_h) if rateable else None)
+    remaining = max(0, GATE_OBSERVATIONS - attributable_observations)
     eta_hours = (remaining / obs_per_hour) if obs_per_hour and obs_per_hour > 0 else None
 
     return {
@@ -631,24 +654,27 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
             # it, the raw count is used and `provenance_available` is false -
             # never silently presented as verified.
             "observations": {
-                "have": (provenance or {}).get("B_verified_operator", 0)
-                        + (provenance or {}).get("B2_verified_operator_audit", 0)
-                if provenance else unique_observations,
+                "have": attributable_observations,
                 "need": GATE_OBSERVATIONS,
-                "met": ((provenance or {}).get("B_verified_operator", 0)
-                        + (provenance or {}).get("B2_verified_operator_audit", 0)
-                        if provenance else unique_observations) >= GATE_OBSERVATIONS,
+                "met": attributable_observations >= GATE_OBSERVATIONS,
             },
-            "provenance_available": provenance is not None,
+            "provenance_available": has_provenance,
             "raw_observations": unique_observations,
-            "unverified": (provenance or {}).get("C_unverified", 0) if provenance else None,
+            "unverified": provenance.get("C_unverified", 0) if has_provenance else None,
             "distinct_turns_suppressed": (
-                (provenance or {}).get("F_distinct_turns_suppressed", 0)
-                if provenance else None
+                provenance.get("F_distinct_turns_suppressed", 0)
+                if has_provenance else None
             ),
             "elapsed": {"have_hours": round(elapsed_h, 2) if elapsed_h is not None else None,
                         "need_hours": GATE_HOURS,
-                        "met": bool(elapsed_h is not None and elapsed_h >= GATE_HOURS)},
+                        "met": bool(elapsed_h is not None and elapsed_h >= GATE_HOURS),
+                        # The count is only half the gate. The time floor is
+                        # reported with what is LEFT of it, so a reader can
+                        # see which of the two conditions is the binding one.
+                        "hours_remaining": (
+                            round(max(0.0, GATE_HOURS - elapsed_h), 2)
+                            if elapsed_h is not None else None
+                        )},
             "unmatched_ok": missing_observation == 0,
             "no_duplicates_ok": not duplicate_event_ids,
             "no_orphans_ok": orphan_total == 0,
@@ -657,11 +683,16 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
             # would read trivially satisfied.
             "boundary_ok": not marker_problem,
         },
+        # The rate's BASIS, and the count it was computed over. Published so a
+        # reader can tell an attributable rate from a raw one. The raw count
+        # is kept beside it, never in place of it.
+        "rate_basis": rate_basis,
+        "rate_events": attributable_observations,
         "observed_per_hour": round(obs_per_hour, 2) if obs_per_hour is not None else None,
         "eta_hours_to_100": round(eta_hours, 1) if eta_hours is not None else None,
         "rate_note": None if rateable else (
             f"needs >= {MIN_RATE_SAMPLE} acceptance observations and >= "
-            f"{MIN_RATE_HOURS}h after the epoch boundary (have {unique_observations} in "
+            f"{MIN_RATE_HOURS}h after the epoch boundary (have {attributable_observations} in "
             f"{(round(elapsed_h, 2) if elapsed_h is not None else 0)}h)"
         ),
         "note": (
@@ -692,15 +723,28 @@ def render(result: dict) -> str:
                      "   -> acceptance slice is empty (fail closed)")
     lines.append(f"now (UTC)     : {result['now']}")
     lines.append(f"elapsed       : {result['elapsed_hours']} h / {GATE_HOURS} h")
-    lines.append(f"unique obs    : {result['unique_observations']} / {GATE_OBSERVATIONS}")
+    # The gate's count, not the raw row count. A raw row that cannot be
+    # attributed to an operator turn cannot certify the campaign, so it is
+    # never presented as progress toward 100. The raw count is reported
+    # separately, and labelled as raw.
+    lines.append(f"attributable  : {gate['observations']['have']} / {GATE_OBSERVATIONS}"
+                 "  (events that count toward the gate)")
+    lines.append(f"raw obs rows  : {result['unique_observations']}"
+                 "  (not all attributable to a stored turn)")
     lines.append(f"admitted rows : {result['admitted_rows']}  (suppressed"
                  f" {result['suppressed_total']}, admission rate {result['admission_rate']})")
     lines.append(f"workstreams   : {result['distinct_workstreams']}")
     if result["observed_per_hour"] is None:
         lines.append(f"rate          : (not yet rateable: {result['rate_note']})")
     else:
-        lines.append(f"rate          : {result['observed_per_hour']} unique obs/h"
+        lines.append(f"rate          : {result['observed_per_hour']} events/h"
+                     f"  ({result['rate_basis']} basis,"
+                     f" {result['rate_events']} events)"
                      f"  ETA {result['eta_hours_to_100']} h to 100")
+    hours_left = gate["elapsed"].get("hours_remaining")
+    if hours_left is not None:
+        lines.append(f"time floor    : {hours_left} h of the {GATE_HOURS} h"
+                     " minimum still to run")
     rv = result["rollout_validation"]
     st = result["straddling_admissions"]
     lines.append(f"rollout-only  : {rv['observations']} observations /"
@@ -736,8 +780,13 @@ def render(result: dict) -> str:
     lines.append(f"  basis    : {result['content_bases']}")
     lines.append("")
     lines.append("COVERAGE (two independent dimensions)")
+    # The raw admitted count is a DIMENSION-A figure. It is not the gate's
+    # count: the gate keys on attributable operator events (B + B2), which
+    # this report states separately, at the top. Labelling this line "these
+    # gate" would reintroduce the exact defect this report was corrected for
+    # - two contradictory statements about the same number.
     lines.append(f"  admitted observations        : {cov['admitted_observations']}"
-                 "  (dimension A events; these gate)")
+                 "  (dimension A events; NOT the gate count)")
     lines.append(f"  five-signal graded           : {cov['graded_full']}")
     lines.append(f"  structural-only -- an EVENT  : {cov['graded_structural_only']}"
                  "  (counts in A, excluded from B)")

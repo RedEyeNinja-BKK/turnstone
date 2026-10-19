@@ -43,19 +43,19 @@ Every raw event lands in **exactly one** bucket.
 
 The gate keys on **B + B2**. `C` is reported beside it, never inside it.
 
-**Observed (2026-10-19T19:09Z, epoch `s6-t2`):**
+**Observed (2026-10-19T20:44Z, epoch `s6-t2`):**
 
 ```
-A raw admitted + observed    : 51
-B verified operator (in store): 43
+A raw admitted + observed    : 61
+B verified operator (in store): 52
 B2 attributed outside store  :  1   (history erased; audit+usage evidence)
 C  unverified                :  0
-C3 system transitions        :  7   (retry / delegation / task-agent)
+C3 system transitions        :  8   (retry / delegation / task-agent)
 E  duplicate firings         :  0
-F  distinct turns suppressed  :  3
+F  distinct turns suppressed  :  4
 
-A (51) = B (43) + B2 (1) + C3 (7) + C (0)     ← disjoint and exhaustive
-gate: B + B2 = 44 attributable / 100 required
+A (61) = B (52) + B2 (1) + C3 (8) + C (0)     ← disjoint and exhaustive
+gate: B + B2 = 53 attributable / 100 required
 ```
 
 ## 3. The two matcher corrections

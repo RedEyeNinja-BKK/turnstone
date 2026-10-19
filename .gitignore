@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 .turnstone.db
+.turnstone.db-*
 *.db-journal

@@ -18,7 +18,9 @@ rc=0
 for proof in liveness_proof.py collector_proof.py t1_exclusion_proof.py \
              epoch_selection_proof.py watch_condition_proof.py \
              watch_lifetime_proof.py provenance_proof.py \
-             gate_provenance_proof.py boundary_marker_proof.py; do
+             gate_provenance_proof.py boundary_marker_proof.py \
+             rate_basis_proof.py handoff_digest_proof.py \
+             staleness_control.py; do
   echo "=== $proof"
   out=$("$PY" "$HERE/$proof" 2>&1)
   code=$?

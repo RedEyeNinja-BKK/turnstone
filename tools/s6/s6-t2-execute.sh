@@ -55,12 +55,16 @@ say() { printf '%s\n' "$*" | tee -a "$LOG"; }
 # and the provenance.py hash is ADDED - provenance.py is loaded by both
 # reporters, so it was trusted without being pinned. The chain is only a
 # check if it covers everything that is executed or trusted.
+#
+# 2026-10-20: the collect/liveness hashes are updated again - the rate and the
+# ETA now key on the attributable count, and the reports no longer label a raw
+# row count as progress toward 100.
 MANIFEST_SHA=f785179fad1963d541c67bf22a22dd1916a58960bace195c5666c8ef1fbb267c
 INSTALLER_SHA=823a094e6b59db8dff74964d5849f49fb2b63fd6a3b152a182e9e6f79e683f68
 ACTIVATE_SHA=5843cc8ce518cfcdc16b5401ba49dbe9c493d282f5c21d0114a436f95f3f7a83
 ROLLBACK_SHA=9f8d7815708e6442d5274c80f46609a29020706e5c1a8749798e0cdd7e938055
-COLLECT_SHA=893db4cc99c808a5b43227e48ba1cce57b379fd06f975dac3ffb95414ee378a7
-LIVENESS_SHA=e1871acfb92104760153189c7a0b50f90b2dbcac3ed33f3e9caa81875a1aa432
+COLLECT_SHA=f1d290b84fb419f9069dbcb72a96d0a55b64f7a97831b0f107da3dd44c275557
+LIVENESS_SHA=13988c65607ca3dd5f12a863d1908950eb3ee8bb9add0bf514ceec643edf2f6a
 PROVENANCE_SHA=5e5f6932eae97f13986041002db13294374e68688b4c55c39c41e81e3eb0dbca
 
 status_block() {

@@ -689,7 +689,12 @@ def render(result: dict, liveness: dict, epoch: pathlib.Path) -> str:
     lines.append(f"  observed operator events     : {cov['observed']}")
     raw = liveness.get("raw_operator_observations")
     if raw is not None and raw != cov["observed"]:
-        lines.append(f"      raw observation rows     : {raw}"
+        # A DIFFERENT population from the "raw operator rows" figure in the
+        # SENSOR OUTPUT block: that one counts every unique observation row,
+        # this one counts the operator-class rows only. Same label for two
+        # different numbers in one report is how a reader ends up comparing
+        # them, so they are named apart.
+        lines.append(f"      raw operator-class rows: {raw}"
                      "  (not all attributable to a stored turn)")
     cov_pct = "n/a" if cov["ratio"] is None else f"{cov['ratio']:.0%}"
     lines.append(f"  coverage                     : {cov_pct}")
@@ -709,8 +714,22 @@ def render(result: dict, liveness: dict, epoch: pathlib.Path) -> str:
     lines.append(f"  qualified rate               : {q_pct}")
     lines.append("")
     lines.append("SENSOR OUTPUT")
-    lines.append(f"  acceptance unique obs        : {result['unique_observations']}")
-    lines.append(f"  elapsed                      : {liveness['elapsed_hours']} h")
+    # The gate's count. The raw row count is reported beside it and labelled
+    # raw: a row that cannot be attributed to a stored operator turn cannot
+    # certify the campaign, so it is never presented as progress toward 100.
+    gate = result.get("gate") or {}
+    gate_obs = gate.get("observations") or {}
+    lines.append(f"  attributable events : {gate_obs.get('have', 0)}"
+                 f" / {gate_obs.get('need', 100)}"
+                 "  (B + B2, the count that gates)")
+    lines.append(f"  raw operator rows    : {result['unique_observations']}"
+                 "  (every unique observation row; not all attributable"
+                 " to a stored turn)")
+    elapsed = gate.get("elapsed") or {}
+    hours_left = elapsed.get("hours_remaining")
+    lines.append(f"  elapsed             : {liveness['elapsed_hours']} h"
+                 + (f"  ({hours_left} h of the {elapsed.get('need_hours')} h"
+                    " minimum still to run)" if hours_left is not None else ""))
     pv = liveness.get("provenance")
     if pv:
         lines.append("")

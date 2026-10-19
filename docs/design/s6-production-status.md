@@ -5,7 +5,7 @@
 
 ## Snapshot
 
-**Observed 2026-10-19T19:30Z.**
+**Observed 2026-10-19T20:44Z.**
 
 | item | value |
 |---|---|
@@ -15,7 +15,7 @@
 | deployed commit | `5427ded3aa7668975e2cef2621e81b9131498281` |
 | epoch | `s6-t2` |
 | boundary | `T2` = `2026-10-18T13:21:51Z` |
-| elapsed | 30.1 h of the 48 h floor |
+| elapsed | 31.4 h of the 48 h floor |
 | next deadline | `2026-10-20T13:21:51Z` (the 48 h floor) |
 
 No service has been restarted since the boundary: all six still carry their
@@ -25,11 +25,11 @@ No service has been restarted since the boundary: all six still carry their
 
 | | |
 |---|---|
-| attributable events (B + B2) | **47** / 100 |
-| raw observation rows | 54 |
+| attributable events (B + B2) | **53** / 100 |
+| raw observation rows | 61 |
 | unverified (C) | 0 |
 | provenance available | true |
-| elapsed | 30.1 h / 48 h |
+| elapsed | 31.4 h / 48 h |
 | **gate** | **PENDING** on both the count and the time |
 
 Integrity checks are all met: zero unmatched, zero duplicate event ids,

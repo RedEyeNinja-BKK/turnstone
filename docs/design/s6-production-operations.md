@@ -16,8 +16,8 @@
 | services | `turnstone-console`, `turnstone-node@2` … `@5` |
 | gate | 100 attributable events **and** 48 h from the boundary |
 
-**Observed (2026-10-19T19:09Z):** all six services active, none restarted
-since the boundary; gate at 44 attributable / 100, 29.8 h elapsed.
+**Observed (2026-10-19T20:44Z):** all six services active, none restarted
+since the boundary; gate at 53 attributable / 100, 31.4 h elapsed.
 
 ## 2. The single operator command
 
@@ -126,7 +126,7 @@ Everything below is read-only or sandboxed; nothing installs a slot,
 restarts a service, writes an epoch, or touches production telemetry.
 
 ```bash
-# the measurement and driver proofs  -> 439 checks, 0 failed
+# the measurement and driver proofs  -> 522 checks, 0 failed
 bash tools/s6/proofs/run-all.sh
 
 # the sensor suite

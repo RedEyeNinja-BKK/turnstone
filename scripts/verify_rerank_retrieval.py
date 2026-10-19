@@ -11,6 +11,7 @@ endpoint-failure handling, and the empty-input fast path.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import time
@@ -23,9 +24,33 @@ from turnstone.core.rerank import (  # noqa: E402
     resolve_rerank_client,
 )
 
-# The endpoint under test. It is not baked in: name it in the environment, so the
-# script carries no address of a private machine.
-URL = os.environ.get("SWITCHYARD_RERANK_URL", "https://switchyard-vm.example.invalid/v1/rerank")
+
+def _load_deployment_config():
+    """Import the sibling configuration module.
+
+    The script directory is not on ``sys.path`` when it is run with ``-I``
+    (isolated mode), which is how the MCP server invokes it. Add the
+    directory explicitly so the import works in every invocation mode.
+    """
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "switchyard_deployment_config.py"
+    )
+    spec = importlib.util.spec_from_file_location("switchyard_deployment_config", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_config = _load_deployment_config()
+
+# The endpoint under test. The address is configuration, not source: read it
+# from the operator's file, falling back to a placeholder that names no
+# reachable host. A published copy of this repository must not carry the
+# address of a private machine.
+URL = _config.deployment_setting(
+    "SWITCHYARD_RERANK_URL", "https://switchyard-vm.example.invalid/v1/rerank"
+)
 MODEL = "switchyard-rerank-local"
 
 DOCS = [

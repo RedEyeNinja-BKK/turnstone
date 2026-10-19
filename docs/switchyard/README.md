@@ -69,6 +69,32 @@ mutates the deployment: `validate` runs the binary's `--dry-run`.
 Exit codes: 0 success, 2 refused request, 3 transport failure, 4 remote
 failure.
 
+### Where the deployment address comes from
+
+The address of the deployment is configuration, not source. The scripts read
+it from an operator-owned file outside the repository, so a published copy of
+this package never names a private machine:
+
+| Setting | Meaning |
+|---|---|
+| `SWITCHYARD_SSH_TARGET` | the SSH destination, `user@host` |
+| `SWITCHYARD_RERANK_URL` | the rerank endpoint URL |
+| `SWITCHYARD_SSH_KEY` | the identity file (default: the Switchyard key) |
+| `SWITCHYARD_SSH_KNOWN_HOSTS` | the pinned `known_hosts` file |
+| `SWITCHYARD_DEPLOYMENT_CONFIG` | the configuration file to read (default `/etc/turnstone/switchyard.env`) |
+
+The file holds `KEY=VALUE` lines; `#` starts a comment. Resolution order is
+**environment, then file, then a placeholder that names no reachable host**,
+so a plain checkout still runs and a missing configuration surfaces as an
+unreachable deployment rather than a traceback.
+
+The environment comes first because an operator can override one value for a
+single invocation. The file comes second because the process that reaches the
+deployment is not always the one that exported the environment — the MCP
+server spawns the runtime script once per call with a fresh environment, so
+an exported variable alone is not enough. Something has to read the value from
+a file.
+
 ---
 
 ## Provenance of this package

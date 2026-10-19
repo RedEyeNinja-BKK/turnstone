@@ -39,11 +39,19 @@ RUNTIME INTERFACE
 
   Output is one JSON object on stdout. Exit codes: 0 success, 2 refused
   request, 3 transport failure, 4 remote failure.
+
+WHERE THE DEPLOYMENT ADDRESS COMES FROM
+  It is configuration, not source. This script reads it from an
+  operator-owned file outside the repository (``/etc/turnstone/switchyard.env``
+  by default; ``SWITCHYARD_DEPLOYMENT_CONFIG`` names another), falling back to
+  a placeholder that names no reachable host. The environment wins over the
+  file. See ``scripts/switchyard_deployment_config.py``.
 """
 
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import os
 import re
@@ -52,13 +60,38 @@ import sys
 import tomllib
 from typing import Any
 
-# The deployment this script reads. The host is not baked in: name it in the
-# environment, so the script carries no address of a private machine.
-SSH_TARGET = os.environ.get("SWITCHYARD_SSH_TARGET", "switchyard-vm.example.invalid")
-SSH_KEY = os.environ.get(
+
+def _load_deployment_config():
+    """Import the sibling configuration module.
+
+    The script directory is not on ``sys.path`` when it is run with ``-I``
+    (isolated mode), which is how the MCP server invokes it. Add the
+    directory explicitly so the import works in every invocation mode.
+    """
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "switchyard_deployment_config.py"
+    )
+    spec = importlib.util.spec_from_file_location("switchyard_deployment_config", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_config = _load_deployment_config()
+
+# The deployment this script reads. The address is configuration, not source:
+# read it from the operator's file, falling back to a placeholder that names
+# no reachable host. A published copy of this repository must not carry the
+# address of a private machine, and the process that reaches the deployment
+# is not always the one that exported the environment.
+SSH_TARGET = _config.deployment_setting(
+    "SWITCHYARD_SSH_TARGET", "turnstone-mgmt@switchyard-vm.example.invalid"
+)
+SSH_KEY = _config.deployment_setting(
     "SWITCHYARD_SSH_KEY", "/srv/turnstone/credentials/ssh/keys/turnstone-switchyard-vm-ed25519"
 )
-SSH_KNOWN_HOSTS = os.environ.get(
+SSH_KNOWN_HOSTS = _config.deployment_setting(
     "SWITCHYARD_SSH_KNOWN_HOSTS", "/srv/turnstone/credentials/ssh/known_hosts"
 )
 

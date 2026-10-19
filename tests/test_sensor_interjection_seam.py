@@ -1,6 +1,8 @@
 """Operator text that arrives MID-TURN must be observed like any other turn.
 
-The gap these pin (measured in production on 2026-10-17, ws ``8bafc394``):
+The gap these pin (measured in production on 2026-10-17, in a workstream
+whose id is deliberately not reproduced here - a published workstream id is a
+lookup key into the live store):
 ``_sensor_observe_substantive`` had exactly one call site — inside
 ``ChatSession.send()``. A message queued while a turn was running is never
 sent through ``send()``: it is either folded into a tool-result system turn

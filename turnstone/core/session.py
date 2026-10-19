@@ -155,6 +155,7 @@ def _sensor_observe_substantive(
     workstream: str = "",
     registry: object = None,
     attachments: object = None,
+    turn_id: str = "",
 ) -> None:
     """The operator_instruction seam, wholly inside the fail-open boundary.
 
@@ -170,6 +171,15 @@ def _sensor_observe_substantive(
     structural descriptor. No attachment body, excerpt, filename, path, mime
     type or attachment id is ever placed in the state — see
     ``sensor_lifecycle.attachment_projection``.
+
+    2026-10-19 (turn identity): ``turn_id`` is the admitted conversation
+    row's commit key — the per-turn idempotency identity of the turn that
+    produced this event. It keys the sensor's dedupe state and NOTHING else:
+    two different operator turns whose bounded projections happen to be
+    identical (two documents in the same size bucket produce the same
+    attachment descriptor) were previously collapsed into one event, so real
+    operator work went unmeasured. The identity never enters the projection
+    and is never recorded.
     """
     if _sensor_lifecycle is None:
         return
@@ -204,6 +214,7 @@ def _sensor_observe_substantive(
             workstream=workstream,
             registry=registry,
             content_basis=basis,
+            turn_id=turn_id,
         )
     except Exception:  # noqa: BLE001 - a sensor must never fail a task
         pass
@@ -11870,7 +11881,7 @@ class ChatSession:
         deferred_persistence: list[Callable[[], None]] | None = None,
         sender_user_id: str | None = None,
         client_send_ids: tuple[str, ...] = (),
-    ) -> None:
+    ) -> str:
         """Append a user turn (plain or multipart) and persist it.
 
         When ``attachments`` is non-empty the in-memory message carries
@@ -11888,9 +11899,16 @@ class ChatSession:
         pre-admission rejection boundary and before any later send can select
         them again. Direct/internal callers without ``send_id`` may supply
         immutable unstaged attachments.
+
+        Returns the turn's ``commit_key``: the per-turn idempotency identity
+        of the admitted row.  The advisory sensor uses it to tell two
+        DIFFERENT operator turns apart when their bounded projections happen
+        to be identical (2026-10-19) — see
+        :func:`turnstone.core.session._sensor_observe_substantive`.  It is an
+        internal identifier and is never sent to the model.
         """
         if deferred_persistence is None:
-            self._direct_commit_reentry(
+            return self._direct_commit_reentry(
                 "Cannot append a user turn to a closed session",
                 lambda durable: self._append_user_turn(
                     user_input,
@@ -11903,7 +11921,6 @@ class ChatSession:
                     client_send_ids=client_send_ids,
                 ),
             )
-            return
         user_content: str | list[dict[str, Any]]
         if attachments:
             # Attachments ride by reference (``{type: kind, attachment_id}`` →
@@ -12127,6 +12144,7 @@ class ChatSession:
             pending.message["_event_id"] = persist_event_id
 
         self._schedule_conversation_persistence(pending, deferred_persistence)
+        return commit_key
 
     @staticmethod
     def _decode_image_part(part: Any, tool_name: str) -> Attachment | None:
@@ -12207,7 +12225,7 @@ class ChatSession:
         be counted as an instruction the model received.
         """
         for source, content, meta in pending:
-            self._append_system_turn(
+            turn_id = self._append_system_turn(
                 source,
                 content,
                 deferred_persistence=deferred_persistence,
@@ -12218,6 +12236,7 @@ class ChatSession:
                     meta.get("message", ""),
                     workstream=getattr(self, "_ws_id", ""),
                     registry=getattr(self, "_registry", None),
+                    turn_id=turn_id,
                 )
 
     def _append_system_turn(
@@ -12227,7 +12246,7 @@ class ChatSession:
         *,
         deferred_persistence: list[Callable[[], None]] | None = None,
         **meta: Any,
-    ) -> None:
+    ) -> str:
         """Append a first-class operator-context system turn and persist it.
 
         Operator context (output-guard findings, user interjections,
@@ -12260,7 +12279,7 @@ class ChatSession:
         the LLM wire (``_source_meta`` is a ``_``-prefixed key).
         """
         if deferred_persistence is None:
-            self._direct_commit_reentry(
+            return self._direct_commit_reentry(
                 "Cannot append a system turn to a closed session",
                 lambda durable: self._append_system_turn(
                     source,
@@ -12269,7 +12288,6 @@ class ChatSession:
                     **meta,
                 ),
             )
-            return
         turn = make_system_turn(source, content, **meta)
         system_turn = turn_from_dict(turn)
         token_estimate = max(1, int(self._msg_char_count(turn) / self._chars_per_token))
@@ -12330,6 +12348,7 @@ class ChatSession:
                 raise
 
         self._schedule_conversation_persistence(pending, deferred_persistence)
+        return commit_key
 
     # -- Main generation loop ------------------------------------------------
 
@@ -12564,7 +12583,7 @@ class ChatSession:
         turn_principal_id: str,
         client_send_ids: tuple[str, ...] = (),
         wire_part_cache: _WirePartCache,
-    ) -> None:
+    ) -> str:
         """Publish the complete pre-stream turn under one generation owner.
 
         Once a generation is claimed, its user turn, nudge/context staging,
@@ -12572,6 +12591,10 @@ class ChatSession:
         successor or close may otherwise land between the old check and
         ``_append_user_turn`` and let an abandoned sender persist into the live
         successor's history.
+
+        Returns the admitted user row's ``commit_key`` — the per-turn identity
+        the advisory sensor uses to tell two different operator turns apart
+        when their bounded projections are identical (2026-10-19).
         """
         # Storage-backed planning runs before the short generation commit.  If a
         # force successor wins while one of these reads is blocked, the commit
@@ -12594,6 +12617,11 @@ class ChatSession:
             if participant_id and participant_id != owner_id:
                 participant_name = self._resolve_display_name(participant_id)
         recompose_out: list[bool] = []
+        # The admitted user row's per-turn identity (its commit key). The
+        # advisory sensor uses it to tell two DIFFERENT operator turns apart
+        # when their bounded projections happen to be identical — 2026-10-19.
+        # It is an internal identifier and never reaches the model.
+        admitted_turn_id: list[str] = []
 
         def _publish(durable: list[Callable[[], None]]) -> None:
             self._notify_count = 0
@@ -12612,14 +12640,16 @@ class ChatSession:
                 record_nudge(planned_nudge[0], self._metacog_state)
 
             if planned_user_turn is None:
-                self._append_user_turn(
-                    user_input,
-                    attachments or (),
-                    send_id=send_id,
-                    from_wake=True,
-                    deferred_persistence=durable,
-                    sender_user_id=turn_principal_id,
-                    client_send_ids=client_send_ids,
+                admitted_turn_id.append(
+                    self._append_user_turn(
+                        user_input,
+                        attachments or (),
+                        send_id=send_id,
+                        from_wake=True,
+                        deferred_persistence=durable,
+                        sender_user_id=turn_principal_id,
+                        client_send_ids=client_send_ids,
+                    )
                 )
                 became_shared = False
             else:
@@ -12635,13 +12665,15 @@ class ChatSession:
                         )
                     )
 
-                self._append_genuine_user_turn(
-                    planned_user_turn,
-                    attachments or (),
-                    send_id=send_id,
-                    deferred_persistence=durable,
-                    client_send_ids=client_send_ids,
-                    after_user=_after_user,
+                admitted_turn_id.append(
+                    self._append_genuine_user_turn(
+                        planned_user_turn,
+                        attachments or (),
+                        send_id=send_id,
+                        deferred_persistence=durable,
+                        client_send_ids=client_send_ids,
+                        after_user=_after_user,
+                    )
                 )
                 became_shared = bool(shared_out and shared_out[0])
             self._emit_pending_user_nudges(deferred_persistence=durable)
@@ -12691,6 +12723,9 @@ class ChatSession:
                 principal_id=turn_principal_id,
             ):
                 raise GenerationCancelled()
+        # The admitted row's per-turn identity, for the advisory sensor seam
+        # that runs immediately after this call (2026-10-19).
+        return admitted_turn_id[0] if admitted_turn_id else ""
 
     def send(
         self,
@@ -12806,7 +12841,7 @@ class ChatSession:
             # cleanup bracket is live.  The helper publishes the user turn,
             # nudges/context, principal, and send-owned attachment cache as one
             # generation transaction.
-            self._initialize_send_generation(
+            admitted_turn_id = self._initialize_send_generation(
                 my_generation=my_generation,
                 user_input=user_input,
                 attachments=attachments,
@@ -12826,12 +12861,18 @@ class ChatSession:
             # 2026-10-18: attachments are passed so a turn whose visible text is
             # "." but which carries a document is still recognised as operator
             # work. It is ONE call, so text+attachment turns stay one event.
+            #
+            # 2026-10-19: the admitted row's commit key is passed as the turn
+            # identity, so two different operator turns whose bounded
+            # projections are identical are both observed instead of being
+            # collapsed into one.
             if not from_wake:
                 _sensor_observe_substantive(
                     user_input,
                     workstream=getattr(self, "_ws_id", ""),
                     registry=getattr(self, "_registry", None),
                     attachments=attachments,
+                    turn_id=admitted_turn_id,
                 )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
             # can mutate history.  The old code's first in-try act was the loop-top
@@ -18347,7 +18388,7 @@ class ChatSession:
             return False
 
         pointer = plan.turn.memory_pointer if exact and content == plan.turn.content else ""
-        self._append_genuine_user_turn(
+        turn_id = self._append_genuine_user_turn(
             dataclasses.replace(
                 plan.turn,
                 content=content,
@@ -18370,6 +18411,7 @@ class ChatSession:
             content,
             workstream=getattr(self, "_ws_id", ""),
             registry=getattr(self, "_registry", None),
+            turn_id=turn_id,
         )
         return True
 
@@ -20727,9 +20769,14 @@ class ChatSession:
         deferred_persistence: list[Callable[[], None]],
         client_send_ids: tuple[str, ...] = (),
         after_user: Callable[[], None] | None = None,
-    ) -> None:
-        """Publish a human USER row and its derived turns in ledger order."""
-        self._append_user_turn(
+    ) -> str:
+        """Publish a human USER row and its derived turns in ledger order.
+
+        Returns the admitted row's ``commit_key`` — the per-turn identity the
+        advisory sensor uses to tell two different operator turns apart when
+        their bounded projections are identical.
+        """
+        commit_key = self._append_user_turn(
             plan.content,
             attachments,
             send_id=send_id,
@@ -20746,6 +20793,7 @@ class ChatSession:
                 plan.memory_pointer,
                 deferred_persistence=deferred_persistence,
             )
+        return commit_key
 
     def _memory_index_backpressure(self, access: _MemoryAccess) -> str:
         """Return a post-save soft-cap notice for the writer's live envelope."""

@@ -1066,10 +1066,12 @@ def test_real_session_registry_reaches_the_sensor(tmp_path, monkeypatch):
     seen = {}
     real_observe = lifecycle.observe_event
 
-    def _record(event, state=None, *, force=False, workstream="", registry=None):
+    def _record(event, state=None, *, force=False, workstream="", registry=None,
+                content_basis="text", turn_id=""):
         seen["registry"] = registry
         return real_observe(
-            event, state, force=force, workstream=workstream, registry=registry
+            event, state, force=force, workstream=workstream, registry=registry,
+            content_basis=content_basis, turn_id=turn_id
         )
 
     monkeypatch.setattr(lifecycle, "observe_event", _record)

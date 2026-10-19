@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import collections
+import difflib
 import inspect
 import pathlib
 import sys
@@ -24,6 +25,203 @@ SESSION = pathlib.Path(__file__).resolve().parents[1] / "turnstone" / "core" / "
 
 
 # ------------------------------------------------------------ diff discipline
+
+
+def _control_flow_delta(baseline: str, candidate: str) -> dict[str, list[str]]:
+    """The control-flow decisions that differ between two versions of a file.
+
+    Scoped by lexical scope (the qualified function name), so a decision added
+    to one function is reported against that function and not against the
+    whole file.
+
+    A DECISION is:
+
+      * ``if`` / ``while`` / ``for`` / ``async for`` - their TEST or TARGET;
+      * ``except`` - the handler type;
+      * ``with`` / ``async with`` - the context expressions;
+      * ``try`` - its ``else`` / ``finally`` shape;
+      * ``raise`` - the raised expression;
+      * ``assert`` - the asserted test;
+      * ``match`` - the subject and its case patterns;
+      * ``break`` / ``continue`` - their presence.
+
+    An EXIT PATH is where control can LEAVE the scope. It is identified by the
+    chain of enclosing constructs it sits under, so an early ``return`` inside
+    ``if deferred_persistence is None:`` is the path
+    ``("if <test>",)`` and the function's normal completion is the path
+    ``()``. The exit path is compared, NOT the return statement's syntax: a
+    function that now returns an admitted turn's identity still returns from
+    exactly the same places, and ``return`` vs ``return value`` is not a
+    control-flow decision. The implicit fall-off the end of a function IS an
+    exit path, and is the same path as an explicit top-level ``return``.
+
+    Everything else - assignments, call sequences, added parameters, the
+    argument lists of existing calls - is deliberately NOT a decision and is
+    left to the other tests in this file.
+    """
+    def _profile(source: str) -> dict[str, dict[str, list[str]]]:
+        decisions: dict[str, list[str]] = {}
+        exits: dict[str, list[str]] = {}
+
+        class _Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.stack: list[str] = []
+                self.chain: list[str] = []
+
+            def _scope(self) -> str:
+                return ".".join(self.stack) if self.stack else "<module>"
+
+            def _decision(self, entry: str) -> None:
+                decisions.setdefault(self._scope(), []).append(entry)
+
+            def _exit(self) -> None:
+                exits.setdefault(self._scope(), []).append(tuple(self.chain))
+
+            def _in(self, marker: str):
+                self.chain.append(marker)
+                self.generic_visit_current()
+
+            def generic_visit_current(self) -> None:
+                for child in ast.iter_child_nodes(self._current):
+                    self.visit(child)
+
+            def visit_FunctionDef(self, node):
+                self.stack.append(node.name)
+                scope = self._scope()
+                exits.setdefault(scope, [])
+                before = len(self.chain)
+                for stmt in node.body:
+                    self.visit(stmt)
+                # The function's normal completion is an exit path. If the body
+                # already ends in an explicit top-level return, that IS the
+                # normal exit and no second one is recorded.
+                if not exits[scope] or exits[scope][-1] != tuple(self.chain[:before]):
+                    exits[scope].append(tuple(self.chain[:before]))
+                self.stack.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_If(self, node):
+                self._decision(f"if {ast.dump(node.test)}")
+                self.chain.append(f"if {ast.dump(node.test)}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_While(self, node):
+                self._decision(f"while {ast.dump(node.test)}")
+                self.chain.append(f"while {ast.dump(node.test)}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_For(self, node):
+                marker = f"for {ast.dump(node.target)} in {ast.dump(node.iter)}"
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_AsyncFor(self, node):
+                marker = f"async for {ast.dump(node.target)}"
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_ExceptHandler(self, node):
+                kind = ast.dump(node.type) if node.type is not None else "bare"
+                self._decision(f"except {kind}")
+                self.chain.append(f"except {kind}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_With(self, node):
+                items = ", ".join(ast.dump(i.context_expr) for i in node.items)
+                self._decision(f"with {items}")
+                self.chain.append(f"with {items}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_AsyncWith(self, node):
+                self.visit_With(node)
+
+            def visit_Try(self, node):
+                marker = (
+                    f"try handlers={len(node.handlers)} "
+                    f"else={node.orelse is not None} finally={node.finalbody is not None}"
+                )
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_Raise(self, node):
+                exc = ast.dump(node.exc) if node.exc is not None else "bare"
+                self._decision(f"raise {exc}")
+                self.generic_visit(node)
+
+            def visit_Assert(self, node):
+                self._decision(f"assert {ast.dump(node.test)}")
+                self.generic_visit(node)
+
+            def visit_Match(self, node):
+                marker = f"match {ast.dump(node.subject)}"
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_Return(self, node):
+                self._exit()
+                self.generic_visit(node)
+
+            def visit_Break(self, node):
+                self._decision("break")
+                self.generic_visit(node)
+
+            def visit_Continue(self, node):
+                self._decision("continue")
+                self.generic_visit(node)
+
+        _Visitor().visit(ast.parse(source))
+        return {"decisions": decisions, "exits": exits}
+
+    before = _profile(baseline)
+    after = _profile(candidate)
+    delta: dict[str, list[str]] = {}
+    for kind in ("decisions", "exits"):
+        old = before[kind]
+        new = after[kind]
+        for scope in sorted(set(old) | set(new)):
+            old_entries = old.get(scope, [])
+            new_entries = new.get(scope, [])
+            if old_entries == new_entries:
+                continue
+            # A SEQUENCE diff, not a membership test: a duplicated decision and
+            # a reordered decision are both changes, and a membership test
+            # would see neither. (A mutation check proved this: duplicating an
+            # existing `if` was invisible to the membership form.)
+            matcher = difflib.SequenceMatcher(a=old_entries, b=new_entries)
+            changes: list[str] = []
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == "equal":
+                    continue
+                for entry in old_entries[i1:i2]:
+                    changes.append(f"- {entry}")
+                for entry in new_entries[j1:j2]:
+                    changes.append(f"+ {entry}")
+            if not changes:
+                continue
+            key = f"{scope} [{kind}]"
+            delta[key] = changes
+    return delta
 
 
 def test_session_wiring_changes_no_control_flow():
@@ -55,68 +253,37 @@ def test_session_wiring_changes_no_control_flow():
     if not diff.stdout.strip():
         pytest.skip("session.py matches HEAD: the wiring is committed, no diff to check")
 
-    added = [line[1:].strip() for line in diff.stdout.splitlines()
-             if line.startswith("+") and not line.startswith("+++")]
+    # 2026-10-19: the historical form asserted that every DIFF HUNK mentions a
+    # sensor marker string. That was a proxy for "the change is local to the
+    # seam", and it was too coarse in two ways:
+    #
+    #   * it was a TEXT test, so it broke on any hunk whose text did not
+    #     happen to spell a marker - including the legitimate addition of a
+    #     `turn_id` parameter to the seam wrapper, and the return-type change
+    #     that carries the admitted turn's identity out of the append
+    #     functions;
+    #   * it could not say WHAT changed, only that the text looked familiar.
+    #
+    # The invariant that actually matters is STRUCTURAL and is now checked
+    # directly: the wiring must not add, remove or reorder any CONTROL-FLOW
+    # DECISION in any scope. A decision is an if / while / for / except /
+    # with / raise / assert / match, and a RETURN - the presence and kind of
+    # a return, not its value, because a function that now yields an
+    # identity still returns exactly where it returned before.
+    #
+    # The comparison is against the committed file (git HEAD), not against a
+    # stored golden copy, so the pin always tracks the last reviewed state.
+    baseline = subprocess.run(
+        ["git", "show", "HEAD:turnstone/core/session.py"],
+        capture_output=True, text=True, cwd=str(repo_root),
+    )
+    assert baseline.returncode == 0, baseline.stderr
 
-    # 2026-10-17: the historical form asserted each removed LINE belonged to a
-    # sensor call. That was too fine-grained once the operator seam's guard and
-    # projection moved inside a wrapper: the diff legitimately touches the
-    # guard expression, the brace lines and the string literals, none of which
-    # contain "sensor". The invariant that actually matters is LOCALITY: every
-    # modified hunk must be a sensor region. A hunk that touches ordinary
-    # session logic would not mention the sensor at all.
-    hunks: list[list[str]] = []
-    current: list[str] | None = None
-    for raw in diff.stdout.splitlines():
-        if raw.startswith("@@"):
-            current = []
-            hunks.append(current)
-        elif current is not None and (raw.startswith("+") or raw.startswith("-")):
-            if raw.startswith(("+++", "---")):
-                continue
-            current.append(raw)
-
-    control = ("if ", "return", "raise", "for ", "while ", "def ", "await ", "yield ",
-               "try:", "except", "else:", "elif ")
-
-    for hunk in hunks:
-        body = "\n".join(hunk)
-        # A hunk made only of a seam call's argument list mentions neither the
-        # module name nor _ws_id; `registry=registry` (2026-10-17, S6) is one
-        # such argument. It is a seam marker in its own right.
-        is_seam_hunk = (
-            ("sensor" in body)
-            or ("_ws_id" in body)
-            or ("registry=registry" in body)
-            or ("registry=getattr(self, \"_registry\", None)" in body)
-            or ("workstream=workstream" in body)
-            # 2026-10-18: the operator seam now forwards `attachments=`, a
-            # one-line addition whose comment block explains the coverage fix.
-            or ("attachments=attachments" in body)
-            or ("2026-10-18: attachments are passed" in body)
-        )
-        # Locality: a change outside a sensor region would not mention it.
-        assert is_seam_hunk, (
-            f"diff hunk is not a sensor call site: {body[:200]!r}"
-        )
-        # Inside a seam hunk, the wrapper's own guard/return lines are the
-        # fail-open boundary, not session control flow. Outside a seam hunk
-        # (unreachable today, kept for the invariant) control flow is frozen.
-        if is_seam_hunk:
-            continue
-        for raw in hunk:
-            stripped = raw[1:].strip()
-            for keyword in control:
-                assert not stripped.startswith(keyword), (
-                    f"control-flow construct introduced or removed: {stripped!r}"
-                )
-    # No assignment may be added outside a seam hunk. Inside a seam hunk the
-    # wrapper legitimately binds its projection locals (2026-10-17).
-    seam_lines = {line[1:].strip() for hunk in hunks for line in hunk}
-    for line in added:
-        if line in seam_lines:
-            continue
-        assert "=" not in line, f"unexpected assignment outside a seam: {line!r}"
+    changed = _control_flow_delta(baseline.stdout, source)
+    assert not changed, (
+        "the session wiring must not change any control-flow decision; "
+        f"changed decisions: {changed}"
+    )
 
     # The call-site count must still be exactly the four material events. Count
     # them in the file, not in the diff: after the wiring is committed the diff
@@ -428,8 +595,18 @@ def test_hook_signature_accepts_no_control_inputs():
     # a route, a provider, a permission or a guard setting, and it is recorded
     # rather than acted on. The forbidden-name loop below is the part that
     # protects routing and stays unchanged.
+    #
+    # `turn_id` (2026-10-19) is the admitted conversation row's per-turn
+    # idempotency identity. It is in the same class as `workstream`: an
+    # IDENTIFIER that keys the dedupe state, deliberately NOT part of the
+    # sensed state. It cannot express a route, a provider, a permission or a
+    # guard setting; it is hashed before it reaches the dedupe state and it
+    # never enters the projection or the record. The invariant this test
+    # protects - no control value crosses the seam - is unchanged, and the
+    # forbidden-name loop below is still the part that enforces it.
     assert parameters == {
         "event", "state", "force", "workstream", "registry", "content_basis",
+        "turn_id",
     }
     for forbidden in ("model", "provider", "route", "lane", "effort", "tools", "guard",
                       "model_alias", "client", "model_binding"):

@@ -45,14 +45,14 @@ class _RecordingSensor:
         self._suppress = suppress
         self._last = None
 
-    def should_sense(self, state, *, event, force=False, workstream=""):
+    def should_sense(self, state, *, event, force=False, workstream="", turn_id=""):
         if self._suppress:
             return False, "unchanged_state"
         return True, Trigger.MATERIAL.value
 
     def observe(self, state, *, event=None, force=False, decided=False,
                 workstream="", event_id="", content_mode="",
-                content_basis="text"):
+                content_basis="text", turn_id=""):
         # `decided` mirrors the real ShadowSensor signature. Without it the hook's
         # `decided=True` call raised TypeError, which the fail-open boundary
         # swallowed -- so this stub silently recorded ZERO calls and the suite
@@ -66,6 +66,10 @@ class _RecordingSensor:
         # hook's call raise TypeError, which the fail-open boundary swallows -
         # the exact phantom-zero-calls failure this docstring already warns
         # about. Recorded so the hook's propagation is testable.
+        # `turn_id` (2026-10-19) is the per-turn dedupe identity. Same hazard:
+        # a double that drops it makes the hook's call raise TypeError, the
+        # fail-open boundary swallows it, and the suite reports a phantom
+        # zero-calls failure instead of the real one.
         self.calls.append((dict(state), event, force, decided, content_basis))
         self._last = dict(state)
         return unavailable(

@@ -106,7 +106,7 @@ def observed(monkeypatch):
     real = lifecycle.observe_event
 
     def _record(event, state=None, *, force=False, workstream="", registry=None,
-                content_basis="text"):
+                content_basis="text", turn_id=""):
         calls.append({
             "event": event,
             "state": dict(state or {}),
@@ -114,7 +114,7 @@ def observed(monkeypatch):
             "content_basis": content_basis,
         })
         return real(event, state, force=force, workstream=workstream,
-                    registry=registry, content_basis=content_basis)
+                    registry=registry, content_basis=content_basis, turn_id=turn_id)
 
     monkeypatch.setattr(lifecycle, "observe_event", _record)
     monkeypatch.setattr(lifecycle, "ENABLED", True)

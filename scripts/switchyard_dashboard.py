@@ -95,6 +95,7 @@ def build_inventory(
                     "id": candidate_target.get("id") or "",
                     "provider": candidate_target.get("llm_client") or "",
                     "vision": candidate_target.get("vision"),
+                    "video": candidate_target.get("video"),
                 }
             )
         record = {
@@ -107,6 +108,7 @@ def build_inventory(
             "context_window": route.get("context_window"),
             "tool_calling": _first(route, target, "tool_calling"),
             "vision": _first(route, target, "vision"),
+            "video": _first(route, target, "video"),
             # Route-level policy is authoritative and applies last. When the
             # route declares none, the target's own policy is the default that
             # only takes effect under `inherit`; keep the scope explicit so a
@@ -382,6 +384,32 @@ def render_tiers(inventory: dict[str, Any]) -> str:
             f"{_fmt_int(composite['context_window'])} |"
         )
 
+    # A tier does not name models; it names child ROUTES. A change to a child's
+    # own ladder is therefore inherited by every tier that contains it, and the
+    # panel has to say so, because the tier table itself never changes.
+    free_children = sorted(
+        {
+            child
+            for composite in inventory["composites"]
+            for child in composite["children"]
+            if child.startswith("smartfree")
+        }
+    )
+    if free_children:
+        inheriting = sorted(
+            composite["name"]
+            for composite in inventory["composites"]
+            if any(child in free_children for child in composite["children"])
+        )
+        lines += [
+            "",
+            "*A tier names child ROUTES, not models. The tiers that contain a free child "
+            f"(`{'`, `'.join(free_children)}`) therefore inherit that child's ladder "
+            "through the child route — a change to the free ladder changes those tiers "
+            f"without any change to their own membership ({', '.join(f'`{t}`' for t in inheriting)} "
+            "are unchanged).*",
+        ]
+
     lines += ["", "**Decision lanes**", "", "| # | Lane | Kind | Members |", "|---|---|---|---|"]
     # One sequence across both kinds: they share a table, so restarting the
     # count at the composed lane would read as a duplicate row.
@@ -431,9 +459,13 @@ def render_tiers(inventory: dict[str, Any]) -> str:
 def render_free_ladder(inventory: dict[str, Any]) -> str:
     """The free ladder, derived from the same records as ROUTE LINEUP.
 
-    R1 is the route's primary target; R2 is its first ordered candidate. Both
-    primitives share the same physical ladder, so the difference between them is
-    the route policy, which is shown per column rather than per row.
+    R1 is the route's primary target; the remaining ranks are its ordered
+    candidates, in the order the manifest declares them. Both primitives share
+    the same physical ladder, so the difference between them is the route
+    policy, which is shown per column rather than per row.
+
+    Every rank is rendered from the manifest, so a ladder that grows a leg is
+    shown with that leg rather than silently truncated to the first two.
     """
     by_name = {r["name"]: r for r in inventory["routes"]}
     routes = [by_name.get(name) for name in ("smartfree", "smartfree-bounded")]
@@ -444,34 +476,68 @@ def render_free_ladder(inventory: dict[str, Any]) -> str:
             "absent from the manifest. Do not trust this panel."
         )
     primary = routes[0]
-    candidate = primary["candidates"][0]
 
     def policy(record: dict[str, Any]) -> str:
         return f"`{record.get('reasoning_policy')}` (route)"
 
+    def modality(record: dict[str, Any]) -> str:
+        parts = []
+        if record.get("vision"):
+            parts.append("image")
+        if record.get("video"):
+            parts.append("video")
+        if not parts:
+            parts.append("text only")
+        return ", ".join(parts)
+
     lines = [
         "**STATIC CATALOG** (manifest, not measurement)",
         "",
-        "| Rank | Role | Upstream ID | Context | Vision | `smartfree` policy | "
+        "| Rank | Role | Upstream ID | Context | Modalities | `smartfree` policy | "
         "`smartfree-bounded` policy |",
         "|---|---|---|---|---|---|---|",
         f"| R1 | primary | `{primary['primary_id']}` | {_fmt_int(primary.get('context_window'))} | "
-        f"**{_yn(primary.get('vision'))}** | {policy(routes[0])} | {policy(routes[1])} |",
-        f"| R2 | ordered candidate | `{candidate['id']}` | {_fmt_int(primary.get('context_window'))} "
-        f"| **{_yn(candidate.get('vision'))}** | {policy(routes[0])} | {policy(routes[1])} |",
+        f"{modality(primary)} | {policy(routes[0])} | {policy(routes[1])} |",
+    ]
+    for index, candidate in enumerate(primary["candidates"], start=2):
+        lines.append(
+            f"| R{index} | ordered candidate | `{candidate['id']}` | "
+            f"{_fmt_int(primary.get('context_window'))} | {modality(candidate)} | "
+            f"{policy(routes[0])} | {policy(routes[1])} |"
+        )
+    last_rank = len(primary["candidates"]) + 1
+
+    text_only = [c["id"] for c in primary["candidates"] if not c.get("vision")]
+    if text_only:
+        lines += [
+            "",
+            "*" + ", ".join(f"`{i}`" for i in text_only) + " is text-only, so a request that "
+            "needs image or video and loses the multimodal legs has no eligible candidate left: "
+            "standalone `smartfree` fails closed, and a composite promotes to its next child "
+            "instead. That is the designed behaviour, not a defect.*",
+        ]
+
+    lines += [
         "",
-        "*R2 is text-only, so an image request that loses R1 has no eligible candidate left: "
-        "standalone `smartfree` fails closed, and a composite promotes to its next child "
-        "instead. That is the designed behaviour, not a defect.*",
+        "*Reasoning: a route policy is applied LAST, so it outranks a target's own "
+        "`reasoning_policy` declaration. Both free primitives currently declare `inherit`, so "
+        "each target's own policy is what reaches the provider.*",
         "",
-        "*Reasoning: the R2 target declares `reasoning_policy = enabled`, but that is a "
-        "**target default** and only applies under `inherit`. `smartfree` is `inherit`, so the "
-        "caller's value survives. `smartfree-bounded` is `none`, and a route policy is applied "
-        "last, so a bounded request cannot re-enable reasoning through the candidate.*",
+        "*Verified 2026-10-19 against the deployed binary and the live OpenRouter free "
+        "endpoints: `smartfree` and `smartfree-bounded` both serve R1 "
+        f"(`{primary['primary_id']}`) with HTTP 200. That endpoint **mandates reasoning**: it "
+        "rejects `reasoning.enabled=false` and `reasoning.effort=none` with HTTP 400 "
+        '*"Reasoning is mandatory for this endpoint and cannot be disabled."*, so a bounded '
+        "route may not disable reasoning on this leg. A plain HTTP 400 is terminal for "
+        "Switchyard's candidate fallback (it falls back on 403/408/429/5xx and "
+        f"`content_policy_violation` only), so a `none` policy here would fail R1 without "
+        f"reaching R{last_rank}.*",
         "",
-        "*Verified 2026-10-17 by deterministic fault injection on an isolated instance (mock 429 "
-        "on both free targets):* `smartfree` TEXT → Xing; `smartfree` IMAGE → 503 with no Xing "
-        "call; `tier1`/`tier1-bounded`/`tier2`/`tier2-bounded` each promoted and served.",
+        "*Verified 2026-10-19 that the ladder falls forward: a video request through "
+        "`smartfree` that failed R1 advanced to R2 "
+        f"(`{primary['candidates'][0]['id']}`) with the log line "
+        '*"model call failed; trying next candidate", and the text-only leg was never '
+        "dispatched for it.*",
     ]
     return "\n".join(lines)
 

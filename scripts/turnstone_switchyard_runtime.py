@@ -45,15 +45,22 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import subprocess
 import sys
 import tomllib
 from typing import Any
 
-SSH_TARGET = "turnstone-mgmt@switchyard-vm.example.invalid"
-SSH_KEY = "/srv/turnstone/credentials/ssh/keys/turnstone-switchyard-vm-ed25519"
-SSH_KNOWN_HOSTS = "/srv/turnstone/credentials/ssh/known_hosts"
+# The deployment this script reads. The host is not baked in: name it in the
+# environment, so the script carries no address of a private machine.
+SSH_TARGET = os.environ.get("SWITCHYARD_SSH_TARGET", "switchyard-vm.example.invalid")
+SSH_KEY = os.environ.get(
+    "SWITCHYARD_SSH_KEY", "/srv/turnstone/credentials/ssh/keys/turnstone-switchyard-vm-ed25519"
+)
+SSH_KNOWN_HOSTS = os.environ.get(
+    "SWITCHYARD_SSH_KNOWN_HOSTS", "/srv/turnstone/credentials/ssh/known_hosts"
+)
 
 UNIT = "switchyard-neutral-green.service"
 BINARY = "/opt/switchyard/bin/switchyard-server"

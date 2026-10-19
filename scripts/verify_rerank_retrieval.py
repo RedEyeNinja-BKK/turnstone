@@ -11,6 +11,7 @@ endpoint-failure handling, and the empty-input fast path.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -22,7 +23,9 @@ from turnstone.core.rerank import (  # noqa: E402
     resolve_rerank_client,
 )
 
-URL = "https://switchyard-vm.example.invalid/v1/rerank"
+# The endpoint under test. It is not baked in: name it in the environment, so the
+# script carries no address of a private machine.
+URL = os.environ.get("SWITCHYARD_RERANK_URL", "https://switchyard-vm.example.invalid/v1/rerank")
 MODEL = "switchyard-rerank-local"
 
 DOCS = [

@@ -158,6 +158,20 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **Anthropic SDK v1 is now supported, and an OpenAI SDK v3.14 connection
+  death no longer aborts a completed generation.** The Anthropic SDK removed
+  `temperature`, `top_p` and `top_k` from the Messages signatures, so a
+  provider that set a temperature through the typed keyword failed before
+  issuing a request; the value now travels in `extra_body`, which puts the
+  same key on the wire, and an operator's `server_compat` pin of
+  `temperature` still takes precedence over the session knob. Separately, the
+  OpenAI SDK now wraps a mid-body connection death in its own
+  `APIConnectionError` instead of letting the transport error escape, so the
+  shared transport guard unwraps it and applies its existing conversion rule:
+  a death before the finish reason is still the retryable incomplete-stream
+  error, and a death after it still ends the stream cleanly instead of
+  discarding a generation that already completed.
+
 - **OpenAI SDK v3 and its HTTPX2 default transport are now supported (#1009).**
   Chat Completions and Responses streams normalize native HTTPX2 connection
   deaths through the same retry boundary as legacy HTTPX-backed providers,

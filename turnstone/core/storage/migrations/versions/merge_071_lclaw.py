@@ -21,7 +21,11 @@ Create Date: 2026-08-14
 """
 
 revision = "merge_071_lclaw"
-down_revision = ("071", "lc_scheduler_claims")  # type: ignore[assignment]
+# A merge revision: two parents, one head.  Alembic types
+# ``down_revision`` as ``Optional[_RevIdType]`` with
+# ``_RevIdType = Union[str, list[str], tuple[str, ...]]`` since 1.14 (the
+# declared floor), so the tuple needs no ignore.
+down_revision = ("071", "lc_scheduler_claims")
 branch_labels = None
 depends_on = None
 

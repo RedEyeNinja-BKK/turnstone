@@ -229,7 +229,6 @@ ck("an ended campaign is reported as inactive", r["target_active"], False)
 
 r = budget.report(fake(28, next_poll="2026-10-18T18:06:29"), 0.10)
 # 72 remaining -> last poll is 71 intervals after the next one.
-from datetime import datetime, timedelta, timezone
 expected = (datetime.strptime("2026-10-18T18:06:29", "%Y-%m-%dT%H:%M:%S")
             .replace(tzinfo=timezone.utc) + timedelta(seconds=1800 * 71))
 ck("expiry matches the runner's schedule", r["expires_utc"],

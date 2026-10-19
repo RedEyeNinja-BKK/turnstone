@@ -45,7 +45,7 @@ def load(conn, name: str):
         return None
     keys = ("watch_id", "name", "interval_secs", "max_polls", "poll_count",
             "active", "last_poll", "next_poll", "last_exit_code")
-    return dict(zip(keys, row))
+    return dict(zip(keys, row, strict=True))
 
 
 def report(watch: dict, warn_fraction: float) -> dict:

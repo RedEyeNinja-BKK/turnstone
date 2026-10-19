@@ -114,7 +114,6 @@ ok("it does not pin --capability (so the epoch's own record answers)",
 # ...and the command really works in the watch runner's environment.
 print()
 print("== the command, run the way the runner runs it")
-import os  # noqa: E402
 import subprocess  # noqa: E402
 
 envmod = load(pathlib.Path(OVERLAY) / "turnstone" / "core" / "env.py", "liveenv")
@@ -137,7 +136,11 @@ ok("scrubbed PYTHONPATH names the live overlay, not the venv copy",
    scrubbed.get("PYTHONPATH", "").startswith("/opt/turnstone-overlays/"),
    scrubbed.get("PYTHONPATH", ""))
 
-proc = subprocess.run(command, shell=True, capture_output=True, text=True,
+# The command is a fixed, operator-authored string with no interpolated input
+# from a request, a user, or the network - it is the live watch runner being
+# exercised on the live cluster. shell=True is what lets the same string be
+# used for the shell pipeline the runner itself uses.
+proc = subprocess.run(command, shell=True, capture_output=True, text=True,  # noqa: S602
                       env=scrubbed, cwd="/var/lib/turnstone", timeout=180)
 ck("the command exits 0 on the live cluster", proc.returncode, 0)
 # The runner appends stderr to stdout before parsing, so one diagnostic byte on

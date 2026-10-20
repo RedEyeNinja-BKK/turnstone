@@ -7,12 +7,19 @@ import hashlib
 import json
 import os
 import re
-from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from mimetypes import guess_type
+from secrets import token_hex
+from typing import TYPE_CHECKING, Any, cast
 
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
-from starlette.responses import FileResponse, PlainTextResponse, Response
+from starlette.responses import (
+    FileResponse,
+    MalformedRangeHeader,
+    PlainTextResponse,
+    RangeNotSatisfiable,
+    Response,
+)
 from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
@@ -493,6 +500,12 @@ def is_safe_static_asset_path(path: str) -> bool:
     )
 
 
+# A byte-range error is a protocol response, not an asset response.  The file
+# response this replaces raised these from inside its own send, so they carry
+# no cache policy at all; the marker keeps them that way.
+_RANGE_ERROR = "_turnstone_range_error"
+
+
 def static_asset_cache_control(path: str) -> str:
     """Return the cache policy for an asset path relative to its mount."""
     if not is_safe_static_asset_path(path):
@@ -509,28 +522,28 @@ class RevalidatingStaticFiles(StaticFiles):
     ``no-cache`` therefore revalidates by content on reload, even when two
     builds share a package version, byte length, and filesystem timestamp.
     Version-named vendor directories retain immutable caching.
+
+    The validator is derived from the asset's BYTES, never from its
+    filesystem metadata.  A metadata signature (``mtime``, ``ctime``,
+    ``size``) cannot distinguish a rewritten asset from the one it replaced
+    when a deployment restores the timestamp and the write lands inside the
+    filesystem's ``ctime`` resolution, which is the case this class exists
+    to survive.  The same snapshot feeds the ETag and the response body, so
+    a validator can never describe bytes the response does not carry.
     """
 
-    @cached_property
-    def _content_etags(self) -> dict[str, tuple[tuple[int, int, int], str]]:
-        """Lazily allocate the bounded per-static-tree validator cache."""
-        return {}
+    def _read_asset(self, full_path: str | os.PathLike[str]) -> bytes:
+        """Return the asset's bytes.
 
-    def _content_etag(
-        self,
-        full_path: str | os.PathLike[str],
-        stat_result: os.stat_result,
-    ) -> str:
-        path = os.fspath(full_path)
-        signature = (stat_result.st_mtime_ns, stat_result.st_ctime_ns, stat_result.st_size)
-        cached = self._content_etags.get(path)
-        if cached is not None and cached[0] == signature:
-            return cached[1]
-        with open(path, "rb") as asset:
-            digest = hashlib.file_digest(asset, "sha256").hexdigest()
-        etag = f'"sha256-{digest}"'
-        self._content_etags[path] = (signature, etag)
-        return etag
+        The read is the single source of truth for both the validator and
+        the body, so the two cannot drift apart.
+        """
+        with open(full_path, "rb") as asset:
+            return asset.read()
+
+    def _content_etag(self, content: bytes) -> str:
+        """Return the content-derived validator for *content*."""
+        return f'"sha256-{hashlib.sha256(content).hexdigest()}"'
 
     def file_response(
         self,
@@ -543,14 +556,85 @@ class RevalidatingStaticFiles(StaticFiles):
         if static_asset_cache_control(asset_path) != "no-cache":
             return super().file_response(full_path, stat_result, scope, status_code)
 
+        content = self._read_asset(full_path)
+        etag = self._content_etag(content)
         request_headers = Headers(scope=scope)
-        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
-        etag = self._content_etag(full_path, stat_result)
+        response = Response(
+            content=content,
+            status_code=status_code,
+            media_type=guess_type(os.fspath(full_path))[0] or "application/octet-stream",
+        )
         response.headers["ETag"] = etag
-        del response.headers["Last-Modified"]
+        response.headers["accept-ranges"] = "bytes"
         if self.is_not_modified(response.headers, request_headers):
             return Response(status_code=304, headers={"ETag": etag})
-        return response
+        return self._range_response(response, content, request_headers)
+
+    def _range_response(
+        self,
+        response: Response,
+        content: bytes,
+        request_headers: Headers,
+    ) -> Response:
+        """Serve a byte range of the snapshot, matching Starlette's file response.
+
+        The range is cut from the SAME snapshot the validator was derived
+        from, so a ranged response can never describe bytes the validator
+        does not cover.  Starlette's own range parser is reused so the
+        accepted syntax, the ``206``/``400``/``416`` split and the multipart
+        layout stay identical to the file response this replaces.
+        """
+        try:
+            http_range = request_headers.get("range")
+            if http_range is None:
+                return response
+            ranges = FileResponse._parse_range_header(http_range, len(content))
+        except MalformedRangeHeader as exc:
+            error = PlainTextResponse(exc.content, status_code=400)
+            setattr(error, _RANGE_ERROR, True)
+            return error
+        except RangeNotSatisfiable as exc:
+            error = PlainTextResponse(
+                status_code=416, headers={"Content-Range": f"bytes */{exc.max_size}"}
+            )
+            setattr(error, _RANGE_ERROR, True)
+            return error
+        if not ranges:
+            return response
+        if len(ranges) == 1:
+            start, end = ranges[0]
+            ranged = Response(
+                content=content[start:end],
+                status_code=206,
+                media_type=response.media_type,
+            )
+            ranged.headers["Content-Range"] = f"bytes {start}-{end - 1}/{len(content)}"
+            ranged.headers["Content-Length"] = str(end - start)
+            ranged.headers["accept-ranges"] = "bytes"
+            ranged.headers["ETag"] = response.headers["ETag"]
+            return ranged
+        boundary = token_hex(13)
+        content_type = response.headers["content-type"]
+        # The multipart builder is declared as an instance method but reads
+        # nothing from the instance, so it is called with a placeholder.
+        content_length, header_generator = FileResponse.generate_multipart(
+            cast("FileResponse", None), ranges, boundary, len(content), content_type
+        )
+        body = b"".join(
+            header_generator(start, end) + content[start:end] + b"\r\n" for start, end in ranges
+        )
+        body += f"--{boundary}--".encode()
+        multipart = Response(
+            content=body,
+            status_code=206,
+            headers={
+                "content-type": f"multipart/byteranges; boundary={boundary}",
+                "content-length": str(content_length),
+                "accept-ranges": "bytes",
+            },
+        )
+        multipart.headers["ETag"] = response.headers["ETag"]
+        return multipart
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         try:
@@ -564,7 +648,8 @@ class RevalidatingStaticFiles(StaticFiles):
         cache_control = (
             "no-store" if response.status_code >= 400 else static_asset_cache_control(path)
         )
-        response.headers["Cache-Control"] = cache_control
+        if not getattr(response, _RANGE_ERROR, False):
+            response.headers["Cache-Control"] = cache_control
         return response
 
 

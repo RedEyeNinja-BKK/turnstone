@@ -181,6 +181,369 @@ class TestRevalidatingStaticFiles:
             assert unchanged.status_code == 304
             assert unchanged.headers["cache-control"] == "no-cache"
 
+    def test_content_change_is_detected_when_every_metadata_field_collides(
+        self, tmp_path, monkeypatch
+    ):
+        """A rewritten asset must change its validator even when the
+        filesystem metadata is byte-for-byte identical.
+
+        The metadata signature the validator used to be keyed on
+        (``mtime_ns``, ``ctime_ns``, ``size``) cannot tell the replacement
+        from the asset it replaced when a deployment restores the timestamp.
+        This pins the collision deterministically: the replacement is given
+        the SAME ``mtime``, the SAME ``ctime`` and the SAME size, so a
+        metadata-derived validator would report "unchanged" and answer a
+        conditional request with 304 and stale bytes.
+
+        The collision is forced by pinning ``os.stat`` for the mount, so the
+        test does not depend on the filesystem's timestamp resolution.
+        """
+        import hashlib
+
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone import __version__
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        old_body = b"export const generation = 'old';"
+        new_body = b"export const generation = 'new';"
+        assert len(old_body) == len(new_body)
+        asset.write_bytes(old_body)
+        original_stat = asset.stat()
+
+        # Pin the metadata the mount sees: after the rewrite the file has the
+        # same size, the same mtime and the same ctime as the original.
+        # A stat_result carries FLOAT timestamps (the nanosecond fields are
+        # derived from them), so pin the three timestamps to one fixed value.
+        fixed_times = (1_700_000_000.0, 1_700_000_000.0, 1_700_000_000.0)
+        rewritten_stat = os.stat_result(tuple(original_stat)[:7] + fixed_times)
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if os.fspath(path) == str(asset):
+                return rewritten_stat
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", fake_stat)
+
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            url = f"/static/app.js?v={__version__}"
+            first = client.get(url)
+            assert first.status_code == 200
+            assert first.content == old_body
+            old_etag = first.headers["etag"]
+
+            asset.write_bytes(new_body)
+            os.utime(
+                asset,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+
+            # The metadata the mount sees is identical before and after, so
+            # only the CONTENT can decide whether the asset changed.
+            assert rewritten_stat.st_size == original_stat.st_size
+            assert rewritten_stat.st_mtime_ns == rewritten_stat.st_ctime_ns
+
+            changed = client.get(url, headers={"If-None-Match": old_etag})
+            assert changed.status_code == 200
+            assert changed.content == new_body
+            assert changed.headers["etag"] != old_etag
+            assert changed.headers["etag"] == (f'"sha256-{hashlib.sha256(new_body).hexdigest()}"')
+
+            # The current validator still revalidates to 304.
+            unchanged = client.get(url, headers={"If-None-Match": changed.headers["etag"]})
+            assert unchanged.status_code == 304
+
+    def test_unchanged_asset_keeps_its_validator(self, tmp_path):
+        """An asset that did not change keeps the validator it had."""
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone import __version__
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        body = b"export const generation = 'same';"
+        asset.write_bytes(body)
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            url = f"/static/app.js?v={__version__}"
+            first = client.get(url)
+            assert first.status_code == 200
+            assert first.headers["etag"]
+
+            second = client.get(url)
+            assert second.status_code == 200
+            assert second.headers["etag"] == first.headers["etag"]
+            assert second.content == body
+
+            revalidated = client.get(url, headers={"If-None-Match": first.headers["etag"]})
+            assert revalidated.status_code == 304
+
+    def test_validator_describes_the_bytes_the_response_carries(self, tmp_path, monkeypatch):
+        """The validator and the body must come from one snapshot.
+
+        The validator used to be computed from one read of the file while the
+        body was streamed by a later read, so a rewrite between the two
+        produced a response whose validator described bytes it did not carry.
+        The rewrite is timed for the SECOND read of the asset, which is where
+        the two implementations differ.
+        """
+        import hashlib
+
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone import __version__
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        old_body = b"export const generation = 'old';"
+        new_body = b"export const generation = 'new';"
+        assert len(old_body) == len(new_body)
+        asset.write_bytes(old_body)
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        # Rewrite the asset as the mount opens it for the SECOND time.  A
+        # single-snapshot implementation never reaches a second read, so the
+        # rewrite lands on the same bytes the validator was taken from.
+        real_open = open
+        opens = {"count": 0}
+
+        def rewriting_open(file, mode="r", *args, **kwargs):
+            path = os.fspath(file)
+            if "b" in mode and path == str(asset):
+                opens["count"] += 1
+                if opens["count"] == 2:
+                    with real_open(path, "wb") as handle:
+                        handle.write(new_body)
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", rewriting_open)
+
+        with TestClient(app) as client:
+            url = f"/static/app.js?v={__version__}"
+            resp = client.get(url)
+
+        assert resp.status_code == 200
+        expected = '"sha256-' + hashlib.sha256(resp.content).hexdigest() + '"'
+        assert resp.headers["etag"] == expected
+
+    def test_rapid_same_size_replacements_always_revalidate(self, tmp_path):
+        """Repeated same-size replacements never answer 304 with stale bytes.
+
+        Every replacement preserves the mtime, so the validator can only be
+        right if it is derived from the content.
+        """
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            url = "/static/app.js"
+            for generation in range(25):
+                body = f"export const generation = '{generation:02d}';".encode()
+                asset.write_bytes(body)
+                stat = asset.stat()
+                os.utime(asset, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                resp = client.get(url)
+                assert resp.status_code == 200
+                assert resp.content == body
+                assert resp.headers["etag"] == (
+                    f'"sha256-{__import__("hashlib").sha256(body).hexdigest()}"'
+                )
+
+    def test_byte_range_is_served_from_the_same_snapshot(self, tmp_path):
+        """A ranged response carries a slice of the bytes the validator covers."""
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone import __version__
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        body = bytes(range(64))
+        asset.write_bytes(body)
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            url = f"/static/app.js?v={__version__}"
+            full = client.get(url)
+            assert full.status_code == 200
+            assert full.headers["accept-ranges"] == "bytes"
+
+            ranged = client.get(url, headers={"Range": "bytes=8-15"})
+            assert ranged.status_code == 206
+            assert ranged.content == body[8:16]
+            assert ranged.headers["content-range"] == f"bytes 8-15/{len(body)}"
+            assert ranged.headers["etag"] == full.headers["etag"]
+
+    def test_multiple_ranges_use_the_multipart_byteranges_layout(self, tmp_path):
+        """A multi-range response keeps the byte layout browsers expect.
+
+        The multipart body is part of the wire format, so it is pinned here
+        rather than left to the file-response implementation it replaced.
+        """
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone import __version__
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        body = bytes(range(64))
+        asset.write_bytes(body)
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            url = f"/static/app.js?v={__version__}"
+            resp = client.get(url, headers={"Range": "bytes=0-3,8-11"})
+
+        assert resp.status_code == 206
+        content_type = resp.headers["content-type"]
+        assert content_type.startswith("multipart/byteranges; boundary=")
+        boundary = content_type.split("boundary=")[1]
+
+        expected = (
+            (
+                f"--{boundary}\r\n"
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Content-Range: bytes 0-3/64\r\n"
+                "\r\n"
+            ).encode()
+            + body[0:4]
+            + b"\r\n"
+            + (
+                f"--{boundary}\r\n"
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Content-Range: bytes 8-11/64\r\n"
+                "\r\n"
+            ).encode()
+            + body[8:12]
+            + b"\r\n"
+            + f"--{boundary}--".encode()
+        )
+        assert resp.content == expected
+        assert resp.headers["content-length"] == str(len(expected))
+
+    def test_the_range_helpers_this_relies_on_keep_their_behaviour(self):
+        """Guard the file-response helpers the range path is built on.
+
+        The range parsing and the multipart layout are taken from the file
+        response, so the accepted syntax, the error split and the multipart
+        bytes are pinned here.  A dependency bump that changed any of them
+        would alter what browsers receive, and this test is where that
+        shows up first.
+        """
+        from starlette.responses import FileResponse
+
+        assert FileResponse._parse_range_header("bytes=0-5", 64) == [(0, 6)]
+        assert FileResponse._parse_range_header("bytes=0-3,8-11", 64) == [(0, 4), (8, 12)]
+        assert FileResponse._parse_range_header("bytes=8-", 64) == [(8, 64)]
+        assert FileResponse._parse_range_header("bytes=-4", 64) == [(60, 64)]
+
+        with pytest.raises(Exception) as malformed:
+            FileResponse._parse_range_header("bytes=abc", 64)
+        assert type(malformed.value).__name__ == "MalformedRangeHeader"
+
+        with pytest.raises(Exception) as unsatisfiable:
+            FileResponse._parse_range_header("bytes=999-", 64)
+        assert type(unsatisfiable.value).__name__ == "RangeNotSatisfiable"
+        assert unsatisfiable.value.max_size == 64
+
+    def test_concurrent_reads_and_replacements_never_serve_a_mismatched_validator(self, tmp_path):
+        """Under contention the validator always matches the bytes served.
+
+        Readers and a writer run at the same time; every response must carry
+        a validator that describes its own body.  The writer replaces the
+        asset in place, so a reader can also observe a torn body - that is a
+        property of a non-atomic write, not of the server, and the validator
+        must describe whatever body was actually served.
+        """
+        import hashlib
+        import threading
+
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        bodies = [
+            f"export const generation = '{generation:02d}';".encode() for generation in range(8)
+        ]
+        assert len({len(body) for body in bodies}) == 1
+        asset.write_bytes(bodies[0])
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        errors: list[str] = []
+        stop = threading.Event()
+
+        def writer() -> None:
+            index = 0
+            while not stop.is_set():
+                body = bodies[index % len(bodies)]
+                index += 1
+                asset.write_bytes(body)
+                stat = asset.stat()
+                os.utime(asset, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+        def reader() -> None:
+            with TestClient(app) as client:
+                while not stop.is_set():
+                    resp = client.get("/static/app.js")
+                    if resp.status_code != 200:
+                        errors.append(f"status {resp.status_code}")
+                        continue
+                    expected = '"sha256-' + hashlib.sha256(resp.content).hexdigest() + '"'
+                    if resp.headers["etag"] != expected:
+                        errors.append(
+                            f"validator {resp.headers['etag']} does not describe the body"
+                        )
+
+        writer_thread = threading.Thread(target=writer)
+        reader_thread = threading.Thread(target=reader)
+        writer_thread.start()
+        reader_thread.start()
+        # Let the two run against each other for a fixed window, then stop.
+        reader_thread.join(timeout=5)
+        stop.set()
+        for thread in (writer_thread, reader_thread):
+            thread.join(timeout=10)
+            assert not thread.is_alive(), "contention thread did not finish"
+
+        assert errors == []
+
     def test_version_named_vendor_asset_is_immutable(self, tmp_path):
         from starlette.applications import Starlette
         from starlette.routing import Mount

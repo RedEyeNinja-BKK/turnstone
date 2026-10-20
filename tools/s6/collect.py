@@ -505,8 +505,8 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
     #
     # An EMPTY reconciliation carries no bucket counts, so it cannot support an
     # attributable count. It is treated as NO reconciliation - the same
-    # fallback, and the same explicit "raw basis" marking - so the basis
-    # label and `provenance_available` can never disagree.
+    # fail-closed path, and the same explicit "raw basis" marking - so the
+    # basis label and `provenance_available` can never disagree.
     has_provenance = bool(provenance)
     if has_provenance:
         attributable_observations = (
@@ -936,8 +936,9 @@ def main() -> int:
             print(f"skipping epoch: {line}", file=sys.stderr)
     # Provenance is computed when the store is reachable. It is the difference
     # between "13 rows exist" and "13 rows are attributable operator work", and
-    # the gate must key on the latter. A failure here degrades to the raw count
-    # and says so rather than failing the report.
+    # the gate must key on the latter. A failure here leaves the report intact
+    # but the gate FAILS CLOSED: with no reconciliation nothing is VERIFIED, so
+    # the gate's count is zero and the raw count stays informational only.
     provenance = None
     try:
         spec = importlib.util.spec_from_file_location(
@@ -950,8 +951,9 @@ def main() -> int:
                                     store=prov.fetch_store(dsn),
                                     audit=prov.fetch_audit(dsn))
     except Exception as error:  # noqa: BLE001 - a report must never crash
-        print(f"provenance unavailable ({type(error).__name__}); gate uses the raw "
-              "observation count", file=sys.stderr)
+        print(f"provenance unavailable ({type(error).__name__}); the gate FAILS "
+              "CLOSED - its count is 0 and the raw observation count is "
+              "informational only", file=sys.stderr)
 
     result = collect(epoch, selection=selection, provenance=provenance)
     result["epochs_skipped"] = skipped

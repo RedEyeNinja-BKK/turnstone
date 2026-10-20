@@ -5,7 +5,7 @@
 
 ## Snapshot
 
-**Observed 2026-10-20T07:38Z.**
+**Observed 2026-10-20T10:50Z.**
 
 | item | value |
 |---|---|
@@ -15,21 +15,41 @@
 | deployed commit | `5427ded3aa7668975e2cef2621e81b9131498281` |
 | epoch | `s6-t2` |
 | boundary | `T2` = `2026-10-18T13:21:51Z` |
-| elapsed | 42.27 h of the 48 h floor |
+| elapsed | 45.48 h of the 48 h floor |
 | next deadline | `2026-10-20T13:21:51Z` (the 48 h floor) |
 
-No service has been restarted since the boundary: all six still carry their
-`T2` start times.
+### One service was restarted, outside this campaign
+
+`turnstone-node@3` was restarted at **2026-10-20T10:08:53Z** by unrelated
+work on this host. It is the only service whose start time is not its
+`T2` one.
+
+This does not disturb the measurement, and the reason is worth stating
+plainly rather than leaving to inference:
+
+- the restart changed **no** measurement configuration. All five services
+  still resolve `PYTHONPATH=/opt/turnstone-overlays/sensor-v187-5427ded`,
+  and node@3's `95-sensor.conf` drop-in — its store directory, its
+  content mode, its timeouts — is unchanged;
+- the restart did **not** move the boundary. `T2` is still
+  `2026-10-18T13:21:51Z`, written once by the activation script;
+- the sensor kept observing across the restart: node@3 wrote cadence and
+  observation rows continuously, with **zero** unmatched admissions, zero
+  orphans, and zero duplicate event ids.
+
+What a restart does cost is *continuity of a single process*, not
+continuity of the epoch. The epoch is a directory of observations, not a
+process's memory, so the measurement is unaffected.
 
 ## The gate
 
 | | |
 |---|---|
 | attributable events (B + B2) | **61** / 100 |
-| raw observation rows | 71 |
+| raw observation rows | 74 |
 | unverified (C) | 0 |
 | provenance available | true |
-| elapsed | 42.27 h / 48 h |
+| elapsed | 45.48 h / 48 h |
 | **gate** | **PENDING** on both the count and the time |
 
 Integrity checks are all met: zero unmatched, zero duplicate event ids,
@@ -42,7 +62,7 @@ measurement of that moment, not a fixed property of the epoch.
 ## The gate fails closed without a reconciliation
 
 The raw count and the attributable count are **different numbers**, and only
-the second one can certify the campaign. `61` attributable events and `71`
+the second one can certify the campaign. `61` attributable events and `74`
 raw rows are not interchangeable: the difference is the events that could not
 be tied to a stored operator turn.
 
@@ -77,9 +97,19 @@ The deployed matcher credits a `delegation_result` — machine work — to an
 operator turn. The corrected matcher removes that inflation, so from the
 **same population** it reports one fewer attributable event.
 
-This is why the expected corrected figure is *lower*, and it is the correct
-direction: the gate must not be satisfied by counting machine work as
-operator work.
+**Measured 2026-10-20T10:50Z**, on the live epoch, same events and same
+store rows, with only the matcher changed:
+
+| matcher | B | B2 | **B + B2** |
+|---|---|---|---|
+| deployed (no eligibility rule) | 60 | 2 | **62** |
+| corrected (eligibility + exact matching) | 59 | 2 | **61** |
+
+The difference is exactly one event, and the direction is correct: the gate
+must not be satisfied by counting machine work as operator work. The
+eligibility rule removes the inflated event; the exact matcher does not
+change the count on this population (it guarantees the count, it does not
+move it).
 
 ## Deployment status
 
@@ -88,16 +118,17 @@ Nothing in this repository has been activated.
 
 | | |
 |---|---|
-| production state | unchanged since the T2 boundary |
+| production state | unchanged since the T2 boundary, except for one unrelated service restart (above) |
 | successor slot | not installed |
-| services restarted | none |
+| services restarted by this campaign | none |
 | measurement epochs | `s6-t0`, `s6-t1`, `s6-t2` — all preserved, none merged |
 
 ## Preserved
 
 Credentials, elevated permissions, the running services, every immutable
 overlay, all historical telemetry, the watches, and the rollback anchors are
-untouched.
+untouched. The one service restart recorded above changed no configuration
+and no epoch marker.
 
 ## How to re-read this
 

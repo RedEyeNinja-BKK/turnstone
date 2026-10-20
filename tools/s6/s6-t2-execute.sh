@@ -67,12 +67,20 @@ say() { printf '%s\n' "$*" | tee -a "$LOG"; }
 #   provenance.py - the attribution is now an EXACT minimum-cost,
 #                  maximum-cardinality assignment instead of a greedy one, so
 #                  it no longer under-reports attributable operator work.
+#
+# 2026-10-20 (third pass): collect.py and liveness.py change again, and only
+# their MESSAGING does. Both used to say the gate "falls back to the raw
+# observation count" when the reconciliation is unavailable - which was the
+# old contract, and contradicted the fail-closed behaviour those same files
+# now implement. The words now say what the code does: the gate FAILS CLOSED,
+# its count is 0, and the raw count is informational only. No behaviour
+# changes here; the pins move because the bytes moved.
 MANIFEST_SHA=f785179fad1963d541c67bf22a22dd1916a58960bace195c5666c8ef1fbb267c
 INSTALLER_SHA=823a094e6b59db8dff74964d5849f49fb2b63fd6a3b152a182e9e6f79e683f68
 ACTIVATE_SHA=5843cc8ce518cfcdc16b5401ba49dbe9c493d282f5c21d0114a436f95f3f7a83
 ROLLBACK_SHA=9f8d7815708e6442d5274c80f46609a29020706e5c1a8749798e0cdd7e938055
-COLLECT_SHA=089cb1044781cbe6299a967c759563f3df19dacb9170963fef7674849a34b892
-LIVENESS_SHA=13988c65607ca3dd5f12a863d1908950eb3ee8bb9add0bf514ceec643edf2f6a
+COLLECT_SHA=eb69e1f447c0f0aff83f31d7da75f01151f977febf9defb09c8d2d5976d24d77
+LIVENESS_SHA=8e783e9198f65950bb1a6a1d776612f796c0381be8d9f1e0a13f302515ca388a
 PROVENANCE_SHA=fb2397b03abed2250a706f5487bb192424806083606310288cea3d8f256321cc
 
 status_block() {

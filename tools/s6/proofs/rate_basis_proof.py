@@ -26,8 +26,8 @@ rate/ETA, and the human-readable labels.
 Three properties are asserted here, on synthetic fixtures only:
 
   1. THE RATE AND THE ETA USE THE GATE'S COUNT. With a reconciliation
-     available the rate is over B + B2; without one it is over the raw count
-     AND the basis is named.
+     available the rate is over B + B2; without one there is NO attributable
+     rate and NO ETA at all, and the basis is named.
   2. THE TIME FLOOR IS STATED. The event count is only half the gate.
   3. NO SURFACE LABELS A RAW COUNT AS THE GATE COUNT.
 
@@ -206,11 +206,11 @@ def main() -> int:
               r_raw["gate"]["raw_observations"], N_RAW)
 
         # An EMPTY reconciliation carries no bucket counts, so it cannot
-        # support an attributable count. It must fall back to the raw basis
-        # AND say so: a report that used the raw basis while claiming a
+        # support an attributable count. It must take the same fail-closed
+        # path AND say so: a report that used the raw basis while claiming a
         # reconciliation was available would present raw rows as verified.
         r_empty = COLLECT.collect(epoch, provenance={})
-        check("an empty reconciliation falls back to the raw basis",
+        check("an empty reconciliation is treated as no reconciliation",
               r_empty.get("rate_basis"), "raw")
         check("...and says provenance was unavailable",
               r_empty["gate"]["provenance_available"], False)

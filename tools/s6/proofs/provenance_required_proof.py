@@ -12,10 +12,11 @@ could satisfy the 100-event acceptance requirement.
     provenance unavailable
     => attributable acceptance can never be MET
 
-The raw count and its rate stay available, and stay clearly labelled as
-raw, but they can never certify the campaign. A campaign is certified by
+The raw count stays available as INFORMATION, and stays clearly labelled as
+raw, but it can never certify the campaign. A campaign is certified by
 events that were VERIFIED against the conversation store, and without the
-reconciliation nothing is verified.
+reconciliation nothing is verified - so there is no attributable rate and no
+ETA to publish either.
 
 Four properties are asserted here, on synthetic fixtures only:
 

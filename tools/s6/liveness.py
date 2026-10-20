@@ -623,9 +623,10 @@ def count_operator_observations(epoch: pathlib.Path, provenance: dict | None = N
     turn-for-turn, so it has to be the same event class.
 
     ``provenance`` is handed to the collector so the acceptance gate it returns
-    is built from the ATTRIBUTABLE event count. Without it the collector falls
-    back to the raw observation count, and this script would publish that raw
-    count as the gate the scheduled watch reads.
+    is built from the ATTRIBUTABLE event count. Without it the collector's
+    gate FAILS CLOSED: its count is zero, ``met`` is false, and the raw
+    observation count stays informational - so this script can never publish a
+    raw count as the gate the scheduled watch reads.
     """
     collector = load_collector()
     result = collector.collect(epoch, provenance=provenance)
@@ -843,9 +844,10 @@ def main() -> int:
         return 2
 
     # Provenance FIRST: the collector builds the acceptance gate, so the
-    # reconciliation has to exist before the collector runs. Otherwise the
-    # collector falls back to the raw observation count and this script would
-    # publish THAT as the gate the scheduled watch reads.
+    # reconciliation has to exist before the collector runs. Without it the
+    # collector's gate FAILS CLOSED - its count is zero, `met` is false, and
+    # the raw observation count stays informational - so this script can never
+    # publish a raw count as the gate the scheduled watch reads.
     #
     # Provenance compares store turns with the observations that can be
     # ATTRIBUTED to them. Raw counts cancel two different errors against each

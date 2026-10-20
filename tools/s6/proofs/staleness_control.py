@@ -206,7 +206,8 @@ def main() -> int:
         original = collect.read_text()
         # Go back to testing the reconciliation's TRUTHINESS: an empty
         # dict would then be treated as a real reconciliation while the
-        # report fell back to the raw basis.
+        # report fell back to the raw basis (and the gate stopped failing
+        # closed).
         mutated = original.replace(
             "    has_provenance = bool(provenance)",
             "    has_provenance = provenance is not None",

@@ -81,6 +81,46 @@ sudo -u turnstone /opt/turnstone-venv/bin/python \
   tools/s6/liveness.py --epoch /var/lib/turnstone/sensor/s6-t2
 ```
 
+### The runner is ONE file, in both trees
+
+`tools/s6/proofs/run-all.sh` and the artifact's
+`s6/evidence/script-tests-proofs.sh` are **byte-identical**. The runner
+resolves the layout it finds, so the source and the artifact run the same
+proof set from the same bytes:
+
+```bash
+# the source tree
+bash tools/s6/proofs/run-all.sh                              # 634 checks, 0 failed
+
+# the artifact tree - the same runner, the same result
+cd /var/lib/turnstone/artifacts/shadow-sensor-recovery-20261017/s6
+bash evidence/script-tests-proofs.sh                          # 634 checks, 0 failed
+```
+
+That correspondence is **checked**, not claimed.
+`tools/s6/proofs/source_artifact_proof.py` (42 checks) reads the published
+digest list `tools/s6/SOURCE-SHA256SUMS` — committed in the source tree and
+mirrored into the artifact tree — and asserts that:
+
+- every file the manifest names is present in the tree, with that digest;
+- the two copies of the manifest are byte-identical;
+- the artifact's byte manifest covers the artifact's copy;
+- **no file in the tree is unlisted** — a file added on one side and not on
+  the other is exactly how the correspondence decays.
+
+The manifest is regenerated mechanically from the tree, so it cannot go
+stale by hand:
+
+```bash
+cd tools/s6 && find . -type f ! -name 'SOURCE-SHA256SUMS' \
+  ! -path '*/__pycache__/*' ! -path '*/.ruff_cache/*' \
+  ! -name '.turnstone.db*' -print0 | sort -z | xargs -0 sha256sum \
+  > SOURCE-SHA256SUMS
+```
+
+The proof reports the **same check count in both layouts**, so the two
+trees' totals are comparable.
+
 ## 6. The evidence set, and what each piece proves
 
 | artifact | checks | what it establishes |
@@ -97,11 +137,15 @@ sudo -u turnstone /opt/turnstone-venv/bin/python \
 | `tools/s6/proofs/rate_basis_proof.py` | 28 | the rate, the ETA and the labels key on the gate's count |
 | `tools/s6/proofs/provenance_required_proof.py` | 24 | acceptance **cannot** be certified without a reconciliation |
 | `tools/s6/proofs/matching_cardinality_proof.py` | 23 | the attribution is an **exact** maximum-cardinality assignment |
+| `tools/s6/proofs/source_artifact_proof.py` | 42 | the source tree and the artifact tree are the **same bytes** |
 | `tools/s6/proofs/handoff_digest_proof.py` | 33 | every digest the handoff states describes the bytes on disk |
 | `tools/s6/proofs/staleness_control.py` | 38 | the proofs above **fail** against a mutated tree |
 | `tools/s6/driver/script-tests-execute.sh` | 40 | the driver's step order, exit codes, read-only proof |
 | `tools/s6/driver/script-tests-execute-chain.sh` | 13 | the hash chain's **negative control** |
-| **total** | **592** | |
+| **total** | **634** | |
+
+Both trees produce the same total: the source runner and the artifact runner
+are the same file, so the count cannot drift between them.
 
 Plus the sensor suite (`374 passed, 2 skipped`) and the red-first proof,
 which shows the new tests **fail** against the pre-fix code.

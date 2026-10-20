@@ -37,7 +37,8 @@ import importlib.util
 import json
 import pathlib
 import sys
-from datetime import datetime, timezone
+from collections import deque
+from datetime import datetime, timedelta, timezone
 
 HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT_DSN = "dbname=turnstone"
@@ -173,11 +174,11 @@ TURN_ROLES = ("user", "system")
 #: cannot match an operator turn's projection, and attributing them to one
 #: counts machine work as operator work.
 #:
-#: Measured live on 2026-10-19, epoch s6-t2: one ``delegation_result``
-#: event's fingerprint matches NO row anywhere in the store, and the old
-#: nearest-neighbour match credited it to a genuine ``user_interjection`` row
-#: on temporal proximity alone. That same row was then credited a second time
-#: to the genuine ``operator_instruction`` event, so the double-claim HID a
+#: Measured live on 2026-10-19, epoch s6-t2: one ``delegation_result`` event's
+#: fingerprint matches NO row anywhere in the store, and the old
+#: nearest-neighbour match credited it to a genuine ``user_interjection`` row on
+#: temporal proximity alone. That same row was then credited a second time to
+#: the genuine ``operator_instruction`` event, so the double-claim HID a
 #: second defect. The row and event ids are omitted here: they are real
 #: production row ids, and a published row id is a lookup key into the live
 #: store. The property being recorded is the SHAPE of the defect - a system
@@ -217,6 +218,221 @@ def _nearest(turns: list[dict], ws_id: str, when: datetime, window: float):
     return best
 
 
+#: Attribution distances are carried as integer MICROSECONDS.
+#:
+#: Floating-point seconds would make the total cost of a matching depend on
+#: the order the summands happen to be added in, which would turn the "same
+#: input, same output" guarantee into a property of floating point rather
+#: than of the algorithm. Integer microseconds are exact, and the stored
+#: timestamps carry microsecond resolution anyway.
+_MICROSECOND = timedelta(microseconds=1)
+
+#: Sentinel for "no path" in the shortest-path search. The distances are
+#: integers (microseconds), so the search uses a float sentinel for
+#: "unreachable" and integer arithmetic everywhere else.
+_INF = float("inf")
+
+
+def _delta_us(later: datetime, earlier: datetime) -> int:
+    """The absolute distance between two instants, in whole microseconds.
+
+    Computed from the integer microsecond fields of the two timestamps, so
+    the result is EXACT - no floating-point rounding is involved anywhere in
+    the cost of the assignment. ``datetime`` guarantees microsecond
+    resolution, and the store's timestamps are microsecond-resolution
+    ``timestamptz`` values.
+    """
+    delta = later - earlier
+    return abs(delta.days * 86_400_000_000 + delta.seconds * 1_000_000
+               + delta.microseconds)
+
+
+def _candidate_key(turn: dict, distance_us: int, event_id: str) -> tuple:
+    """The deterministic ranking key for one (event, row) pair.
+
+    Ordered so that, among equally good pairings, the winner is stable:
+    closest first, then an operator-origin row ahead of a system one, then
+    the lower row id, then the lower event id. The event id is last so the
+    outcome never depends on the order the events arrive in.
+    """
+    return (distance_us, 0 if turn["origin"] == "operator" else 1,
+            turn["id"], str(event_id))
+
+
+def _min_cost_matching(
+    event_ids: list[str],
+    row_ids: list[int],
+    pairs: list[tuple[str, int, int]],
+) -> tuple[int, int, dict[str, int]]:
+    """Exact minimum-cost, maximum-cardinality bipartite matching.
+
+    The objective is lexicographic:
+
+      1. MAXIMISE the number of matched (event, row) pairs. A campaign is
+         measured in operator turns, so a matching that credits more turns
+         is better even if some pairings are less close in time. A greedy
+         assignment does not achieve this: it can take a row that a later
+         event needed, leaving that event unmatched while another row sat
+         idle - which UNDER-reports attributable operator work.
+      2. Among maximum-cardinality matchings, MINIMISE the total distance,
+         so the pairing is as tight as the data allows.
+
+    It is solved EXACTLY, by successive shortest paths over the residual
+    graph. Bellman-Ford is used for each shortest-path search, so the
+    negative residual edges that appear as soon as a path is re-routed are
+    handled exactly rather than approximated.
+
+    Only ADMISSIBLE pairs are passed in: a pair that is too far apart in
+    time is absent from ``pairs``, and therefore can never be chosen.
+
+    The problem sizes are small - on the live epoch the largest workstream
+    had 20 operator events against at most 8 candidate rows per event - so
+    the exact solver is affordable.
+
+    Returns ``(cardinality, total_cost, {event_id: row_id})``.
+    """
+    epos = {e: i for i, e in enumerate(event_ids)}
+    rpos = {r: i for i, r in enumerate(row_ids)}
+    edges = [(epos[e], rpos[r], d) for e, r, d in pairs
+             if e in epos and r in rpos]
+    if not edges:
+        return 0, 0, {}
+
+    n_e, n_r = len(event_ids), len(row_ids)
+    source = 0
+    sink = 1 + n_e + n_r
+    n_nodes = sink + 1
+    graph: list[list[int]] = [[] for _ in range(n_nodes)]
+    to: list[int] = []
+    cap: list[int] = []
+    cost: list[int] = []
+
+    def add_edge(u: int, v: int, capacity: int, c: int) -> None:
+        forward = len(to)
+        graph[u].append(forward)
+        to.append(v)
+        cap.append(capacity)
+        cost.append(c)
+        graph[v].append(forward + 1)
+        to.append(u)
+        cap.append(0)
+        cost.append(-c)
+
+    for i in range(n_e):
+        add_edge(source, 1 + i, 1, 0)
+    for j in range(n_r):
+        add_edge(1 + n_e + j, sink, 1, 0)
+    for e_pos, r_pos, c in edges:
+        add_edge(1 + e_pos, 1 + n_e + r_pos, 1, c)
+
+    total: int = 0
+    flow = 0
+    while True:
+        dist: list[float] = [_INF] * n_nodes
+        prev = [-1] * n_nodes
+        dist[source] = 0
+        queue = deque([source])
+        queued = [False] * n_nodes
+        queued[source] = True
+        while queue:
+            u = queue.popleft()
+            queued[u] = False
+            du = dist[u]
+            for edge_index in graph[u]:
+                if cap[edge_index] <= 0:
+                    continue
+                v = to[edge_index]
+                nd = du + cost[edge_index]
+                if nd < dist[v]:
+                    dist[v] = nd
+                    prev[v] = edge_index
+                    if not queued[v]:
+                        queued[v] = True
+                        queue.append(v)
+        if prev[sink] == -1:
+            break
+        node = sink
+        while node != source:
+            edge_index = prev[node]
+            cap[edge_index] -= 1
+            cap[edge_index ^ 1] += 1
+            node = to[edge_index ^ 1]
+        total += int(dist[sink])
+        flow += 1
+
+    assignment: dict[str, int] = {}
+    for event_id, row_id, _d in pairs:
+        if event_id in assignment:
+            continue
+        node = 1 + epos[event_id]
+        for edge_index in graph[node]:
+            if edge_index & 1:
+                continue  # a reverse edge, not an event->row edge
+            if cap[edge_index] != 0:
+                continue  # the pair was not used
+            target = to[edge_index]
+            if 1 + n_e <= target < 1 + n_e + n_r:
+                assignment[event_id] = row_ids[target - 1 - n_e]
+                break
+    return flow, total, assignment
+
+
+def _lexicographic_assignment(
+    pairs: list[tuple[str, int, int, tuple]],
+    event_ids: list[str],
+    row_ids: list[int],
+) -> dict[str, int]:
+    """Choose THE optimal assignment, breaking ties by the documented order.
+
+    The minimum-cost maximum-cardinality solution is usually unique, but
+    not always. When several solutions are optimal, the preferred one is
+    the one that includes the EARLIEST-ranked admissible pair, where a
+    pair is ranked by
+
+        (distance, operator-origin first, row id, event id)
+
+    That is decided exactly, not approximately: candidate pairs are
+    examined in rank order, and a pair is FIXED only when an optimal
+    assignment still exists that contains it. The result therefore never
+    depends on the order the events arrive in.
+
+    ``pairs`` are ``(event_id, row_id, distance_us, rank)`` tuples.
+    """
+    card, cost, _ = _min_cost_matching(
+        event_ids, row_ids, [(e, r, d) for e, r, d, _rank in pairs])
+    if card == 0:
+        return {}
+
+    chosen: dict[str, int] = {}
+    chosen_rows: set[int] = set()
+    remaining = list(pairs)
+    live_events = list(event_ids)
+    live_rows = list(row_ids)
+    target_card, target_cost = card, cost
+
+    for event_id, row_id, delta_us, _rank in sorted(pairs, key=lambda p: p[3]):
+        if target_card == 0:
+            break
+        if event_id in chosen or row_id in chosen_rows:
+            continue
+        rest = [p for p in remaining if p[0] != event_id and p[1] != row_id]
+        rest_events = [e for e in live_events if e != event_id]
+        rest_rows = [r for r in live_rows if r != row_id]
+        sub_card, sub_cost, _ = _min_cost_matching(
+            rest_events, rest_rows, [(e, r, d) for e, r, d, _rk in rest])
+        if 1 + sub_card != target_card:
+            continue
+        if delta_us + sub_cost != target_cost:
+            continue
+        chosen[event_id] = row_id
+        chosen_rows.add(row_id)
+        remaining = rest
+        live_events, live_rows = rest_events, rest_rows
+        target_card -= 1
+        target_cost -= delta_us
+    return chosen
+
+
 def match_events_to_turns(
     events: list[dict],
     turns: list[dict],
@@ -226,23 +442,24 @@ def match_events_to_turns(
 
     Why this exists (measured live on 2026-10-19, epoch s6-t2): the
     independent nearest-neighbour match can hand the SAME row to two events.
-    One store row was claimed by both of two admitted events 0.68 s apart,
-    because the two candidate interjection rows carry the same
-    second-resolution timestamp and both events tie on distance. One row was
-    therefore credited twice and one event was attributed to the wrong turn.
+    Two candidate interjection rows carry the same second-resolution
+    timestamp, so both events tie on distance. One row was therefore
+    credited twice and one event was attributed to the wrong turn.
 
     The fingerprints settle the tie independently of the matcher::
 
         c3eab1e49e95a55d087a90d82eee66bd == "do not modify the staging host"
         7424fc427f7909b93ee2ec1b058862a4 == "scope is limited to the second node"
 
-    These are SYNTHETIC messages with RECOMPUTED fingerprints. The originals
-    were real operator text, and the fingerprint is an unsalted SHA-256 of
-    the projection - so publishing the text beside its digest published the
-    content AND a lookup key for it, and the digest of a real message is a
-    confirmation oracle (guess the message, hash it, compare). The property
-    the test needs - two DISTINCT digests over two DISTINCT messages - is
-    preserved exactly.
+    These are SYNTHETIC messages with recomputed fingerprints. The originals
+    were real operator text, and the fingerprint is an UNSALTED SHA-256 of the
+    projection - so publishing the text next to its digest published both the
+    content and a lookup key for it. The digest of a real message is also a
+    confirmation oracle: anyone who can guess the message can verify it
+    against the published digest, and anyone holding the digest can find the
+    matching row in the live telemetry. Synthetic text with a recomputed
+    digest has neither property, and the property the test needs - two
+    DISTINCT digests over two DISTINCT messages - is preserved exactly.
 
     TWO rules, both required:
 
@@ -255,11 +472,23 @@ def match_events_to_turns(
        machine work as operator work. They are reported in their own bucket
        instead - see :func:`reconcile`.
 
-    2. ONE ROW, ONE EVENT. The assignment consumes each row at most once.
-       Events are processed in timestamp order, and each event takes its best
-       still-unclaimed candidate, ranked by (distance, operator-origin first,
-       row id). The row id is the final tie-break so the result never depends
-       on the order the events arrive in.
+    2. ONE ROW, ONE EVENT, MAXIMALLY MANY. The assignment is a MIMUM-COST
+       MAXIMUM-CARDINALITY bipartite matching, solved exactly. It consumes
+       each row at most once, and among all such assignments it:
+
+         a. matches as MANY events as the data allows, and
+         b. subject to that, minimises the total attribution distance.
+
+       A greedy assignment (each event takes its best still-unclaimed
+       candidate) does not achieve (a): it can take a row that a later
+       event needed, leaving that event unmatched while another row sat
+       idle. That UNDER-reports attributable operator work, which is the
+       same class of defect as the double-claim it was written to fix.
+
+       Ties among equally optimal assignments are broken by
+       (distance, operator-origin first, row id, event id), decided
+       exactly, so the result never depends on the order the events
+       arrive in.
 
     A row that is not claimed stays unclaimed. An event with no candidate
     stays unmatched - it is not allowed to steal a row from a better-matched
@@ -271,34 +500,83 @@ def match_events_to_turns(
             continue
         by_workstream.setdefault(turn["ws_id"], []).append(turn)
 
-    claimed: set[int] = set()
+    # Workstreams are independent: a row in one workstream can never be
+    # claimed by an event in another, so each workstream is solved on its
+    # own and the results are merged.
     matched: list[dict] = []
-    for event in sorted(events, key=lambda e: (e["ts"], str(e.get("event_id", "")))):
-        if event.get("event_type") not in (None, OPERATOR_EVENT):
-            # Not operator instruction work: see OPERATOR_EVENT.
+    for ws_id, ws_turns in by_workstream.items():
+        ws_events = [
+            e for e in events
+            if e.get("ws_id") == ws_id
+            and e.get("event_type") in (None, OPERATOR_EVENT)
+            and e.get("ts") is not None
+        ]
+        if not ws_events:
             continue
+        matched.extend(_match_one_workstream(ws_events, ws_turns, window))
+    matched.sort(key=lambda m: (m["event"]["ts"], str(m["event"].get("event_id", ""))))
+    return matched
+
+
+def _match_one_workstream(
+    events: list[dict],
+    turns: list[dict],
+    window: float,
+) -> list[dict]:
+    """The exact one-to-one assignment for ONE workstream.
+
+    Events and rows are matched across the whole workstream at once, not
+    event by event, because that is what makes the matching maximum-
+    cardinality: an event is allowed to give up its closest row to a
+    later event if that is what lets both be attributed.
+    """
+    # The event id is the identity of an event in the assignment. Fall back
+    # to a positional id when the caller did not supply one, so the
+    # assignment is still well defined.
+    ordered_events = sorted(
+        events, key=lambda e: (e["ts"], str(e.get("event_id", ""))))
+    event_keys: list[str] = []
+    event_by_key: dict[str, dict] = {}
+    for index, event in enumerate(ordered_events):
+        key = str(event.get("event_id") or f"__idx_{index}")
+        if key in event_by_key:
+            # Two events with the same id: disambiguate so that neither is
+            # silently dropped from the assignment.
+            key = f"{key}#{index}"
+        event_keys.append(key)
+        event_by_key[key] = event
+
+    ordered_turns = sorted(turns, key=lambda t: (t["ts"], t["id"]))
+    turn_by_id = {t["id"]: t for t in ordered_turns}
+
+    window_us = int(round(window * 1_000_000))
+    pairs: list[tuple[str, int, int, tuple]] = []
+    for event_key in event_keys:
+        event = event_by_key[event_key]
         when = event["ts"]
-        if when is None:
-            continue
-        best, best_key = None, None
-        for turn in by_workstream.get(event["ws_id"], ()):
-            if turn["id"] in claimed:
+        for turn in ordered_turns:
+            delta_us = _delta_us(turn["ts"], when)
+            if delta_us > window_us:
                 continue
-            delta = abs((turn["ts"] - when).total_seconds())
-            if delta > window:
-                continue
-            # (distance, 0 for operator, row id) - operator first at equal
-            # distance, row id last so the outcome is order-independent.
-            key = (round(delta, 3), 0 if turn["origin"] == "operator" else 1, turn["id"])
-            if best_key is None or key < best_key:
-                best, best_key = turn, key
-        if best is None:
-            continue
-        claimed.add(best["id"])
+            pairs.append((event_key, turn["id"], delta_us,
+                          _candidate_key(turn, delta_us, event_key)))
+
+    # A row that is not admissible for ANY event can never be matched, so it
+    # is left out of the assignment entirely. This keeps the exact solver's
+    # graph proportional to the contested region rather than to the size of
+    # the workstream's whole history.
+    contested_rows = sorted({row_id for _e, row_id, _d, _rank in pairs})
+    assignment = _lexicographic_assignment(pairs, event_keys, contested_rows)
+
+    matched: list[dict] = []
+    for event_key, row_id in assignment.items():
+        event = event_by_key[event_key]
+        turn = turn_by_id[row_id]
+        delta_us = _delta_us(turn["ts"], event["ts"])
         matched.append({
             "event": event,
-            "turn": best,
-            "distance_s": best_key[0],
+            "turn": turn,
+            "distance_s": delta_us / 1_000_000,
         })
     return matched
 
@@ -329,8 +607,8 @@ def reconcile(
     admitted_by_fp: dict[tuple[str, str], dict] = {}
 
     # The attribution is a ONE-TO-ONE assignment over the ADMITTED OPERATOR
-    # events. The independent nearest-neighbour match could hand one row to
-    # two events, which double-credits a row and mis-attributes an event.
+    # events. The independent nearest-neighbour match could hand one row to two
+    # events, which double-credits a row and mis-attributes an event.
     # See match_events_to_turns for the full account.
     admitted_events = [e for e in events if e["outcome"] == "sensor_call"]
     assignment = {

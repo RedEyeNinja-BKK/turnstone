@@ -93,9 +93,10 @@ def build(root: pathlib.Path, *, name: str = "s6-proof", t1: str | None = T1_TEX
 
 
 def run(**kw) -> dict:
+    provenance = kw.pop("provenance", None)
     with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
         epoch = build(pathlib.Path(tmp), **kw)
-        return col.collect(epoch)
+        return col.collect(epoch, provenance=provenance)
 
 
 def main() -> int:
@@ -236,9 +237,32 @@ def main() -> int:
     check("no T1 marker: gate not met", r["gate"]["observations"]["met"], False)
 
     # ---- the gate speaks about EVENTS ONLY, never about grading ------------
+    # The gate counts ATTRIBUTABLE events. Without a reconciliation there
+    # are none that have been verified against the store, so the gate fails
+    # closed: the raw rows are still reported as events, but they cannot
+    # certify anything.
     r = run(cadence=[admitted(f"g{i}", 10 + i) for i in range(100)],
             observations=[observation(f"g{i}", 11 + i, basis="attachments_only")
                           for i in range(100)])
+    check("100 descriptor-only rows do NOT satisfy the gate without provenance",
+          r["gate"]["observations"]["met"], False)
+    check("...and the raw rows are still counted as events",
+          r["unique_observations"], 100)
+    check("...and grade nothing at all",
+          r["coverage"]["semantic_graded_events"], 0)
+    check("...with the semantic rate undefined, not 1.0",
+          r["coverage"]["qualified_semantic_rate"], None)
+    check("the gate exposes no grading key to be misread",
+          sorted(k for k in r["gate"] if "grad" in k or "semantic" in k), [])
+
+    # With a reconciliation, the same 100 events DO satisfy the gate: the
+    # gate speaks about EVENTS, never about grading.
+    r = run(cadence=[admitted(f"g{i}", 10 + i) for i in range(100)],
+            observations=[observation(f"g{i}", 11 + i, basis="attachments_only")
+                          for i in range(100)],
+            provenance={"B_verified_operator": 100,
+                        "B2_verified_operator_audit": 0,
+                        "C_unverified": 0})
     check("100 descriptor-only events satisfy the observation gate",
           r["gate"]["observations"]["met"], True)
     check("...and grade nothing at all",
@@ -251,12 +275,18 @@ def main() -> int:
     # ---- 99 vs 100 is the boundary the gate actually enforces ---------------
     r = run(cadence=[admitted(f"g{i}", 10 + i) for i in range(100)],
             observations=[observation(f"g{i}", 11 + i, basis="text")
-                          for i in range(100)])
+                          for i in range(100)],
+            provenance={"B_verified_operator": 100,
+                        "B2_verified_operator_audit": 0,
+                        "C_unverified": 0})
     check("100 events meet the observation gate",
           r["gate"]["observations"]["met"], True)
     r = run(cadence=[admitted(f"g{i}", 10 + i) for i in range(99)],
             observations=[observation(f"g{i}", 11 + i, basis="text")
-                          for i in range(99)])
+                          for i in range(99)],
+            provenance={"B_verified_operator": 99,
+                        "B2_verified_operator_audit": 0,
+                        "C_unverified": 0})
     check("99 events do not meet it", r["gate"]["observations"]["met"], False)
 
     print("---")

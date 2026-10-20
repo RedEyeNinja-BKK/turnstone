@@ -73,13 +73,59 @@ Eligibility is decided by the event's recorded **type**, not by its
 materiality, so an event with no recorded type is still attributed exactly
 as before.
 
-### 3.2 One row, one event
+### 3.2 One row, one event, and as many as the data allows
 
 The deployed assignment could match the **same store row** to more than one
 event. Each row is now consumed at most once.
 
-Ties are ordered deterministically by `(distance, operator-origin first, row
-id)`, so the same population always produces the same assignment.
+That alone was not enough. The one-to-one rule was implemented as a **greedy**
+assignment — each event took its best still-unclaimed candidate, in event
+order — and a greedy assignment does not find a *complete* matching when
+events compete for the same rows. It can take a row that a later event needed,
+leaving that event unmatched while another row sat idle. That **under-reports**
+attributable operator work, which is the same class of defect as the
+double-claim: reporting less work than was done.
+
+The counterexample (a 5-second window):
+
+```
+store rows at  -4 s  and  +1 s
+events        at  +0.5 s and +5.5 s
+
+event @ +0.5 s  -> candidates: row @ -4 s (d = 4.5), row @ +1 s (d = 0.5)
+event @ +5.5 s  -> candidates: row @ +1 s (d = 4.5)
+```
+
+The greedy matcher gives row `+1 s` to the event at `+0.5 s` (it is the
+closest) and leaves the event at `+5.5 s` unmatched: **one** match. But event
+`+0.5 s` → row `-4 s` and event `+5.5 s` → row `+1 s` is a valid **two**-match
+assignment.
+
+The attribution is now an **exact minimum-cost, maximum-cardinality**
+bipartite matching, solved by successive shortest paths over the residual
+graph:
+
+1. **MAXIMISE** the number of matched (event, row) pairs. A campaign is
+   measured in operator turns, so a matching that credits more turns is
+   better even if some pairings are less close in time.
+2. Among maximum-cardinality matchings, **MINIMISE** the total attribution
+   distance, so the pairing is as tight as the data allows.
+3. Break remaining ties deterministically by
+   `(distance, operator-origin first, row id, event id)`, decided exactly, so
+   the result never depends on the order the events arrive in.
+
+Distances are carried as integer **microseconds**, computed from the
+timestamps' integer fields, so the cost of a matching never depends on
+floating-point rounding or on the order the summands happen to be added in.
+
+The problem sizes are small: on the live epoch the largest workstream had 20
+operator events against at most 8 candidate rows per event, so the exact
+solver is affordable.
+
+`tools/s6/proofs/matching_cardinality_proof.py` pins the property, and its
+last check cross-checks the solver against a **brute-force** optimum over 60
+randomised instances. The proof is red-first: against the greedy matcher it
+fails 5 checks, including 16 of the 60 brute-force comparisons.
 
 ### 3.3 The effect on the count
 
@@ -87,11 +133,18 @@ id)`, so the same population always produces the same assignment.
 |---|---|
 | deployed (type-blind, row-reusing) | **44** |
 | corrected (type-aware, one-to-one) | **43** |
+| corrected (type-aware, exact maximum-cardinality) | **43** |
 
 **The count goes DOWN by one, and that is correct.** The deployed matcher was
 crediting a `delegation_result` — machine work — to an operator turn, so it
 was counting machine work as operator work. The correction removes that
 inflation.
+
+The exact matching does not change the live count: on the live epoch the
+contested region is small enough that the greedy and exact assignments agree
+on every event. It changes the *guarantee* — the count is now the maximum
+the data supports, and it stays that way as the population grows, rather
+than depending on the order the events happen to arrive in.
 
 ## 4. The independent cross-check
 

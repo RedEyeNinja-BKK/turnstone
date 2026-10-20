@@ -167,7 +167,7 @@ Everything below runs without root, without a service, and without writing
 outside `/var/tmp`.
 
 ```bash
-# the measurement and driver proofs  -> 522 checks, 0 failed
+# the measurement and driver proofs  -> 592 checks, 0 failed
 bash tools/s6/proofs/run-all.sh
 
 # the sensor suite

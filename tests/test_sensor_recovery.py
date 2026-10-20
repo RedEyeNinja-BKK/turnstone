@@ -795,14 +795,14 @@ def test_sanitized_mode_redacts_secrets_paths_and_emails():
     state = lifecycle.build_state(
         content_mode="sanitized",
         objective=(
-            "Deploy with token=abc123SECRET to /home/vincent/.ssh/id_rsa "
+            "Deploy with token=abc123SECRET to /home/example-user/.ssh/id_rsa "
             "and mail ops@example.com"
         ),
         phase="operator_instruction",
     )
     text = state["objective"]
     assert "abc123SECRET" not in text
-    assert "/home/vincent/.ssh/id_rsa" not in text
+    assert "/home/example-user/.ssh/id_rsa" not in text
     assert "ops@example.com" not in text
     assert "\u005bredacted\u005d" in text
     assert "\u005bpath\u005d" in text

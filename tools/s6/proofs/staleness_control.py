@@ -118,6 +118,14 @@ def main() -> int:
         check("the handoff digest proof passes the shipped tree", rc, 0)
         ok("...and reports no failures",
            "fail=0" in out, out[-300:])
+        rc, out = run_proof("provenance_required_proof.py", tree)
+        check("the provenance-required proof passes the shipped tree", rc, 0)
+        ok("...and reports no failures",
+           "fail=0" in out, out[-300:])
+        rc, out = run_proof("matching_cardinality_proof.py", tree)
+        check("the matching-cardinality proof passes the shipped tree", rc, 0)
+        ok("...and reports no failures",
+           "fail=0" in out, out[-300:])
 
     # ---- 1. the rate computed on the RAW count must be caught --------------
     print()
@@ -211,6 +219,91 @@ def main() -> int:
         ok("...and the failure names the disagreement",
            "the basis label and the availability flag agree" in out, out[-600:])
         collect.write_text(original)
+
+    # ---- 4b. a raw-count fallback in the GATE must be caught --------------
+    print()
+    print("4b. GATE FALLBACK - a raw count must not be able to satisfy the gate")
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as raw:
+        tmp = pathlib.Path(raw)
+        tree = mutated_tree(tmp)
+        collect = tree / "collect.py"
+        original = collect.read_text()
+        # Put the pre-fix behaviour back: the gate reads the RAW count, so
+        # raw rows can satisfy the 100-event acceptance requirement even
+        # when nothing has been verified against the store.
+        mutated = original.replace(
+            '                "met": bool(has_provenance\n'
+            '                           and attributable_observations >= GATE_OBSERVATIONS),',
+            '                "met": bool(unique_observations >= GATE_OBSERVATIONS),',
+        )
+        ok("the mutation applied", mutated != original)
+        collect.write_text(mutated)
+        rc, out = run_proof("provenance_required_proof.py", tree)
+        ok("a raw-count gate fallback is rejected", rc != 0, f"rc={rc}")
+        ok("...and the failure names the fail-closed gate",
+           "FAIL" in out, out[-600:])
+        collect.write_text(original)
+
+    # ---- 4c. a raw count published as the ATTRIBUTABLE rate must be caught -
+    print()
+    print("4c. NO-PROVENANCE RATE - no attributable rate may be published")
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as raw:
+        tmp = pathlib.Path(raw)
+        tree = mutated_tree(tmp)
+        collect = tree / "collect.py"
+        original = collect.read_text()
+        # With no reconciliation, publish the raw count AS the attributable
+        # count. The gate still fails closed, but the published rate would
+        # then be a raw rate wearing an attributable label.
+        mutated = original.replace(
+            "        attributable_observations = 0\n"
+            '        rate_basis = "raw"',
+            "        attributable_observations = unique_observations\n"
+            '        rate_basis = "raw"',
+        )
+        ok("the mutation applied", mutated != original)
+        collect.write_text(mutated)
+        rc, out = run_proof("provenance_required_proof.py", tree)
+        ok("a raw count published as attributable is rejected", rc != 0,
+           f"rc={rc}")
+        ok("...and the failure names the count",
+           "FAIL" in out, out[-600:])
+        collect.write_text(original)
+
+    # ---- 4d. the GREEDY matcher must be caught ---------------------------
+    print()
+    print("4d. GREEDY MATCHER - the exact assignment must be restored")
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as raw:
+        tmp = pathlib.Path(raw)
+        tree = mutated_tree(tmp)
+        prov = tree / "provenance.py"
+        original = prov.read_text()
+        # Replace the exact assignment with the ORIGINAL greedy matcher:
+        # each event, in timestamp order, takes its best still-unclaimed
+        # candidate. That is the pre-fix matcher, and it UNDER-reports
+        # attributable work.
+        mutated = original.replace(
+            "    assignment = _lexicographic_assignment(pairs, event_keys, contested_rows)",
+            "    assignment = {}\n"
+            "    _claimed = set()\n"
+            "    for _ek in event_keys:\n"
+            "        _best = None\n"
+            "        for _p in pairs:\n"
+            "            if _p[0] != _ek or _p[1] in _claimed:\n"
+            "                continue\n"
+            "            if _best is None or _p[3] < _best[3]:\n"
+            "                _best = _p\n"
+            "        if _best is not None:\n"
+            "            assignment[_ek] = _best[1]\n"
+            "            _claimed.add(_best[1])",
+        )
+        ok("the mutation applied", mutated != original)
+        prov.write_text(mutated)
+        rc, out = run_proof("matching_cardinality_proof.py", tree)
+        ok("a greedy matcher is rejected", rc != 0, f"rc={rc}")
+        ok("...and the failure names the matching",
+           "FAIL" in out, out[-600:])
+        prov.write_text(original)
 
     # ---- 5. a stale digest in the handoff must be caught -------------------
     print()

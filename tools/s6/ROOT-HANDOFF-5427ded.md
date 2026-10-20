@@ -4,7 +4,7 @@
 child process and never alters your shell.
 
 ```bash
-sudo bash -c 'cd /var/lib/turnstone/artifacts/shadow-sensor-recovery-20261017/s6 && echo "dcaabb9ce3c25fcd631d15c7204744f1de4e708b88c43b78d4294f91eb960367  s6-t2-execute.sh" | sha256sum -c - && bash s6-t2-execute.sh'
+sudo bash -c 'cd /var/lib/turnstone/artifacts/shadow-sensor-recovery-20261017/s6 && echo "cddf81c83acf7931c2f25aacc271c8cc6dc105231212b9fbafd24b75bdb10f09  s6-t2-execute.sh" | sha256sum -c - && bash s6-t2-execute.sh'
 ```
 
 That is the whole operator interface. No `set -euo pipefail` is typed into your
@@ -247,19 +247,19 @@ f785179fad1963d541c67bf22a22dd1916a58960bace195c5666c8ef1fbb267c  staging-5427de
 823a094e6b59db8dff74964d5849f49fb2b63fd6a3b152a182e9e6f79e683f68  staging-5427ded/install-slot.sh
 5843cc8ce518cfcdc16b5401ba49dbe9c493d282f5c21d0114a436f95f3f7a83  activate-cluster-5427ded.sh
 9f8d7815708e6442d5274c80f46609a29020706e5c1a8749798e0cdd7e938055  rollback-cluster-5427ded.sh
-f1d290b84fb419f9069dbcb72a96d0a55b64f7a97831b0f107da3dd44c275557  collect.py
+089cb1044781cbe6299a967c759563f3df19dacb9170963fef7674849a34b892  collect.py
 13988c65607ca3dd5f12a863d1908950eb3ee8bb9add0bf514ceec643edf2f6a  liveness.py
-5e5f6932eae97f13986041002db13294374e68688b4c55c39c41e81e3eb0dbca  provenance.py
+fb2397b03abed2250a706f5487bb192424806083606310288cea3d8f256321cc  provenance.py
 ```
 
-`dcaabb9ce3c25fcd631d15c7204744f1de4e708b88c43b78d4294f91eb960367  s6-t2-execute.sh` — the driver itself, checked by the inline
+`cddf81c83acf7931c2f25aacc271c8cc6dc105231212b9fbafd24b75bdb10f09  s6-t2-execute.sh` — the driver itself, checked by the inline
 `sha256sum -c` in the command at the top of this document.
 
 Byte manifests, regenerated after the last write:
 
 ```
-s6/SHA256SUMS  122 entries   sha256sum -c clean
-SHA256SUMS (artifact root)  147 entries   sha256sum -c clean
+s6/SHA256SUMS  129 entries   sha256sum -c clean
+SHA256SUMS (artifact root)  158 entries   sha256sum -c clean
 ```
 
 Rule: every regular file under the artifact root, excluding `SHA256SUMS`

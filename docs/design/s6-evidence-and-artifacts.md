@@ -86,22 +86,24 @@ sudo -u turnstone /opt/turnstone-venv/bin/python \
 | artifact | checks | what it establishes |
 |---|---|---|
 | `tools/s6/proofs/liveness_proof.py` | 71 | the liveness reporter's coverage arithmetic |
-| `tools/s6/proofs/collector_proof.py` | 51 | the collector's epoch window and grading split |
+| `tools/s6/proofs/collector_proof.py` | 56 | the collector's epoch window and grading split |
 | `tools/s6/proofs/t1_exclusion_proof.py` | 27 | pre-boundary rows are excluded, epoch-name independent |
 | `tools/s6/proofs/epoch_selection_proof.py` | 57 | each epoch closes at the next epoch's boundary |
 | `tools/s6/proofs/watch_condition_proof.py` | 29 | the watch's stop condition |
 | `tools/s6/proofs/watch_lifetime_proof.py` | 60 | the watch's budget and lifetime |
 | `tools/s6/proofs/provenance_proof.py` | 35 | the provenance classification |
-| `tools/s6/proofs/gate_provenance_proof.py` | 20 | the gate cannot silently fall back to raw rows |
+| `tools/s6/proofs/gate_provenance_proof.py` | 22 | the gate cannot silently fall back to raw rows |
 | `tools/s6/proofs/boundary_marker_proof.py` | 36 | the boundary is written once, never overwritten |
-| `tools/s6/proofs/rate_basis_proof.py` | 25 | the rate, the ETA and the labels key on the gate's count |
+| `tools/s6/proofs/rate_basis_proof.py` | 28 | the rate, the ETA and the labels key on the gate's count |
+| `tools/s6/proofs/provenance_required_proof.py` | 24 | acceptance **cannot** be certified without a reconciliation |
+| `tools/s6/proofs/matching_cardinality_proof.py` | 23 | the attribution is an **exact** maximum-cardinality assignment |
 | `tools/s6/proofs/handoff_digest_proof.py` | 33 | every digest the handoff states describes the bytes on disk |
-| `tools/s6/proofs/staleness_control.py` | 25 | the two proofs above **fail** against a mutated tree |
+| `tools/s6/proofs/staleness_control.py` | 38 | the proofs above **fail** against a mutated tree |
 | `tools/s6/driver/script-tests-execute.sh` | 40 | the driver's step order, exit codes, read-only proof |
 | `tools/s6/driver/script-tests-execute-chain.sh` | 13 | the hash chain's **negative control** |
-| **total** | **522** | |
+| **total** | **592** | |
 
-Plus the sensor suite (`362 passed, 2 skipped`) and the red-first proof,
+Plus the sensor suite (`374 passed, 2 skipped`) and the red-first proof,
 which shows the new tests **fail** against the pre-fix code.
 
 ## 7. The red-first evidence

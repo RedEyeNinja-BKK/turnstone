@@ -185,15 +185,25 @@ def main() -> int:
 
         # ---- 2. without a reconciliation the basis is named as raw --------
         print()
-        print("2. NO RECONCILIATION - the raw basis is used and named")
+        print("2. NO RECONCILIATION - the raw basis is named, and the gate "
+              "fails closed")
+        # Without a reconciliation nothing is VERIFIED, so there is no
+        # attributable rate, no ETA, and the gate's count is zero. The raw
+        # count stays available as INFORMATION - it is published beside the
+        # gate and labelled as raw - but it can never certify the campaign.
         r_raw = COLLECT.collect(epoch)
         check("the basis is named", r_raw.get("rate_basis"), "raw")
-        check("the rate counts the raw rows", r_raw.get("rate_events"), N_RAW)
-        check("the rate is over the raw count", r_raw["observed_per_hour"], raw_rate)
-        check("the gate falls back to the raw count",
-              r_raw["gate"]["observations"]["have"], N_RAW)
+        check("there is no attributable rate without a reconciliation",
+              r_raw["observed_per_hour"], None)
+        check("...and no ETA", r_raw["eta_hours_to_100"], None)
+        check("the gate's count is zero without a reconciliation",
+              r_raw["gate"]["observations"]["have"], 0)
+        check("...and the gate cannot be met",
+              r_raw["gate"]["observations"]["met"], False)
         check("...and says provenance was unavailable",
               r_raw["gate"]["provenance_available"], False)
+        check("...but the raw count is still published as information",
+              r_raw["gate"]["raw_observations"], N_RAW)
 
         # An EMPTY reconciliation carries no bucket counts, so it cannot
         # support an attributable count. It must fall back to the raw basis
@@ -204,6 +214,8 @@ def main() -> int:
               r_empty.get("rate_basis"), "raw")
         check("...and says provenance was unavailable",
               r_empty["gate"]["provenance_available"], False)
+        check("...and the gate fails closed",
+              r_empty["gate"]["observations"]["met"], False)
         ok("the basis label and the availability flag agree",
            (r_empty.get("rate_basis") == "attributable")
            == bool(r_empty["gate"]["provenance_available"]),

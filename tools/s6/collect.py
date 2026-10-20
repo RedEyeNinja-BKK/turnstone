@@ -515,7 +515,17 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
         )
         rate_basis = "attributable"
     else:
-        attributable_observations = unique_observations
+        # No reconciliation: nothing is VERIFIED, so the count that can
+        # certify the campaign is ZERO. The raw count stays available for
+        # INFORMATION - "how many rows exist at all" is worth knowing - but
+        # it is never the gate's count.
+        #
+        # The rate and the ETA are computed over the same count as the gate,
+        # so with no reconciliation they are unavailable too. That is
+        # deliberate: a forecast built on rows nobody has attributed to an
+        # operator turn is a forecast of unverified work, and publishing it
+        # next to a real forecast invites the reader to treat them alike.
+        attributable_observations = 0
         rate_basis = "raw"
 
     admitted_total = sum(v["acceptance_admitted"] for v in per_service.values())
@@ -650,13 +660,20 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
             # The gate counts INDEPENDENTLY ATTRIBUTABLE operator events, not
             # raw observation rows. When provenance reconciliation is
             # available the verified count is what `met` keys on, so an
-            # unattributable row can never help certify the campaign. Without
-            # it, the raw count is used and `provenance_available` is false -
-            # never silently presented as verified.
+            # unattributable row can never help certify the campaign.
+            #
+            # WITHOUT a reconciliation the gate FAILS CLOSED. The raw count
+            # is still reported beside it, and is still useful information,
+            # but it can never satisfy the 100-event requirement: a campaign
+            # is certified by events VERIFIED against the conversation store,
+            # and with no reconciliation nothing is verified. The count is
+            # zero in that case, so `met` is false no matter how many raw
+            # rows exist.
             "observations": {
                 "have": attributable_observations,
                 "need": GATE_OBSERVATIONS,
-                "met": attributable_observations >= GATE_OBSERVATIONS,
+                "met": bool(has_provenance
+                           and attributable_observations >= GATE_OBSERVATIONS),
             },
             "provenance_available": has_provenance,
             "raw_observations": unique_observations,
@@ -690,10 +707,18 @@ def collect(epoch: pathlib.Path, *, selection: str = "", provenance: dict | None
         "rate_events": attributable_observations,
         "observed_per_hour": round(obs_per_hour, 2) if obs_per_hour is not None else None,
         "eta_hours_to_100": round(eta_hours, 1) if eta_hours is not None else None,
-        "rate_note": None if rateable else (
-            f"needs >= {MIN_RATE_SAMPLE} acceptance observations and >= "
-            f"{MIN_RATE_HOURS}h after the epoch boundary (have {attributable_observations} in "
-            f"{(round(elapsed_h, 2) if elapsed_h is not None else 0)}h)"
+        "rate_note": (
+            "no provenance reconciliation: nothing is verified, so there is "
+            "no attributable rate and no ETA. The raw count is reported "
+            "separately as information"
+            if not has_provenance else (
+                None if rateable else (
+                    f"needs >= {MIN_RATE_SAMPLE} acceptance observations and >= "
+                    f"{MIN_RATE_HOURS}h after the epoch boundary (have "
+                    f"{attributable_observations} in "
+                    f"{(round(elapsed_h, 2) if elapsed_h is not None else 0)}h)"
+                )
+            )
         ),
         "note": (
             "Only observations at or after this epoch's boundary count toward "
@@ -727,10 +752,18 @@ def render(result: dict) -> str:
     # attributed to an operator turn cannot certify the campaign, so it is
     # never presented as progress toward 100. The raw count is reported
     # separately, and labelled as raw.
+    if not gate.get("provenance_available"):
+        lines.append("PROVENANCE UNAVAILABLE - the gate FAILS CLOSED.")
+        lines.append("  No reconciliation means nothing is VERIFIED against the")
+        lines.append("  conversation store, so the attributable count is 0 and")
+        lines.append("  acceptance CANNOT be met, whatever the raw row count is.")
+        lines.append(f"  rate basis    : {result['rate_basis']}"
+                     "  (raw rows are informational; no attributable rate,"
+                     " no ETA)")
     lines.append(f"attributable  : {gate['observations']['have']} / {GATE_OBSERVATIONS}"
                  "  (events that count toward the gate)")
     lines.append(f"raw obs rows  : {result['unique_observations']}"
-                 "  (not all attributable to a stored turn)")
+                 "  (informational only; not all attributable to a stored turn)")
     lines.append(f"admitted rows : {result['admitted_rows']}  (suppressed"
                  f" {result['suppressed_total']}, admission rate {result['admission_rate']})")
     lines.append(f"workstreams   : {result['distinct_workstreams']}")
@@ -846,6 +879,9 @@ def render(result: dict) -> str:
                  + (f"; raw {gate['raw_observations']}, unverified "
                     f"{gate['unverified']}" if gate.get('provenance_available') else "")
                  + ")")
+    if not gate.get("provenance_available"):
+        lines.append("  provenance available   : NO - the gate fails closed, so")
+        lines.append("                           the raw count cannot certify it")
     lines.append(f"  elapsed >= 48h         : "
                  f"{'MET' if gate['elapsed']['met'] else 'PENDING'}")
     lines.append(f"  zero unmatched         : {'MET' if gate['unmatched_ok'] else 'FAILED'}")

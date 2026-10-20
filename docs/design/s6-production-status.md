@@ -5,7 +5,7 @@
 
 ## Snapshot
 
-**Observed 2026-10-19T20:44Z.**
+**Observed 2026-10-20T07:38Z.**
 
 | item | value |
 |---|---|
@@ -15,7 +15,7 @@
 | deployed commit | `5427ded3aa7668975e2cef2621e81b9131498281` |
 | epoch | `s6-t2` |
 | boundary | `T2` = `2026-10-18T13:21:51Z` |
-| elapsed | 31.4 h of the 48 h floor |
+| elapsed | 42.27 h of the 48 h floor |
 | next deadline | `2026-10-20T13:21:51Z` (the 48 h floor) |
 
 No service has been restarted since the boundary: all six still carry their
@@ -25,11 +25,11 @@ No service has been restarted since the boundary: all six still carry their
 
 | | |
 |---|---|
-| attributable events (B + B2) | **53** / 100 |
-| raw observation rows | 61 |
+| attributable events (B + B2) | **61** / 100 |
+| raw observation rows | 71 |
 | unverified (C) | 0 |
 | provenance available | true |
-| elapsed | 31.4 h / 48 h |
+| elapsed | 42.27 h / 48 h |
 | **gate** | **PENDING** on both the count and the time |
 
 Integrity checks are all met: zero unmatched, zero duplicate event ids,
@@ -38,6 +38,28 @@ zero orphans, boundary present.
 **The count is live and it moves.** The epoch is receiving genuine operator
 work, so the number rises on its own. The figure at any moment is a
 measurement of that moment, not a fixed property of the epoch.
+
+## The gate fails closed without a reconciliation
+
+The raw count and the attributable count are **different numbers**, and only
+the second one can certify the campaign. `61` attributable events and `71`
+raw rows are not interchangeable: the difference is the events that could not
+be tied to a stored operator turn.
+
+The corrected collector makes that distinction unarguable. **Without** a
+provenance reconciliation:
+
+- the gate count is **zero**, and `met` is **false** — the gate cannot be
+  satisfied by raw rows;
+- the raw count is still published, explicitly labelled informational;
+- **no** attributable rate and **no** ETA are published, because a forecast
+  built on events nobody has attributed to an operator turn is a forecast of
+  unverified work, and publishing it next to a real forecast invites the
+  reader to treat the two alike.
+
+`tools/s6/proofs/provenance_required_proof.py` pins this, with negative
+controls in `staleness_control.py` that re-introduce the old fallback and
+require the proof to reject it.
 
 ## Distinct-turn suppression
 

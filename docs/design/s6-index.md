@@ -33,13 +33,13 @@ against the evidence that produced it.
 | `tools/s6/liveness.py` | the liveness reporter: operator-work coverage |
 | `tools/s6/provenance.py` | the event-provenance reconciliation |
 | `tools/s6/s6-t2-execute.sh` | the single operator command |
-| `tools/s6/proofs/` | the pure-logic proofs (522 checks) |
+| `tools/s6/proofs/` | the pure-logic proofs (592 checks) |
 | `tools/s6/driver/` | the driver's own proofs, including the hash-chain negative control |
 
 ## Quick start
 
 ```bash
-bash tools/s6/proofs/run-all.sh     # 522 checks, 0 failed
+bash tools/s6/proofs/run-all.sh     # 592 checks, 0 failed
 python -m pytest -q                 # the sensor suite
 ```
 

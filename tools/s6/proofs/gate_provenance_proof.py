@@ -150,14 +150,21 @@ def main() -> int:
               COLLECT.collect(epoch, provenance=provenance_for(0, 2))
               ["gate"]["observations"]["met"], False)
 
-        # Without provenance the raw count is used, but it is never presented
-        # as verified: the flag is false and `unverified` is unknown.
+        # Without provenance the gate FAILS CLOSED: nothing is verified, so
+        # the gate's count is zero and the gate can never be met, whatever
+        # the raw row count is. The raw count stays available as information,
+        # and the flag says it is not verified.
         r_raw = COLLECT.collect(epoch)
-        check("without provenance the raw count is used", r_raw["gate"]["observations"]["have"], 2)
+        check("without provenance the gate's count is zero",
+              r_raw["gate"]["observations"]["have"], 0)
+        check("...and the gate cannot be met",
+              r_raw["gate"]["observations"]["met"], False)
         check("...and it is NOT presented as verified",
               r_raw["gate"]["provenance_available"], False)
         check("...and the unverified count is unknown, not zero",
               r_raw["gate"]["unverified"], None)
+        check("...but the raw count is still reported as information",
+              r_raw["gate"]["raw_observations"], 2)
 
         # ---- 2. the lanes counter and the reconciliation are DIFFERENT -----
         print()

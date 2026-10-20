@@ -76,10 +76,10 @@ def observed(monkeypatch):
     real = lifecycle.observe_event
 
     def _record(event, state=None, *, force=False, workstream="", registry=None,
-                content_basis="text"):
+                content_basis="text", turn_id=""):
         calls.append((event, str((state or {}).get("objective", ""))))
         return real(event, state, force=force, workstream=workstream,
-                    registry=registry, content_basis=content_basis)
+                    registry=registry, content_basis=content_basis, turn_id=turn_id)
 
     monkeypatch.setattr(lifecycle, "observe_event", _record)
     # The seam is what is under test here; the enabled gate has its own tests.
@@ -195,6 +195,28 @@ def _seam1_call_nodes(tree: ast.AST) -> list[ast.Call]:
     return found
 
 
+def _append_system_turn_statements(body: list[ast.stmt]) -> list[int]:
+    """Indices of the loop-body statements that call ``_append_system_turn``.
+
+    2026-10-19: the append is now BOUND to a name (``turn_id =
+    self._append_system_turn(...)``) so the advisory seam can pass the
+    admitted row's per-turn identity to the sensor. The call is therefore an
+    ``ast.Assign`` rather than a bare ``ast.Expr``. The invariant this test
+    protects - the append happens BEFORE the observation - is unaffected, so
+    the shape check accepts both forms.
+    """
+    indices = []
+    for i, stmt in enumerate(body):
+        value = None
+        if isinstance(stmt, ast.Expr):
+            value = stmt.value
+        elif isinstance(stmt, ast.Assign):
+            value = stmt.value
+        if isinstance(value, ast.Call) and getattr(value.func, "attr", None) == "_append_system_turn":
+            indices.append(i)
+    return indices
+
+
 def test_advisory_interjection_is_observed_after_the_turn_is_appended():
     """Seam 1 must observe the committed turn, not the collected spec.
 
@@ -216,18 +238,9 @@ def test_advisory_interjection_is_observed_after_the_turn_is_appended():
         if target not in list(ast.walk(node)):
             continue
         body = node.body
-        assert any(
-            isinstance(stmt, ast.Expr)
-            and isinstance(stmt.value, ast.Call)
-            and getattr(stmt.value.func, "attr", None) == "_append_system_turn"
-            for stmt in body
-        ), "the interjection append is not in the same loop body"
-        append_index = next(
-            i for i, stmt in enumerate(body)
-            if isinstance(stmt, ast.Expr)
-            and isinstance(stmt.value, ast.Call)
-            and getattr(stmt.value.func, "attr", None) == "_append_system_turn"
-        )
+        append_indices = _append_system_turn_statements(body)
+        assert append_indices, "the interjection append is not in the same loop body"
+        append_index = append_indices[0]
         observe_index = next(
             i for i, stmt in enumerate(body) if target in list(ast.walk(stmt))
         )

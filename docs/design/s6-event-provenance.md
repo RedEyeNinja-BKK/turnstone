@@ -1,7 +1,11 @@
 # S6 event provenance — the classification ledger
 
 > **Status: NOT DEPLOYED.** The ledger below is the staged correction. The
-> deployed matcher is type-blind and may reuse a store row.
+> legacy type-blind matcher that ships in the measurement artifact is
+> type-blind and may reuse a store row. The current corrected read-only
+> matcher on this branch fixes both, and reads the same epoch without
+> changing anything on disk. The deployed sensor runtime is unaffected by
+> either.
 
 ## 1. Why a raw row count is not an answer
 
@@ -62,12 +66,14 @@ gate: B + B2 = 53 attributable / 100 required
 
 ### 3.1 Type awareness
 
-The deployed matcher matched **any** material event to **any** operator turn.
-`retry_transition`, `delegation_result` and `task_agent_failure` are the
-system's own transitions: real, observed, and **not** operator work.
+The legacy type-blind matcher matched **any** material event to **any**
+operator turn. `retry_transition`, `delegation_result` and
+`task_agent_failure` are the system's own transitions: real, observed, and
+**not** operator work.
 
-They are now reported in their own bucket (`C3_system_transitions`) rather
-than matched to an operator row or vanishing.
+The current corrected read-only matcher reports them in their own bucket
+(`C3_system_transitions`) rather than matching them to an operator row or
+letting them vanish.
 
 Eligibility is decided by the event's recorded **type**, not by its
 materiality, so an event with no recorded type is still attributed exactly
@@ -75,8 +81,8 @@ as before.
 
 ### 3.2 One row, one event, and as many as the data allows
 
-The deployed assignment could match the **same store row** to more than one
-event. Each row is now consumed at most once.
+The legacy type-blind assignment could match the **same store row** to more
+than one event. Each row is now consumed at most once.
 
 That alone was not enough. The one-to-one rule was implemented as a **greedy**
 assignment — each event took its best still-unclaimed candidate, in event
@@ -131,14 +137,19 @@ fails 5 checks, including 16 of the 60 brute-force comparisons.
 
 | matcher | attributable |
 |---|---|
-| deployed (type-blind, row-reusing) | **44** |
-| corrected (type-aware, one-to-one) | **43** |
-| corrected (type-aware, exact maximum-cardinality) | **43** |
+| legacy type-blind matcher (row-reusing) | **44** |
+| current corrected read-only matcher (type-aware, one-to-one) | **43** |
+| current corrected read-only matcher (type-aware, exact maximum-cardinality) | **43** |
 
-**The count goes DOWN by one, and that is correct.** The deployed matcher was
-crediting a `delegation_result` — machine work — to an operator turn, so it
-was counting machine work as operator work. The correction removes that
-inflation.
+This table is the historical snapshot taken when the correction was
+authored, on a 44-event population. The live comparison at the current
+epoch size is in [s6-production-status.md](s6-production-status.md), which
+reports the same one-event difference at a larger population.
+
+**The count goes DOWN by one, and that is correct.** The legacy type-blind
+matcher was crediting a `delegation_result` — machine work — to an operator
+turn, so it was counting machine work as operator work. The correction
+removes that inflation.
 
 The exact matching does not change the live count: on the live epoch the
 contested region is small enough that the greedy and exact assignments agree

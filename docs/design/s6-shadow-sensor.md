@@ -188,10 +188,12 @@ checkout with no host paths.
 - **The suppressed turns are not recovered.** The correction prevents
   future suppression; it does not recreate the observations that were
   dropped. `F_distinct_turns_suppressed` keeps reporting the loss.
-- **The corrected matcher lowers the count.** The deployed matcher credits
-  a `delegation_result` to an operator turn, so correcting it *reduces* the
-  attributable count by one. That is the correct direction: it stops
-  counting machine work as operator work.
+- **The corrected matcher lowers the count.** The legacy type-blind
+  matcher credits a `delegation_result` to an operator turn, so correcting
+  it *reduces* the attributable count by one. That is the correct
+  direction: it stops counting machine work as operator work. This is a
+  change in the **read-only reporting** code; it deploys nothing and it
+  does not change the deployed sensor runtime.
 - **The hash chain covers the deployment's own files only.** It does not
   attest any external library, interpreter, or system package. See
   [the hash-chain note](s6-hash-chain.md) for exactly what is and is not

@@ -5,7 +5,7 @@
 
 ## Snapshot
 
-**Observed 2026-10-20T11:10Z.**
+**Observed 2026-10-20T17:25Z.**
 
 | item | value |
 |---|---|
@@ -15,41 +15,40 @@
 | deployed commit | `5427ded3aa7668975e2cef2621e81b9131498281` |
 | epoch | `s6-t2` |
 | boundary | `T2` = `2026-10-18T13:21:51Z` |
-| elapsed | 45.81 h of the 48 h floor |
-| next deadline | `2026-10-20T13:21:51Z` (the 48 h floor) |
+| elapsed | 52.07 h of the 48 h floor |
+| next deadline | **passed** — the 48 h floor was met at `2026-10-20T13:21:51Z` |
 
-### One service was restarted, outside this campaign
+### One service was restarted twice, outside this campaign
 
-`turnstone-node@3` was restarted at **2026-10-20T10:08:53Z** by unrelated
-work on this host. It is the only service whose start time is not its
-`T2` one.
+`turnstone-node@3` is the only service whose start time is not its `T2`
+one. It has been restarted **twice** since the boundary, at
+**2026-10-20T10:08:53Z** and again at **2026-10-20T13:31:47Z**, by
+unrelated work on this host. Neither restart was performed by this
+campaign.
+
+Two independent counts agree on that, so the claim does not rest on a
+single reading. systemd's restart counter for the unit reads
+`NRestarts=2`, and the epoch's own telemetry carries node@3's cadence
+rows under **three** distinct process identities — the original one plus
+one per restart. The gaps in node@3's cadence rows bracket both restart
+times.
 
 This does not disturb the measurement, and the reason is worth stating
 plainly rather than leaving to inference:
 
-- the restart changed **no** measurement configuration. All five services
+- the restarts changed **no** measurement configuration. All five services
   still resolve `PYTHONPATH=/opt/turnstone-overlays/sensor-v187-5427ded`,
   and node@3's `95-sensor.conf` drop-in — its store directory, its
   content mode, its timeouts — is unchanged. The **running** process
   confirms it: `/proc/<pid>/environ` carries the sensor overlay on
   `PYTHONPATH` and all seven `TURNSTONE_SENSOR_*` variables, and the
   store directory is still node@3's own;
-- the restart did **not** move the boundary. `T2` is still
+- the restarts did **not** move the boundary. `T2` is still
   `2026-10-18T13:21:51Z`, written once by the activation script;
-- the sensor was **live** throughout. node@3 wrote no cadence row between
-  the restart and this snapshot, and the reason is that **no substantive
-  operator turn reached it**: node@3's own workstreams received exactly
-  **two** operator turns in that window, and both carried the literal text
-  `resume`, which `is_substantive_instruction` rejects — it is in the
-  acknowledgement whitelist. No other seam could have fired either: the
-  only wired non-operator seams are `retry_transition`,
-  `delegation_result` and `task_agent_failure`, and node@3 had no model
-  retry and no task-agent call in the window.
-
-  The one substantive turn in that window — `.` carrying an attachment —
-  was on a workstream resident on **node@5**, and node@5 observed it. The
-  sensor's liveness is not an inference: node@3's **next** cadence row
-  follows at `2026-10-20T12:21:37Z`, after this snapshot.
+- the sensor was **live** throughout, on **both** sides of both restarts.
+  node@3's first cadence row under each new process is a real
+  observation, not a heartbeat, so the epoch's own record shows the
+  sensor observing work again immediately after each restart.
 
 What a restart does cost is *continuity of a single process*, not
 continuity of the epoch. The epoch is a directory of observations, not a
@@ -62,12 +61,12 @@ acceptance arithmetic.
 
 | | |
 |---|---|
-| attributable events (B + B2) | **62** / 100 |
-| raw observation rows | 75 |
+| attributable events (B + B2) | **66** / 100 |
+| raw observation rows | 84 |
 | unverified (C) | 0 |
 | provenance available | true |
-| elapsed | 45.81 h / 48 h |
-| **gate** | **PENDING** on both the count and the time |
+| elapsed | 52.07 h / 48 h |
+| **gate** | **PENDING** on the count; the 48 h floor is **MET** |
 
 Integrity checks are all met: zero unmatched, zero duplicate event ids,
 zero orphans, boundary present.
@@ -76,10 +75,14 @@ zero orphans, boundary present.
 work, so the number rises on its own. The figure at any moment is a
 measurement of that moment, not a fixed property of the epoch.
 
+**The time floor is now met.** The 48 h floor was reached at
+`2026-10-20T13:21:51Z`. The count is the only remaining condition, and it
+is still short — 66 of 100 attributable events.
+
 ## The gate fails closed without a reconciliation
 
 The raw count and the attributable count are **different numbers**, and only
-the second one can certify the campaign. `62` attributable events and `75`
+the second one can certify the campaign. `66` attributable events and `84`
 raw rows are not interchangeable: the difference is the events that could not
 be tied to a stored operator turn.
 
@@ -101,7 +104,10 @@ require the proof to reject it.
 ## Distinct-turn suppression
 
 **Observed: 4 distinct operator turns are currently suppressed** by the
-deployed fingerprint-only dedupe key.
+deployed fingerprint-only dedupe key (`F_distinct_turns_suppressed = 4`).
+The same-turn re-fire count is **0** (`E_legitimate_duplicates_suppressed
+= 0`), so every suppression in the epoch is a **distinct** turn that was
+dropped, not a duplicate firing that was correctly collapsed.
 
 This is the defect the staged correction addresses. It is reported here
 rather than hidden, and the correction **does not recover** the lost
@@ -114,20 +120,21 @@ The deployed matcher credits a `delegation_result` — machine work — to an
 operator turn. The corrected matcher removes that inflation, so from the
 **same population** it reports one fewer attributable event.
 
-**Measured 2026-10-20T11:10Z**, on the live epoch, same events and same
+**Measured 2026-10-20T17:25Z**, on the live epoch, same events and same
 store rows, with only the matcher changed:
 
 | matcher | B | B2 | **B + B2** | C | C2 | C3 |
 |---|---|---|---|---|---|---|
-| deployed (type-blind, row-reusing) | 61 | 2 | **63** | 11 | 1 | — |
-| corrected (eligibility + exact matching) | 60 | 2 | **62** | 0 | 0 | 13 |
+| deployed (type-blind, row-reusing) | 65 | 2 | **67** | 13 | 4 | — |
+| corrected (eligibility + exact matching) | 64 | 2 | **66** | 0 | 0 | 18 |
 
 The deployed matcher is named for what it is: it applies **no event-type
 eligibility rule** and it is an **independent nearest-neighbour match**, so
 it can hand the same store row to two events. On this population it claims
 **two** rows twice. The corrected matcher is both: it admits only
 `operator_instruction` events, and it solves an exact minimum-cost,
-maximum-cardinality assignment in which each row is consumed at most once.
+maximum-cardinality assignment in which each row is consumed at most once —
+**zero** rows are claimed twice.
 
 The difference is exactly one event, and the direction is correct: the gate
 must not be satisfied by counting machine work as operator work. The
@@ -137,12 +144,13 @@ move it).
 
 The other column is the point of the correction. The deployed matcher
 files the system's own transitions — a retry, a delegation result, a
-task-agent failure — into **C (unverified)**, because it attributes them
-to operator rows and then finds the origin does not match. The corrected
-matcher **excludes** them from the assignment and reports them in their own
-bucket, **C3 = 13**. Nothing disappears: the 13 are still counted, just
-counted as what they are. The gate reads the same 62 either way, and the
-difference is only visible in how the same 62 is accounted for.
+task-agent failure — into **C (unverified)** and **C2**, because it
+attributes them to operator rows and then finds the origin does not match.
+The corrected matcher **excludes** them from the assignment and reports
+them in their own bucket, **C3 = 18**. Nothing disappears: the 18 are still
+counted, just counted as what they are. The gate reads 66 under the
+corrected matcher and 67 under the deployed one, and the difference is
+only visible in how the same events are accounted for.
 
 ## Deployment status
 
@@ -151,7 +159,7 @@ Nothing in this repository has been activated.
 
 | | |
 |---|---|
-| production state | unchanged since the T2 boundary, except for one unrelated service restart (above) |
+| production state | unchanged since the T2 boundary, except for unrelated service restarts (above) |
 | successor slot | not installed |
 | services restarted by this campaign | none |
 | measurement epochs | `s6-t0`, `s6-t1`, `s6-t2` — all preserved, none merged |

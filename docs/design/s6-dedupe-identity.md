@@ -55,8 +55,10 @@ A second pair (the same shape, in a larger size bucket) collapsed the same
 way. All four rows carried **distinct `client_send_id`s**, so they were four
 different turns.
 
-**Three distinct turns are currently suppressed** this way
-(`F_distinct_turns_suppressed = 3`).
+**Three distinct turns were suppressed** this way
+(`F_distinct_turns_suppressed = 3` at that measurement). The count has since
+risen to **4** as the epoch has received more work; the loss is a running
+figure, not a fixed property of the epoch.
 
 ### 2.2 Why the fingerprint is not the defect
 
@@ -183,7 +185,7 @@ a helper function.
 
   What *is* suppressed is a re-fire of the *same* turn identity — the same
   admitted row re-observed, which the pinned test covers.
-- **The three suppressed turns are not recovered.** The correction prevents
+- **The suppressed turns are not recovered.** The correction prevents
   future suppression; it does not recreate dropped observations.
 
 ## 6. The wiring pin

@@ -185,7 +185,7 @@ checkout with no host paths.
   workstream, so an identical projection in a *different* workstream was
   never at risk. The identity does not change that; it only separates
   distinct turns *within* a workstream.
-- **The three suppressed turns are not recovered.** The correction prevents
+- **The suppressed turns are not recovered.** The correction prevents
   future suppression; it does not recreate the observations that were
   dropped. `F_distinct_turns_suppressed` keeps reporting the loss.
 - **The corrected matcher lowers the count.** The deployed matcher credits

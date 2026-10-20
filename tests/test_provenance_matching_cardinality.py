@@ -213,6 +213,63 @@ def test_an_event_with_no_candidate_stays_unmatched():
     assert prov.match_events_to_turns(events, turns, window=5.0) == []
 
 
+# ---- 4b. one row, many events: a ROW is credited once -----------------------
+
+
+def test_one_row_credits_at_most_one_event_however_many_events_arrive():
+    """A store ROW is credited to at most one event.
+
+    The attribution is a one-to-one assignment, so one store row cannot be
+    credited to more than one event, no matter how many events arrive for
+    it. Three events over one row produce ONE attributed event.
+
+    This is a property of the ROWS, and it is deliberately NOT stated as a
+    property of turns: the row-level bound does not close the
+    consecutive-only question (see the next test, which is the counter-shape
+    that shows why).
+    """
+    turns = [turn(1, "ws", at(0))]
+    events = [event("e1", "ws", at(0)), event("e2", "ws", at(0)),
+              event("e3", "ws", at(0))]
+    matched = prov.match_events_to_turns(events, turns, window=5.0)
+    assert len(matched) == 1, matched
+    claimed = [m["turn"]["id"] for m in matched]
+    assert len(claimed) == len(set(claimed)), (
+        f"one store row was credited to more than one event: {claimed}"
+    )
+
+
+def test_a_repeated_identity_can_be_credited_to_a_different_row():
+    """The counter-shape: the row-level bound is NOT a turn-level bound.
+
+    The dedupe state is a single slot, so the same turn identity CAN be
+    admitted again after an intervening event (see
+    ``docs/design/s6-dedupe-identity.md`` §5). The gate counts attributable
+    EVENTS.
+
+    One store row being credited once does **not** mean a repeated identity
+    yields one attributable event: the identity's second admission is matched
+    against the rows still unclaimed, so it lands on a DIFFERENT row - here a
+    different admitted turn - and both events are counted.
+
+    This is pinned so the row-level one-to-one property is never mistaken for
+    a turn-level one. What actually bounds a repeated identity is upstream,
+    in the sensor: every operator seam observes the row it has just admitted,
+    exactly once, and every admission mints a fresh commit key, so one
+    admitted row never reaches the seam twice.
+    """
+    turns = [turn(1, "ws", at(0)), turn(2, "ws", at(1))]
+    events = [event("e1", "ws", at(0)), event("e2", "ws", at(0.5))]
+    matched = prov.match_events_to_turns(events, turns, window=5.0)
+
+    assert len(matched) == 2, matched
+    by_event = {m["event"]["event_id"]: m["turn"]["id"] for m in matched}
+    assert by_event == {"e1": 1, "e2": 2}, by_event
+    assert len(set(by_event.values())) == len(by_event), (
+        "the assignment must still be one-to-one over the rows"
+    )
+
+
 # ---- 6. system transitions are excluded ------------------------------------
 
 

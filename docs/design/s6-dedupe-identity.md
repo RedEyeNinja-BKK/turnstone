@@ -102,8 +102,8 @@ a helper function.
 
 | file | tests | pre-fix |
 |---|---|---|
-| `tests/test_sensor_turn_identity_dedupe.py` | 13 | **9 failed**, 4 passed |
-| `tests/test_sensor_turn_identity_session.py` | 10 | **8 failed**, 2 passed |
+| `tests/test_sensor_turn_identity_dedupe.py` | 14 | **10 failed**, 4 passed |
+| `tests/test_sensor_turn_identity_session.py` | 11 | **9 failed**, 2 passed |
 
 ### 4.1 What the sensor-level tests pin
 
@@ -115,6 +115,10 @@ a helper function.
 - duplicate hooks for one logical turn **are** suppressed
 - a turn identity that is present but whose state changed is admitted (a
   change is a change)
+- **suppression is consecutive-only** — a repeated identity that returns
+  after an intervening event is admitted again
+- **the same `client_send_id` sent twice is two distinct turns** with two
+  distinct identities, because the identity is minted per admitted turn
 - the identity **never reaches the projection** — the key set is unchanged
   and no identity appears in the serialized state
 - the identity **never reaches the wire** — no identity in the observation
@@ -137,9 +141,48 @@ a helper function.
 - **Dedupe state is per workstream.** The identity only separates turns
   *within* a workstream. Two identical turns in different workstreams were
   never at risk from this defect.
-- **The identity is the commit key, not the send id.** A turn re-sent with
-  the same `client_send_ids` is the same logical turn and is suppressed; a
-  turn sent again as new work gets a new commit key and is admitted.
+- **Suppression is CONSECUTIVE-ONLY.** The dedupe state holds the workstream's
+  *last admitted key*, so a turn is suppressed only if it arrives with the
+  same key as the immediately preceding admitted event. The same turn
+  identity returning after an intervening event is admitted again:
+
+  | sequence | admitted? |
+  |---|---|
+  | A, A | second **suppressed** (`unchanged_state`) |
+  | A, B, A | the second A is **admitted** (`material_state_transition`) |
+
+  This is the pre-existing contract — the state is a single slot, not a set —
+  and the correction did not change it. It is a **known limitation** rather
+  than a defect, but the reason it does not corrupt the gate's count is
+  worth stating exactly, because the obvious argument for it is wrong.
+
+  The gate counts *attributable events*, and the attribution is a one-to-one
+  assignment, so **one store row can be credited to at most one event**. That
+  alone does **not** bound a repeated identity to one attributable event: the
+  identity's second admission is matched against the rows still unclaimed, so
+  it can be credited to a *different* row — a different admitted turn — and
+  the event count can then exceed the count of distinct turns.
+
+  What does bound it is upstream, in the sensor: every operator seam observes
+  the row it has *just* admitted, exactly once, and every admission mints a
+  fresh `commit_key`. So one admitted row never reaches the seam twice, and
+  the A-B-A re-admission is a re-admission of the same *projection* by a
+  genuinely different turn, not a second observation of one turn. The
+  provenance ledger measures this directly: `E_legitimate_duplicates_suppressed`
+  counts re-fires of the *same* turn, and it is **0** on the live epoch.
+
+  The one-row-one-event property is a property of the *rows*, and it is
+  pinned as such — it is not a claim about turns. A future change to a
+  set-valued dedupe state would be a separate, deliberate decision.
+- **The identity is the commit key, not the send id — and the commit key is
+  fresh per turn.** `commit_key` is a `uuid4()` generated at admission, and
+  the API's own schema states that `client_send_id` "is not an idempotency
+  key; repeated sends with the same value remain distinct turns". So a
+  browser re-send of the same message produces a **new** commit key, and the
+  re-sent turn is **admitted** rather than suppressed.
+
+  What *is* suppressed is a re-fire of the *same* turn identity — the same
+  admitted row re-observed, which the pinned test covers.
 - **The three suppressed turns are not recovered.** The correction prevents
   future suppression; it does not recreate dropped observations.
 

@@ -79,9 +79,10 @@ def _session() -> ChatSession:
     return session
 
 
-def _send(session: ChatSession, text: str, attachments=None) -> None:
+def _send(session: ChatSession, text: str, attachments=None,
+          client_send_ids=()) -> None:
     try:
-        session.send(text, attachments=attachments)
+        session.send(text, attachments=attachments, client_send_ids=client_send_ids)
     except RuntimeError as error:
         if "stop after append" not in str(error):
             raise
@@ -182,7 +183,7 @@ def test_the_same_turn_refired_keeps_its_identity(observed):
 
     The identity is a property of the ADMITTED ROW, not of the observation, so
     the same row always presents the same identity. That is what keeps a
-    redelivery suppressed instead of being counted twice.
+    re-fire of the same turn suppressed instead of being counted twice.
     """
     session = _session()
     _send(session, "Rotate the ingest credentials now.")
@@ -197,6 +198,33 @@ def test_the_same_turn_refired_keeps_its_identity(observed):
     )
     calls = _operator_calls(observed)
     assert calls[-1]["turn_id"] == first
+
+
+def test_a_repeated_client_send_id_is_still_two_distinct_turns(observed):
+    """The same browser correlation token does NOT make two sends one turn.
+
+    ``client_send_id`` is a browser-generated correlation token. The API
+    schema says so explicitly: "It is not an idempotency key; repeated sends
+    with the same value remain distinct turns." Each admitted turn mints a
+    FRESH ``commit_key`` (a ``uuid4()`` at admission), so two sends carrying
+    the same token are two turns with two identities.
+
+    This is the property that makes the dedupe correction correct rather
+    than merely different: the identity separates turns, and a re-sent
+    message is a re-sent message - it is new work and it must be observed.
+    """
+    session = _session()
+    _send(session, "Rotate the ingest credentials.", client_send_ids=("cs-1",))
+    _send(session, "Rotate the ingest credentials.", client_send_ids=("cs-1",))
+
+    operator = _operator_calls(observed)
+    assert len(operator) == 2, observed
+    first, second = operator[0]["turn_id"], operator[1]["turn_id"]
+    assert first and second
+    assert first != second, (
+        "two sends carrying the same client_send_id were given the same "
+        "identity, so the second would be suppressed as a duplicate"
+    )
 
 
 # ------------------------------------------------------ the other two seams

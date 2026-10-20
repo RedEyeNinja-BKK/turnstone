@@ -24,9 +24,22 @@ idempotency identity that already exists in the production path — into the
 DEDUPE KEY only:
 
   * two distinct turns with identical projections are BOTH admitted;
-  * a redelivery of the SAME turn is still suppressed;
+  * a re-fire of the SAME turn identity is still suppressed (the same
+    admitted row, observed again);
   * an event with no turn identity keeps plain fingerprint dedupe, so the
     pinned no-retry-storm contract is unchanged.
+
+Note on the second point: it is a re-fire of the same IDENTITY, not a
+browser re-send. ``commit_key`` is generated per admitted turn
+(``uuid4()``), and the API's own schema states that ``client_send_id`` "is
+not an idempotency key; repeated sends with the same value remain distinct
+turns" — so a re-sent message gets a new commit key and is admitted as new
+work. The session-level file
+(``tests/test_sensor_turn_identity_session.py``) pins that at the seam
+that matters. The dedupe state is also a single slot, not a set:
+suppression is CONSECUTIVE-ONLY, so the same identity returning after an
+intervening event is admitted again. Both are pre-existing contracts this
+change did not move; see ``docs/design/s6-dedupe-identity.md`` §5.
 
 And the identity must never leak: it is not part of the graded projection, so
 the grader receives exactly the bytes it received before.
@@ -108,6 +121,37 @@ def test_the_same_turn_refired_is_still_suppressed():
     assert first is True
     assert (second, why_second) == (False, "unchanged_state"), (
         f"the same turn re-fired must stay suppressed; got {second!r}"
+    )
+
+
+def test_suppression_is_consecutive_only():
+    """The dedupe state is a single slot, so A-B-A is admitted again.
+
+    The state holds the workstream's LAST admitted key, not a set of seen
+    keys. The same identity returning after an intervening event is
+    therefore admitted, even when the projection is byte-identical
+    throughout - the projection alone cannot suppress it either, because
+    the intervening event reset the slot.
+
+    This is the pre-existing contract, unchanged by the turn-identity work,
+    and it is pinned here so a future change to a set-valued state is a
+    deliberate decision rather than an accident.
+    """
+    sensor = ShadowSensor(store=None)
+
+    outcomes = [
+        sensor.should_sense(
+            _attachment_state(),
+            event="operator_instruction",
+            workstream="ws",
+            turn_id=turn_id,
+        )
+        for turn_id in ("turn-a", "turn-b", "turn-a")
+    ]
+
+    assert [allowed for allowed, _ in outcomes] == [True, True, True], (
+        "A-B-A must be admitted: the dedupe state is a single slot, not a "
+        f"set; got {outcomes!r}"
     )
 
 

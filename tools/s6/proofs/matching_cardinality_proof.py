@@ -171,6 +171,54 @@ def main() -> int:
               matched[0]["event"]["event_id"], "e2")
         check("at zero distance", matched[0]["distance_s"], 0.0)
 
+    # ---- 4b. the row-level credit bound -------------------------------------
+    print()
+    print("4b. ONE ROW, THREE IDENTICAL EVENTS - a ROW is credited once")
+    # The attribution is a one-to-one assignment: one store ROW is credited
+    # to at most one event, however many events arrive for it.
+    #
+    # This is a property of the ROWS. It is NOT a claim that a repeated turn
+    # identity is bounded to one attributable EVENT: the identity's second
+    # admission is matched against the rows still unclaimed, so it can be
+    # credited to a DIFFERENT row - a different admitted turn - and the
+    # event count can then exceed the count of distinct turns.
+    #
+    # What actually bounds a repeated identity is upstream, in the sensor:
+    # every operator seam observes the row it has just admitted, exactly
+    # once, and every admission mints a fresh commit_key, so one admitted row
+    # never reaches the seam twice. The provenance ledger measures that
+    # directly as E_legitimate_duplicates_suppressed, which is 0 on the live
+    # epoch.
+    turns = [turn(1, "ws", at(0))]
+    events = [event("e1", "ws", at(0)), event("e2", "ws", at(0)),
+              event("e3", "ws", at(0))]
+    matched = prov.match_events_to_turns(events, turns, window=5.0)
+    check("exactly one event is credited to the row", len(matched), 1)
+    if matched:
+        claimed = [m["turn"]["id"] for m in matched]
+        check("no row is credited twice", len(set(claimed)), len(claimed))
+
+    # ---- 4c. a second admission can land on a DIFFERENT row ----------------
+    print()
+    print("4c. A REPEATED IDENTITY - the second admission takes another row")
+    # The counter-shape, stated explicitly so the row-level bound is not
+    # mistaken for a turn-level one. Two rows, two admitted events carrying
+    # the SAME fingerprint: the second event is credited to the second row.
+    # Both rows are distinct admitted turns, so this is two turns, not one
+    # turn counted twice - but the EVENT count is 2 either way, and that is
+    # exactly why the row-level bound cannot be used to close the
+    # consecutive-only question.
+    turns = [turn(1, "ws", at(0)), turn(2, "ws", at(1))]
+    events = [event("e1", "ws", at(0)), event("e2", "ws", at(0.5))]
+    matched = prov.match_events_to_turns(events, turns, window=5.0)
+    check("both events are credited", len(matched), 2)
+    if matched:
+        by_event = {m["event"]["event_id"]: m["turn"]["id"] for m in matched}
+        check("the second event took the second row",
+              by_event.get("e2"), 2)
+        check("each event holds a distinct row",
+              len(set(by_event.values())), len(by_event))
+
     # ---- 5. an event with no valid candidate ------------------------------
     print()
     print("5. NO CANDIDATE - the event stays unmatched")

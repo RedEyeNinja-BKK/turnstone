@@ -90,11 +90,11 @@ proof set from the same bytes:
 
 ```bash
 # the source tree
-bash tools/s6/proofs/run-all.sh                              # 634 checks, 0 failed
+bash tools/s6/proofs/run-all.sh                              # 639 checks, 0 failed
 
 # the artifact tree - the same runner, the same result
 cd /var/lib/turnstone/artifacts/shadow-sensor-recovery-20261017/s6
-bash evidence/script-tests-proofs.sh                          # 634 checks, 0 failed
+bash evidence/script-tests-proofs.sh                          # 639 checks, 0 failed
 ```
 
 That correspondence is **checked**, not claimed.
@@ -136,29 +136,35 @@ trees' totals are comparable.
 | `tools/s6/proofs/boundary_marker_proof.py` | 36 | the boundary is written once, never overwritten |
 | `tools/s6/proofs/rate_basis_proof.py` | 28 | the rate, the ETA and the labels key on the gate's count |
 | `tools/s6/proofs/provenance_required_proof.py` | 24 | acceptance **cannot** be certified without a reconciliation |
-| `tools/s6/proofs/matching_cardinality_proof.py` | 23 | the attribution is an **exact** maximum-cardinality assignment |
+| `tools/s6/proofs/matching_cardinality_proof.py` | 28 | the attribution is an **exact** maximum-cardinality assignment |
 | `tools/s6/proofs/source_artifact_proof.py` | 42 | the source tree and the artifact tree are the **same bytes** |
 | `tools/s6/proofs/handoff_digest_proof.py` | 33 | every digest the handoff states describes the bytes on disk |
 | `tools/s6/proofs/staleness_control.py` | 38 | the proofs above **fail** against a mutated tree |
 | `tools/s6/driver/script-tests-execute.sh` | 40 | the driver's step order, exit codes, read-only proof |
 | `tools/s6/driver/script-tests-execute-chain.sh` | 13 | the hash chain's **negative control** |
-| **total** | **634** | |
+| **total** | **639** | |
 
 Both trees produce the same total: the source runner and the artifact runner
 are the same file, so the count cannot drift between them.
 
-Plus the sensor suite (`374 passed, 2 skipped`) and the red-first proof,
+Plus the sensor suite (`377 passed, 2 skipped`) and the red-first proof,
 which shows the new tests **fail** against the pre-fix code.
 
 ## 7. The red-first evidence
 
 | test file | pre-fix result |
 |---|---|
-| `tests/test_sensor_turn_identity_dedupe.py` | 9 failed, 4 passed |
-| `tests/test_sensor_turn_identity_session.py` | 8 failed, 2 passed |
+| `tests/test_sensor_turn_identity_dedupe.py` | 10 failed, 4 passed |
+| `tests/test_sensor_turn_identity_session.py` | 9 failed, 2 passed |
 | `tests/test_provenance_one_to_one.py` | 14 failed |
+| `tests/test_provenance_matching_cardinality.py` | 14 failed |
 | `tools/s6/driver/script-tests-execute-chain.sh` | 7 passed, 6 failed |
 
 Each of these is a proof that **fails against the defective implementation**
 and passes after the fix. A test that only passes afterwards proves
 nothing.
+
+The two provenance files are run against the **pre-fix matcher module**,
+which is the only thing that changed in the correction: the sensor files
+are run against the pre-fix **tree** (commit `5427ded`), which is where
+the dedupe key changed.

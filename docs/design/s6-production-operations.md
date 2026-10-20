@@ -126,7 +126,7 @@ Everything below is read-only or sandboxed; nothing installs a slot,
 restarts a service, writes an epoch, or touches production telemetry.
 
 ```bash
-# the measurement and driver proofs  -> 634 checks, 0 failed
+# the measurement and driver proofs  -> 639 checks, 0 failed
 bash tools/s6/proofs/run-all.sh
 
 # the sensor suite

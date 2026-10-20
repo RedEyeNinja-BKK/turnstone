@@ -222,19 +222,60 @@ def has_reasoning_bearing_block(blocks: list[dict[str, Any]]) -> bool:
     )
 
 
+def _unwrap_transport_error(
+    exc: BaseException, transport_types: tuple[type[BaseException], ...]
+) -> BaseException | None:
+    """The transport error *exc* carries, or ``None`` if it carries none.
+
+    OpenAI v3.14+ wraps a body-read failure in the SDK's own
+    ``APIConnectionError`` (verified on 3.14.0 through 3.35.1), keeping
+    the raw transport error as the wrapper's ``__cause__``.  The wrapper
+    itself is not a transport error, so without this recovery the one
+    conversion rule in :func:`transport_guarded` would never see the
+    death it is written to normalize.
+
+    The search is bounded to a small chain (the SDK's wrapper is one
+    level deep; a legacy client's error is zero levels) and matches on
+    the EXCEPTION CLASSES of the two HTTP stacks, not on names: a
+    non-transport error with a transport-shaped ``__cause__`` (an
+    ``APIStatusError`` chained to a retry's transport error, say) must
+    not be mistaken for a transport death.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(4):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        if isinstance(current, transport_types):
+            return current
+        current = current.__cause__
+    return None
+
+
 def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     """Normalize mid-body transport deaths on a ``create_streaming`` iterator.
 
-    Streaming moves the body read out of the SDK's
-    ``APIConnectionError``-wrapped request into raw iteration, so a
-    mid-body wire death (connection drop, TLS record failure, read
-    timeout) surfaces as a bare transport error no retry predicate
+    Streaming moves the body read out of the SDK's request into raw
+    iteration, so a mid-body wire death (connection drop, TLS record
+    failure, read timeout) surfaces as an error no retry predicate
     recognizes.  OpenAI v3's default client raises ``httpx2`` errors;
     Anthropic, Turnstone's own HTTP clients, and the OpenAI v3 legacy-client
     escape hatch raise ``httpx`` errors.  This wrapper is the one conversion
     rule for both families, reusable by consumers that keep streaming
     semantics (the interactive loop); :func:`drain_stream` applies it for
     the single-shot lanes.
+
+    OpenAI v3.14 changed the SHAPE of that death: the SDK's stream
+    iterator now wraps a body-read failure in its own
+    ``APIConnectionError`` instead of letting the raw transport error
+    escape (verified on 3.14.0 through 3.35.1).  The transport error
+    survives as the wrapper's ``__cause__``, so
+    :func:`_unwrap_transport_error` recovers it and the one conversion
+    rule below applies unchanged.  Without the unwrap, a post-finish blip
+    would abort an already-completed generation instead of forfeiting
+    only its trailing metadata, and a mid-body death would escape
+    unnormalized.
 
     - A ``TransportError`` BEFORE any finish reason re-raises (chained)
       as the retryable :class:`IncompleteStreamError`.
@@ -253,13 +294,32 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
 
     finish_seen = False
     usage_seen = False
+    transport_types: tuple[type[BaseException], ...] = (
+        httpx.TransportError,
+        httpx2.TransportError,
+    )
     iterator = iter(chunks)
+    # The recovered transport error is typed as ``BaseException`` (the
+    # transport families are declared that way), so the local holds the
+    # wider type from the start.
+    exc: BaseException
     while True:
         try:
             sc = next(iterator)
         except StopIteration:
             return
-        except (httpx.TransportError, httpx2.TransportError) as exc:
+        except Exception as raw_exc:
+            # The SDK may hand us its own wrapper instead of the transport
+            # error (OpenAI v3.14+); recover the transport error it
+            # carries so the one conversion rule below still applies.  A
+            # ``BaseException`` (a Stop's ``GenerationCancelled``, a
+            # ``KeyboardInterrupt``) never reaches this arm.
+            exc = raw_exc
+            if not isinstance(raw_exc, transport_types):
+                recovered = _unwrap_transport_error(raw_exc, transport_types)
+                if recovered is None:
+                    raise
+                exc = recovered
             if finish_seen:
                 # usage_captured distinguishes "completed result kept but
                 # its spend went missing from usage accounting" (the chat

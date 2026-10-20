@@ -4569,7 +4569,13 @@ class TestAnthropicPromptCaching:
         assert "temperature" not in kwargs
 
     def test_opus_4_6_still_has_temperature(self) -> None:
-        """Opus 4.6 must still send temperature (regression guard)."""
+        """Opus 4.6 must still send temperature (regression guard).
+
+        The value rides ``extra_body``: Anthropic SDK v1 removed the typed
+        sampling kwargs from the Messages signature, so a typed
+        ``temperature=`` is a TypeError before any request is issued.  The
+        wire body is unchanged — ``extra_body`` puts the same key there.
+        """
         caps = self.provider.get_capabilities("claude-opus-4-6")
         kwargs = self.provider._build_thinking_and_kwargs(
             caps=caps,
@@ -4582,8 +4588,8 @@ class TestAnthropicPromptCaching:
             model="claude-opus-4-6",
             tools=None,
         )
-        assert "temperature" in kwargs
-        assert kwargs["temperature"] == 1.0  # forced for adaptive thinking
+        assert "temperature" not in kwargs  # a typed kwarg is a TypeError on SDK v1
+        assert kwargs["extra_body"] == {"temperature": 1.0}  # forced for adaptive thinking
 
     def test_opus_4_7_thinking_display_summarized(self) -> None:
         """Opus 4.7 must opt in to thinking display with 'summarized'."""

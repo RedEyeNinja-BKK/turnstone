@@ -503,8 +503,17 @@ class AnthropicProvider:
         # None temperature is never written — the request omits the field so
         # the server default applies (house rule: no code pins).  The
         # thinking branches above still force 1.0 where the API requires it.
+        #
+        # It rides ``extra_body`` rather than the typed kwarg: Anthropic
+        # SDK v1 REMOVED ``temperature``/``top_p``/``top_k`` from the
+        # Messages signatures, and a typed ``temperature=`` is a TypeError
+        # before any request is issued (verified on anthropic 1.15.0).
+        # ``extra_body`` puts the same key on the wire — measured
+        # byte-identical request bodies on 0.121.0 (the locked floor) and
+        # 1.15.0 — so one code path serves both SDK majors.
+        extra_body: dict[str, Any] = {}
         if caps.supports_temperature and temperature is not None:
-            kwargs["temperature"] = temperature
+            extra_body["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         if tools:
@@ -525,10 +534,15 @@ class AnthropicProvider:
 
         # Operator server_compat extra_body overrides (e.g. chat_template_kwargs
         # for anthropic-compatible local servers) ride the SDK's extra_body.
+        # Applied AFTER temperature, so an operator pin of ``temperature``
+        # beats the resolved knob — the precedence the OpenAI lanes give a
+        # server_compat pin.
         if extra_params:
-            wire_extra = {k: v for k, v in extra_params.items() if k not in _INTERNAL_EXTRA_PARAMS}
-            if wire_extra:
-                kwargs["extra_body"] = wire_extra
+            extra_body.update(
+                (k, v) for k, v in extra_params.items() if k not in _INTERNAL_EXTRA_PARAMS
+            )
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         return kwargs
 

@@ -18,3 +18,20 @@ ignore = [
 ]
 # UP035/UP042/F541 style findings in the historical modules are pre-existing;
 # they are excluded from select rather than churned.
+
+# The S6 measurement modules are DEPLOYED ARTIFACTS. The deployment driver
+# pins their SHA-256 before running anything, and the pins must keep
+# describing the files on disk - so a lint fix to them would break the
+# deployment's trust chain. They are committed byte-identical, and their
+# findings are recorded here rather than fixed:
+#
+#   tools/s6/collect.py     B007, F841 x2
+#   tools/s6/liveness.py    S112
+#   tools/s6/provenance.py  B007
+#
+# The proofs and the budget script are NOT pinned, so they are linted
+# normally and kept clean.
+[lint.per-file-ignores]
+"tools/s6/collect.py" = ["B007", "F841"]
+"tools/s6/liveness.py" = ["S112"]
+"tools/s6/provenance.py" = ["B007"]

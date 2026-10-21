@@ -12,6 +12,7 @@ and never a failure.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -242,10 +243,15 @@ class ShadowSensor:
     # -- cadence ---------------------------------------------------------
 
     def _dedupe_state(self, workstream: str) -> list:
-        """Return the mutable [last_fingerprint, initial_done] for a workstream.
+        """Return the mutable [last_key, initial_done] for a workstream.
 
         Must be called under ``_dedupe_lock``. A missing workstream starts
         un-initialised. LRU: the touched entry moves to the end.
+
+        The first slot is the DEDUPE KEY, not a bare fingerprint: it is
+        ``(fingerprint, turn_id)`` when the event carries a turn identity and
+        the plain fingerprint when it does not. See
+        :meth:`should_sense` for why the turn identity belongs in the key.
         """
         entry = self._dedupe.pop(workstream, None)
         if entry is None:
@@ -255,6 +261,24 @@ class ShadowSensor:
         self._dedupe[workstream] = entry
         return entry
 
+    @staticmethod
+    def _dedupe_key(fingerprint: str, turn_id: str) -> tuple[str, str]:
+        """The dedupe key for one event.
+
+        The turn identity is a per-turn idempotency token that already exists
+        in the production path (the admitted conversation row's commit key).
+        It is HASHED before it reaches the dedupe state, so the raw token is
+        never held, logged or transmitted.
+
+        The key is ``(fingerprint, "")`` when no identity is supplied, which
+        is exactly the historical behaviour: an event without a turn identity
+        keeps plain fingerprint dedupe, so the no-retry-storm contract is
+        untouched.
+        """
+        if not turn_id:
+            return (fingerprint, "")
+        return (fingerprint, hashlib.sha256(turn_id.encode()).hexdigest()[:32])
+
     def should_sense(
         self,
         state: Mapping[str, Any],
@@ -262,6 +286,7 @@ class ShadowSensor:
         event: str | None,
         force: bool = False,
         workstream: str = "",
+        turn_id: str = "",
     ) -> tuple[bool, str]:
         """Decide whether this state warrants a fresh observation.
 
@@ -269,9 +294,32 @@ class ShadowSensor:
         because that is the common case and it must not cost a call.
 
         Dedupe is per workstream: an unchanged state is suppressed only when
-        THIS workstream's last admitted fingerprint matches. A different
+        THIS workstream's last admitted key matches. A different
         workstream's observations between two of this workstream's events leave
         this workstream's dedupe state untouched.
+
+        The key is ``(fingerprint, turn identity)`` when a turn identity is
+        supplied. The fingerprint alone is NOT enough, and that was a real
+        production defect measured on 2026-10-19: the fingerprint hashes the
+        BOUNDED PROJECTION, and for an operator turn whose instruction lives in
+        an attachment the only attachment-derived field is the bounded
+        descriptor (count / kinds / size bucket / two verification counts).
+        Two DIFFERENT documents in the same size bucket therefore produce a
+        byte-identical projection, an identical fingerprint, and the second
+        turn was suppressed as ``unchanged_state`` - two genuinely different
+        operator turns counted as one. Live proof in epoch s6-t2: two pairs of
+        store rows, each pair carrying attachments of 2427 B and 2654 B, and
+        8885 B and 11777 B respectively (each pair inside one size bucket),
+        were each collapsed into a single event, and all four rows carried
+        distinct client_send_ids, so they were four different turns. The row
+        ids are not reproduced here: a published conversation id is a lookup
+        key into the live store.
+
+        The turn identity is the admitted conversation row's commit key: a
+        per-turn idempotency token that already exists in the production path.
+        It enters the DEDUPE KEY ONLY. It is never part of the projection, so
+        the grader still receives exactly the bounded semantic view it received
+        before, and it is hashed before it reaches the dedupe state.
 
         This method also **commits** the cadence decision. That is deliberate and
         was a real defect when it did not: dedupe state was only advanced by
@@ -282,25 +330,26 @@ class ShadowSensor:
         caller's own state, never on whether a network call happened to succeed.
         """
         fingerprint = state_fingerprint(state)
+        key = self._dedupe_key(fingerprint, turn_id)
         with self._dedupe_lock:
             entry = self._dedupe_state(workstream)
-            last_fingerprint, initial_done = entry[0], entry[1]
+            last_key, initial_done = entry[0], entry[1]
             if force:
                 return True, "forced"
             if not initial_done:
-                entry[0] = fingerprint
+                entry[0] = key
                 entry[1] = True
                 return True, Trigger.INITIAL.value
             if not is_material(event or ""):
                 return False, f"not_material:{event}"
-            if fingerprint == last_fingerprint:
+            if key == last_key:
                 return False, "unchanged_state"
             # Commit on the admit branch too. Missing this was the second half of
             # the dedupe defect: only the INITIAL branch advanced the fingerprint,
             # so after a successful material observation the state was never
             # recorded and an identical state was admitted again on every
             # subsequent event.
-            entry[0] = fingerprint
+            entry[0] = key
             return True, Trigger.MATERIAL.value
 
     # -- observation -----------------------------------------------------
@@ -316,6 +365,7 @@ class ShadowSensor:
         event_id: str = "",
         content_mode: str = "",
         content_basis: str = "text",
+        turn_id: str = "",
     ):
         """Take one advisory observation, or record why none was taken.
 
@@ -373,7 +423,11 @@ class ShadowSensor:
             allowed, why = True, Trigger.MATERIAL.value
         else:
             allowed, why = self.should_sense(
-                state, event=event, force=force, workstream=workstream
+                state,
+                event=event,
+                force=force,
+                workstream=workstream,
+                turn_id=turn_id,
             )
         if not allowed:
             if why == "unchanged_state":

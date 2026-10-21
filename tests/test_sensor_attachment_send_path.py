@@ -141,7 +141,7 @@ def observed(monkeypatch):
     monkeypatch.setattr(lifecycle, "ENABLED", True)
 
     def _record(event, state=None, *, force=False, workstream="", registry=None,
-                content_basis="text"):
+                content_basis="text", turn_id=""):
         calls.append({
             "event": event,
             "state": dict(state or {}),

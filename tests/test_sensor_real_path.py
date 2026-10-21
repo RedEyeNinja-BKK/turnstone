@@ -152,9 +152,10 @@ def test_should_sense_is_called_exactly_once_per_event(tmp_path):
     calls = []
     original = sensor.should_sense
 
-    def counting(state, *, event=None, force=False, workstream=""):  # noqa: ANN001
+    def counting(state, *, event=None, force=False, workstream="", turn_id=""):  # noqa: ANN001
         calls.append(event)
-        return original(state, event=event, force=force, workstream=workstream)
+        return original(state, event=event, force=force, workstream=workstream,
+                        turn_id=turn_id)
 
     sensor.should_sense = counting  # type: ignore[method-assign]
 

@@ -723,8 +723,17 @@ class SensorHook:
         force: bool = False,
         workstream: str = "",
         content_basis: str = "text",
+        turn_id: str = "",
     ) -> None:
-        """Observe one material event. Never raises; the result is discarded."""
+        """Observe one material event. Never raises; the result is discarded.
+
+        ``turn_id`` is the per-turn identity of the admitted conversation row
+        (its commit key). It is used ONLY to key the dedupe state, so two
+        distinct operator turns that happen to produce an identical bounded
+        projection are both observed, while a redelivery of the same turn is
+        still suppressed. It never enters the projection and is never
+        recorded: see :meth:`turnstone.core.shadow_driver.ShadowSensor.should_sense`.
+        """
         # One id per admitted event, minted before anything can fail. It is the
         # join key between the cadence ledger and the observation store.
         event_id = uuid.uuid4().hex
@@ -741,7 +750,11 @@ class SensorHook:
             # catch it; materialising here keeps containment in this function.
             projection = {str(name): value for name, value in dict(state or {}).items()}
             allowed, _why = self._sensor.should_sense(
-                projection, event=event, force=force, workstream=workstream
+                projection,
+                event=event,
+                force=force,
+                workstream=workstream,
+                turn_id=turn_id,
             )
             if not allowed:
                 self._record_cadence(
@@ -776,6 +789,7 @@ class SensorHook:
                 event_id=event_id,
                 content_mode=CONTENT_MODE,
                 content_basis=content_basis,
+                turn_id=turn_id,
             )
         except Exception:  # noqa: BLE001 - a sensor must never fail a task
             try:
@@ -900,6 +914,7 @@ def observe_event(
     workstream: str = "",
     registry: Any = None,
     content_basis: str = "text",
+    turn_id: str = "",
 ) -> None:
     """Module-level convenience wrapper around :func:`hook`.
 
@@ -912,11 +927,19 @@ def observe_event(
     ``registry`` is the calling session's registry, passed explicitly on every
     event. It is not stored anywhere: it only selects (or builds) that
     registry's hook.
+
+    ``turn_id`` is the per-turn identity of the admitted conversation row. It
+    keys the dedupe state only; it never enters the projection or the record.
     """
     if not ENABLED:
         return
     hook(registry).observe_event(
-        event, state, force=force, workstream=workstream, content_basis=content_basis
+        event,
+        state,
+        force=force,
+        workstream=workstream,
+        content_basis=content_basis,
+        turn_id=turn_id,
     )
 
 

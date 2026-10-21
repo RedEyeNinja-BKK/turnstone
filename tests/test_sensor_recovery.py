@@ -795,14 +795,14 @@ def test_sanitized_mode_redacts_secrets_paths_and_emails():
     state = lifecycle.build_state(
         content_mode="sanitized",
         objective=(
-            "Deploy with token=abc123SECRET to /home/vincent/.ssh/id_rsa "
+            "Deploy with token=abc123SECRET to /home/example-user/.ssh/id_rsa "
             "and mail ops@example.com"
         ),
         phase="operator_instruction",
     )
     text = state["objective"]
     assert "abc123SECRET" not in text
-    assert "/home/vincent/.ssh/id_rsa" not in text
+    assert "/home/example-user/.ssh/id_rsa" not in text
     assert "ops@example.com" not in text
     assert "\u005bredacted\u005d" in text
     assert "\u005bpath\u005d" in text
@@ -1066,10 +1066,12 @@ def test_real_session_registry_reaches_the_sensor(tmp_path, monkeypatch):
     seen = {}
     real_observe = lifecycle.observe_event
 
-    def _record(event, state=None, *, force=False, workstream="", registry=None):
+    def _record(event, state=None, *, force=False, workstream="", registry=None,
+                content_basis="text", turn_id=""):
         seen["registry"] = registry
         return real_observe(
-            event, state, force=force, workstream=workstream, registry=registry
+            event, state, force=force, workstream=workstream, registry=registry,
+            content_basis=content_basis, turn_id=turn_id
         )
 
     monkeypatch.setattr(lifecycle, "observe_event", _record)

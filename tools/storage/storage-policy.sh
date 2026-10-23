@@ -96,7 +96,13 @@ storage_emit() {
   line="$(date -u +%FT%TZ) level=$level event=$event"
   local kv
   for kv in "$@"; do line+=" $kv"; done
-  printf '%s\n' "$line"
+  # In JSON mode the caller is a machine parser, so events go to stderr and
+  # stdout carries only the JSON document. Mixing them silently breaks parsing.
+  if [ "${STORAGE_JSON:-0}" -eq 1 ]; then
+    printf '%s\n' "$line" >&2
+  else
+    printf '%s\n' "$line"
+  fi
   { printf '%s\n' "$line" >>"$(storage_log_file)"; } 2>/dev/null || true
 }
 
@@ -119,12 +125,35 @@ storage_free_gib() {
 
 # A build or test process may be writing underneath any target. This is the
 # safety interlock for every destructive path.
+# Is a build or test process running?
+#
+# `pgrep -f` on a substring is NOT safe here: it matches any process whose
+# command line merely mentions the word, including the consumer of this very
+# monitor (a JSON parser referencing a "pytest" field produced a false "build
+# active"). The check looks at argv instead: the executable base name, or a
+# `python -m pytest` style invocation, and nothing else.
 storage_build_active() {
-  pgrep -x cargo  >/dev/null 2>&1 && return 0
-  pgrep -x rustc  >/dev/null 2>&1 && return 0
-  pgrep -x pytest >/dev/null 2>&1 && return 0
-  pgrep -f 'cargo (build|test|check|run)' >/dev/null 2>&1 && return 0
-  pgrep -f '[p]ytest' >/dev/null 2>&1 && return 0
+  local pid cmd a0 a1
+  pgrep -x cargo >/dev/null 2>&1 && return 0
+  pgrep -x rustc >/dev/null 2>&1 && return 0
+  for pid in /proc/[0-9]*; do
+    [ -r "$pid/cmdline" ] || continue
+    cmd=$(tr '\0' '\n' < "$pid/cmdline" 2>/dev/null) || continue
+    [ -n "$cmd" ] || continue
+    a0=$(printf '%s\n' "$cmd" | sed -n '1p')
+    a1=$(printf '%s\n' "$cmd" | sed -n '2p')
+    case "${a0##*/}" in
+      cargo|rustc|rustup|pytest) return 0 ;;
+    esac
+    # python -m pytest / python -m cargo ...
+    case "${a0##*/}" in
+      python|python3|python3.*)
+        [ "$a1" = "-m" ] || continue
+        case "$(printf '%s\n' "$cmd" | sed -n '3p')" in
+          pytest|cargo|rustup) return 0 ;;
+        esac ;;
+    esac
+  done
   return 1
 }
 

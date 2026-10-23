@@ -22,6 +22,9 @@ HERE=$(dirname "$(readlink -f "$0")")
 
 JSON=0
 [ "${1:-}" = "--json" ] && JSON=1
+# Tell the shared emitter to keep stdout clean for the JSON document.
+[ "$JSON" -eq 1 ] && STORAGE_JSON=1
+export STORAGE_JSON
 
 anchor=$(storage_anchor)
 pct=$(storage_used_pct "$anchor")

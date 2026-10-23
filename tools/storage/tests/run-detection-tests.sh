@@ -126,6 +126,46 @@ q=$(grep -c 'turnstone storage' "$STORAGE_ALERT_QUEUE" 2>/dev/null || true)
 ck "working dispatcher delivers" "$n" 1
 ck "delivered alert is not also queued" "$q" 0
 
+echo "== sampler: 15-minute capacity sampling =="
+SM="$TOOLS/storage-sample.sh"
+export STORAGE_SAMPLE_LOG="$WORK/samples.log" STORAGE_SAMPLE_STATE="$WORK/sample.state"
+: > "$STORAGE_SAMPLE_LOG"; rm -f "$STORAGE_SAMPLE_STATE"
+
+"$SM" >/dev/null 2>&1; ck "sampler exits 0 when healthy" "$?" 0
+n=$(grep -c 'used_pct=' "$STORAGE_SAMPLE_LOG" 2>/dev/null || true)
+ck "sampler records a sample line" "$n" 1
+if grep -q 'total_gib=' "$STORAGE_SAMPLE_LOG" && grep -q 'rate_mib_per_h=' "$STORAGE_SAMPLE_LOG"; then
+  ok "sample carries capacity, growth and rate fields"
+else
+  bad "sample carries capacity, growth and rate fields" "missing field" "all present"
+fi
+
+"$SM" >/dev/null 2>&1
+n=$(grep -c 'used_pct=' "$STORAGE_SAMPLE_LOG" 2>/dev/null || true)
+ck "second sample appended" "$n" 2
+
+: > "$STORAGE_LOG"
+"$SM" >/dev/null 2>&1
+n=$(grep -c 'alert_level=util_' "$STORAGE_LOG" 2>/dev/null || true)
+ck "no alert while healthy" "$n" 0
+
+STORAGE_WARN_PCT=20 "$SM" >/dev/null 2>&1
+n=$(grep -c 'alert_level=util_warn' "$STORAGE_LOG" 2>/dev/null || true)
+ck "warn transition alerts once" "$n" 1
+STORAGE_WARN_PCT=20 "$SM" >/dev/null 2>&1
+STORAGE_WARN_PCT=20 "$SM" >/dev/null 2>&1
+n=$(grep -c 'alert_level=util_warn' "$STORAGE_LOG" 2>/dev/null || true)
+ck "sustained warn does not re-alert" "$n" 1
+"$SM" >/dev/null 2>&1
+n=$(grep -c 'alert_level=util_recovered' "$STORAGE_LOG" 2>/dev/null || true)
+ck "recovery alerts once" "$n" 1
+
+"$SM" >/dev/null 2>&1
+rc=$(STORAGE_SAMPLE_ANCHOR_OVERRIDE=/nonexistent/path "$SM" >/dev/null 2>&1; echo $?)
+ck "measurement failure returns 20" "$rc" 20
+n=$(grep -c 'MEASURE-FAILED' "$STORAGE_SAMPLE_LOG" 2>/dev/null || true)
+ck "failure recorded in sample log" "$n" 1
+
 echo
 echo "RESULT: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -30,6 +30,7 @@ sy-build campaign "<reason>" -- cargo test --workspace
 | bypass detection (read-only) | `tools/storage/storage-detect.sh` |
 | daily summary (read-only) | `tools/storage/storage-daily.sh` |
 | alerting (transition-based) | `tools/storage/storage-alert.sh` |
+| 15-minute sampler (read-only) | `tools/storage/storage-sample.sh` |
 | tests | `tools/storage/tests/run-storage-tests.sh`, `tools/storage/tests/run-detection-tests.sh` |
 
 Not `cargo build`. Not `CARGO_TARGET_DIR=/var/tmp/something cargo build`.
@@ -141,5 +142,22 @@ an alert is never lost.
 | `storage-monitor.sh` | `17 */4 * * *` | read-only |
 | `storage-prune.sh --explain` | `37 4 * * *` | dry run |
 | `storage-daily.sh` | `17 5 * * *` | read-only |
+| `storage-sample.sh` | `*/15 * * * *` | read-only |
 
 Destructive pruning is not scheduled and requires `--apply --confirm`.
+
+### The 15-minute sampler
+
+One `df` call per run - no recursive scan, because `du` over multi-GiB trees
+every 15 minutes would itself become the load the sampler exists to notice. It
+takes no build lock, runs no cargo, and writes only its own sample log and the
+shared event log, so it cannot interfere with the four-hour monitor, the daily
+summary, or a build campaign.
+
+It records timestamp, capacity, used, available, utilisation, the delta since
+the previous sample, and the growth rate. Alerts are transitions with a
+cooldown: 70/85/92% escalation fires once, a sustained condition reminds every
+6 hours, and recovery fires once. Growth of 5 GiB or more between two samples
+fires immediately and then at most once per hour. Measurement failure is
+recorded every time but only alerts after two consecutive failures, so a single
+transient blip does not page anyone.

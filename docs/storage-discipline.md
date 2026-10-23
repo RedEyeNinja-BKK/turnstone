@@ -27,7 +27,10 @@ sy-build campaign "<reason>" -- cargo test --workspace
 | policy | `tools/storage/storage-policy.sh` |
 | monitor (read-only) | `tools/storage/storage-monitor.sh` |
 | pruner (gated) | `tools/storage/storage-prune.sh` |
-| tests | `tools/storage/tests/run-storage-tests.sh` |
+| bypass detection (read-only) | `tools/storage/storage-detect.sh` |
+| daily summary (read-only) | `tools/storage/storage-daily.sh` |
+| alerting (transition-based) | `tools/storage/storage-alert.sh` |
+| tests | `tools/storage/tests/run-storage-tests.sh`, `tools/storage/tests/run-detection-tests.sh` |
 
 Not `cargo build`. Not `CARGO_TARGET_DIR=/var/tmp/something cargo build`.
 
@@ -107,3 +110,36 @@ not *prevented*. Enforcement would require one of:
 
 Until one of those is in place, treat "one build area" as a **team convention
 with monitoring**, and say so plainly rather than claiming enforcement.
+
+## 7. Detection and alerting
+
+`storage-detect.sh` covers what a disk-usage check cannot see: a `cargo`
+process that is not running under `sy-build`, a `CARGO_TARGET_DIR` that is not
+the canonical one, an in-tree `target/` directory, abandoned build output,
+concurrent campaigns, and growth since the previous sample. It reads
+`/proc/PID/environ` only for own-uid processes.
+
+`storage-daily.sh` produces the daily summary and runs the detection sweep as
+part of its own execution, so one scheduled job covers both.
+
+`storage-alert.sh` alerts on **transitions**, not levels: entering a worse
+state, a bounded reminder while still in it, and recovery. A level-triggered
+alert on a 4-hourly job fires six times a day for an unchanged condition, which
+is how an alert channel stops being read.
+
+No notification channel is configured on this host. Without
+`STORAGE_ALERT_CMD`, alerts are appended to `storage-alerts.queue` and are not
+sent anywhere. `STORAGE_ALERT_CMD` is invoked with the message on stdin; it must
+be a simple command with arguments (it is not shell-evaluated, so redirection
+operators are not interpreted). A failing dispatcher falls back to the queue so
+an alert is never lost.
+
+### Schedules
+
+| Job | Schedule (local, Asia/Bangkok) | Mode |
+|---|---|---|
+| `storage-monitor.sh` | `17 */4 * * *` | read-only |
+| `storage-prune.sh --explain` | `37 4 * * *` | dry run |
+| `storage-daily.sh` | `17 5 * * *` | read-only |
+
+Destructive pruning is not scheduled and requires `--apply --confirm`.

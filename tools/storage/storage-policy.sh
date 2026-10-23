@@ -66,6 +66,9 @@ STORAGE_PROTECTED=(
   /var/tmp/t2.bundle
   /var/tmp/lc-rd-003-clone-backup
   /var/tmp/lc-rd-003-restore-test
+  # A durable tool install that happens to live in /var/tmp. Sourced by
+  # ~/.profile; removing it would silently break agent tooling.
+  /var/tmp/uv0918
 )
 
 # Alert only on paths this host is expected to have. The deployed v1 asserted

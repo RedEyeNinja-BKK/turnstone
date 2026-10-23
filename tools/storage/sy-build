@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# sy-build — the single canonical Cargo entrypoint for switchyard builds.
+#
+# WHY THIS EXISTS
+#   Five debug build trees (57 GiB) accumulated because each session chose its
+#   own CARGO_TARGET_DIR, or none. Nothing serialised campaigns and nothing
+#   expired their output. This wrapper fixes the mechanism, not just the mess.
+#
+#   It is a CONVENTION, not an enforced boundary: any session that runs
+#   `cargo build` directly still bypasses it. See `sy-build status` and
+#   docs/storage-discipline.md for the enforcement gap and its detection.
+#
+# DESIGN NOTES (each one is a bug that the earlier draft had)
+#   1. No `exec cargo`. The earlier draft used `exec`, which replaces the shell
+#      so no cleanup could ever run on the default path. Here cargo is a CHILD
+#      and the parent stays alive to clean up and to hold the lock.
+#   2. The lock is held on fd 9 for the whole lifetime of the cargo process AND
+#      its children (fd inheritance), not just for the wrapper's first moment.
+#   3. Signals: TERM/INT/HUP/QUIT run the same cleanup path as normal exit.
+#      Bash does not run an EXIT trap when it dies from an untrapped SIGTERM, so
+#      those traps are mandatory, not decorative.
+#   4. SIGKILL cannot be trapped. Cleanup therefore never depends solely on the
+#      trap: a campaign state file is written at start, and the next invocation
+#      reconciles a dead-PID state file before doing anything else.
+#   5. Cleanup is gated on still holding the lock. The earlier draft used
+#      `pgrep cargo`, which could not tell its own finished build from another
+#      session's running build, and silently skipped cleanup when they collided.
+#
+# USAGE
+#   sy-build campaign REASON -- cargo build --release
+#   sy-build campaign REASON -- cargo test --workspace
+#   sy-build status
+#   sy-build clean            # explicit dev-profile cleanup, lock-gated
+set -Eeuo pipefail
+
+TARGET_DIR=${SY_BUILD_TARGET:-/var/lib/turnstone/sytarget}
+LOCK_FILE=${SY_BUILD_LOCK:-/var/lib/turnstone/.build.lock}
+STATE_FILE=${SY_BUILD_STATE:-/var/lib/turnstone/.build-campaign}
+LOG=${SY_BUILD_LOG:-/var/lib/turnstone/build.log}
+MIN_FREE_GIB=${SY_BUILD_MIN_FREE_GIB:-35}
+# Set to 1 only after we ourselves acquire fd 9. Cleanup is gated on this, not
+# on a lock probe: probing fd 8 cannot distinguish our own lock from a peer's.
+LOCK_OWNED=0
+CHILD_PID=0
+# One measured debug tree of this workspace is 12-25 GiB. Reserve for it.
+PROJECTED_DEBUG_GIB=${SY_BUILD_PROJECTED_GIB:-25}
+# How long to wait for children to exit before deciding cleanup is unsafe.
+QUIESCE_TIMEOUT=${SY_BUILD_QUIESCE_TIMEOUT:-10}
+# Headroom that must remain AFTER the projected build. Configurable so the
+# refusal logic can be tested on a small filesystem without weakening the
+# production default.
+MIN_SPARE_GIB=${SY_BUILD_MIN_SPARE_GIB:-5}
+
+log() {
+  local msg; msg="$(date -u +%FT%TZ) $*"
+  printf '%s\n' "$msg" >&2
+  { printf '%s\n' "$msg" >>"$LOG"; } 2>/dev/null || true
+}
+# die MESSAGE [CODE] - $2 must not be interpolated into the message.
+die() { local msg=$1 code=${2:-1}; log "REFUSED: $msg"; exit "$code"; }
+
+free_gib() {
+  local probe=$TARGET_DIR
+  [ -d "$probe" ] || probe=$(dirname "$TARGET_DIR")
+  [ -d "$probe" ] || probe=/
+  df -Pk "$probe" 2>/dev/null | awk 'NR==2{printf "%d", $4/1048576}'
+}
+used_pct() {
+  local probe=$TARGET_DIR
+  [ -d "$probe" ] || probe=$(dirname "$TARGET_DIR")
+  [ -d "$probe" ] || probe=/
+  df -P "$probe" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}'
+}
+target_mib() {
+  [ -d "$TARGET_DIR" ] && du -xs --block-size=1M "$TARGET_DIR" 2>/dev/null | cut -f1 || echo 0
+}
+
+lock_held_by_other() {
+  # Non-blocking probe on a separate fd so we do not disturb our own lock.
+  ! ( exec 8>"$LOCK_FILE"; flock -n 8 ) 2>/dev/null
+}
+
+# --- SIGKILL recovery -------------------------------------------------------
+# Runs before any campaign starts. If a state file exists whose PID is gone,
+# the previous campaign died uncleanly (SIGKILL, OOM, power loss) and left
+# debitage behind. We report it; we do NOT auto-delete on that basis, because
+# an unclean exit is exactly when we are least sure what is safe to remove.
+reconcile_orphan() {
+  [ -f "$STATE_FILE" ] || return 0
+  # shellcheck disable=SC1090
+  . "$STATE_FILE" 2>/dev/null || { log "state file unreadable; ignoring"; rm -f "$STATE_FILE"; return 0; }
+  local pid=${CAMPAIGN_PID:-0}
+  if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then
+    log "campaign pid $pid is still alive; leaving state file alone"
+    return 0
+  fi
+  log "ORPHANED CAMPAIGN: pid ${pid} is gone (started ${CAMPAIGN_START:-?}, reason '${CAMPAIGN_REASON:-?}')"
+  log "  the previous run ended without running its cleanup trap (SIGKILL or crash)"
+  log "  dev output: $(target_mib) MiB in $TARGET_DIR"
+  log "  run 'sy-build clean' once you have confirmed no build is active"
+  rm -f "$STATE_FILE"
+  return 0
+}
+
+write_state() {
+  {
+    printf 'CAMPAIGN_PID=%q\n' "$$"
+    printf 'CAMPAIGN_START=%q\n' "$(date -u +%FT%TZ)"
+    printf 'CAMPAIGN_REASON=%q\n' "$1"
+  } > "$STATE_FILE"
+}
+clear_state() { rm -f "$STATE_FILE"; }
+
+# --- quiescence ------------------------------------------------------------
+# Deleting a tree that a still-running child is writing to would truncate its
+# output and present as a source failure. Before any removal we must be able to
+# show that no descendant of this wrapper, and no builder working under the
+# target directory, is still alive. If we cannot show that, we do not delete.
+#
+# Returns 0 when quiescent, 1 when work is still in flight.
+processes_in_my_group() {
+  local pgid=$1 p stat
+  for p in /proc/[0-9]*; do
+    [ -r "$p/stat" ] || continue
+    stat=$(cat "$p/stat" 2>/dev/null) || continue
+    # field 5 is pgrp; comm may contain spaces so strip through the last ')'
+    set -- ${stat##*) }
+    [ "${3:-}" = "$pgid" ] && echo "${p#/proc/}"
+  done
+}
+
+# Any process with an OPEN FILE inside the tree is the authoritative signal:
+# it is the condition that makes deletion destructive. It catches detached
+# grandchildren that changed process group or session, which a pgid scan misses.
+holders_in_target() {
+  local p fd target
+  target=$(readlink -f "$TARGET_DIR" 2>/dev/null || printf '%s' "$TARGET_DIR")
+  for p in /proc/[0-9]*; do
+    for fd in "$p"/fd/*; do
+      [ -e "$fd" ] || continue
+      local l
+      l=$(readlink "$fd" 2>/dev/null) || continue
+      case "$l" in
+        "$target"|"$target"/*) echo "${p#/proc/}"; break ;;
+      esac
+    done
+  done
+}
+
+builders_under_target() {
+  local p c
+  for p in /proc/[0-9]*; do
+    c=$(readlink "$p/cwd" 2>/dev/null) || continue
+    case "$c" in
+      "$TARGET_DIR"|"$TARGET_DIR"/*) echo "${p#/proc/}"; continue ;;
+    esac
+  done
+  # cargo/rustc anywhere is also disqualifying: it may be writing here even if
+  # its cwd is the source tree.
+  pgrep -x cargo 2>/dev/null
+  pgrep -x rustc 2>/dev/null
+}
+
+wait_for_quiescence() {
+  local deadline=$(( SECONDS + QUIESCE_TIMEOUT ))
+  local childpgid busy
+  # Check the CHILD's process group, never our own. This wrapper is not a
+  # session leader: its own group is the parent agent shell's group, so
+  # scanning it would find unrelated long-lived processes and refuse cleanup
+  # forever. The child group is created by `set -m` and contains exactly the
+  # build and its descendants.
+  childpgid=${CHILD_PID:-0}
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    busy=""
+    if [ "$childpgid" -gt 1 ] 2>/dev/null; then
+      busy=$(processes_in_my_group "$childpgid" | head -3)
+    fi
+    if [ -z "$busy" ]; then
+      # open handles are checked first: they are decisive, and they survive
+      # setsid / process-group changes.
+      busy=$(holders_in_target | head -3)
+    fi
+    if [ -z "$busy" ]; then
+      busy=$(builders_under_target | head -3)
+    fi
+    if [ -z "$busy" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  log "NOT QUIESCENT after ${QUIESCE_TIMEOUT}s; still alive: $(echo $busy | tr '\n' ' ')"
+  return 1
+}
+
+# --- cleanup ---------------------------------------------------------------
+# Only ever removes $TARGET_DIR/debug. Never source, never .git, never release.
+cleanup_dev() {
+  local why=${1:-exit}
+  [ -d "$TARGET_DIR/debug" ] || return 0
+  # Gate on OWNERSHIP, not on a lock probe. A fresh probe on another fd reports
+  # "held" when the holder is us, which made cleanup skip itself.
+  if [ "$LOCK_OWNED" -ne 1 ]; then
+    log "cleanup skipped ($why): this process does not own the build lock"
+    return 0
+  fi
+  # Fail closed: if work is still in flight we leave the tree alone and say so.
+  if ! wait_for_quiescence; then
+    log "cleanup REFUSED ($why): descendants still running; leaving $TARGET_DIR/debug intact"
+    log "  reclaim later with: sy-build clean (after 'sy-build status' shows no build)"
+    return 0
+  fi
+  local mib; mib=$(du -xs --block-size=1M "$TARGET_DIR/debug" 2>/dev/null | cut -f1 || echo 0)
+  rm -rf -- "$TARGET_DIR/debug"
+  log "cleanup ($why): removed $TARGET_DIR/debug (${mib} MiB)"
+}
+
+on_signal() {
+  local sig=$1
+  log "received SIG$sig"
+  # Ask our own child to stop before judging quiescence. Without this the child
+  # keeps running, quiescence is never reached, and the tree is (correctly) kept
+  # but the build is also never told to stop.
+  if [ "${CHILD_PID:-0}" -gt 0 ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    log "forwarding SIG$sig to child process group $CHILD_PID"
+    # Negative PID = the child's process group, so its descendants are asked to
+    # stop too. Falls back to the direct child if the group is gone.
+    kill -TERM "-$CHILD_PID" 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null || true
+  fi
+  cleanup_dev "signal SIG$sig" || true
+  clear_state || true
+  trap - EXIT
+  exit 130
+}
+on_exit() {
+  local rc=$?
+  cleanup_dev "exit rc=$rc" || true
+  clear_state || true
+  return "$rc"
+}
+
+# --- preflight -------------------------------------------------------------
+preflight() {
+  local free pct cur
+  free=$(free_gib)
+  pct=$(used_pct)
+  cur=$(target_mib)
+  [ -n "$free" ] || die "cannot determine free space for $TARGET_DIR" 1
+
+  log "budget: ${free} GiB free, ${pct}% used, existing target ${cur} MiB"
+  if [ "$free" -lt "$MIN_FREE_GIB" ]; then
+    log "  a debug build of this workspace needs up to ${PROJECTED_DEBUG_GIB} GiB"
+    die "insufficient space: ${free} GiB free, floor is ${MIN_FREE_GIB} GiB (run storage-monitor.sh)" 4
+  fi
+  # The floor covers the build itself; this catches the case where the floor is
+  # met but the resulting headroom would be dangerously thin.
+  if [ $(( free - PROJECTED_DEBUG_GIB )) -lt "$MIN_SPARE_GIB" ]; then
+    die "build would leave only $(( free - PROJECTED_DEBUG_GIB )) GiB free (need ${MIN_SPARE_GIB} GiB spare)" 4
+  fi
+  if [ "${pct:-0}" -ge 70 ]; then
+    log "  NOTE: filesystem already at ${pct}% (warn threshold 70%)"
+  fi
+  return 0
+}
+
+acquire_lock() {
+  # fd 9 is inherited by cargo and by every rustc child, so the lock is held for
+  # the real duration of the build, not just the wrapper's setup.
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    local holder=""
+    [ -f "$STATE_FILE" ] && holder=$(grep -o "CAMPAIGN_PID=[0-9]*" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+    log "another build campaign is active${holder:+ (pid $holder)}"
+    die "build lock $LOCK_FILE is held" 3
+  fi
+  LOCK_OWNED=1
+}
+
+# --- commands --------------------------------------------------------------
+cmd_campaign() {
+  local reason=${1:-unnamed}; shift
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die "campaign needs a command after --" 2
+
+  reconcile_orphan
+  acquire_lock
+  preflight
+
+  export CARGO_TARGET_DIR="$TARGET_DIR"
+  export CARGO_INCREMENTAL=0
+
+  write_state "$reason"
+  trap 'on_signal TERM' TERM
+  trap 'on_signal INT'  INT
+  trap 'on_signal HUP'  HUP
+  trap 'on_signal QUIT' QUIT
+  trap 'on_exit'        EXIT
+
+  log "campaign start: $reason :: $*"
+
+  local rc=0
+  # Deliberately NOT `exec`: the shell must survive to run cleanup. The command
+  # runs as a background child so its PID is known and signals can be forwarded
+  # to it. `set +e` around the wait so a failing build is reported with its own
+  # status instead of being intercepted by errexit before we can log it.
+  set +e
+  # Job control gives the child its own process group. Without it, a signal sent
+  # to the child leaves its own children running, quiescence is never reached,
+  # and cleanup is refused forever. With it, `kill -TERM -PGID` reaches the
+  # whole subtree but cannot reach this wrapper.
+  set -m
+  "$@" &
+  CHILD_PID=$!
+  set +m
+  wait "$CHILD_PID"
+  rc=$?
+  CHILD_PID=0
+  set -e
+
+  log "campaign finished rc=$rc"
+  exit "$rc"
+}
+
+cmd_clean() {
+  reconcile_orphan
+  acquire_lock
+  log "explicit cleanup requested"
+  cleanup_dev "explicit"
+  return 0
+}
+
+cmd_status() {
+  local free pct cur running="no"
+  free=$(free_gib); pct=$(used_pct); cur=$(target_mib)
+  pgrep -x cargo >/dev/null 2>&1 && running="yes (cargo)"
+  pgrep -x rustc >/dev/null 2>&1 && running="yes (rustc)"
+  echo "sy-build status"
+  echo "  target dir      : $TARGET_DIR"
+  echo "  target size     : ${cur} MiB"
+  echo "  filesystem used : ${pct}%"
+  echo "  free            : ${free} GiB (floor ${MIN_FREE_GIB} GiB)"
+  echo "  build running   : $running"
+  if lock_held_by_other; then
+    echo "  lock            : HELD by another campaign"
+  else
+    echo "  lock            : free"
+  fi
+  [ -f "$STATE_FILE" ] && echo "  state file      : $(tr '\n' ' ' < "$STATE_FILE")" || echo "  state file      : none"
+  if [ "${free:-0}" -lt "$MIN_FREE_GIB" ]; then
+    echo "  VERDICT         : would REFUSE a new campaign (insufficient space)"
+    return 4
+  fi
+  echo "  VERDICT         : a new campaign may start"
+  return 0
+}
+
+case "${1:-}" in
+  campaign) shift; cmd_campaign "$@" ;;
+  clean)    cmd_clean ;;
+  status)   cmd_status ;;
+  ""|help|-h|--help)
+    cat >&2 <<'EOF'
+usage:
+  sy-build campaign REASON -- cargo <args>   build under the canonical target dir
+  sy-build status                            report budget, lock, running state
+  sy-build clean                             remove the dev profile (lock-gated)
+EOF
+    exit 2 ;;
+  *) die "unknown command '$1' (see sy-build help)" 2 ;;
+esac

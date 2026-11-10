@@ -12,14 +12,23 @@ this host. Normative, not advisory.
   ```
   Source: `tools/storage/sy-build`. Installed as `/var/lib/turnstone/bin/sy-build`
   (on `PATH` for the service account via `~/.profile`).
-- There is exactly one target directory: `/var/lib/turnstone/sytarget`.
+- Builds land on the dedicated build filesystem, never on the root filesystem
+  that holds the OS, the services and the credentials store. The wrapper derives
+  one target directory per worktree:
+  `/mnt/turnstone-build-ssd/targets/<worktree>-<hash>`.
+- The build filesystem is proven before every campaign by
+  `/var/lib/turnstone/build-disk/build-env.sh --check`, which asserts the
+  filesystem UUID. There is no root-local fallback: a missing or replaced disk
+  stops the build.
 - **Never** set `CARGO_TARGET_DIR` to an ad-hoc path. A per-session directory
   under `/var/tmp` is the mechanism that produced 43 GiB of duplicate debug
-  output in five days.
+  output in five days. `SY_BUILD_TARGET` is the wrapper's own override and is
+  for tests only.
 - One campaign at a time. If the wrapper exits `3`, another campaign holds the
   lock — wait, do not work around it.
-- If the wrapper exits `4`, there is not enough free space. Do not start a build
-  "anyway"; run `storage-monitor.sh` and report.
+- If the wrapper exits `4`, the build filesystem is unusable or there is not
+  enough free space. Do not start a build "anyway"; run `storage-monitor.sh` and
+  report.
 - Do not run `cargo` directly. It bypasses the lock, the budget check and the
   cleanup, and the monitor will flag the resulting tree as an unexpected build
   root.

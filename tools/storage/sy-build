@@ -34,6 +34,28 @@
 set -Eeuo pipefail
 
 TARGET_DIR=${SY_BUILD_TARGET:-/var/lib/turnstone/sytarget}
+
+# --- build filesystem -------------------------------------------------------
+# Builds belong on the dedicated build SSD, not on the root filesystem that
+# also holds the OS, the services and the credentials store. Two properties are
+# required and both are enforced below rather than assumed:
+#   * the mount is present and is the intended disk (build-env.sh asserts the
+#     filesystem UUID, not merely that some filesystem is at the path)
+#   * each worktree gets its own target directory, because two worktrees
+#     sharing one target contend on Cargo's lock and can overwrite artefacts
+BUILD_MNT=${TURNSTONE_BUILD_MNT:-/mnt/turnstone-build-ssd}
+BUILD_ENV=${TURNSTONE_BUILD_ENV:-/var/lib/turnstone/build-disk/build-env.sh}
+
+# Derived from the resolved CWD, not from git: the NFS worktrees trip git's
+# dubious-ownership check, which would make the target directory depend on
+# whether a safe.directory exception happened to exist.
+if [ -z "${SY_BUILD_TARGET+x}" ]; then
+  _pwd_real=$(pwd -P)
+  _wt_name=$(basename "$_pwd_real" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/-$//')
+  _wt_hash=$(printf '%s' "$_pwd_real" | sha256sum | cut -c1-12)
+  TARGET_DIR="$BUILD_MNT/targets/${_wt_name}-${_wt_hash}"
+  unset _pwd_real _wt_name _wt_hash
+fi
 LOCK_FILE=${SY_BUILD_LOCK:-/var/lib/turnstone/.build.lock}
 STATE_FILE=${SY_BUILD_STATE:-/var/lib/turnstone/.build-campaign}
 LOG=${SY_BUILD_LOG:-/var/lib/turnstone/build.log}
@@ -60,15 +82,16 @@ log() {
 die() { local msg=$1 code=${2:-1}; log "REFUSED: $msg"; exit "$code"; }
 
 free_gib() {
+  # Walk UP to the nearest directory that exists: a per-worktree target
+  # directory does not exist before its first build, and falling straight to /
+  # would silently measure the root filesystem instead of the build disk.
   local probe=$TARGET_DIR
-  [ -d "$probe" ] || probe=$(dirname "$TARGET_DIR")
-  [ -d "$probe" ] || probe=/
+  while [ ! -d "$probe" ] && [ "$probe" != "/" ]; do probe=$(dirname "$probe"); done
   df -Pk "$probe" 2>/dev/null | awk 'NR==2{printf "%d", $4/1048576}'
 }
 used_pct() {
   local probe=$TARGET_DIR
-  [ -d "$probe" ] || probe=$(dirname "$TARGET_DIR")
-  [ -d "$probe" ] || probe=/
+  while [ ! -d "$probe" ] && [ "$probe" != "/" ]; do probe=$(dirname "$probe"); done
   df -P "$probe" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}'
 }
 target_mib() {
@@ -241,6 +264,21 @@ on_exit() {
 # --- preflight -------------------------------------------------------------
 preflight() {
   local free pct cur
+
+  # Fail CLOSED on the build filesystem. There is deliberately no root-local
+  # fallback: a missing or wrong disk must stop the build, not quietly move
+  # output onto the filesystem that holds production and the credential store.
+  # build-env.sh is the single authority and asserts the filesystem UUID, so a
+  # remounted or replaced disk is refused as well.
+  if [ ! -x "$BUILD_ENV" ]; then
+    die "missing build filesystem guard at $BUILD_ENV" 4
+  fi
+  local envout
+  if ! envout=$("$BUILD_ENV" --check 2>&1); then
+    printf '%s\n' "$envout" >&2
+    die "build filesystem unusable; refusing to build (no root-local fallback)" 4
+  fi
+
   free=$(free_gib)
   pct=$(used_pct)
   cur=$(target_mib)
@@ -287,6 +325,15 @@ cmd_campaign() {
 
   export CARGO_TARGET_DIR="$TARGET_DIR"
   export CARGO_INCREMENTAL=0
+  # Scratch belongs on the build disk too: rustc writes large temporaries, and
+  # leaving TMPDIR on the root filesystem repeats the mistake this wrapper is
+  # meant to prevent. An inherited TMPDIR is honoured unless forced.
+  if [ -z "${TMPDIR:-}" ] || [ "${SY_BUILD_FORCE_TMPDIR:-0}" = 1 ]; then
+    if [ -d "$BUILD_MNT" ]; then
+      export TMPDIR="$BUILD_MNT/tmp"
+      mkdir -p "$TMPDIR" 2>/dev/null || true
+    fi
+  fi
 
   write_state "$reason"
   trap 'on_signal TERM' TERM

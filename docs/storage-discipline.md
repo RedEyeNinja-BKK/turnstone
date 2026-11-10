@@ -7,18 +7,16 @@ taking the root filesystem to 85% and blocking work.
 
 ## 1. The rule
 
-There is exactly **one** Cargo target directory:
-
-```
-/var/lib/turnstone/sytarget
-```
-
 Every build goes through the wrapper in this repository:
 
 ```bash
 sy-build campaign "<reason>" -- cargo build --release
 sy-build campaign "<reason>" -- cargo test --workspace
 ```
+
+Build output goes to the dedicated build filesystem, one target directory per
+worktree: `/mnt/turnstone-build-ssd/targets/<worktree>-<hash>`. Nothing is built
+onto `/var/lib/turnstone/`, and nothing falls back to the root filesystem.
 
 | Item | Path |
 |---|---|
@@ -43,7 +41,8 @@ reasonable local decision by a session that did not know a convention existed.
 
 | Guarantee | How |
 |---|---|
-| One target dir | fixed in the wrapper, not overridable by accident |
+| Builds off the root filesystem | the target lives under `/mnt/turnstone-build-ssd`, and the wrapper refuses to build if that filesystem is not the intended disk |
+| One target dir per worktree | derived in the wrapper from the resolved CWD (`<worktree>-<hash>`), so two worktrees cannot overwrite each other's artefacts; `SY_BUILD_TARGET` is the wrapper's own override and exists for the tests |
 | No incremental bloat | `CARGO_INCREMENTAL=0` (incremental state measured 2.1–5.7 GiB per tree) |
 | One campaign at a time | `flock` on `/var/lib/turnstone/.build.lock`, held for the whole cargo lifetime **and inherited by its children** |
 | Enough headroom | refuses below 35 GiB free, and refuses if the build would leave under 5 GiB spare |

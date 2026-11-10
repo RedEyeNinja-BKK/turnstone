@@ -63,10 +63,22 @@ case "$out" in *in_tree_target*) ok "in-tree target detected" ;;
                 *) bad "in-tree target detected" "absent" "present" ;; esac
 
 echo "== detection: retained release is not called a bypass =="
-REL="$WORK/canonical"; mkdir -p "$REL/release"
-out=$(STORAGE_TARGETS="$REL" "$DETECT" 2>&1)
+# The rule is "release/ only, and protected". Both halves are supplied by the
+# fixture: the scan root via the documented testability override, and the
+# protection via the additive-only protected list. The previous version of this
+# assertion simply grepped for a protected path that happened to exist on the
+# dev host, so it passed there and failed on a runner where no such path exists.
+RELROOT="$WORK/retained"; REL="$RELROOT/repo/target"
+mkdir -p "$REL/release"; printf 'x' > "$REL/release/artefact"
+out=$(STORAGE_SCAN_ROOTS_OVERRIDE="$RELROOT" STORAGE_PROTECTED_EXTRA="$REL/release" "$DETECT" 2>&1)
 case "$out" in *retained_release*) ok "retained release classified separately" ;;
                 *) bad "retained release classified separately" "absent" "present" ;; esac
+# Negative control: the same shape without the protection is a bypass. Proves
+# the classification comes from the protected prefix, not from the shape alone.
+out=$(STORAGE_SCAN_ROOTS_OVERRIDE="$RELROOT" "$DETECT" 2>&1)
+case "$out" in *retained_release*) bad "an unprotected release dir is a bypass (control)" "retained_release" "in_tree_target" ;;
+                *in_tree_target*) ok "an unprotected release dir is a bypass (control)" ;;
+                *) bad "an unprotected release dir is a bypass (control)" "absent" "in_tree_target" ;; esac
 
 echo "== detection: cargo with a non-canonical target =="
 mkdir -p "$WORK/bin"; cp /bin/sleep "$WORK/bin/cargo" 2>/dev/null || cp "$(command -v sleep)" "$WORK/bin/cargo"

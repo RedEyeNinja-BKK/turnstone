@@ -174,6 +174,16 @@ STORAGE_PROTECTED=(
   /var/tmp/uv0918
 )
 
+# Additive only. A caller may ADD paths to the never-delete set (the test suite
+# does this to put a fixture under a protected prefix); it can never shrink the
+# set, so no environment variable can remove a protection. STORAGE_PROTECTED
+# itself is deliberately not overridable for that reason.
+if [ -n "${STORAGE_PROTECTED_EXTRA:-}" ]; then
+  read -r -a _storage_protected_extra <<<"$STORAGE_PROTECTED_EXTRA"
+  STORAGE_PROTECTED+=("${_storage_protected_extra[@]}")
+  unset _storage_protected_extra
+fi
+
 # Alert only on paths this host is expected to have. The deployed v1 asserted
 # every entry in one list and produced meaningless noise for paths that never
 # existed here - which is how a real finding gets ignored.

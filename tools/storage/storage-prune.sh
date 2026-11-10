@@ -12,7 +12,9 @@
 #   4. no campaign holds the build lock
 #   5. every candidate passes: not protected, not a symlink, not a foreign
 #      filesystem, no nested mount, and not a bare `target` or `release` dir
-#   6. the tree is genuinely stale (NOTHING modified within N days)
+#   6. the tree is genuinely stale (NOTHING modified within N days). An active
+#      tree is classified and logged, then skipped — it is never proposed and
+#      never removed. Eligibility is positively required, not merely inferred.
 #
 # FAIL CLOSED: if any gate cannot be evaluated, nothing is removed and the exit
 # status is non-zero. An unverifiable safety condition is treated as unsafe.
@@ -159,14 +161,25 @@ for c in "${CANDIDATES[@]}"; do
   # answers; only a proven-stale tree may proceed. A scan that could not run is
   # an environment problem a human must resolve, so it stops the run rather than
   # being quietly skipped.
+  #
+  # Eligibility is POSITIVELY established here and re-checked below. An earlier
+  # version logged class=active and then fell through to the removal step, so a
+  # tree modified seconds ago was deleted. Requiring `eligible=1` means a future
+  # arm that forgets to `continue` still cannot reach `rm`.
+  eligible=0
   stale_rc=0; storage_is_stale "$path" "$STALE_DAYS" || stale_rc=$?
   case "$stale_rc" in
-    0) storage_emit info classify path="$path" class=stale kind="$kind" ;;
-    1) storage_emit info classify path="$path" class=active kind="$kind" ;;
+    0) storage_emit info classify path="$path" class=stale kind="$kind"; eligible=1 ;;
+    1) storage_emit info classify path="$path" class=active kind="$kind"
+       skipped=$((skipped+1)); continue ;;
     *) storage_emit error prune_failed reason=staleness_undeterminable path="$path"
        echo "storage-prune: cannot determine staleness of $path — refusing to continue" >&2
        exit 20 ;;
   esac
+  if [ "$eligible" -ne 1 ]; then
+    storage_emit warn refuse path="$path" reason=not_proven_stale
+    skipped=$((skipped+1)); continue
+  fi
   # Path validation is three-way as well: a check that could not run is not a
   # licence to delete.
   safety=0; storage_path_safety "$path" || safety=$?

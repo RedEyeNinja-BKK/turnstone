@@ -179,6 +179,61 @@ STORAGE_TARGETS="$LIVETARGET" STORAGE_PYTEST_GLOBS="$WORK/pytest-of-*" \
   STORAGE_PRUNE_PCT=0 STORAGE_LOG="$WORK/ev.log" run_prune "$PR" --apply >/dev/null 2>&1
 [ -d "$PT" ] && r=present || r=absent; check_eq "--apply without --confirm deletes nothing" "$r" present
 
+echo "== storage-prune: an ACTIVE candidate is never deleted, only logged =="
+# Regression: the per-candidate loop classified a fresh tree as class=active and
+# then fell through to the removal step, so a tree modified seconds ago was
+# deleted. `debug/incremental` is the exposed case: it is added as a candidate
+# unconditionally, relying on this loop for its staleness gate.
+ACT="$WORK/active-target"; mkdir -p "$ACT/debug/incremental" "$ACT/debug/deps"
+echo fresh > "$ACT/debug/incremental/live.bin"
+echo fresh > "$ACT/debug/deps/live.rlib"
+touch "$ACT/debug/incremental/live.bin" "$ACT/debug/deps/live.rlib"
+
+# Dry run first, so "not even proposed" is a real assertion rather than a grep
+# over a log produced by a destructive pass.
+ACTLOG="$WORK/active-dryrun.log"
+STORAGE_TARGETS="$ACT" STORAGE_PYTEST_GLOBS="$WORK/none" STORAGE_PRUNE_PCT=0 \
+  STORAGE_LOG="$ACTLOG" run_prune "$PR" --apply >/dev/null 2>&1
+check_rc "a fresh target completes a dry run" "$?" 0
+if grep -q "event=would_remove .*active-target" "$ACTLOG"; then
+  bad "an active candidate is not even proposed in a dry run" "proposed" "absent"
+else
+  ok "an active candidate is not even proposed in a dry run"
+fi
+grep -q "class=active" "$ACTLOG" \
+  && ok "the active candidate is classified in a dry run" \
+  || bad "the active candidate is classified in a dry run" "absent" "class=active"
+
+ACTLOG="$WORK/active-apply.log"
+STORAGE_TARGETS="$ACT" STORAGE_PYTEST_GLOBS="$WORK/none" STORAGE_PRUNE_PCT=0 \
+  STORAGE_LOG="$ACTLOG" run_prune "$PR" --apply --confirm >/dev/null 2>&1
+check_rc "a fresh target still completes an authorized run" "$?" 0
+[ -e "$ACT/debug/incremental/live.bin" ] && r=present || r=absent
+check_eq "an active incremental tree is not deleted" "$r" present
+[ -e "$ACT/debug/deps/live.rlib" ] && r=present || r=absent
+check_eq "an active deps tree is not deleted" "$r" present
+if grep -q "event=removed .*active-target" "$ACTLOG"; then
+  bad "an active candidate is not reported as removed" "removed" "absent"
+else
+  ok "an active candidate is not reported as removed"
+fi
+
+echo "== storage-prune: a stale candidate IS still deleted (control) =="
+# The guard above must not become a blanket refusal: a genuinely stale tree has
+# to remain deletable, or the pruner silently stops working.
+OLD="$WORK/old-target"; mkdir -p "$OLD/debug/incremental" "$OLD/debug/deps"
+echo old > "$OLD/debug/incremental/gone.bin"
+echo old > "$OLD/debug/deps/gone.rlib"
+touch -d '5 days ago' "$OLD/debug/incremental/gone.bin" "$OLD/debug/deps/gone.rlib" \
+  "$OLD/debug/incremental" "$OLD/debug/deps" "$OLD/debug"
+STORAGE_TARGETS="$OLD" STORAGE_PYTEST_GLOBS="$WORK/none" STORAGE_PRUNE_PCT=0 \
+  STORAGE_LOG="$WORK/ev.log" run_prune "$PR" --apply --confirm >/dev/null 2>&1
+check_rc "a stale target completes the run" "$?" 0
+[ -e "$OLD/debug/incremental/gone.bin" ] && r=present || r=absent
+check_eq "a stale incremental tree is deleted" "$r" absent
+[ -e "$OLD/debug/deps/gone.rlib" ] && r=present || r=absent
+check_eq "a stale deps tree is deleted" "$r" absent
+
 echo "== storage_size_mib: incomplete scan fails closed, never zero ==="
 POLICY="$TOOLS/storage-policy.sh"
 # shellcheck source=/dev/null

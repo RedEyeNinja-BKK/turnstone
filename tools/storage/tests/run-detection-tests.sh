@@ -28,8 +28,29 @@ export STORAGE_SAMPLE_FILE="$WORK/sample"
 export SY_BUILD_TARGET="$WORK/canonical"
 export SY_BUILD_LOCK="$WORK/lock"
 
+# Host-independent targets. The policy defaults name this host's build tree and
+# optional recovery tree; on any machine without them `storage_anchor` finds
+# nothing and detection exits 20, so the suite passed only where those paths
+# happened to exist. A CI runner has none of them: the first assertion failed
+# with "clean host exits 0 (got 20, want 0)" while the same suite was green on
+# the dev host. Point both lists at a fixture and clear the optional list, so
+# no assertion can be satisfied or broken by the host's own filesystem.
+#
+# The fixture carries a freshly written file: an empty directory measures as
+# abandoned output, which is a finding and would make the clean-baseline case
+# fail for the wrong reason.
+mkdir -p "$WORK/canonical/debug/deps"
+printf 'x' > "$WORK/canonical/debug/deps/fixture"
+export STORAGE_TARGETS="$WORK/canonical"
+export STORAGE_OPTIONAL_TARGETS=""
+
 echo "== detection: clean baseline =="
 "$DETECT" >/dev/null 2>&1; ck "clean host exits 0" "$?" 0
+# Guard the property above: if a future edit drops the override, this fails
+# here instead of passing on a host that happens to have the default tree.
+( . "$TOOLS/storage-policy.sh"; printf '%s\n' "${STORAGE_TARGETS[0]}" ) | grep -q "^${WORK}/" \
+  && ok "target list is the fixture, not a host path" \
+  || bad "target list is the fixture, not a host path" "host path" "$WORK"
 
 echo "== detection: in-tree target is reported =="
 ROOT="$WORK/srcrepo"; mkdir -p "$ROOT/target/debug/deps"

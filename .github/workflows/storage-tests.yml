@@ -1,0 +1,76 @@
+name: Storage controls
+
+# The storage control scripts (monitor, prune, detect, daily) and the build
+# wrappers are Bash and Rust-free: no Rust toolchain is needed, so this runs in
+# seconds and does not belong in the main CI matrix. It is a separate workflow
+# because these scripts can delete build trees, and a regression in one of them
+# must fail loudly on its own rather than be buried in a 10-job run.
+
+on:
+  push:
+    branches: [main, "stable/*"]
+  pull_request:
+    branches: [main, "stable/*"]
+
+permissions:
+  contents: read
+
+jobs:
+  storage-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Recorded, not asserted: the deletion-path cases need user namespaces,
+      # and the suite decides for itself whether it can run them (see the
+      # isolation step below). Printing this makes an INCONCLUSIVE result
+      # diagnosable from the log instead of looking like a broken workflow.
+      - name: Report user-namespace availability
+        run: |
+          if unshare -r -m -p -f --mount-proc true 2>/dev/null; then
+            echo "user namespaces: available"
+          else
+            echo "user namespaces: UNAVAILABLE"
+          fi
+
+      # Catches the defect class that started this: a joined line can look
+      # valid to `bash -n` while silently turning one statement into arguments
+      # of another.
+      - name: Bash syntax
+        run: bash -n tools/storage/*.sh tools/storage/tests/*.sh
+
+      # Read-only assertions only: detection, daily summary, policy, sizing.
+      - name: Storage detection suite
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: tools/storage/tests/run-detection-tests.sh
+
+      # Isolation is REQUIRED here. Without user namespaces the pruner's
+      # "no cargo/rustc/pytest anywhere" gate refuses every deletion case, so
+      # the assertions would pass without proving anything. The suite exits 3
+      # with RESULT: INCONCLUSIVE in that case rather than reporting green —
+      # a runner that cannot isolate must not be able to claim the deletion
+      # paths are verified. Those cases are verified host-locally instead.
+      - name: Storage policy and pruner suite
+        env:
+          TMPDIR: ${{ runner.temp }}
+          STORAGE_TESTS_REQUIRE_ISOLATION: "1"
+        run: tools/storage/tests/run-storage-tests.sh
+
+      # Pinned: a newer ShellCheck can introduce diagnostics that would turn
+      # this gate red for reasons unrelated to the change under review.
+      - name: Install ShellCheck
+        run: pip install shellcheck-py==0.11.0.1
+
+      # Warning severity on the scripts that run on the host: SC2171 (a
+      # trailing "]" outside a test) is a warning, and it is exactly the
+      # defect this gate exists to catch. Both suites currently pass at this
+      # severity, so the gate is strict with no exclusions.
+      - name: ShellCheck — production scripts
+        run: shellcheck -S warning -x tools/storage/*.sh
+
+      # Error severity only: the harnesses source a path held in a variable
+      # (SC1090) and use deliberately empty command prefixes (SC1007).
+      - name: ShellCheck — test harnesses
+        run: shellcheck -S error -x tools/storage/tests/*.sh

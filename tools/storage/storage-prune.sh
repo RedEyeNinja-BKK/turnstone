@@ -81,8 +81,11 @@ fi
 
 # ---- candidate construction ----------------------------------------------
 # Each candidate is <path>|<kind>. Only these kinds exist; there is no default.
+# Missing targets are an explicit, actionable error — not a silent no-op.
 CANDIDATES=()
-for t in "${STORAGE_TARGETS[@]}"; do
+have_target=0
+for t in $(storage_target_list); do
+  have_target=1
   [ -d "$t" ] || continue
   CANDIDATES+=("$t/debug/incremental|incremental")
   if storage_is_stale "$t/debug" "$STALE_DAYS"; then
@@ -91,6 +94,11 @@ for t in "${STORAGE_TARGETS[@]}"; do
     CANDIDATES+=("$t/debug/examples|examples")
   fi
 done
+if [ "$have_target" -eq 0 ]; then
+  storage_emit error prune_failed reason=no_targets
+  echo "storage-prune: no storage targets found — refusing to run with nothing to measure" >&2
+  exit 20
+fi
 for g in "${STORAGE_PYTEST_GLOBS[@]}"; do
   for d in $g; do
     [ -d "$d" ] || continue
@@ -131,7 +139,11 @@ for c in "${CANDIDATES[@]}"; do
     skipped=$((skipped+1)); continue
   fi
 
-  mib=$(storage_size_mib "$path")
+  mib=$(storage_size_mib "$path") || {
+    storage_emit error prune_failed reason=cannot_measure_candidate path="$path"
+    echo "storage-prune: cannot measure candidate $path — refusing to remove it" >&2
+    exit 20
+  }
 
   if [ "$APPLY" -eq 1 ] && [ "$CONFIRM" -eq 1 ]; then
     rm -rf -- "$path"

@@ -36,12 +36,18 @@ if [ -z "$pct" ] || [ -z "$free" ]; then
   exit 20
 fi
 
-# Collect build roots.
+# Collect build roots. Each root's size is measured independently; a single
+# unreadable root must not silence the whole measurement or report zero.
 build_rows=()
 build_total=0
-for t in "${STORAGE_TARGETS[@]}"; do
-  if [ -d "$t" ]; then
-    mib=$(storage_size_mib "$t"); build_total=$((build_total + mib))
+for t in $(storage_target_list); do
+  if [ -e "$t" ]; then
+    if ! mib=$(storage_size_mib "$t"); then
+      storage_emit error monitor_failed reason=cannot_measure_build_root path="$t"
+      echo "storage-monitor: cannot measure build root $t" >&2
+      exit 20
+    fi
+    build_total=$((build_total + mib))
     build_rows+=("$t|$mib|present")
   else
     build_rows+=("$t|0|absent")
@@ -58,7 +64,12 @@ for pat in "${STORAGE_UNEXPECTED_PATTERNS[@]}"; do
     skip=0
     for t in "${STORAGE_TARGETS[@]}"; do [ "$hit" = "$t" ] && skip=1; done
     [ "$skip" -eq 1 ] && continue
-    unexpected+=("$hit|$(storage_size_mib "$hit")")
+    if ! mib=$(storage_size_mib "$hit"); then
+      storage_emit error monitor_failed reason=cannot_measure_unexpected_root path="$hit"
+      echo "storage-monitor: cannot measure unexpected root $hit" >&2
+      exit 20
+    fi
+    unexpected+=("$hit|$mib")
   done
 done
 
@@ -68,7 +79,12 @@ pytest_total=0
 for g in "${STORAGE_PYTEST_GLOBS[@]}"; do
   for d in $g; do
     [ -d "$d" ] || continue
-    mib=$(storage_size_mib "$d"); pytest_total=$((pytest_total + mib))
+    if ! mib=$(storage_size_mib "$d"); then
+      storage_emit error monitor_failed reason=cannot_measure_pytest path="$d"
+      echo "storage-monitor: cannot measure pytest sandbox $d" >&2
+      exit 20
+    fi
+    pytest_total=$((pytest_total + mib))
     pytest_rows+=("$d|$mib")
   done
 done

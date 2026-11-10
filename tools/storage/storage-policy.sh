@@ -9,11 +9,38 @@
 # Every Rust target root on this host. One explicit entry per tree — a glob
 # here would silently adopt the next stray /var/tmp/sytarget-* a session
 # invents, which is the behaviour we are trying to stop.
+#
+# The build SSD holds per-worktree targets under
+#   /mnt/turnstone-build-ssd/targets/<worktree>-<hash>
+# discovered at run time (see storage_target_list). The two legacy roots are
+# listed explicitly; the SSD entry is added when the mount is present and
+# never assumed when it is absent.
 if [ -z "${STORAGE_TARGETS+x}" ]; then STORAGE_TARGETS=(
   /var/lib/turnstone/sytarget
   /var/lib/turnstone/switchyard-upstream/recovered-6de85da1/target
 )
 fi
+
+# Build roots that live on the build SSD. Not in STORAGE_TARGETS by default
+# because the SSD may be unmounted; they are discovered by storage_target_list
+# only when the mount is present (guarded by build-env.sh's UUID assertion).
+STORAGE_SSD_TARGET_ROOT=${STORAGE_SSD_TARGET_ROOT:-/mnt/turnstone-build-ssd/targets}
+
+# Return every target root to measure: the configured roots plus any live
+# per-worktree target directory on the build SSD. The SSD entry is discovered
+# lazily so an absent mount is reported cleanly rather than measured as /.
+storage_target_list() {
+  local t
+  for t in "${STORAGE_TARGETS[@]}"; do
+    [ -e "$t" ] && printf '%s\n' "$t"
+  done
+  if [ -d "$STORAGE_SSD_TARGET_ROOT" ]; then
+    local w
+    for w in "$STORAGE_SSD_TARGET_ROOT"/*/; do
+      [ -d "$w" ] && printf '%s\n' "$w"
+    done
+  fi
+}
 
 # Roots that are NOT expected to exist but must be detected if they reappear:
 # an ad-hoc CARGO_TARGET_DIR is exactly how 43 GiB appeared before.
@@ -44,11 +71,11 @@ STORAGE_PROTECTED=(
   /var/lib/turnstone/staging
   /var/lib/turnstone/canary
   /var/lib/turnstone/sensor-runtime
-  /var/lib/turnstone/credentials
+  # The live credentials directory is under /srv, not /var/lib/turnstone.
+  /srv/turnstone/credentials
   /var/lib/turnstone/github
   /var/lib/turnstone/source
   /var/lib/turnstone/switchyard-upstream/recovered-6de85da1/.git
-  /var/lib/turnstone/switchyard-upstream/recovered-6de85da1/recovered
   /var/lib/turnstone/switchyard-upstream/recovered-6de85da1/target/release
   /var/lib/turnstone/integrations
   /var/lib/turnstone/builds
@@ -112,7 +139,7 @@ storage_emit() {
 # Filesystem holding the first existing target, else /.
 storage_anchor() {
   local t
-  for t in "${STORAGE_TARGETS[@]}"; do
+  for t in $(storage_target_list); do
     if [ -e "$t" ]; then printf '%s' "$t"; return 0; fi
   done
   printf '/'
@@ -204,6 +231,29 @@ storage_is_stale() {
   return 1
 }
 
+# storage_size_mib — measure one path in MiB, failing closed.
+#
+# Prints exactly one integer on stdout and returns 0 on success.
+#
+# Exit codes:
+#   0  measured successfully
+#   2  path does not exist (distinct from "measures zero")
+#   3  du could not scan the path (permission error, missing mount, etc.)
+#   4  du produced output that is not a single clean integer
+#
+# Never prints a partial size followed by a fallback "0": that was the defect
+# that let an inaccessible directory report as zero usage with an OK verdict.
+# An unmeasurable path is an error, not zero usage.
 storage_size_mib() {
-  du -xs --block-size=1M "$1" 2>/dev/null | cut -f1 || echo 0
+  local path=$1 raw line count
+  [ -e "$path" ] || { storage_emit error size_missing path="$path"; return 2; }
+  raw=$(du -xs --block-size=1M -- "$path" 2>/dev/null) || { storage_emit error size_unreadable path="$path"; return 3; }
+  # du prints "size\tpath"; keep only the size field.
+  line=$(printf '%s\n' "$raw" | cut -f1)
+  count=$(printf '%s\n' "$line" | grep -c .)
+  [ "$count" -eq 1 ] || { storage_emit error size_malformed path="$path" lines="$count"; return 4; }
+  case "$line" in
+    *[!0-9]*) storage_emit error size_malformed path="$path" value="$line"; return 4 ;;
+  esac
+  printf '%s\n' "$line"
 }

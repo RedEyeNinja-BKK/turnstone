@@ -109,7 +109,11 @@ for root in "${SCAN_ROOTS[@]}"; do
     [ "$t_real" = "$CANON_REAL" ] && continue
     case " $seen_targets " in *" $t_real "*) continue ;; esac
     seen_targets="$seen_targets $t_real"
-    mib=$(storage_size_mib "$t")
+    if ! mib=$(storage_size_mib "$t"); then
+      note warn in_tree_target path="$t" mib=unreadable state=unmeasurable
+      findings=$((findings+1))
+      continue
+    fi
     # A target directory whose only profile is `release` inside a protected
     # prefix is the retained release artefact, not a bypass. Saying otherwise
     # would make this check cry wolf on a healthy host.
@@ -130,7 +134,11 @@ done
 
 # ---- 4: abandoned canonical output ---------------------------------------
 if [ -d "$CANONICAL" ] && storage_is_stale "$CANONICAL" "$ABANDON_DAYS"; then
-  note warn abandoned_output path="$CANONICAL" mib="$(storage_size_mib "$CANONICAL")" age_days="$ABANDON_DAYS"
+  if mib=$(storage_size_mib "$CANONICAL"); then
+    note warn abandoned_output path="$CANONICAL" mib="$mib" age_days="$ABANDON_DAYS"
+  else
+    note warn abandoned_output path="$CANONICAL" mib=unreadable age_days="$ABANDON_DAYS"
+  fi
   findings=$((findings+1))
 fi
 

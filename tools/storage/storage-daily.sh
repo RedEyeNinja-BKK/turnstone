@@ -38,6 +38,12 @@ anchor=$(storage_anchor)
 pct=$(storage_used_pct "$anchor")
 free=$(storage_free_gib "$anchor")
 
+if [ -z "$pct" ] || [ -z "$free" ]; then
+  storage_emit error daily_failed reason=cannot_measure anchor="$anchor"
+  echo "storage-daily: cannot measure $anchor" >&2
+  exit 20
+fi
+
 # --- monitoring liveness ---------------------------------------------------
 # Six runs per day are expected (every 4 hours). Count today's monitor events.
 mon_all=$(grep -c "event=monitor" "$EVENTS" 2>/dev/null || true)
@@ -72,9 +78,14 @@ cand_mib=$(printf '%s\n' "$cand_map" | awk '{s+=$2} END{printf "%d", s+0}')
 # --- build footprint -------------------------------------------------------
 build_total=0
 build_lines=""
-for t in "${STORAGE_TARGETS[@]}"; do
+for t in $(storage_target_list); do
   if [ -d "$t" ]; then
-    m=$(storage_size_mib "$t"); build_total=$((build_total + m))
+    if ! m=$(storage_size_mib "$t"); then
+      storage_emit error daily_failed reason=cannot_measure_build_root path="$t"
+      echo "storage-daily: cannot measure build root $t" >&2
+      exit 20
+    fi
+    build_total=$((build_total + m))
     build_lines="$build_lines  $(printf '%-62s %8s MiB' "$t" "$m")\n"
   fi
 done

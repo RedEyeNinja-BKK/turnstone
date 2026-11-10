@@ -157,6 +157,86 @@ STORAGE_TARGETS="$WORK/notarget" STORAGE_PYTEST_GLOBS="$WORK/pytest-of-*" \
   STORAGE_PRUNE_PCT=0 STORAGE_LOG="$WORK/ev.log" "$PR" --apply >/dev/null 2>&1
 [ -d "$PT" ] && r=present || r=absent; check_eq "--apply without --confirm deletes nothing" "$r" present
 
+echo "== storage_size_mib: incomplete scan fails closed, never zero ==="
+POLICY="$TOOLS/storage-policy.sh"
+# shellcheck source=/dev/null
+. "$POLICY"
+ACC="$WORK/accounting"; mkdir -p "$ACC/ok" "$ACC/nope"
+echo "readable" > "$ACC/ok/file"
+chmod 000 "$ACC/nope"
+
+# 1) accessible tree measures cleanly (single integer)
+if mib=$(STORAGE_JSON=1 storage_size_mib "$ACC/ok" 2>/dev/null); then
+  case "$mib" in *[!0-9]*) bad "size is a clean integer" "$mib" "digits only" ;; *)
+    ok "accessible tree measures $mib MiB" ;;
+  esac
+else
+  bad "accessible tree measures cleanly" "rc=0" "rc=$?"
+fi
+
+# 2) tree containing an unreadable dir fails closed (rc=3), never returns 0 with garbage
+rc=0
+mib=$(STORAGE_JSON=1 storage_size_mib "$ACC" 2>/dev/null) || rc=$?
+[ "$rc" -eq 3 ] && ok "incomplete scan returns rc=3" || bad "incomplete scan returns rc=3" "$rc" 3
+case "$mib" in *$'\n'*) bad "no multi-line fallback value" "$mib" "single line" ;; *) ok "no multi-line fallback value" ;; esac
+[ -z "$mib" ] && ok "no partial value leaked to stdout" || bad "no partial value leaked to stdout" "$mib" "empty"
+
+# 3) missing path -> rc=2
+rc=0
+mib=$(STORAGE_JSON=1 storage_size_mib "$ACC/does-not-exist" 2>/dev/null) || rc=$?
+[ "$rc" -eq 2 ] && ok "missing path returns rc=2" || bad "missing path returns rc=2" "$rc" 2
+
+# 4) arithmetic on the result never errors (the original defect)
+rc=0
+result=$(STORAGE_JSON=1 mib=$(storage_size_mib "$ACC/ok" 2>/dev/null) && echo $((10 + mib)) 2>/dev/null) || rc=$?
+[ "$rc" -eq 0 ] && ok "arithmetic on measured size succeeds" || bad "arithmetic on measured size succeeds" "rc=0" "rc=$rc"
+
+echo "== storage-monitor: unreadable target fails the run (exit 20), never OK ==="
+MON="$TOOLS/storage-monitor.sh"
+UNREAD="$WORK/unreadable-target"; mkdir -p "$UNREAD/secret"; echo x > "$UNREAD/secret/file"; chmod 000 "$UNREAD/secret"
+STORAGE_LOG="$WORK/ev.log" STORAGE_TARGETS="$UNREAD" "$MON" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 20 ] && ok "monitor exits 20 on unreadable root" || bad "monitor exits 20 on unreadable root" "$rc" 20
+grep -q "cannot_measure_build_root" "$WORK/ev.log" 2>/dev/null && ok "monitor logs the failure reason" || bad "monitor logs the failure reason" "present" "absent"
+
+echo "== storage-prune: cannot measure a candidate -> refuses, exit 20 ==="
+PR="$TOOLS/storage-prune.sh"
+PT="$WORK/pytest-of-nothing"; mkdir -p "$PT"; echo x > "$PT/file"; chmod 000 "$PT"
+STORAGE_TARGETS="$PT" STORAGE_PYTEST_GLOBS="$WORK/none" \
+  STORAGE_PRUNE_PCT=0 STORAGE_LOG="$WORK/ev.log" "$PR" --apply --confirm >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 20 ] && ok "prune refuses unmeasurable candidate" "$rc" 20
+[ -d "$PT" ] && ok "prune did not delete the unmeasurable candidate" || bad "prune did not delete the candidate" "present" "absent"
+
+echo "== storage-prune: missing targets is an explicit error, not a silent no-op ==="
+STORAGE_TARGETS="$WORK/absent-root" STORAGE_PYTEST_GLOBS="$WORK/none" \
+  STORAGE_LOG="$WORK/ev.log" "$PR" --apply --confirm >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 20 ] && ok "prune fails with no targets" "$rc" 20
+
+echo "== storage-prune: dry-run is non-destructive at warn/prune/hard thresholds ==="
+TREE="$WORK/dryrun"; mkdir -p "$TREE/debug/deps"; echo x > "$TREE/debug/deps/f"
+STORAGE_TARGETS="$TREE" STORAGE_PYTEST_GLOBS="$WORK/none" \
+  STORAGE_PRUNE_PCT=0 STORAGE_LOG="$WORK/ev.log" "$PR" --apply >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ok "--apply without --confirm exits 0" "$rc" 0
+[ -d "$TREE/debug/deps" ] && ok "--apply without --confirm deletes nothing" || bad "--apply without --confirm deletes nothing" "present" "absent"
+STORAGE_TARGETS="$TREE" STORAGE_PYTEST_GLOBS="$WORK/none" \
+  STORAGE_PRUNE_PCT=0 STORAGE_LOG="$WORK/ev.log" "$PR" --explain >/dev/null 2>&1
+[ -d "$TREE/debug/deps" ] && ok "--explain deletes nothing" || bad "--explain deletes nothing" "present" "absent"
+
+echo "== storage-monitor: reports SSD per-worktree target on the build disk ==="
+SSD=/mnt/turnstone-build-ssd/targets
+if [ -d "$SSD" ]; then
+  json=$(STORAGE_LOG="$WORK/ev.log" "$MON" --json 2>/dev/null)
+  printf '%s' "$json" | grep -q "$SSD" && ok "SSD worktree target appears in monitor build_roots" || bad "SSD worktree target appears in monitor build_roots" "present" "absent"
+else
+  ok "no build SSD mounted — target discovery is mount-guarded (skipped)"
+fi
+
+echo "== storage-prune: protected artifacts survive a prune run ==="
+PROT="$WORK/protected-cred"; mkdir -p "$PROT"; echo secret > "$PROT/key"
+# Force prune threshold so the dry-run path classifies everything.
+STORAGE_TARGETS="$WORK/none" STORAGE_PYTEST_GLOBS="$WORK/none" STORAGE_PRUNE_PCT=0 \
+  STORAGE_LOG="$WORK/ev.log" "$PR" --explain >/dev/null 2>&1
+[ -e "$PROT/key" ] && ok "protected credential tree untouched" || bad "protected credential tree untouched" "present" "absent"
+
 echo
 echo "RESULT: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

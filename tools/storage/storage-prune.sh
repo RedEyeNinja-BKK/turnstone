@@ -56,14 +56,37 @@ if storage_build_active; then
 fi
 
 # ---- gate 4: campaign lock ------------------------------------------------
+# FD 8 is opened in THIS shell and stays open until the process exits, so the
+# lock is held across candidate enumeration and every rm. The earlier probe ran
+# in a subshell, which released the lock the moment the test returned: a
+# campaign could start while a permitted prune was deleting.
 LOCK=${SY_BUILD_LOCK:-/var/lib/turnstone/.build.lock}
-if ! ( exec 8>"$LOCK"; flock -n 8 ) 2>/dev/null; then
+if ! { exec 8>>"$LOCK"; } 2>/dev/null; then
+  storage_emit error prune_failed reason=lock_unopenable path="$LOCK"
+  echo "storage-prune: cannot open the build lock $LOCK — nothing removed." >&2
+  exit 20
+fi
+if ! flock -n 8; then
   storage_emit warn prune_blocked reason=build_lock_held
   echo "storage-prune: the build lock is held by a campaign — nothing removed." >&2
   exit 0
 fi
 
-anchor=$(storage_anchor)
+# ---- gate 4b: required targets --------------------------------------------
+# A configured target that has vanished means the picture this run is deciding
+# on is incomplete. Fail closed rather than prune whatever is left.
+missing_required=$(storage_missing_required_targets)
+if [ -n "$missing_required" ]; then
+  paths=$(printf '%s\n' "$missing_required" | tr '\n' ',')
+  storage_emit error prune_failed reason=missing_required_target paths="$paths"
+  echo "storage-prune: required build root(s) missing: ${paths%,} — refusing to run" >&2
+  exit 20
+fi
+if ! anchor=$(storage_anchor); then
+  storage_emit error prune_failed reason=no_targets
+  echo "storage-prune: no storage target exists — refusing to run" >&2
+  exit 20
+fi
 pct=$(storage_used_pct "$anchor")
 if [ -z "$pct" ]; then
   storage_emit error prune_failed reason=cannot_measure
@@ -88,7 +111,10 @@ for t in $(storage_target_list); do
   have_target=1
   [ -d "$t" ] || continue
   CANDIDATES+=("$t/debug/incremental|incremental")
-  if storage_is_stale "$t/debug" "$STALE_DAYS"; then
+  # Only a tree proven stale with a successful scan contributes its shared
+  # debug output. An undeterminable scan is not evidence of staleness.
+  stale_debug=0; storage_is_stale "$t/debug" "$STALE_DAYS" || stale_debug=$?
+  if [ "$stale_debug" -eq 0 ]; then
     CANDIDATES+=("$t/debug/deps|deps")
     CANDIDATES+=("$t/debug/build|build")
     CANDIDATES+=("$t/debug/examples|examples")
@@ -102,7 +128,8 @@ fi
 for g in "${STORAGE_PYTEST_GLOBS[@]}"; do
   for d in $g; do
     [ -d "$d" ] || continue
-    if storage_is_stale "$d" 1; then CANDIDATES+=("$d|pytest"); fi
+    stale_d=0; storage_is_stale "$d" 1 || stale_d=$?
+    if [ "$stale_d" -eq 0 ]; then CANDIDATES+=("$d|pytest"); fi
   done
 done
 
@@ -128,16 +155,29 @@ for c in "${CANDIDATES[@]}"; do
     storage_emit warn refuse path="$path" reason=protected
     skipped=$((skipped+1)); continue
   fi
-  # explicit classification for the observation log
-  if storage_is_stale "$path" "$STALE_DAYS"; then
-    storage_emit info classify path="$path" class=stale kind="$kind"
-  else
-    storage_emit info classify path="$path" class=active kind="$kind"
-  fi
-  if storage_is_unsafe_path "$path"; then
-    storage_emit warn refuse path="$path" reason=symlink_or_foreign_fs_or_mount
-    skipped=$((skipped+1)); continue
-  fi
+  # explicit classification for the observation log. Staleness has three
+  # answers; only a proven-stale tree may proceed. A scan that could not run is
+  # an environment problem a human must resolve, so it stops the run rather than
+  # being quietly skipped.
+  stale_rc=0; storage_is_stale "$path" "$STALE_DAYS" || stale_rc=$?
+  case "$stale_rc" in
+    0) storage_emit info classify path="$path" class=stale kind="$kind" ;;
+    1) storage_emit info classify path="$path" class=active kind="$kind" ;;
+    *) storage_emit error prune_failed reason=staleness_undeterminable path="$path"
+       echo "storage-prune: cannot determine staleness of $path — refusing to continue" >&2
+       exit 20 ;;
+  esac
+  # Path validation is three-way as well: a check that could not run is not a
+  # licence to delete.
+  safety=0; storage_path_safety "$path" || safety=$?
+  case "$safety" in
+    0) ;;
+    1) storage_emit warn refuse path="$path" reason=symlink_or_foreign_fs_or_mount
+       skipped=$((skipped+1)); continue ;;
+    *) storage_emit error prune_failed reason=path_unvalidated path="$path"
+       echo "storage-prune: cannot validate $path — refusing to continue" >&2
+       exit 20 ;;
+  esac
 
   mib=$(storage_size_mib "$path") || {
     storage_emit error prune_failed reason=cannot_measure_candidate path="$path"
@@ -173,10 +213,12 @@ if [ "$EXPLAIN" -eq 1 ]; then
   for pat in "${STORAGE_UNEXPECTED_PATTERNS[@]}"; do
     for hit in $pat; do
       [ -e "$hit" ] || continue
-      skip=0
-      for t in "${STORAGE_TARGETS[@]}"; do [ "$hit" = "$t" ] && skip=1; done
-      [ "$skip" -eq 1 ] && continue
-      storage_emit warn classify path="$hit" class=unknown_unexpected_root mib="$(storage_size_mib "$hit")"
+      storage_target_is_known "$hit" && continue
+      if mib=$(storage_size_mib "$hit"); then
+        storage_emit warn classify path="$hit" class=unknown_unexpected_root mib="$mib"
+      else
+        storage_emit warn classify path="$hit" class=unknown_unexpected_root mib=unmeasurable
+      fi
     done
   done
   storage_emit info observe_done note="explain mode: nothing was deleted"

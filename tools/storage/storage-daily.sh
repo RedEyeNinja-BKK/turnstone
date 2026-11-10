@@ -34,7 +34,20 @@ fi
 today=$(date -u +%Y-%m-%d)
 day_start="${today}T00:00:00Z"
 
-anchor=$(storage_anchor)
+# A required target that is absent is a measurement failure. The daily summary
+# must not describe a host whose build tree vanished as healthy.
+missing_required=$(storage_missing_required_targets)
+if [ -n "$missing_required" ]; then
+  paths=$(printf '%s\n' "$missing_required" | tr '\n' ',')
+  storage_emit error daily_failed reason=missing_required_target paths="$paths"
+  echo "storage-daily: required build root(s) missing: ${paths%,}" >&2
+  exit 20
+fi
+if ! anchor=$(storage_anchor); then
+  storage_emit error daily_failed reason=no_targets
+  echo "storage-daily: no storage target exists — refusing to measure / in its place" >&2
+  exit 20
+fi
 pct=$(storage_used_pct "$anchor")
 free=$(storage_free_gib "$anchor")
 

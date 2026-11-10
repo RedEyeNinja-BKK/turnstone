@@ -121,30 +121,49 @@ for root in "${SCAN_ROOTS[@]}"; do
       note info retained_release path="$t" mib="$mib"
       continue
     fi
-    # abandoned when nothing under it has been written recently
-    if storage_is_stale "$t" "$ABANDON_DAYS"; then
-      note warn in_tree_target path="$t" mib="$mib" state=abandoned
-      findings=$((findings+1))
-    else
-      note warn in_tree_target path="$t" mib="$mib" state=active
-      findings=$((findings+1))
-    fi
+    # abandoned when nothing under it has been written recently. An
+    # undeterminable scan is reported as its own state: reporting it as either
+    # active or abandoned would be a guess.
+    stale_rc=0; storage_is_stale "$t" "$ABANDON_DAYS" || stale_rc=$?
+    case "$stale_rc" in
+      0) note warn in_tree_target path="$t" mib="$mib" state=abandoned ;;
+      1) note warn in_tree_target path="$t" mib="$mib" state=active ;;
+      *) note warn in_tree_target path="$t" mib="$mib" state=undeterminable ;;
+    esac
+    findings=$((findings+1))
   done < <(find "$root" -maxdepth 3 -type d -name target 2>/dev/null)
 done
 
 # ---- 4: abandoned canonical output ---------------------------------------
-if [ -d "$CANONICAL" ] && storage_is_stale "$CANONICAL" "$ABANDON_DAYS"; then
+stale_canon=0
+if [ -d "$CANONICAL" ]; then
+  storage_is_stale "$CANONICAL" "$ABANDON_DAYS" || stale_canon=$?
+fi
+if [ -d "$CANONICAL" ] && [ "$stale_canon" -eq 0 ]; then
   if mib=$(storage_size_mib "$CANONICAL"); then
     note warn abandoned_output path="$CANONICAL" mib="$mib" age_days="$ABANDON_DAYS"
   else
     note warn abandoned_output path="$CANONICAL" mib=unreadable age_days="$ABANDON_DAYS"
   fi
   findings=$((findings+1))
+elif [ -d "$CANONICAL" ] && [ "$stale_canon" -eq 2 ]; then
+  # The scan itself failed. Report it rather than silently considering the tree
+  # healthy or abandoned.
+  note warn abandoned_output path="$CANONICAL" mib=unmeasurable age_days="$ABANDON_DAYS" state=undeterminable
+  findings=$((findings+1))
 fi
 
 # ---- 6: growth since the previous sample ---------------------------------
-anchor=$(storage_anchor)
-now_bytes=$(df -B1 --output=used "$anchor" 2>/dev/null | awk 'NR==2{print $1}')
+# The growth sample needs a real filesystem anchor. With no target the sample
+# cannot be taken, and that is a detection failure, not a healthy host.
+detect_failed=0
+if ! anchor=$(storage_anchor); then
+  note error detect_failed reason=no_targets
+  detect_failed=1
+  anchor=
+fi
+now_bytes=
+[ -n "$anchor" ] && now_bytes=$(df -B1 --output=used "$anchor" 2>/dev/null | awk 'NR==2{print $1}')
 now_ts=$(date -u +%s)
 growth_mib=0
 if [ -n "$now_bytes" ]; then
@@ -176,5 +195,6 @@ fi
 rc=0
 [ "$findings" -gt 0 ] && rc=10
 [ "$cargo_count" -gt 1 ] && rc=11
+[ "$detect_failed" -eq 1 ] && rc=20
 note info detect_done findings="$findings" cargo="$cargo_count" exit="$rc"
 exit "$rc"

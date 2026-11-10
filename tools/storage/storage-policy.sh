@@ -10,32 +10,104 @@
 # here would silently adopt the next stray /var/tmp/sytarget-* a session
 # invents, which is the behaviour we are trying to stop.
 #
-# The build SSD holds per-worktree targets under
-#   /mnt/turnstone-build-ssd/targets/<worktree>-<hash>
-# discovered at run time (see storage_target_list). The two legacy roots are
-# listed explicitly; the SSD entry is added when the mount is present and
-# never assumed when it is absent.
+# REQUIRED targets: a missing entry is a measurement failure, never a zero and
+# never a fallback to /. A monitor that quietly measured / on behalf of an
+# absent build tree reported "healthy" for a host that had lost its target,
+# which is the defect this list is shaped to prevent.
 if [ -z "${STORAGE_TARGETS+x}" ]; then STORAGE_TARGETS=(
   /var/lib/turnstone/sytarget
+)
+fi
+
+# OPTIONAL targets: measured when present, but their absence is expected. A
+# recovered release tree can be removed legitimately, so it must not make the
+# monitor fail for ever.
+if [ -z "${STORAGE_OPTIONAL_TARGETS+x}" ]; then STORAGE_OPTIONAL_TARGETS=(
   /var/lib/turnstone/switchyard-upstream/recovered-6de85da1/target
 )
 fi
 
+# A caller that overrides these through the environment (the test suite does)
+# can only pass one string. Split it so a multi-path override behaves like the
+# array it replaces. Build paths do not contain spaces.
+#
+# `declare -p` decides whether the name is already an array: under `set -u`,
+# `${#name[@]}` on a plain scalar raises "unbound variable", so it cannot be
+# used as the test.
+storage_normalise_targets() {
+  local name=$1 decl
+  local -n targets_ref=$name
+  decl=$(declare -p "$name" 2>/dev/null) || return 0
+  case "$decl" in
+    "declare -a"*|"declare -A"*) return 0 ;;
+  esac
+  [ -n "${targets_ref:-}" ] || return 0
+  local -a split_targets
+  read -r -a split_targets <<<"${targets_ref}"
+  targets_ref=("${split_targets[@]}")
+}
+storage_normalise_targets STORAGE_TARGETS
+storage_normalise_targets STORAGE_OPTIONAL_TARGETS
+
 # Build roots that live on the build SSD. Not in STORAGE_TARGETS by default
 # because the SSD may be unmounted; they are discovered by storage_target_list
-# only when the mount is present (guarded by build-env.sh's UUID assertion).
-STORAGE_SSD_TARGET_ROOT=${STORAGE_SSD_TARGET_ROOT:-/mnt/turnstone-build-ssd/targets}
+# only when the mount is genuinely a mounted filesystem.
+STORAGE_SSD_MOUNT=${STORAGE_SSD_MOUNT:-/mnt/turnstone-build-ssd}
+STORAGE_SSD_TARGET_ROOT=${STORAGE_SSD_TARGET_ROOT:-$STORAGE_SSD_MOUNT/targets}
 
-# Return every target root to measure: the configured roots plus any live
-# per-worktree target directory on the build SSD. The SSD entry is discovered
-# lazily so an absent mount is reported cleanly rather than measured as /.
-storage_target_list() {
+# True only when the build SSD is an actually mounted filesystem.
+#
+# A directory that merely exists under the root filesystem is not a mount: a
+# plain `[ -d ]` test treated one as an SSD, so root-filesystem bytes were
+# counted as build output and a missing mount looked healthy. The check is an
+# exact mount-point match against the kernel's own table plus a device
+# comparison with /, and it fails closed when either cannot be read.
+#
+# findmnt --first-only is deliberately not used: on a systemd automount it
+# returns the autofs trigger rather than the real mount.
+storage_ssd_mounted() {
+  local mount=${STORAGE_SSD_MOUNT:-/mnt/turnstone-build-ssd} rootdev dev
+  [ -d "$mount" ] || return 1
+  awk -v want="$mount" '
+    { p = $5; gsub(/\\040/, " ", p); gsub(/\\011/, "\t", p); gsub(/\\012/, "\n", p)
+      if (p == want) found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' /proc/self/mountinfo 2>/dev/null || return 1
+  rootdev=$(stat -c %d / 2>/dev/null) || return 1
+  dev=$(stat -c %d "$mount" 2>/dev/null) || return 1
+  # A bind mount of a root-filesystem directory has the same device id, and its
+  # contents are not separable from the root filesystem.
+  [ "$dev" != "$rootdev" ]
+}
+
+# Required roots that are absent. Callers must treat a non-empty result as a
+# measurement failure rather than proceeding with whatever remains.
+storage_missing_required_targets() {
   local t
   for t in "${STORAGE_TARGETS[@]}"; do
+    [ -e "$t" ] || printf '%s\n' "$t"
+  done
+}
+
+# True when a path is one of the configured targets (required or optional), so
+# a legitimate optional root is never reported as an unexpected build root.
+storage_target_is_known() {
+  local t
+  for t in "${STORAGE_TARGETS[@]}" "${STORAGE_OPTIONAL_TARGETS[@]}"; do
+    [ "$t" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# Return every target root to measure: the configured roots that exist plus any
+# live per-worktree target directory on the build SSD. The SSD entry is
+# discovered only when the device is genuinely mounted.
+storage_target_list() {
+  local t w
+  for t in "${STORAGE_TARGETS[@]}" "${STORAGE_OPTIONAL_TARGETS[@]}"; do
     [ -e "$t" ] && printf '%s\n' "$t"
   done
-  if [ -d "$STORAGE_SSD_TARGET_ROOT" ]; then
-    local w
+  if storage_ssd_mounted; then
     for w in "$STORAGE_SSD_TARGET_ROOT"/*/; do
       [ -d "$w" ] && printf '%s\n' "$w"
     done
@@ -118,6 +190,19 @@ storage_log_file() {
   printf '%s' "${STORAGE_LOG:-/var/lib/turnstone/storage-events.log}"
 }
 
+# Structured diagnostic that must never contaminate a measurement's stdout.
+# Always stderr plus the event log, in both plain and JSON modes, because a
+# function whose stdout is a number has no other lawful place to report why it
+# failed.
+storage_emit_err() {
+  local level=$1 event=$2; shift 2
+  local line kv
+  line="$(date -u +%FT%TZ) level=$level event=$event"
+  for kv in "$@"; do line+=" $kv"; done
+  printf '%s\n' "$line" >&2
+  { printf '%s\n' "$line" >>"$(storage_log_file)"; } 2>/dev/null || true
+}
+
 # Structured event line: timestamp, level, event, then key=value pairs.
 # Both scripts emit the same shape so one log can be parsed or grepped.
 storage_emit() {
@@ -136,13 +221,17 @@ storage_emit() {
   { printf '%s\n' "$line" >>"$(storage_log_file)"; } 2>/dev/null || true
 }
 
-# Filesystem holding the first existing target, else /.
+# Filesystem anchor: the first target that exists.
+#
+# Prints nothing and returns 1 when no target exists. Defaulting to / made a
+# missing build tree indistinguishable from a healthy host: the monitor
+# measured the root filesystem's usage and reported OK.
 storage_anchor() {
   local t
   for t in $(storage_target_list); do
     if [ -e "$t" ]; then printf '%s' "$t"; return 0; fi
   done
-  printf '/'
+  return 1
 }
 
 storage_used_pct() {
@@ -187,22 +276,39 @@ storage_build_active() {
   return 1
 }
 
-# True when a path is a symlink or sits under a mount point that is not the
-# root filesystem. Either condition makes `du` and `rm` mean something other
-# than what the operator approved.
-storage_is_unsafe_path() {
-  local p=$1 real dev rootdev
-  [ -L "$p" ] && return 0
-  real=$(realpath -e -- "$p" 2>/dev/null) || return 1
-  [ "$real" = "$p" ] || return 0
-  rootdev=$(stat -c %d / 2>/dev/null) || return 1
-  dev=$(stat -c %d "$p" 2>/dev/null) || return 1
-  [ "$dev" = "$rootdev" ] || return 0
+# Three-way path validation for a destructive operation.
+#
+# The earlier two-way form returned "safe" when realpath or stat failed, so a
+# broken resolution or an unreadable parent was read as permission to delete.
+# Validation failure is now its own answer, and every caller refuses removal on
+# it.
+#
+#   0  safe        resolvable, not a symlink, on the root filesystem, no nested mount
+#   1  unsafe      a symlink, a relocated path, a foreign filesystem or a nested mount
+#   2  unvalidated the checks themselves failed — treat as unsafe
+storage_path_safety() {
+  local p=$1 real dev rootdev mounts
+  rootdev=$(stat -c %d / 2>/dev/null) || return 2
+  [ -L "$p" ] && return 1
+  real=$(realpath -e -- "$p" 2>/dev/null) || return 2
+  [ "$real" = "$p" ] || return 1
+  dev=$(stat -c %d "$p" 2>/dev/null) || return 2
+  [ "$dev" = "$rootdev" ] || return 1
   # A nested mount point inside a target would be measured but not freed.
-  if findmnt -rn -o TARGET 2>/dev/null | awk -v q="$p" 'index($0,q"/")==1{found=1} END{exit !found}'; then
-    return 0
+  mounts=$(findmnt -rn -o TARGET 2>/dev/null) || return 2
+  if printf '%s\n' "$mounts" |
+     awk -v q="$p" 'index($0,q"/")==1{found=1} END{exit !found}'; then
+    return 1
   fi
-  return 1
+  return 0
+}
+
+# Kept for callers that only ask the yes/no question. "Could not validate" is
+# reported as unsafe, so this can never authorise a removal.
+storage_is_unsafe_path() {
+  local rc=0
+  storage_path_safety "$1" || rc=$?
+  [ "$rc" -ne 0 ]
 }
 
 storage_is_protected() {
@@ -222,13 +328,22 @@ storage_is_protected() {
 # which is true when ANY old file exists — so a tree with one stale byte and a
 # thousand freshly-written files counted as stale. Stale must mean NOTHING has
 # been touched recently.
+#
+# Returns three answers, because "the scan failed" is not "the tree is stale":
+#   0  stale              nothing under the tree was written within the window
+#   1  active             a fresh file exists
+#   2  undeterminable     the scan itself failed (unreadable tree, I/O error)
+# A caller making a destructive decision must treat 2 as ineligible. find is
+# stopped with -quit rather than piped to head, so a SIGPIPE on the pipe cannot
+# masquerade as a scan failure.
 storage_is_stale() {
-  local p=$1 days=${2:-2}
+  local p=$1 days=${2:-2} fresh rc=0
   [ -d "$p" ] || return 1
-  if [ -z "$(find "$p" -type f -newermt "-${days} days" 2>/dev/null | head -1)" ]; then
-    return 0
-  fi
-  return 1
+  fresh=$(find "$p" -type f -newermt "-${days} days" -print -quit 2>/dev/null) || rc=$?
+  # A fresh file is positive evidence, whatever the exit status says.
+  [ -n "$fresh" ] && return 1
+  [ "$rc" -ne 0 ] && return 2
+  return 0
 }
 
 # storage_size_mib — measure one path in MiB, failing closed.
@@ -246,14 +361,14 @@ storage_is_stale() {
 # An unmeasurable path is an error, not zero usage.
 storage_size_mib() {
   local path=$1 raw line count
-  [ -e "$path" ] || { storage_emit error size_missing path="$path"; return 2; }
-  raw=$(du -xs --block-size=1M -- "$path" 2>/dev/null) || { storage_emit error size_unreadable path="$path"; return 3; }
+  [ -e "$path" ] || { storage_emit_err error size_missing path="$path"; return 2; }
+  raw=$(du -xs --block-size=1M -- "$path" 2>/dev/null) || { storage_emit_err error size_unreadable path="$path"; return 3; }
   # du prints "size\tpath"; keep only the size field.
   line=$(printf '%s\n' "$raw" | cut -f1)
   count=$(printf '%s\n' "$line" | grep -c .)
-  [ "$count" -eq 1 ] || { storage_emit error size_malformed path="$path" lines="$count"; return 4; }
+  [ "$count" -eq 1 ] || { storage_emit_err error size_malformed path="$path" lines="$count"; return 4; }
   case "$line" in
-    *[!0-9]*) storage_emit error size_malformed path="$path" value="$line"; return 4 ;;
+    *[!0-9]*) storage_emit_err error size_malformed path="$path" value="$line"; return 4 ;;
   esac
   printf '%s\n' "$line"
 }

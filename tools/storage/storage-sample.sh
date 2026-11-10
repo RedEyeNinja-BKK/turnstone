@@ -34,8 +34,11 @@ FAIL_THRESHOLD=${STORAGE_FAIL_THRESHOLD:-2}
 MAX_LINES=${STORAGE_SAMPLE_MAX_LINES:-20000}
 
 # Testability hook: lets the suite point the sampler at an unmeasurable path to
-# exercise the failure branch. Production always uses storage_anchor().
-anchor=${STORAGE_SAMPLE_ANCHOR_OVERRIDE:-$(storage_anchor)}
+# exercise the failure branch. Production always uses storage_anchor(). When no
+# target exists the anchor stays empty and the measurement-failure branch below
+# records the failure, rather than sampling / on the build tree's behalf.
+anchor=${STORAGE_SAMPLE_ANCHOR_OVERRIDE:-}
+[ -n "$anchor" ] || anchor=$(storage_anchor) || anchor=
 now=$(date -u +%s)
 ts=$(date -u +%FT%TZ)
 

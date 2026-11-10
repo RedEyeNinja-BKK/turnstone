@@ -26,7 +26,22 @@ JSON=0
 [ "$JSON" -eq 1 ] && STORAGE_JSON=1
 export STORAGE_JSON
 
-anchor=$(storage_anchor)
+# A missing required target is a failure, not a zero and not a reason to look at
+# / instead. Report every absent required root so the operator knows which one.
+missing_required=$(storage_missing_required_targets)
+if [ -n "$missing_required" ]; then
+  count=$(printf '%s\n' "$missing_required" | grep -c .)
+  paths=$(printf '%s\n' "$missing_required" | tr '\n' ',')
+  storage_emit error monitor_failed reason=missing_required_target \
+    count="$count" paths="$paths"
+  echo "storage-monitor: required build root(s) missing: ${paths%,}" >&2
+  exit 20
+fi
+if ! anchor=$(storage_anchor); then
+  storage_emit error monitor_failed reason=no_targets
+  echo "storage-monitor: no storage target exists — refusing to measure / in its place" >&2
+  exit 20
+fi
 pct=$(storage_used_pct "$anchor")
 free=$(storage_free_gib "$anchor")
 
@@ -54,16 +69,21 @@ for t in $(storage_target_list); do
   fi
 done
 
+# The SSD is optional, but a directory that exists without being a mount means
+# the mount was lost and build output is silently landing on the root
+# filesystem. Report it; do not count it as SSD capacity.
+if [ -d "$STORAGE_SSD_MOUNT" ] && ! storage_ssd_mounted; then
+  storage_emit warn sd_present_but_not_mounted path="$STORAGE_SSD_MOUNT"
+fi
+
 # Detect unexpected build roots: an ad-hoc CARGO_TARGET_DIR is the exact
 # mechanism that produced 43 GiB before. Report, never remove.
 unexpected=()
 for pat in "${STORAGE_UNEXPECTED_PATTERNS[@]}"; do
   for hit in $pat; do
     [ -e "$hit" ] || continue
-    # skip anything already in TARGETS
-    skip=0
-    for t in "${STORAGE_TARGETS[@]}"; do [ "$hit" = "$t" ] && skip=1; done
-    [ "$skip" -eq 1 ] && continue
+    # skip anything that is a configured target, required or optional
+    storage_target_is_known "$hit" && continue
     if ! mib=$(storage_size_mib "$hit"); then
       storage_emit error monitor_failed reason=cannot_measure_unexpected_root path="$hit"
       echo "storage-monitor: cannot measure unexpected root $hit" >&2
@@ -189,8 +209,7 @@ elif [ "$pct" -ge "$STORAGE_WARN_PCT" ]; then
   rc=10; verdict="WARN"
 fi
 
-[ "${#missing_protected[@]}" -gt 0 ] && storage_emit warn protected_path_missing count="${#missing_protected[@]}"
-[ "${#unexpected[@]}" -gt 0 ] && [ "$rc" -lt 10 ] && rc=10
+[ "${#missing_protected[@]}" -gt 0 ] && storage_emit warn protected_path_missing count="${#missing_protected[@]}"[ "${#unexpected[@]}" -gt 0 ] && [ "$rc" -lt 10 ] && rc=10
 
 if [ "$JSON" -eq 0 ]; then
   echo "  verdict         : $verdict (exit $rc)"

@@ -76,6 +76,18 @@ Thresholds: **WARN 70%**, **PRUNE 85%**, **HARD 92%**.
 `/var/tmp/sytarget-*` is exactly how the last incident started, so it is
 detected and alerted even though it is never deleted automatically.
 
+`20` also covers the two cases that used to look healthy: a configured target
+that does not exist (`reason=missing_required_target`) and a host with no target
+at all (`reason=no_targets`). The monitor never substitutes `/` for a missing
+build root, because that reported a lost target as an ordinary filesystem.
+
+Targets are classified in two lists. `STORAGE_TARGETS` are required: absent
+means failure. `STORAGE_OPTIONAL_TARGETS` are measured when present and their
+absence is normal. Build output on the SSD is discovered only when that device
+is genuinely mounted - an exact mount-point match in `/proc/self/mountinfo`
+plus a device id different from `/` - so a plain directory left behind by a
+lost mount is reported rather than counted.
+
 ## 5. Temporary files
 
 - pytest: use an explicit `--basetemp` under the canonical area, with a trap

@@ -31,7 +31,11 @@ TEST_MODE=0
 [ "${1:-}" = "--test" ] && TEST_MODE=1
 
 now=$(date -u +%s)
-anchor=$(storage_anchor)
+if ! anchor=$(storage_anchor); then
+  storage_emit error alert_failed reason=no_targets
+  echo "cannot measure: no storage target exists; no alert emitted" >&2
+  exit 20
+fi
 pct=$(storage_used_pct "$anchor")
 [ -n "$pct" ] || { echo "cannot measure; no alert emitted" >&2; exit 20; }
 

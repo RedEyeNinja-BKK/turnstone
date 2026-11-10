@@ -116,11 +116,15 @@ storage_target_list() {
 
 # Roots that are NOT expected to exist but must be detected if they reappear:
 # an ad-hoc CARGO_TARGET_DIR is exactly how 43 GiB appeared before.
-STORAGE_UNEXPECTED_PATTERNS=(
+#
+# Overridable by environment, like STORAGE_TARGETS and STORAGE_PYTEST_GLOBS, so
+# the detection path can be exercised against a fixture. The defaults are what
+# production uses; a cron/systemd run never sets this.
+if [ -z "${STORAGE_UNEXPECTED_PATTERNS+x}" ]; then STORAGE_UNEXPECTED_PATTERNS=(
   /var/tmp/sytarget
   /var/tmp/sytarget-*
   /var/tmp/*target-integration
-)
+); fi
 
 # pytest sandboxes. BOTH locations: /tmp is a 1.9 GiB tmpfs and TMPDIR is
 # /var/tmp, so a single-location glob misses everything that matters.
@@ -173,6 +177,9 @@ STORAGE_PROTECTED=(
 # Alert only on paths this host is expected to have. The deployed v1 asserted
 # every entry in one list and produced meaningless noise for paths that never
 # existed here - which is how a real finding gets ignored.
+# Consumed by storage-monitor.sh (missing-protected report), so it is unused
+# within this library file only — not dead configuration.
+# shellcheck disable=SC2034
 STORAGE_REQUIRED=(
   /var/lib/turnstone/backups
   /var/lib/turnstone/artifacts

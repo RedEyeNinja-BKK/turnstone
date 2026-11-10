@@ -209,7 +209,15 @@ elif [ "$pct" -ge "$STORAGE_WARN_PCT" ]; then
   rc=10; verdict="WARN"
 fi
 
-[ "${#missing_protected[@]}" -gt 0 ] && storage_emit warn protected_path_missing count="${#missing_protected[@]}"[ "${#unexpected[@]}" -gt 0 ] && [ "$rc" -lt 10 ] && rc=10
+# An ad-hoc target root is a warning even when the filesystem is roomy: it is
+# the recurrence of the exact condition that produced 43 GiB. Escalate only
+# when no higher-severity verdict already applies.
+if [ "${#missing_protected[@]}" -gt 0 ]; then
+  storage_emit warn protected_path_missing count="${#missing_protected[@]}"
+fi
+if [ "${#unexpected[@]}" -gt 0 ] && [ "$rc" -lt 10 ]; then
+  rc=10; verdict="WARN"
+fi
 
 if [ "$JSON" -eq 0 ]; then
   echo "  verdict         : $verdict (exit $rc)"

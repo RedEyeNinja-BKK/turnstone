@@ -64,6 +64,19 @@ export SY_BUILD_MIN_FREE_GIB=1
 # tree. Both are overridden only inside this fixture; production keeps 35/25.
 export SY_BUILD_PROJECTED_GIB=1
 export SY_BUILD_MIN_SPARE_GIB=0
+
+# The wrapper proves its build filesystem through build-env.sh, which asserts a
+# filesystem UUID. That guard is a host artifact, so the fixture supplies its
+# own: a suite that needs the production guard file present is not hermetic and
+# fails on any other machine, including a CI runner.
+cat > "$WORK/bin/build-env-ok.sh" <<'MOCK'
+#!/usr/bin/env bash
+[ "${1:-}" = "--check" ] || exit 2
+echo "MOCK build-env: ok"
+exit 0
+MOCK
+chmod 0755 "$WORK/bin/build-env-ok.sh"
+export TURNSTONE_BUILD_ENV="$WORK/bin/build-env-ok.sh"
 SYB="$TOOLS/sy-build"
 
 echo "== build wrapper: lifecycle =="
@@ -123,6 +136,21 @@ out=$("$SYB" campaign "post" -- cargo build 2>&1 || true)
 case "$out" in *ORPHANED*|*"campaign finished"*) ok "orphan reconciled on next run" ;;
                 *) bad "orphan reconciled on next run" "no marker" "ORPHANED or finish";; esac
 
+echo "== build wrapper: an unusable build filesystem refuses the campaign =="
+# Negative control for the fail-closed gate: this is the same check that used
+# to make the suite host-dependent, now exercised deliberately.
+TURNSTONE_BUILD_ENV="$WORK/absent-build-env.sh" "$SYB" campaign "no-env" -- cargo build \
+  >/dev/null 2>&1; check_rc "missing build-env guard refuses (exit 4)" "$?" 4
+cat > "$WORK/bin/build-env-bad.sh" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+chmod 0755 "$WORK/bin/build-env-bad.sh"
+TURNSTONE_BUILD_ENV="$WORK/bin/build-env-bad.sh" "$SYB" campaign "bad-env" -- cargo build \
+  >/dev/null 2>&1; check_rc "failing build-env check refuses (exit 4)" "$?" 4
+[ -d "$SY_BUILD_TARGET/debug" ] && r=present || r=absent
+check_eq "a refused campaign builds nothing" "$r" absent
+
 echo "== retention policy: protection rules =="
 POLICY="$TOOLS/storage-policy.sh"
 # shellcheck source=/dev/null
@@ -158,6 +186,26 @@ touch -d '10 days ago' "$ST/mixed/old"; touch "$ST/mixed/new"
 # cases still run, and the interlock is exercised rather than bypassed.
 UNSHARE_OK=0
 if unshare -r -m -p -f --mount-proc true 2>/dev/null; then UNSHARE_OK=1; fi
+
+# In CI the isolation is REQUIRED. Falling back to an unisolated run there would
+# let the pruner's "no cargo/rustc/pytest anywhere" gate refuse every deletion
+# case on a busy runner, turning assertions into passes that prove nothing. Say
+# INCONCLUSIVE and fail, rather than report green.
+#
+# Cases that need this isolation, and therefore cannot be verified on a runner
+# without user namespaces: everything driven through run_prune(), i.e. the
+# dry-run/--apply/--confirm gating, the lock-held-across-deletion case, the
+# path-safety refusals, the staleness refusals, the active-candidate skip and
+# the mid-run activation race. Those must be verified host-locally instead.
+if [ "$UNSHARE_OK" -eq 0 ] && [ "${STORAGE_TESTS_REQUIRE_ISOLATION:-0}" = "1" ]; then
+  echo "INCONCLUSIVE: user namespaces are unavailable, so the deletion-path" >&2
+  echo "  assertions cannot run in isolation. They are NOT being run, and this" >&2
+  echo "  suite will not report success. Verify them on a host that allows" >&2
+  echo "  'unshare -r -m -p -f', or unset STORAGE_TESTS_REQUIRE_ISOLATION to run" >&2
+  echo "  the reduced set with that limitation printed." >&2
+  echo "RESULT: INCONCLUSIVE (isolation required but unavailable)"
+  exit 3
+fi
 run_prune() {
   if [ "$UNSHARE_OK" -eq 1 ]; then
     unshare -r -m -p -f --mount-proc "$@"
@@ -385,6 +433,41 @@ else
   ok "no build SSD mounted — target discovery is mount-guarded (skipped)"
 fi
 
+echo "== storage-monitor: an unexpected build root escalates the verdict (rc=10) =="
+# Regression: a single line joined two `[ … ] && …` statements with no newline
+# (shellcheck SC2171), so the second condition became arguments to storage_emit
+# and the unexpected-root escalation never ran. A rogue ad-hoc CARGO_TARGET_DIR
+# is the exact recurrence the monitor exists to catch, so this must bite.
+BOX="$WORK/box"; mkdir -p "$BOX/sytarget-rogue/debug/deps"
+echo x > "$BOX/sytarget-rogue/debug/deps/f"
+CLEAN="$WORK/clean-root"; mkdir -p "$CLEAN"
+# Thresholds above any real usage percentage, so only the rogue root can raise rc.
+HIGH_PCT_ENV=(STORAGE_WARN_PCT=101 STORAGE_PRUNE_PCT=102 STORAGE_HARD_PCT=103)
+rc=0
+out=$(env "${HIGH_PCT_ENV[@]}" STORAGE_LOG="$WORK/ev.log" STORAGE_TARGETS="$CLEAN" \
+      STORAGE_UNEXPECTED_PATTERNS="$BOX/sytarget-*" "$MON" 2>/dev/null) || rc=$?
+check_rc "unexpected root raises the exit code to 10" "$rc" 10
+printf '%s' "$out" | grep -q 'UNEXPECTED build roots' \
+  && ok "the rogue root is reported as unexpected" || bad "the rogue root is reported as unexpected" "present" "absent"
+printf '%s' "$out" | grep -q 'sytarget-rogue' \
+  && ok "the rogue root is named by path" || bad "the rogue root is named by path" "present" "absent"
+printf '%s' "$out" | grep -q 'WARN' \
+  && ok "the printed verdict agrees with the exit code" || bad "the printed verdict agrees with the exit code" "OK" "WARN"
+grep -q "event=unexpected_build_root" "$WORK/ev.log" 2>/dev/null \
+  && ok "the escalation is logged as an event" || bad "the escalation is logged as an event" "present" "absent"
+# Negative control: the same fixture with no matching pattern stays healthy, so
+# the assertion above is caused by the rogue root and not by the fixture itself.
+rc=0
+out=$(env "${HIGH_PCT_ENV[@]}" STORAGE_LOG="$WORK/ev.log" STORAGE_TARGETS="$CLEAN" \
+      STORAGE_UNEXPECTED_PATTERNS="$BOX/nothing-matches-*" "$MON" 2>/dev/null) || rc=$?
+check_rc "control: no unexpected root stays exit 0" "$rc" 0
+# A higher-severity verdict must not be downgraded by the unexpected-root path.
+rc=0
+env "${HIGH_PCT_ENV[@]}" STORAGE_LOG="$WORK/ev.log" STORAGE_TARGETS="$CLEAN" \
+    STORAGE_UNEXPECTED_PATTERNS="$BOX/sytarget-*" \
+    STORAGE_WARN_PCT=0 STORAGE_PRUNE_PCT=100 STORAGE_HARD_PCT=101 "$MON" >/dev/null 2>&1 || rc=$?
+check_rc "an already-WARN run is not re-escalated" "$rc" 10
+
 echo "== storage-prune: protected artifacts survive a prune run ==="
 PROT="$WORK/protected-cred"; mkdir -p "$PROT"; echo secret > "$PROT/key"
 # Force prune threshold so the dry-run path classifies everything.
@@ -509,23 +592,23 @@ echo "== storage_size_mib: stdout stays clean on failure in BOTH modes =="
 ACC2="$WORK/acc2"; mkdir -p "$ACC2/secret"; echo x > "$ACC2/secret/f"; chmod 000 "$ACC2/secret"
 SIZELOG="$WORK/ev-size.log"; : > "$SIZELOG"
 # plain mode: no STORAGE_JSON, diagnostics must not reach stdout
-out=$(( . "$POLICY"; STORAGE_LOG="$SIZELOG" storage_size_mib "$ACC2" ) 2>/dev/null); rc=$?
+out=$( ( . "$POLICY"; STORAGE_LOG="$SIZELOG" storage_size_mib "$ACC2" ) 2>/dev/null); rc=$?
 [ -z "$out" ] && ok "plain mode: no diagnostic on stdout" \
   || bad "plain mode: no diagnostic on stdout" "$out" "empty"
 check_rc "plain mode: returns rc=3" "$rc" 3
-err=$(( . "$POLICY"; STORAGE_LOG="$SIZELOG" storage_size_mib "$ACC2" ) 2>&1 >/dev/null)
+err=$( ( . "$POLICY"; STORAGE_LOG="$SIZELOG" storage_size_mib "$ACC2" ) 2>&1 >/dev/null)
 case "$err" in *size_unreadable*) ok "the failure is reported on stderr" ;;
   *) bad "the failure is reported on stderr" "$err" "size_unreadable" ;; esac
 grep -q "event=size_unreadable" "$SIZELOG" 2>/dev/null \
   && ok "the failure reaches the event log" \
   || bad "the failure reaches the event log" "absent" "size_unreadable"
 # JSON mode keeps the same contract
-out=$(( . "$POLICY"; STORAGE_LOG="$SIZELOG" STORAGE_JSON=1 storage_size_mib "$ACC2" ) 2>/dev/null); rc=$?
+out=$( ( . "$POLICY"; STORAGE_LOG="$SIZELOG" STORAGE_JSON=1 storage_size_mib "$ACC2" ) 2>/dev/null); rc=$?
 [ -z "$out" ] && ok "JSON mode: no diagnostic on stdout" \
   || bad "JSON mode: no diagnostic on stdout" "$out" "empty"
 check_rc "JSON mode: returns rc=3" "$rc" 3
 # the missing-path branch has the same stdout contract
-out=$(( . "$POLICY"; STORAGE_LOG="$SIZELOG" storage_size_mib "$ACC2/absent" ) 2>/dev/null); rc=$?
+out=$( ( . "$POLICY"; STORAGE_LOG="$SIZELOG" storage_size_mib "$ACC2/absent" ) 2>/dev/null); rc=$?
 [ -z "$out" ] && ok "missing path: no diagnostic on stdout" \
   || bad "missing path: no diagnostic on stdout" "$out" "empty"
 check_rc "missing path: returns rc=2" "$rc" 2

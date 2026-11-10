@@ -19,7 +19,6 @@ JSON=0
 [ "$JSON" -eq 1 ] && { STORAGE_JSON=1; export STORAGE_JSON; }
 
 EVENTS=$(storage_log_file)
-MONLOG=${STORAGE_MONITOR_LOG:-/var/lib/turnstone/storage-monitor.log}
 WIN_START=${OBSERVATION_START:-2026-10-23T19:05:08Z}
 WIN_END=${OBSERVATION_END:-2026-10-30T19:05:08Z}
 
@@ -32,7 +31,6 @@ if [ "${STORAGE_SKIP_DETECT:-0}" -ne 1 ] && [ -x "$DETECT" ]; then
 fi
 
 today=$(date -u +%Y-%m-%d)
-day_start="${today}T00:00:00Z"
 
 # A required target that is absent is a measurement failure. The daily summary
 # must not describe a host whose build tree vanished as healthy.
@@ -71,7 +69,6 @@ fi
 
 # --- findings from the retained event log ---------------------------------
 unexpected=$(grep -c "event=unexpected_build_root" "$EVENTS" 2>/dev/null || true)
-would_remove=$(grep -c "event=would_remove" "$EVENTS" 2>/dev/null || true)
 blocked=$(grep -c "event=prune_blocked" "$EVENTS" 2>/dev/null || true)
 errors=$(grep -cE "level=error|event=monitor_failed|event=prune_failed" "$EVENTS" 2>/dev/null || true)
 bypass=$(grep -c "event=bypass_kind" "$EVENTS" 2>/dev/null || true)

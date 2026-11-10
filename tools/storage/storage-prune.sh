@@ -148,6 +148,12 @@ for c in "${CANDIDATES[@]}"; do
   if [ ! -e "$path" ]; then continue; fi
 
   # Structural refusals, independent of the policy list.
+  #
+  # SC2221/SC2222 below are false positives, measured with bash `case`:
+  # "a/b/.git" is matched by *.git and */.git, but "a/b/.git/config" is matched
+  # only by */.git/* — so that alternative is reachable and is not dead. It is
+  # kept as defence in depth for a .git tree appearing under a candidate root.
+  # shellcheck disable=SC2221,SC2222
   case "$path" in
     */target|*/target/release|*/target/release/*|*.git|*/.git|*/.git/*)
       storage_emit warn refuse path="$path" reason=structural_kind

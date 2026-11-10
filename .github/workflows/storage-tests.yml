@@ -1,0 +1,89 @@
+name: Storage controls
+
+# The storage control scripts (monitor, prune, detect, daily) and the build
+# wrappers are Bash and Rust-free: no Rust toolchain is needed, so this runs in
+# seconds and does not belong in the main CI matrix. It is a separate workflow
+# because these scripts can delete build trees, and a regression in one of them
+# must fail loudly on its own rather than be buried in a 10-job run.
+
+on:
+  push:
+    branches: [main, "stable/*"]
+  pull_request:
+    branches: [main, "stable/*"]
+
+permissions:
+  contents: read
+
+jobs:
+  storage-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The pruner suite needs `unshare -r -m -p -f`, and Ubuntu 24.04 (the
+      # ubuntu-latest image) restricts unprivileged user namespaces through
+      # AppArmor. That made the suite exit 3 on the first run of this workflow.
+      # The fix is to ENABLE isolation, never to drop it: the deletion-path
+      # assertions are meaningless without it.
+      - name: Enable unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          if unshare -r -m -p -f --mount-proc true 2>/dev/null; then
+            echo "user namespaces: available"
+          else
+            echo "user namespaces: UNAVAILABLE"
+            echo "::warning::The pruner suite will report INCONCLUSIVE (exit 3). Its deletion-path assertions will NOT be verified on this runner."
+          fi
+
+      # Catches the defect class that started this: a joined line can look
+      # valid to `bash -n` while silently turning one statement into arguments
+      # of another.
+      - name: Bash syntax
+        run: bash -n tools/storage/*.sh tools/storage/tests/*.sh
+
+      # Read-only assertions only: detection, daily summary, policy, sizing.
+      - name: Storage detection suite
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: tools/storage/tests/run-detection-tests.sh
+
+      # Isolation is REQUIRED here. Without user namespaces the pruner's
+      # "no cargo/rustc/pytest anywhere" gate refuses every deletion case, so
+      # the assertions would pass without proving anything. The suite exits 3
+      # with RESULT: INCONCLUSIVE in that case rather than reporting green —
+      # a runner that cannot isolate must not be able to claim the deletion
+      # paths are verified. The step turns that into a red job with an explicit
+      # message instead of a misleading pass.
+      - name: Storage policy and pruner suite
+        env:
+          TMPDIR: ${{ runner.temp }}
+          STORAGE_TESTS_REQUIRE_ISOLATION: "1"
+        run: |
+          set +e
+          tools/storage/tests/run-storage-tests.sh
+          rc=$?
+          set -e
+          if [ "$rc" -eq 3 ]; then
+            echo "::error::INCONCLUSIVE: user namespaces are unavailable, so the deletion-path assertions were NOT verified. Isolation was not relaxed and this is not a pass. Verify these cases on a host that allows 'unshare -r -m -p -f'."
+          fi
+          exit "$rc"
+
+      # Pinned: a newer ShellCheck can introduce diagnostics that would turn
+      # this gate red for reasons unrelated to the change under review.
+      - name: Install ShellCheck
+        run: pip install shellcheck-py==0.11.0.1
+
+      # Warning severity on the scripts that run on the host: SC2171 (a
+      # trailing "]" outside a test) is a warning, and it is exactly the
+      # defect this gate exists to catch. Both suites currently pass at this
+      # severity, so the gate is strict with no exclusions.
+      - name: ShellCheck — production scripts
+        run: shellcheck -S warning -x tools/storage/*.sh
+
+      # Error severity only: the harnesses source a path held in a variable
+      # (SC1090) and use deliberately empty command prefixes (SC1007).
+      - name: ShellCheck — test harnesses
+        run: shellcheck -S error -x tools/storage/tests/*.sh

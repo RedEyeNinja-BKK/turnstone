@@ -234,6 +234,48 @@ check_eq "a stale incremental tree is deleted" "$r" absent
 [ -e "$OLD/debug/deps/gone.rlib" ] && r=present || r=absent
 check_eq "a stale deps tree is deleted" "$r" absent
 
+echo "== storage-prune: a tree that becomes fresh AFTER enumeration is skipped =="
+# The build lock only excludes registered campaigns; a process that does not
+# take it (a hand-run cargo, an editor, an unpacking job) can write into a
+# candidate after the run started. A stub `rm` on PATH touches a LATER
+# candidate's tree at the moment the first candidate is deleted, so the later
+# one is stale when enumerated and fresh when its turn comes.
+RT="$WORK/race-target"; mkdir -p "$RT/debug/incremental" "$RT/debug/deps"
+echo old > "$RT/debug/incremental/first.bin"
+echo old > "$RT/debug/deps/second.rlib"
+touch -d '10 days ago' "$RT/debug/incremental/first.bin" "$RT/debug/deps/second.rlib" \
+  "$RT/debug/incremental" "$RT/debug/deps" "$RT/debug"
+RACE_PROBE="$WORK/race-probe"; : > "$RACE_PROBE"
+cat > "$WORK/bin/rm" <<'MOCK'
+#!/usr/bin/env bash
+# Record that a removal really happened, then make a LATER candidate fresh
+# before the pruner reaches it.
+echo "rm $*" >> "$RACE_PROBE"
+if [ -n "${RACE_TOUCH:-}" ] && [ -e "$RACE_TOUCH" ]; then
+  touch "$RACE_TOUCH" 2>/dev/null || true
+fi
+exec /bin/rm "$@"
+MOCK
+chmod 0755 "$WORK/bin/rm"
+export RACE_PROBE RACE_TOUCH="$RT/debug/deps/second.rlib"
+STORAGE_TARGETS="$RT" STORAGE_PYTEST_GLOBS="$WORK/none" STORAGE_PRUNE_PCT=0 \
+  STORAGE_LOG="$WORK/race.log" run_prune "$PR" --apply --confirm >/dev/null 2>&1
+check_rc "the racing run completes" "$?" 0
+# Not vacuous: the first candidate must actually have been removed, so the stub
+# ran and the later tree really did turn fresh mid-run.
+grep -q "incremental" "$RACE_PROBE" \
+  && ok "the first stale candidate was removed, so the race really occurred" \
+  || bad "the first stale candidate was removed, so the race really occurred" "no rm call" "rm invoked"
+[ -e "$RT/debug/incremental/first.bin" ] && r=present || r=absent
+check_eq "the stale candidate enumerated first is deleted" "$r" absent
+[ -e "$RT/debug/deps/second.rlib" ] && r=present || r=absent
+check_eq "the tree that turned fresh mid-run survives" "$r" present
+grep -q "event=classify.*deps.*class=active" "$WORK/race.log" \
+  && ok "the tree that turned fresh is re-classified as active at its turn" \
+  || bad "the tree that turned fresh is re-classified as active at its turn" "absent" "class=active"
+unset RACE_PROBE RACE_TOUCH
+/bin/rm -f "$WORK/bin/rm"
+
 echo "== storage_size_mib: incomplete scan fails closed, never zero ==="
 POLICY="$TOOLS/storage-policy.sh"
 # shellcheck source=/dev/null

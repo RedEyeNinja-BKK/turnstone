@@ -64,6 +64,7 @@ from turnstone.core.config import get_searxng_engines, get_searxng_url, get_work
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.ip_classify import AddressLane
+from turnstone.core.judge import JudgeCancelReason, _pin_judge_cancel
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
@@ -474,6 +475,62 @@ def _generation_superseded(session: ChatSession, my_generation: int) -> bool:
     window a force-cancel can land inside).
     """
     return bool(my_generation and session._generation != my_generation)
+
+
+#: Upper bound on the call ids an aborted-batch audit row carries.  A tool
+#: batch is small in practice; the cap keeps one pathological batch from
+#: writing an unbounded audit detail.
+_JUDGE_AUDIT_MAX_CALL_IDS = 50
+
+
+def _record_judge_batch_abort(
+    *,
+    ws_id: str,
+    user_id: str,
+    batch_id: str,
+    reason: Any,
+    call_ids: list[str],
+) -> None:
+    """Persist one durable row for an abandoned judge batch.
+
+    The per-verdict cause is already durable inside
+    ``intent_verdicts.reasoning`` (the heuristic verdict is relabelled
+    ``llm_fallback`` with the cause in parentheses).  The batch identity was
+    only in structured logs, which is not a store every operator can read, so
+    the batch itself gets an audit row: it carries the bounded cause and the
+    ``call_id`` list of the abandoned verdicts, which is the join key back to
+    those ``intent_verdicts`` rows.
+
+    Deliberately detail-minimal: opaque ids and a bounded enum label only -
+    no prompts, reasoning text, tool arguments, tokens, or credentials.
+    Best-effort: a storage failure must never disturb verdict delivery.
+    """
+    if not call_ids:
+        return
+    try:
+        from turnstone.core.audit import record_audit
+        from turnstone.core.judge import fallback_metric_reason
+        from turnstone.core.storage._registry import get_storage
+
+        storage = get_storage()
+        if storage is None:
+            return
+        record_audit(
+            storage,
+            user_id or "",
+            "judge.batch.aborted",
+            "workstream",
+            ws_id,
+            {
+                "batch_id": batch_id,
+                "reason": fallback_metric_reason(reason),
+                "abandoned_calls": len(call_ids),
+                "call_ids": call_ids[:_JUDGE_AUDIT_MAX_CALL_IDS],
+                "truncated": len(call_ids) > _JUDGE_AUDIT_MAX_CALL_IDS,
+            },
+        )
+    except Exception:
+        log.debug("judge.batch.audit_failed", exc_info=True)
 
 
 class _CancelRef(list[Any]):
@@ -4623,8 +4680,10 @@ class ChatSession:
             live_judges = list(self._judge_cancel_events)
             current_judge_event = self._judge_cancel_event
         if current_judge_event is not None:
+            _pin_judge_cancel(current_judge_event, JudgeCancelReason.SESSION_CLOSED)
             current_judge_event.set()
         for ev in live_judges:
+            _pin_judge_cancel(ev, JudgeCancelReason.SESSION_CLOSED)
             ev.set()
         with self._output_guard_judge_lock:
             self._output_guard_judge_shutdown = True
@@ -8441,8 +8500,10 @@ class ChatSession:
         # cancel-on-approval preference: that setting governs a normal gate
         # decision, not abandonment of the owning turn.
         if current_intent_judge_event is not None:
+            _pin_judge_cancel(current_intent_judge_event, JudgeCancelReason.OPERATOR_CANCEL)
             current_intent_judge_event.set()
         for event in intent_judge_events:
+            _pin_judge_cancel(event, JudgeCancelReason.OPERATOR_CANCEL)
             event.set()
         # Output-guard checks run in a worker pool and can be blocked in their
         # own model request after the primary stream has ended.  Retire and
@@ -15328,6 +15389,14 @@ class ChatSession:
             and "on_intent_verdict" not in base_ui.__dict__
         )
 
+        # Batch-level accounting for the durable audit row written in
+        # ``_on_done``.  The daemon delivers every abandoned item through
+        # ``_on_verdict`` before ``_on_done`` runs, so by then this holds the
+        # exact set of verdicts that were never evaluated.
+        abandoned_call_ids: list[str] = []
+        abandoned_batch_id = ""
+        abandoned_reason: Any = ""
+
         def _on_verdict(verdict: object) -> None:
             """Callback from the daemon judge thread.
 
@@ -15357,6 +15426,20 @@ class ChatSession:
             the next turn began left ``intent_verdicts`` claiming the judge
             never answered.
             """
+
+            # Collect before any delivery branch: a superseded verdict is
+            # persist-only here, but it is still an abandoned evaluation and
+            # its call_id is the join key back to the intent_verdicts row.
+            # ``isinstance(str)`` keeps duck-typed doubles out of the durable
+            # row: only a real verdict's fallback_reason is a string.
+            fallback_cause = getattr(verdict, "fallback_reason", "")
+            if isinstance(fallback_cause, str) and fallback_cause:
+                nonlocal abandoned_batch_id, abandoned_reason
+                abandoned_call_ids.append(getattr(verdict, "call_id", ""))
+                if not abandoned_batch_id:
+                    abandoned_batch_id = getattr(verdict, "batch_id", "")
+                if not abandoned_reason:
+                    abandoned_reason = fallback_cause
 
             def _persist_only() -> None:
                 persist_only = getattr(self.ui, "on_superseded_intent_verdict", None)
@@ -15425,6 +15508,14 @@ class ChatSession:
         def _on_done() -> None:
             with self._judge_events_lock:
                 self._judge_cancel_events.discard(cancel_event)
+            if abandoned_call_ids:
+                _record_judge_batch_abort(
+                    ws_id=self.ws_id,
+                    user_id=judge_principal,
+                    batch_id=abandoned_batch_id,
+                    reason=abandoned_reason,
+                    call_ids=[cid for cid in abandoned_call_ids if cid],
+                )
 
         # A shared workstream may bind a new actor while this daemon is still
         # evaluating later items.  Capture the initiating identity now; the
@@ -16775,6 +16866,12 @@ class ChatSession:
             _stage_unstarted_tool_calls()
             raise GenerationCancelled()
         if prior_judge_cancel is not None:
+            # The next batch supersedes this generation: the predecessor's judge
+            # daemon is aborted so its in-flight evaluations degrade to
+            # ``llm_fallback`` verdicts rather than racing a successor's
+            # approval surface.  Pin the reason so the daemon's abort path can
+            # tell "superseded" from "provider fault" in the audit trail.
+            _pin_judge_cancel(prior_judge_cancel, JudgeCancelReason.SUPERSEDED_BATCH)
             prior_judge_cancel.set()
         try:
             judge_cancel = self._evaluate_intent(
@@ -16828,6 +16925,7 @@ class ChatSession:
             # by ``close()``.
             jc_live = self._judge_cfg
             if judge_cancel and jc_live and jc_live.cancel_on_approval:
+                _pin_judge_cancel(judge_cancel, JudgeCancelReason.APPROVAL_GATE)
                 judge_cancel.set()
         denial_memory_count = (
             self._visible_memory_count() if not approved and self._nudges_enabled("denial") else 0
@@ -24038,6 +24136,9 @@ class ChatSession:
                             # trail (bounded to this one call).
                             jc_live = self._judge_cfg
                             if agent_judge_cancel and jc_live and jc_live.cancel_on_approval:
+                                _pin_judge_cancel(
+                                    agent_judge_cancel, JudgeCancelReason.APPROVAL_GATE
+                                )
                                 agent_judge_cancel.set()
                         # The approval witness may have self-denied because
                         # Stop/close won before or during cycle registration.

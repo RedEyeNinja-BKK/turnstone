@@ -15,7 +15,14 @@ import pytest
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core.admission import ModelAdmission
-from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.judge import (
+    IntentJudge,
+    IntentVerdict,
+    JudgeCancelReason,
+    JudgeConfig,
+    _pin_judge_cancel,
+    evaluate_heuristic,
+)
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.model_registry import ModelConfig
 from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
@@ -444,6 +451,230 @@ class TestCancelEventSemantics:
         # ...and no inference was spent after the abort signal.
         assert provider.create_streaming.call_count == 0
 
+    def test_pinned_supersede_reason_reaches_the_audit_trail(self):
+        """A superseding batch pins WHY it aborted the predecessor.
+
+        The safety invariant is unchanged (every call still gets exactly one
+        verdict); what the pin buys is an auditable reason: a supersede must
+        not be indistinguishable from a provider fault in ``intent_verdicts``.
+        """
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        cancel = threading.Event()
+        _pin_judge_cancel(cancel, JudgeCancelReason.SUPERSEDED_BATCH)
+        cancel.set()
+
+        results: list[IntentVerdict] = []
+        items = [_make_item(call_id=f"tc_{i}") for i in range(3)]
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+        )
+        _wait_for(results, 3)
+
+        assert [v.call_id for v in results] == ["tc_0", "tc_1", "tc_2"]
+        assert all(v.tier == "llm_fallback" for v in results)
+        assert all("(superseded_batch)" in v.reasoning for v in results)
+        # The structured fields make the same fact filterable without parsing
+        # prose, and every verdict of one batch shares one identity.
+        assert all(v.fallback_reason == "superseded_batch" for v in results)
+        assert all(v.batch_id for v in results)
+        assert len({v.batch_id for v in results}) == 1
+        assert results[0].to_dict()["fallback_reason"] == "superseded_batch"
+        assert results[0].to_dict()["batch_id"] == results[0].batch_id
+        assert provider.create_streaming.call_count == 0
+
+    def test_real_llm_verdict_carries_no_fallback_reason(self):
+        """A completed LLM verdict must not look like a fallback in audit."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            results.append,
+        )
+        _wait_for(results, 1)
+
+        assert len(results) == 1
+        assert results[0].tier == "llm"
+        assert results[0].fallback_reason == ""
+        # Batch identity is present even on the real-verdict path, so a
+        # superseding batch can be joined to what it displaced.
+        assert results[0].batch_id
+
+    def test_unpinned_cancel_keeps_the_legacy_wording(self):
+        """A caller that pins nothing keeps the historical audit suffix.
+
+        The typed reason is additive: existing rows and log greps must still
+        match, and an unpinned abort must never render as ``(unknown)``.
+        """
+        judge = _make_judge(_make_mock_provider(_good_verdict_json()))
+        cancel = threading.Event()
+        cancel.set()  # never pinned
+
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item(), _make_item(call_id="tc_b")],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+        )
+        _wait_for(results, 2)
+
+        assert len(results) == 2
+        assert all("judge cancelled before evaluating this call" in v.reasoning for v in results)
+        assert all("(unknown)" not in v.reasoning for v in results)
+        # An unpinned caller still gets a machine-readable cause, and it is
+        # explicitly not one of the typed enum values.
+        assert all(
+            v.fallback_reason == "judge cancelled before evaluating this call" for v in results
+        )
+
+    def test_provider_fault_is_pinned_as_provider_error(self):
+        """A backend-auth fault is typed, not lumped in with caller aborts."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        admission = ModelAdmission("judge", 1)
+        auth_config = MagicMock(name="pinned-auth-config")
+        judge._lane = replace(
+            judge._lane,
+            alias="judge",
+            admission=admission,
+            backend_auth_config=auth_config,
+        )
+        judge._create_client = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
+        resolver = MagicMock(side_effect=BackendAuthUnavailableError("mint unavailable"))
+
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            backend_auth_resolver=resolver,
+        )
+        _wait_for(results, 1)
+
+        assert len(results) == 1
+        assert results[0].tier == "llm_fallback"
+        assert "(provider_error)" in results[0].reasoning
+        assert results[0].fallback_reason == "provider_error"
+
+    def test_pin_is_first_writer_wins_and_ignores_unknown(self):
+        """The caller that fired first owns the reason; UNKNOWN is a no-op.
+
+        This is what keeps a deadline or a worker fault from relabelling an
+        operator stop that happened earlier in the same generation.
+        """
+        event = threading.Event()
+        _pin_judge_cancel(event, JudgeCancelReason.UNKNOWN)
+        assert JudgeCancelReason.from_cancel_event(event) is JudgeCancelReason.UNKNOWN
+        assert not hasattr(event, "_judge_cancel_reason")
+
+        _pin_judge_cancel(event, JudgeCancelReason.OPERATOR_CANCEL)
+        _pin_judge_cancel(event, JudgeCancelReason.DEADLINE)
+        assert JudgeCancelReason.from_cancel_event(event) is JudgeCancelReason.OPERATOR_CANCEL
+
+    def test_classify_prefers_pin_over_deadline(self):
+        """A pinned reason beats deadline inference; an unpinned expiry is DEADLINE."""
+        pinned = threading.Event()
+        _pin_judge_cancel(pinned, JudgeCancelReason.SESSION_CLOSED)
+        assert (
+            JudgeCancelReason.classify(pinned, deadline_expired=True)
+            is JudgeCancelReason.SESSION_CLOSED
+        )
+        assert (
+            JudgeCancelReason.classify(threading.Event(), deadline_expired=True)
+            is JudgeCancelReason.DEADLINE
+        )
+        assert JudgeCancelReason.classify(threading.Event()) is JudgeCancelReason.UNKNOWN
+
+    def test_deadline_expiry_pins_deadline_and_differs_from_supersede(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An unpinned expiry is DEADLINE; a pinned supersede stays supersede.
+
+        The deadline arm is the one place the judge classifies rather than
+        being told, so it must (a) pin DEADLINE on the caller's own event and
+        (b) not relabel an event the caller already pinned.
+        """
+        from turnstone.core.deadline import DeadlineExceededError
+
+        def _expire(*_args: Any, **_kwargs: Any) -> Any:
+            raise DeadlineExceededError("per-call timeout")
+
+        monkeypatch.setattr("turnstone.core.judge.run_abortable_with_deadline", _expire)
+        judge = _make_judge(_make_mock_provider(_good_verdict_json()))
+
+        cancel = threading.Event()
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+        )
+        _wait_for(results, 1)
+
+        assert len(results) == 1
+        assert results[0].tier == "llm_fallback"
+        assert results[0].fallback_reason == "deadline"
+        assert not cancel.is_set()  # a per-call expiry is not a batch abort
+        assert JudgeCancelReason.from_cancel_event(cancel) is JudgeCancelReason.DEADLINE
+
+        superseded = threading.Event()
+        _pin_judge_cancel(superseded, JudgeCancelReason.SUPERSEDED_BATCH)
+        results.clear()
+        judge.evaluate(
+            [_make_item(call_id="tc_s")],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=superseded,
+        )
+        _wait_for(results, 1)
+
+        assert results[0].fallback_reason == "superseded_batch"
+        assert JudgeCancelReason.from_cancel_event(superseded) is JudgeCancelReason.SUPERSEDED_BATCH
+
+    def test_cancel_after_completion_is_inert(self):
+        """An already-terminal batch must not acquire a new reason or verdict."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        cancel = threading.Event()
+        done = threading.Event()
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item(), _make_item(call_id="tc_b")],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+            done_callback=done.set,
+        )
+        assert done.wait(5.0)
+        assert len(results) == 2
+        assert [v.tier for v in results] == ["llm", "llm"]
+        calls = provider.create_streaming.call_count
+
+        _pin_judge_cancel(cancel, JudgeCancelReason.SUPERSEDED_BATCH)
+        cancel.set()
+        _wait_for(results, 3, timeout=0.3)
+
+        assert len(results) == 2
+        assert provider.create_streaming.call_count == calls
+        assert all(v.fallback_reason == "" for v in results)
+
+    def test_expected_auxiliary_excludes_faults(self):
+        """Faults must stay distinguishable from routine caller aborts."""
+        assert JudgeCancelReason.SUPERSEDED_BATCH.is_expected_auxiliary
+        assert JudgeCancelReason.SESSION_CLOSED.is_expected_auxiliary
+        assert JudgeCancelReason.OPERATOR_CANCEL.is_expected_auxiliary
+        assert JudgeCancelReason.APPROVAL_GATE.is_expected_auxiliary
+        assert JudgeCancelReason.DEADLINE.is_expected_auxiliary
+        assert not JudgeCancelReason.PROVIDER_ERROR.is_expected_auxiliary
+        assert not JudgeCancelReason.UNKNOWN.is_expected_auxiliary
+
     def test_unfired_event_runs_every_item_with_default_config(self):
         """The run-to-completion contract: with cancel_on_approval=False
         and no abort signal, all items get REAL LLM verdicts — resolving
@@ -592,9 +823,7 @@ class TestCancelEventSemantics:
         assert admission.snapshot().in_flight == 0
         assert [verdict.call_id for verdict in results] == ["tc_0", "tc_1", "tc_2"]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all(
-            "judge backend authentication failed" in verdict.reasoning for verdict in results
-        )
+        assert all("(provider_error)" in verdict.reasoning for verdict in results)
         auth_logs = [
             record
             for record in caplog.records
@@ -773,7 +1002,7 @@ class TestParallelEvaluationScheduling:
         assert len(results) == 5
         assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(5)]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all("worker initialization failed" in verdict.reasoning for verdict in results)
+        assert all("(worker_init)" in verdict.reasoning for verdict in results)
         assert done_count == 1
         assert len(clients) == 1
         assert clients[0].close_count == 1
@@ -816,7 +1045,7 @@ class TestParallelEvaluationScheduling:
         assert len(results) == 4
         assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(4)]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all("worker initialization failed" in verdict.reasoning for verdict in results)
+        assert all("(worker_init)" in verdict.reasoning for verdict in results)
         assert done_count == 1
         assert clients == []
 
@@ -1043,7 +1272,7 @@ class TestParallelEvaluationScheduling:
         assert len(results) == 6
         assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(6)]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all("backend authentication failed" in verdict.reasoning for verdict in results)
+        assert all("(provider_error)" in verdict.reasoning for verdict in results)
         assert len(clients) == 3
         assert all(client.close_count == 1 for client in clients)
 

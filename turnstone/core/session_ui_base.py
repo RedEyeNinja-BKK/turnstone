@@ -509,6 +509,17 @@ def fire_judge_verdict_metric(
         verdict.get("risk_level", "medium"),
         verdict.get("latency_ms", 0),
     )
+    fallback_reason = verdict.get("fallback_reason")
+    if fallback_reason:
+        # Additive: the (tier, risk_level) counter above keeps its exact
+        # meaning, and this records WHY an evaluation was abandoned so the
+        # durable before/after receipt can be split by cause.  The label is
+        # normalised to a bounded set inside the judge module.
+        from turnstone.core.judge import fallback_metric_reason
+
+        record_fallback = getattr(metrics, "record_judge_fallback", None)
+        if record_fallback is not None:
+            record_fallback(fallback_metric_reason(fallback_reason))
 
 
 class AutoApproveReason:

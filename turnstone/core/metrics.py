@@ -37,6 +37,12 @@ class MetricsCollector:
         self._node_models_publish_skipped: int = 0
         # judge metrics
         self._judge_verdicts: dict[tuple[str, str], int] = defaultdict(int)
+        # Fallback causes are aggregated SEPARATELY and additively: the
+        # (tier, risk_level) counter above keeps its exact meaning, and this
+        # counter is a strict subdivision of its ``llm_fallback`` slice.  The
+        # label set is bounded by the caller (JudgeCancelReason values plus
+        # ``unclassified``), never by free text.
+        self._judge_fallbacks: dict[str, int] = defaultdict(int)
         self._judge_latency: dict[str, Any] = {
             "buckets": [0] * len(self.BUCKETS),
             "sum": 0.0,
@@ -140,6 +146,15 @@ class MetricsCollector:
                 self._judge_latency["sum"] += seconds
                 self._judge_latency["count"] += 1
 
+    def record_judge_fallback(self, reason: str) -> None:
+        """Record one abandoned judge evaluation and its bounded cause.
+
+        Additive: ``record_judge_verdict`` still counts the same verdict, so
+        neither counter is a re-partition of the other.
+        """
+        with self._lock:
+            self._judge_fallbacks[reason] += 1
+
     def generate_text(
         self,
         workstream_states: dict[str, int],
@@ -187,6 +202,7 @@ class MetricsCollector:
             backend_up = self._backend_up
             evictions = self._evictions
             judge_verdicts = dict(self._judge_verdicts)
+            judge_fallbacks = dict(self._judge_fallbacks)
             judge_latency = dict(self._judge_latency)
             judge_enabled = self._judge_enabled
             node_models_publish_written = self._node_models_publish_written
@@ -332,6 +348,15 @@ class MetricsCollector:
                 lines.append(
                     f'turnstone_judge_verdicts_total{{tier="{tier}",risk_level="{risk}"}} {cnt}'
                 )
+
+        # turnstone_judge_fallbacks_total
+        if judge_fallbacks:
+            lines.append(
+                "# HELP turnstone_judge_fallbacks_total Abandoned judge evaluations by cause"
+            )
+            lines.append("# TYPE turnstone_judge_fallbacks_total counter")
+            for reason, cnt in sorted(judge_fallbacks.items()):
+                lines.append(f'turnstone_judge_fallbacks_total{{reason="{reason}"}} {cnt}')
 
         # turnstone_judge_llm_latency_seconds (histogram)
         if judge_latency["count"] > 0:

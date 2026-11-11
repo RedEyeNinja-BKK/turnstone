@@ -33,6 +33,17 @@ Action-name conventions (non-exhaustive — grep
                         ``prompt_policy``, ``setting``, ``token``,
                         ``conversation``, ``memory``, ``org``.
 
+    judge.batch.aborted One durable row per abandoned intent-judge batch
+                        (superseded / session_closed / operator_cancel /
+                        approval_gate / deadline / provider_error /
+                        workstream_init, or ``unclassified`` for a legacy
+                        unpinned caller).  ``detail`` carries the bounded
+                        cause, the batch id and the abandoned ``call_ids``
+                        that join back to the ``intent_verdicts`` rows -
+                        written from the judge daemon's done callback, so it
+                        is durable even where systemd journals are not
+                        readable.
+
     mcp_server.oauth.*  OAuth-MCP delegated authorization events
                         (``mcp_server.oauth.client_secret_set`` from
                         admin handlers when the operator stores or

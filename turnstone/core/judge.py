@@ -245,6 +245,30 @@ def _normalise_reason(reason: JudgeCancelReason | str) -> str:
 _UNPINNED_EARLY_CANCEL = "judge cancelled before evaluating this call"
 
 
+#: Label used when a fallback's cause is free text rather than a bounded
+#: enum value (an unpinned legacy caller, or a future path that has not been
+#: classified yet).  Keeping it explicit bounds the metric's label set: the
+#: cause label is never derived from arbitrary text.
+UNCLASSIFIED_FALLBACK_REASON = "unclassified"
+
+_FALLBACK_REASON_LABELS = frozenset(member.value for member in JudgeCancelReason)
+
+
+def fallback_metric_reason(reason: object) -> str:
+    """Map any fallback cause onto the bounded metric label set.
+
+    Only :class:`JudgeCancelReason` values pass through; free text (the
+    preserved legacy wording, or anything new that was not classified)
+    collapses to ``unclassified`` so the counter's cardinality cannot grow
+    with log content.
+    """
+    if isinstance(reason, JudgeCancelReason):
+        return reason.value
+    if isinstance(reason, str) and reason in _FALLBACK_REASON_LABELS:
+        return reason
+    return UNCLASSIFIED_FALLBACK_REASON
+
+
 def _early_cancel_reason(event: Any) -> JudgeCancelReason | str:
     """Reason text for a batch cancelled before its first evaluation.
 

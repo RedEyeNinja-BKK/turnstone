@@ -26,6 +26,9 @@ class ConsoleMetrics:
         # alerting rules can fire on a coord-side risk distribution
         # shift the same way they do on per-node interactive metrics.
         self._judge_verdicts: dict[tuple[str, str], int] = defaultdict(int)
+        # Additive subdivision of the llm_fallback slice, keyed by bounded
+        # cause - same series name as the per-node collector.
+        self._judge_fallbacks: dict[str, int] = defaultdict(int)
         self._start_time: float = time.monotonic()
 
     def record_route(self, method: str, status: int, duration: float) -> None:
@@ -54,6 +57,11 @@ class ConsoleMetrics:
         with self._lock:
             self._judge_verdicts[(tier, risk_level)] += 1
 
+    def record_judge_fallback(self, reason: str) -> None:
+        """Record an abandoned judge evaluation and its bounded cause."""
+        with self._lock:
+            self._judge_fallbacks[reason] += 1
+
     def generate_text(self) -> str:
         """Return Prometheus text exposition format (v0.0.4)."""
         lines: list[str] = []
@@ -65,6 +73,7 @@ class ConsoleMetrics:
             router_membership = self._router_membership
             router_refresh_count = self._router_refresh_count
             judge_verdicts = dict(self._judge_verdicts)
+            judge_fallbacks = dict(self._judge_fallbacks)
 
         # turnstone_router_requests_total
         lines.append("# HELP turnstone_router_requests_total Console-routed requests")
@@ -111,6 +120,16 @@ class ConsoleMetrics:
                 lines.append(
                     f'turnstone_judge_verdicts_total{{tier="{tier}",risk_level="{risk}"}} {cnt}'
                 )
+
+        # turnstone_judge_fallbacks_total - same name as the per-node series
+        # so a cluster query rolls coord and node rows up uniformly.
+        if judge_fallbacks:
+            lines.append(
+                "# HELP turnstone_judge_fallbacks_total Abandoned judge evaluations by cause"
+            )
+            lines.append("# TYPE turnstone_judge_fallbacks_total counter")
+            for reason, cnt in sorted(judge_fallbacks.items()):
+                lines.append(f'turnstone_judge_fallbacks_total{{reason="{reason}"}} {cnt}')
 
         lines.append("")  # trailing newline
         return "\n".join(lines)

@@ -6422,6 +6422,14 @@ let _modelAuthPersisted = { mode: "static", audience: "", scopes: "" };
 // edit modal (like server_compat), held here so they survive an unrelated edit
 // and are re-merged on save. Reset per modal open.
 let _rerankCalFields = {};
+// server_compat as loaded from the row being edited. Lifted out of the raw
+// JSON on edit-load (the structured fields own it while visible), so the save
+// path must put it back: only the lanes the form renders controls for rebuild
+// their keys, and every other key - and every provider that renders no
+// control at all - round-trips from here. Without it an unrelated save
+// silently discards a stored server_type/api_surface/extra_body. Reset per
+// modal open.
+let _modelLiftedServerCompat = {};
 
 // Capability tile matrix — sparse-override semantics. The tiles display
 // merge(dataclass defaults, known-model table baseline, explicit overrides);
@@ -7789,6 +7797,7 @@ function showCreateModelModal() {
   // Reranker calibration: reset extracted fields and hide the chip + the
   // Re-calibrate button (edit mode re-shows them after loading the def).
   _rerankCalFields = {};
+  _modelLiftedServerCompat = {};
   const _calChip = document.getElementById("model-calibration-chip");
   if (_calChip) _calChip.style.display = "none";
   const _recalBtn = document.getElementById("model-recalibrate-btn");
@@ -7900,6 +7909,10 @@ function showEditModelModal(definitionId) {
       const sc = _isPlainObject(capsObj.server_compat)
         ? capsObj.server_compat
         : {};
+      // Kept for the save path (see the declaration): the object is lifted out
+      // of the raw JSON below, so this is its only surviving copy. Deep copy so
+      // later form edits cannot mutate the loaded row's shape.
+      _modelLiftedServerCompat = JSON.parse(JSON.stringify(sc));
       // Only extract thinking_mode into the dropdown when the UI can
       // represent it ("", "manual" = effort-knob controlled, "adaptive" =
       // always on).  Unrepresentable/garbage values keep thinking_mode in
@@ -8081,25 +8094,38 @@ function submitCreateModel() {
     if (effortParam) caps.effort_param = effortParam;
   }
 
-  // Build server_compat from structured fields.  Only meaningful for the
-  // compat lanes (openai-compatible: all fields; anthropic-compatible: the
-  // extra-body JSON only) — for other providers the section is hidden
-  // but the form values can linger after a provider switch, so gate the
-  // whole block on the active provider to keep persisted state honest.
-  const serverCompat = {};
+  // Build server_compat from structured fields.  The form renders controls
+  // for a subset of the keys, per lane (openai-compatible: server_type,
+  // api_surface, extra_body; anthropic-compatible: extra_body only), and
+  // NONE for the other providers.  Whatever is not editable must round-trip
+  // unchanged: the object was lifted out of the raw JSON on edit-load, so
+  // rebuilding it from the form alone would silently discard a stored
+  // server_type/api_surface/extra_body on an unrelated save (issue #19).
+  // The base is the operator's own raw-JSON value if they typed one, else
+  // the loaded row.
   const ebEl = document.getElementById("model-extra-body");
   ebEl.removeAttribute("aria-invalid");
   ebEl.style.borderColor = "";
+  const baseCompat = _isPlainObject(caps.server_compat)
+    ? caps.server_compat
+    : _isPlainObject(_modelLiftedServerCompat)
+      ? _modelLiftedServerCompat
+      : {};
+  const serverCompat = JSON.parse(JSON.stringify(baseCompat));
+  if (providerVal === "openai-compatible") {
+    // Fully editable: an emptied control is the operator clearing the key.
+    const serverType = document.getElementById("model-server-type").value;
+    if (serverType) serverCompat.server_type = serverType;
+    else delete serverCompat.server_type;
+    const apiSurface = document.getElementById("model-api-surface").value;
+    if (apiSurface) serverCompat.api_surface = apiSurface;
+    else delete serverCompat.api_surface;
+  }
   if (
     providerVal === "openai-compatible" ||
     providerVal === "anthropic-compatible"
   ) {
-    if (providerVal === "openai-compatible") {
-      const serverType = document.getElementById("model-server-type").value;
-      if (serverType) serverCompat.server_type = serverType;
-      const apiSurface = document.getElementById("model-api-surface").value;
-      if (apiSurface) serverCompat.api_surface = apiSurface;
-    }
+    delete serverCompat.extra_body;
     const ebText = ebEl.value.trim();
     if (ebText) {
       try {
@@ -8116,8 +8142,12 @@ function submitCreateModel() {
       }
     }
   }
+  // A hidden textarea left over from a previous provider selection is never
+  // read on a lane that cannot edit it, so it cannot resurrect stale text.
   if (Object.keys(serverCompat).length > 0) {
     caps.server_compat = serverCompat;
+  } else {
+    delete caps.server_compat;
   }
 
   // Capability tiles: persist exactly the explicit keys (saved-in-JSON +

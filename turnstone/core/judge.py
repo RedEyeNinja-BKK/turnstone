@@ -1814,17 +1814,17 @@ class IntentJudge:
                         # typed cause and whether it was expected auxiliary
                         # behaviour, so the log alone answers "did the judge
                         # fail, or did the caller legitimately abort it?".
-                        reason = outcome.fallback_reason
+                        fallback_reason = outcome.fallback_reason
                         log.info(
                             "judge.verdict.fallback",
                             batch_id=batch_id,
                             recommendation=verdict.recommendation,
                             confidence=verdict.confidence,
                             call_id=verdict.call_id,
-                            fallback_reason=_normalise_reason(reason),
+                            fallback_reason=_normalise_reason(fallback_reason),
                             expected_auxiliary=(
-                                reason.is_expected_auxiliary
-                                if isinstance(reason, JudgeCancelReason)
+                                fallback_reason.is_expected_auxiliary
+                                if isinstance(fallback_reason, JudgeCancelReason)
                                 else None
                             ),
                         )

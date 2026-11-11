@@ -591,6 +591,80 @@ class TestCancelEventSemantics:
         )
         assert JudgeCancelReason.classify(threading.Event()) is JudgeCancelReason.UNKNOWN
 
+    def test_deadline_expiry_pins_deadline_and_differs_from_supersede(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An unpinned expiry is DEADLINE; a pinned supersede stays supersede.
+
+        The deadline arm is the one place the judge classifies rather than
+        being told, so it must (a) pin DEADLINE on the caller's own event and
+        (b) not relabel an event the caller already pinned.
+        """
+        from turnstone.core.deadline import DeadlineExceededError
+
+        def _expire(*_args: Any, **_kwargs: Any) -> Any:
+            raise DeadlineExceededError("per-call timeout")
+
+        monkeypatch.setattr("turnstone.core.judge.run_abortable_with_deadline", _expire)
+        judge = _make_judge(_make_mock_provider(_good_verdict_json()))
+
+        cancel = threading.Event()
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+        )
+        _wait_for(results, 1)
+
+        assert len(results) == 1
+        assert results[0].tier == "llm_fallback"
+        assert results[0].fallback_reason == "deadline"
+        assert not cancel.is_set()  # a per-call expiry is not a batch abort
+        assert JudgeCancelReason.from_cancel_event(cancel) is JudgeCancelReason.DEADLINE
+
+        superseded = threading.Event()
+        _pin_judge_cancel(superseded, JudgeCancelReason.SUPERSEDED_BATCH)
+        results.clear()
+        judge.evaluate(
+            [_make_item(call_id="tc_s")],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=superseded,
+        )
+        _wait_for(results, 1)
+
+        assert results[0].fallback_reason == "superseded_batch"
+        assert JudgeCancelReason.from_cancel_event(superseded) is JudgeCancelReason.SUPERSEDED_BATCH
+
+    def test_cancel_after_completion_is_inert(self):
+        """An already-terminal batch must not acquire a new reason or verdict."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        cancel = threading.Event()
+        done = threading.Event()
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            [_make_item(), _make_item(call_id="tc_b")],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+            done_callback=done.set,
+        )
+        assert done.wait(5.0)
+        assert len(results) == 2
+        assert [v.tier for v in results] == ["llm", "llm"]
+        calls = provider.create_streaming.call_count
+
+        _pin_judge_cancel(cancel, JudgeCancelReason.SUPERSEDED_BATCH)
+        cancel.set()
+        _wait_for(results, 3, timeout=0.3)
+
+        assert len(results) == 2
+        assert provider.create_streaming.call_count == calls
+        assert all(v.fallback_reason == "" for v in results)
+
     def test_expected_auxiliary_excludes_faults(self):
         """Faults must stay distinguishable from routine caller aborts."""
         assert JudgeCancelReason.SUPERSEDED_BATCH.is_expected_auxiliary

@@ -277,14 +277,24 @@ def _pin_judge_cancel(event: Any, reason: JudgeCancelReason) -> None:
     without creating a circular import: ``session.py`` already imports
     ``judge`` lazily inside methods, and this helper only needs the enum's
     identity, which it resolves on first use.
+
+    The batch's private abort event composes the caller's event and carries
+    it as ``_upstream``; a reason pinned there must also land on the caller's
+    object, because that is the object the session owns and the one the
+    coordinator reads back when it classifies abandoned work.
     """
     if event is None or reason is JudgeCancelReason.UNKNOWN:
         return
-    existing = getattr(event, "_judge_cancel_reason", None)
-    if isinstance(existing, JudgeCancelReason):
-        return
-    with contextlib.suppress(AttributeError, TypeError):
-        event._judge_cancel_reason = reason
+    targets = [event]
+    upstream = getattr(event, "_upstream", None)
+    if upstream is not None and upstream is not event:
+        targets.append(upstream)
+    for target in targets:
+        existing = getattr(target, "_judge_cancel_reason", None)
+        if isinstance(existing, JudgeCancelReason):
+            continue
+        with contextlib.suppress(AttributeError, TypeError):
+            target._judge_cancel_reason = reason
 
 
 class _JudgeBatchCancelEvent(threading.Event):

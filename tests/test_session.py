@@ -1602,6 +1602,13 @@ class TestTaskExec:
         execute.assert_not_called()
         assert session._judge_cancel_event is successor_event
         assert old_event.is_set()
+        # The abort carries WHY it fired, so a stop is distinguishable from a
+        # provider fault in the audit trail.  This test stops the session
+        # before the successor supersedes, and first-writer-wins preserves the
+        # operator's reason rather than relabelling it downstream.
+        from turnstone.core.judge import JudgeCancelReason
+
+        assert JudgeCancelReason.from_cancel_event(old_event) is JudgeCancelReason.OPERATOR_CANCEL
         assert not successor_event.is_set()
         assert {old_event, successor_event} <= session._judge_cancel_events
 

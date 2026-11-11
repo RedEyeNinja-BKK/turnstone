@@ -64,6 +64,7 @@ from turnstone.core.config import get_searxng_engines, get_searxng_url, get_work
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.ip_classify import AddressLane
+from turnstone.core.judge import JudgeCancelReason, _pin_judge_cancel
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
@@ -4623,8 +4624,10 @@ class ChatSession:
             live_judges = list(self._judge_cancel_events)
             current_judge_event = self._judge_cancel_event
         if current_judge_event is not None:
+            _pin_judge_cancel(current_judge_event, JudgeCancelReason.SESSION_CLOSED)
             current_judge_event.set()
         for ev in live_judges:
+            _pin_judge_cancel(ev, JudgeCancelReason.SESSION_CLOSED)
             ev.set()
         with self._output_guard_judge_lock:
             self._output_guard_judge_shutdown = True
@@ -8441,8 +8444,10 @@ class ChatSession:
         # cancel-on-approval preference: that setting governs a normal gate
         # decision, not abandonment of the owning turn.
         if current_intent_judge_event is not None:
+            _pin_judge_cancel(current_intent_judge_event, JudgeCancelReason.OPERATOR_CANCEL)
             current_intent_judge_event.set()
         for event in intent_judge_events:
+            _pin_judge_cancel(event, JudgeCancelReason.OPERATOR_CANCEL)
             event.set()
         # Output-guard checks run in a worker pool and can be blocked in their
         # own model request after the primary stream has ended.  Retire and
@@ -16775,6 +16780,12 @@ class ChatSession:
             _stage_unstarted_tool_calls()
             raise GenerationCancelled()
         if prior_judge_cancel is not None:
+            # The next batch supersedes this generation: the predecessor's judge
+            # daemon is aborted so its in-flight evaluations degrade to
+            # ``llm_fallback`` verdicts rather than racing a successor's
+            # approval surface.  Pin the reason so the daemon's abort path can
+            # tell "superseded" from "provider fault" in the audit trail.
+            _pin_judge_cancel(prior_judge_cancel, JudgeCancelReason.SUPERSEDED_BATCH)
             prior_judge_cancel.set()
         try:
             judge_cancel = self._evaluate_intent(
@@ -16828,6 +16839,7 @@ class ChatSession:
             # by ``close()``.
             jc_live = self._judge_cfg
             if judge_cancel and jc_live and jc_live.cancel_on_approval:
+                _pin_judge_cancel(judge_cancel, JudgeCancelReason.APPROVAL_GATE)
                 judge_cancel.set()
         denial_memory_count = (
             self._visible_memory_count() if not approved and self._nudges_enabled("denial") else 0
@@ -24038,6 +24050,9 @@ class ChatSession:
                             # trail (bounded to this one call).
                             jc_live = self._judge_cfg
                             if agent_judge_cancel and jc_live and jc_live.cancel_on_approval:
+                                _pin_judge_cancel(
+                                    agent_judge_cancel, JudgeCancelReason.APPROVAL_GATE
+                                )
                                 agent_judge_cancel.set()
                         # The approval witness may have self-denied because
                         # Stop/close won before or during cycle registration.

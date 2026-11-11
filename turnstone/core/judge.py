@@ -7,6 +7,7 @@ is a fast, pure-function rule engine with zero external dependencies.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import itertools
 import json
@@ -18,6 +19,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -75,6 +77,15 @@ class IntentVerdict:
     tier: str = "heuristic"  # "heuristic" | "llm" | "arbitrated"
     judge_model: str = ""
     latency_ms: int = 0
+    # Bounded, machine-readable cause for an ``llm_fallback`` verdict (one of
+    # ``JudgeCancelReason``'s values, or "" for a real LLM verdict).  The same
+    # text also lands in ``reasoning``; this field exists so audit consumers
+    # can filter without parsing prose.
+    fallback_reason: str = ""
+    # Identifies the judge batch that produced this verdict, so a caller can
+    # join a verdict to the batch it was superseded with.  Empty for verdicts
+    # built outside a batch run (heuristic tier, tests).
+    batch_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         """Serialize for SSE/JSON transport."""
@@ -92,6 +103,8 @@ class IntentVerdict:
             "tier": self.tier,
             "judge_model": self.judge_model,
             "latency_ms": self.latency_ms,
+            "fallback_reason": self.fallback_reason,
+            "batch_id": self.batch_id,
         }
 
 
@@ -145,8 +158,133 @@ class _JudgeWorkOutcome:
 
     index: int
     verdict: IntentVerdict | None
-    fallback_reason: str
+    fallback_reason: JudgeCancelReason | str
     acknowledged: threading.Event = field(default_factory=threading.Event)
+
+
+class JudgeCancelReason(Enum):
+    """Typed cancellation reason for a judge batch.
+
+    The judge's abort path is the safety net: when it fires, the batch is
+    stopped and every uncompleted item is relabelled as an ``llm_fallback``
+    verdict.  The safety invariant (every call still gets exactly one
+    verdict) must never be weakened, but the reason that fired is now a
+    typed, auditable value instead of a bare string, so the caller can see
+    whether the abort was expected auxiliary behaviour (a superseding
+    batch, a closed session, an operator cancel) or something that needs
+    investigation (a provider fault, a deadline, an unknown cause).
+    """
+
+    SUPERSEDED_BATCH = "superseded_batch"
+    SESSION_CLOSED = "session_closed"
+    OPERATOR_CANCEL = "operator_cancel"
+    APPROVAL_GATE = "approval_gate"
+    DEADLINE = "deadline"
+    PROVIDER_ERROR = "provider_error"
+    WORKER_INIT = "worker_init"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def from_cancel_event(cls, event: Any) -> JudgeCancelReason:
+        """Recover a reason pinned onto a cancel event, if any."""
+        reason = getattr(event, "_judge_cancel_reason", None)
+        if isinstance(reason, JudgeCancelReason):
+            return reason
+        return cls.UNKNOWN
+
+    @classmethod
+    def classify(
+        cls,
+        event: Any | None = None,
+        *,
+        deadline_expired: bool = False,
+    ) -> JudgeCancelReason:
+        """Classify a batch abort from its trigger and deadline state.
+
+        A pinned reason wins: the caller that fired the event knows why.
+        Only when nothing is pinned do we infer from the deadline, and only
+        then do we fall back to UNKNOWN.
+        """
+        if event is not None:
+            pinned = cls.from_cancel_event(event)
+            if pinned is not cls.UNKNOWN:
+                return pinned
+        if deadline_expired:
+            return cls.DEADLINE
+        return cls.UNKNOWN
+
+    @property
+    def is_expected_auxiliary(self) -> bool:
+        """True when this abort is routine caller behaviour, not a fault.
+
+        ``PROVIDER_ERROR`` and ``UNKNOWN`` are faults; the rest are the
+        caller's policy (supersede, close, operator cancel, approval gate)
+        or a bounded deadline, all of which the judge is designed to absorb
+        without surfacing as a failure.
+        """
+        return self not in (JudgeCancelReason.PROVIDER_ERROR, JudgeCancelReason.UNKNOWN)
+
+
+def _normalise_reason(reason: JudgeCancelReason | str) -> str:
+    """Render a judge abort reason for the audit trail.
+
+    Enum members carry their own human-readable label; a bare string (a
+    legacy caller that did not pin, or a worker fault text that survived
+    classification) is passed through unchanged.  This keeps the fallback
+    reasoning suffix stable across the migration: an old "(deadline)"
+    still reads "(deadline)" and a new enum still reads "(deadline)".
+    """
+    if isinstance(reason, JudgeCancelReason):
+        return reason.value
+    return str(reason)
+
+
+# Legacy wording for a batch aborted before any evaluation started.  Preserved
+# verbatim for callers that never pin a reason: the audit suffix must not
+# silently change shape just because the reason became a typed value.
+_UNPINNED_EARLY_CANCEL = "judge cancelled before evaluating this call"
+
+
+def _early_cancel_reason(event: Any) -> JudgeCancelReason | str:
+    """Reason text for a batch cancelled before its first evaluation.
+
+    A caller that pinned a typed reason gets it; an unpinned caller keeps the
+    historical wording so existing audit rows and log greps still match.
+    """
+    pinned = JudgeCancelReason.classify(event)
+    if pinned is JudgeCancelReason.UNKNOWN:
+        return _UNPINNED_EARLY_CANCEL
+    return pinned
+
+
+def _pin_judge_cancel(event: Any, reason: JudgeCancelReason) -> None:
+    """Stamp a typed cancellation reason onto a judge cancel event.
+
+    The judge's abort path is the safety net: when it fires, the batch is
+    stopped and every uncompleted item is relabelled as an ``llm_fallback``
+    verdict.  The safety invariant (every call still gets exactly one
+    verdict) is never weakened — what changes is that the reason is now a
+    typed :class:`JudgeCancelReason` the caller knows why, rather than a
+    bare string the worker happened to observe first.
+
+    First-writer-wins: the caller that fired the event knows why, and a
+    later caller (a deadline wrapper, a worker fault) must not overwrite it
+    with a less specific classification.  ``JudgeCancelReason.UNKNOWN`` is
+    the no-op sentinel — callers that have nothing to say pass it through
+    harmlessly.
+
+    Defined in ``judge.py`` so ``session.py`` can import it at top level
+    without creating a circular import: ``session.py`` already imports
+    ``judge`` lazily inside methods, and this helper only needs the enum's
+    identity, which it resolves on first use.
+    """
+    if event is None or reason is JudgeCancelReason.UNKNOWN:
+        return
+    existing = getattr(event, "_judge_cancel_reason", None)
+    if isinstance(existing, JudgeCancelReason):
+        return
+    with contextlib.suppress(AttributeError, TypeError):
+        event._judge_cancel_reason = reason
 
 
 class _JudgeBatchCancelEvent(threading.Event):
@@ -1396,6 +1534,11 @@ class IntentJudge:
             )
             heuristic_verdicts.append(verdict)
 
+        # One identity per batch: lets audit consumers join a verdict to the
+        # batch that was superseded (or aborted) instead of inferring it from
+        # timestamps.
+        batch_id = uuid.uuid4().hex
+
         # Spawn daemon thread for LLM judge
         thread = threading.Thread(
             target=self._run_judge,
@@ -1407,6 +1550,7 @@ class IntentJudge:
                 cancel_event,
                 done_callback,
                 backend_auth_resolver,
+                batch_id,
             ),
             daemon=True,
             name="intent-judge",
@@ -1424,6 +1568,7 @@ class IntentJudge:
         cancel_event: threading.Event | None = None,
         done_callback: Callable[[], None] | None = None,
         backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+        batch_id: str = "",
     ) -> None:
         """Daemon coordinator: run bounded LLM evaluations and invoke callback.
 
@@ -1446,7 +1591,8 @@ class IntentJudge:
                     items,
                     heuristic_verdicts,
                     callback,
-                    "judge cancelled before evaluating this call",
+                    _early_cancel_reason(cancel_event),
+                    batch_id,
                 )
                 return
 
@@ -1470,7 +1616,8 @@ class IntentJudge:
                     items,
                     heuristic_verdicts,
                     callback,
-                    "judge cancelled before evaluating this call",
+                    _early_cancel_reason(cancel_event),
+                    batch_id,
                 )
                 return
 
@@ -1484,6 +1631,7 @@ class IntentJudge:
                 width = min(width, alias_limit)
             log.info(
                 "judge.batch.start",
+                batch_id=batch_id,
                 items=len(items),
                 parallel_evaluations=width,
                 configured_parallel_evaluations=self._config.parallel_evaluations,
@@ -1494,23 +1642,37 @@ class IntentJudge:
             outcomes: queue.Queue[_JudgeWorkOutcome] = queue.Queue()
             batch_cancel = _JudgeBatchCancelEvent(cancel_event)
             abort_lock = threading.Lock()
-            abort_reason = ""
+            abort_reason: JudgeCancelReason = JudgeCancelReason.from_cancel_event(cancel_event)
 
             for idx in range(len(items)):
                 work.put(idx)
             for _ in range(width):
                 work.put(None)
 
-            def _current_abort_reason() -> str:
-                if cancel_event is not None and cancel_event.is_set():
-                    return "judge cancelled before evaluating this call"
+            def _current_abort_reason() -> JudgeCancelReason | str:
+                """Effective abort reason: the caller's pin wins over the local one.
+
+                A reason pinned onto the cancel event by the caller (e.g. a
+                superseding batch) is authoritative — it describes why the
+                caller fired, which is more useful than whatever the worker
+                happened to observe first.  An UNPINNED but set event is
+                still an unconditional abort (the pre-existing contract), so
+                it returns the legacy wording rather than UNKNOWN; the local
+                reason is only consulted when the caller did not fire at all.
+                """
+                if cancel_event is not None:
+                    pinned = JudgeCancelReason.from_cancel_event(cancel_event)
+                    if pinned is not JudgeCancelReason.UNKNOWN:
+                        return pinned
+                    if cancel_event.is_set():
+                        return _UNPINNED_EARLY_CANCEL
                 with abort_lock:
                     return abort_reason
 
-            def _abort_batch(reason: str) -> bool:
+            def _abort_batch(reason: JudgeCancelReason) -> bool:
                 nonlocal abort_reason
                 with abort_lock:
-                    first = not abort_reason
+                    first = abort_reason is JudgeCancelReason.UNKNOWN
                     if first:
                         abort_reason = reason
                 batch_cancel.set()
@@ -1527,14 +1689,16 @@ class IntentJudge:
                         outcome: _JudgeWorkOutcome
                         try:
                             reason = _current_abort_reason()
-                            if reason:
+                            # A string reason (the legacy unpinned wording) is
+                            # also a real abort; only UNKNOWN means "keep going".
+                            if reason is not JudgeCancelReason.UNKNOWN:
                                 outcome = _JudgeWorkOutcome(idx, None, reason)
                             else:
                                 if client is None:
                                     try:
                                         client = self._create_client()
                                     except BaseException:  # noqa: BLE001 - contain daemon failure
-                                        reason = "judge client initialization failed"
+                                        reason = JudgeCancelReason.WORKER_INIT
                                         if _abort_batch(reason):
                                             log.exception("Judge client initialization failed")
                                         outcome = _JudgeWorkOutcome(idx, None, reason)
@@ -1548,19 +1712,28 @@ class IntentJudge:
                                             client,
                                             lane=worker_lane,
                                         )
+                                        if verdict is not None and not verdict.batch_id:
+                                            # Stamp batch identity on real
+                                            # verdicts too: every path that
+                                            # can produce a verdict for this
+                                            # batch must be joinable to it.
+                                            verdict = replace(verdict, batch_id=batch_id)
                                         reason = _current_abort_reason()
-                                        outcome = _JudgeWorkOutcome(
-                                            idx,
-                                            verdict,
-                                            reason
-                                            or (
-                                                ""
-                                                if verdict is not None
-                                                else "LLM judge did not return a verdict"
-                                            ),
-                                        )
+                                        fallback_reason: JudgeCancelReason | str
+                                        if isinstance(reason, JudgeCancelReason):
+                                            if reason is not JudgeCancelReason.UNKNOWN:
+                                                fallback_reason = reason
+                                            elif verdict is not None:
+                                                fallback_reason = ""
+                                            else:
+                                                fallback_reason = (
+                                                    "LLM judge did not return a verdict"
+                                                )
+                                        else:
+                                            fallback_reason = reason
+                                        outcome = _JudgeWorkOutcome(idx, verdict, fallback_reason)
                                     except BackendAuthUnavailableError:
-                                        reason = "judge backend authentication failed"
+                                        reason = JudgeCancelReason.PROVIDER_ERROR
                                         if _abort_batch(reason):
                                             log.exception("Judge backend authentication failed")
                                         outcome = _JudgeWorkOutcome(idx, None, reason)
@@ -1572,7 +1745,7 @@ class IntentJudge:
                                         outcome = _JudgeWorkOutcome(
                                             idx,
                                             None,
-                                            "judge evaluation error",
+                                            JudgeCancelReason.PROVIDER_ERROR,
                                         )
                         finally:
                             work.task_done()
@@ -1599,11 +1772,19 @@ class IntentJudge:
                     worker.start()
                     workers.append(worker)
             except BaseException:  # noqa: BLE001 - preserve exact-once fallbacks
-                reason = "judge worker initialization failed"
+                reason = JudgeCancelReason.WORKER_INIT
                 _abort_batch(reason)
                 log.exception("Judge worker initialization failed")
             if not workers:
-                self._deliver_fallbacks(items, heuristic_verdicts, callback, abort_reason)
+                self._deliver_fallbacks(
+                    items,
+                    heuristic_verdicts,
+                    callback,
+                    abort_reason
+                    if abort_reason is not JudgeCancelReason.UNKNOWN
+                    else "judge worker initialization failed",
+                    batch_id,
+                )
                 return
 
             delivered: set[int] = set()
@@ -1618,15 +1799,35 @@ class IntentJudge:
                     verdict = outcome.verdict or self._fallback_verdict(
                         h_verdict,
                         outcome.fallback_reason,
+                        batch_id=batch_id,
                     )
-                    log.info(
-                        "judge.verdict.llm"
-                        if outcome.verdict is not None
-                        else "judge.verdict.fallback",
-                        recommendation=verdict.recommendation,
-                        confidence=verdict.confidence,
-                        call_id=verdict.call_id,
-                    )
+                    if outcome.verdict is not None:
+                        log.info(
+                            "judge.verdict.llm",
+                            batch_id=batch_id,
+                            recommendation=verdict.recommendation,
+                            confidence=verdict.confidence,
+                            call_id=verdict.call_id,
+                        )
+                    else:
+                        # A fallback is not automatically a fault: carry the
+                        # typed cause and whether it was expected auxiliary
+                        # behaviour, so the log alone answers "did the judge
+                        # fail, or did the caller legitimately abort it?".
+                        reason = outcome.fallback_reason
+                        log.info(
+                            "judge.verdict.fallback",
+                            batch_id=batch_id,
+                            recommendation=verdict.recommendation,
+                            confidence=verdict.confidence,
+                            call_id=verdict.call_id,
+                            fallback_reason=_normalise_reason(reason),
+                            expected_auxiliary=(
+                                reason.is_expected_auxiliary
+                                if isinstance(reason, JudgeCancelReason)
+                                else None
+                            ),
+                        )
                     try:
                         callback(verdict)
                     except Exception:
@@ -1648,16 +1849,23 @@ class IntentJudge:
         remaining_items: list[dict[str, Any]],
         remaining_verdicts: list[IntentVerdict],
         callback: Callable[[IntentVerdict], None],
-        reason: str,
+        reason: JudgeCancelReason | str,
+        batch_id: str = "",
     ) -> None:
         """Deliver ``llm_fallback`` verdicts (heuristic content) for items the judge didn't complete."""
         for _item, h_verdict in zip(remaining_items, remaining_verdicts, strict=True):
             try:
-                callback(self._fallback_verdict(h_verdict, reason))
+                callback(self._fallback_verdict(h_verdict, reason, batch_id=batch_id))
             except Exception:
                 log.debug("judge.verdict_delivery_failed", exc_info=True)
 
-    def _fallback_verdict(self, h_verdict: IntentVerdict, reason: str) -> IntentVerdict:
+    def _fallback_verdict(
+        self,
+        h_verdict: IntentVerdict,
+        reason: JudgeCancelReason | str,
+        *,
+        batch_id: str = "",
+    ) -> IntentVerdict:
         """Relabel one heuristic verdict as an LLM fallback."""
         return IntentVerdict(
             verdict_id=h_verdict.verdict_id,
@@ -1668,11 +1876,13 @@ class IntentJudge:
             risk_level=h_verdict.risk_level,
             confidence=h_verdict.confidence,
             recommendation=h_verdict.recommendation,
-            reasoning=h_verdict.reasoning + f" ({reason})",
+            reasoning=h_verdict.reasoning + f" ({_normalise_reason(reason)})",
             evidence=h_verdict.evidence,
             tier="llm_fallback",
             judge_model=self._model,
             latency_ms=h_verdict.latency_ms,
+            fallback_reason=_normalise_reason(reason) if reason else "",
+            batch_id=batch_id,
         )
 
     def _evaluate_single(
@@ -1796,8 +2006,16 @@ class IntentJudge:
                     thread_name="judge-api",
                 )
             except DeadlineCancelledError:
+                # The deadline wrapper aborted because the caller's cancel event
+                # fired (or the per-call timeout expired).  Pin the reason onto
+                # that event so the worker's post-call classification sees it.
+                # ``_pin_judge_cancel`` is first-writer-wins, so a caller that
+                # already pinned (a superseding batch) keeps its own reason and
+                # only an unpinned deadline becomes DEADLINE.
+                _pin_judge_cancel(cancel_event, JudgeCancelReason.DEADLINE)
                 return None
             except DeadlineExceededError:
+                _pin_judge_cancel(cancel_event, JudgeCancelReason.DEADLINE)
                 log.info("judge.turn.timeout", turn=turn + 1, timeout=per_call_timeout)
                 # Safety net: if we have a partial result from a previous turn,
                 # try to parse a verdict from it before giving up.

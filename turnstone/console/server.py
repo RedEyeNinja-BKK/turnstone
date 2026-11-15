@@ -1650,6 +1650,30 @@ async def mcp_oauth_clear_all_pending(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 
+def _is_typed_decision_row(row: dict[str, Any]) -> bool:
+    """Whether a model definition is a decision backend, not a chat model.
+
+    A row declaring ``supports_typed_decision`` answers with a typed decision
+    object and generates no assistant text, so it cannot back a workstream; it
+    is excluded from the creation picker only. It stays in the registry, in the
+    Models admin tab, and is still executed by the Output Guard's semantic tier.
+
+    ``capabilities`` is a JSON string (a ``sa.Text`` column). A row that fails to
+    parse is treated as an ordinary model -- the same fail-open choice the
+    ladder annotation makes, because the picker must never take down model
+    selection over a malformed annotation.
+    """
+    raw = row.get("capabilities")
+    if not raw:
+        return False
+    try:
+        caps = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        log.debug("models.capabilities_parse_failed alias=%s", row.get("alias"))
+        return False
+    return isinstance(caps, dict) and bool(caps.get("supports_typed_decision"))
+
+
 async def list_available_models(request: Request) -> JSONResponse:
     """GET /v1/api/models — enabled model aliases for workstream creation."""
     from turnstone.core.web_helpers import require_storage_or_503
@@ -1660,7 +1684,11 @@ async def list_available_models(request: Request) -> JSONResponse:
 
     rows = await asyncio.to_thread(storage.list_model_definitions, enabled_only=True)
     # Only expose alias/model/provider — rows also contain api_key, base_url, etc.
-    models = [{"alias": r["alias"], "model": r["model"], "provider": r["provider"]} for r in rows]
+    models = [
+        {"alias": r["alias"], "model": r["model"], "provider": r["provider"]}
+        for r in rows
+        if not _is_typed_decision_row(r)
+    ]
 
     # Include effective defaults for clients (web UI, channel gateway). The
     # default, channel and coordinator aliases are reported as configured even

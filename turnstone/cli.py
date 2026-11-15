@@ -2152,7 +2152,9 @@ def main() -> None:
     # Print banner
     print(f"\n{bold('Chat')} with {cyan(model)}")
     if registry.count > 1:
-        others = [a for a in registry.list_aliases() if a != registry.default]
+        others = [
+            a for a in registry.offered_aliases(None) if a != registry.default
+        ]
         print(f"Models: {registry.default} (default), {', '.join(others)}")
     if mcp_client:
         mcp_tools = mcp_client.get_tools()

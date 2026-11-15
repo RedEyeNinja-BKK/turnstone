@@ -557,6 +557,15 @@ def serves_chat(capabilities: Mapping[str, Any], model: str) -> bool:
     """
     if capabilities.get("supports_rerank"):
         return False
+    # A typed-decision row answers with a typed decision object and generates no
+    # assistant text, so a chat request against it fails outright. Every
+    # automatic pick routes through here (the loader's default, the Models tab,
+    # offered_aliases, the console's first model), so this one rule keeps such a
+    # row out of all of them. The row is NOT removed from the registry: the
+    # Models tab manages it and Output Guard executes it through the
+    # typed-decision seam.
+    if capabilities.get("supports_typed_decision"):
+        return False
     # Imported here: audio imports model_turn, which reaches back to this module.
     from turnstone.core.audio import is_speech_only_model
 

@@ -218,6 +218,10 @@ class OutputJudgeVerdict:
     judge_model: str = ""
     latency_ms: int = 0
     error: str = ""
+    # How a non-chat backend produced this verdict, e.g. the typed-decision
+    # contract and provider leg. Audit metadata only: it is NOT model reasoning
+    # and must never be surfaced as if it were.
+    provenance: str = ""
 
     @property
     def succeeded(self) -> bool:
@@ -402,6 +406,65 @@ def guard_alias(config: JudgeConfig) -> str:
     return str(config.output_guard_model or "").strip() or judge_alias(config)
 
 
+def _registry_config(registry: Any, alias: str) -> Any:
+    """The registry row for ``alias``, or ``None`` when it is not registered.
+
+    ``ModelRegistry`` is not a Mapping; its per-alias accessor is
+    ``get_config``, which raises :class:`UnknownModelAliasError` for an unknown
+    alias.  An unregistered alias is genuinely "not a typed row", so ``None`` is
+    the right answer there.
+
+    Every OTHER failure means the registry could not be read.  Returning
+    ``None`` for that case would mean "ordinary generative model", which is the
+    defect this module exists to prevent: a row that declared
+    ``supports_typed_decision`` reaching the generative path and then the
+    session-model fallback.  Propagate instead; the caller logs
+    ``output_guard_judge.init_failed`` and leaves the semantic guard unset
+    (heuristic tier only) -- fail-closed and loud, never fail-open.
+    """
+    if registry is None or not alias:
+        return None
+    getter = getattr(registry, "get_config", None)
+    if not callable(getter):
+        return None
+    from turnstone.core.model_registry import UnknownModelAliasError
+
+    try:
+        return getter(alias)
+    except UnknownModelAliasError:
+        return None
+
+
+def _registry_capabilities(registry: Any, alias: str) -> dict:
+    cfg = _registry_config(registry, alias)
+    return dict(getattr(cfg, "capabilities", {}) or {})
+
+
+def _typed_decision_base_url(registry: Any, alias: str) -> str:
+    """The configured base URL of a typed-decision registry row."""
+    cfg = _registry_config(registry, alias)
+    return str(getattr(cfg, "base_url", "") or "")
+
+
+def _typed_decision_spec(registry: Any, alias: str) -> Any | None:
+    """Return the typed-decision spec for ``alias``, or ``None``.
+
+    ``None`` means "ordinary generative model, keep the existing path". A row
+    that declares ``supports_typed_decision`` is never treated as generative,
+    even if it also happens to carry an api_surface.
+
+    A malformed declaration (no contract, or an unsupported one) propagates as
+    :class:`~turnstone.core.typed_decision.TypedDecisionError`; it is a
+    configuration error and must not be read as "ordinary model".
+    """
+    caps = _registry_capabilities(registry, alias)
+    if not caps.get("supports_typed_decision"):
+        return None
+    from turnstone.core.typed_decision import TypedDecisionSpec
+
+    return TypedDecisionSpec.from_capabilities(caps)
+
+
 class OutputGuardJudge:
     """Synchronous, single-shot LLM judge for tool output.
 
@@ -447,7 +510,42 @@ class OutputGuardJudge:
         # window (which would zero out the guard) to the session window, then a floor.
         requested_alias = guard_alias(config)
         config_version_at_start = _config_store_version(config_store)
-        binding = resolve_judge_binding(requested_alias, session_binding, config_store)
+        # TYPED-DECISION ALIASES are identified from the registry row BEFORE any
+        # binding resolution.  Such a row deliberately carries no
+        # ``api_surface``, so ``resolve_judge_binding`` binds it to a Chat
+        # Completions lane (measured on this version: it succeeds, provider
+        # ``openai-compatible``) and the guard would POST a chat request at a
+        # decisions backend.  Detect it first; a typed alias never falls back to
+        # the session model, because a session-model answer recorded as a
+        # successful semantic guard is exactly the failure this prevents.
+        registry = session_binding.lane.registry
+        typed_spec = _typed_decision_spec(registry, requested_alias)
+        self._typed_spec = typed_spec
+        self._typed_base_url = (
+            _typed_decision_base_url(registry, requested_alias) if typed_spec is not None else ""
+        )
+        self._typed_alias = requested_alias if typed_spec is not None else ""
+        if typed_spec is not None:
+            log.info(
+                "output_guard_judge.typed_decision_alias",
+                alias=requested_alias,
+                contract=typed_spec.contract,
+            )
+            # Expected: typed aliases intentionally bypass generative model
+            # binding -- the typed adapter uses the registry URL directly.
+            # Never report this normal path as an unresolved alias.
+            log.debug(
+                "output_guard_judge.typed_decision_binding_bypassed",
+                alias=requested_alias,
+                contract=typed_spec.contract,
+            )
+            # The empty alias is the documented "judge with no alias of its own"
+            # path, which builds the session lane with judge sampling semantics.
+            # Nothing generative is ever dispatched on a typed judge, but the
+            # object must still carry a well-formed binding.
+            binding = resolve_judge_binding("", session_binding, config_store)
+        else:
+            binding = resolve_judge_binding(requested_alias, session_binding, config_store)
 
         self._binding_state = _JudgeBindingState(
             binding=binding,
@@ -688,6 +786,111 @@ class OutputGuardJudge:
         finally:
             self._end_evaluation()
 
+    def _evaluate_typed_decision(
+        self,
+        output: str,
+        *,
+        spec: Any,
+        base_url: str,
+        alias: str,
+        call_id: str,
+        func_name: str,
+        heuristic_risk: str,
+        cancel_event: threading.Event | None,
+        timeout: float,
+        start: float,
+        verdict_id: str,
+    ) -> OutputJudgeVerdict:
+        """Execute a typed-decision backend and normalize it into a verdict.
+
+        Every failure is a LABELLED error, so the caller degrades to
+        heuristic-only.  In particular a ``choice`` of ``none`` here is a real
+        semantic grade, while any error is emphatically NOT ``none``: the merge
+        keeps ``max(heuristic, semantic)``, and an errored semantic tier must
+        never lower a heuristic finding.
+        """
+        from turnstone.core.typed_decision import (
+            TypedDecisionError,
+            execute_decision,
+        )
+
+        state = f"Tool {func_name} produced this output:\n{output}"
+        # Honour cancellation before spending the call.  ``execute_decision``
+        # blocks for up to ``timeout`` on a synchronous HTTP request, so this
+        # cannot interrupt an in-flight decision -- the bound is the timeout.
+        # Checking at the start boundary keeps the typed path's cancellation
+        # contract aligned with the generative path's: a cancelled or superseded
+        # generation must not BEGIN new semantic work.
+        if cancel_event is not None and cancel_event.is_set():
+            return self._error_verdict(verdict_id, call_id, start, "cancelled")
+        try:
+            result = execute_decision(
+                base_url=base_url,
+                model=alias,
+                caps={
+                    "supports_typed_decision": True,
+                    "decision_contract": spec.contract,
+                    "decision_types": list(spec.decision_types),
+                    "decision_endpoint": spec.endpoint,
+                    "max_questions": spec.max_questions,
+                },
+                state=state,
+                decision_id=alias,
+                timeout=timeout,
+            )
+        except TypedDecisionError as exc:
+            log.warning(
+                "output_guard_judge.typed_decision_failed",
+                alias=alias,
+                contract=spec.contract,
+                error=str(exc),
+            )
+            # Explicit typed-stage failure: heuristic-only. NEVER the session
+            # model, and never a silent "clean".
+            return self._error_verdict(verdict_id, call_id, start, f"typed_decision: {exc}")
+        except Exception as exc:  # defensive: adapter bugs must not crash the guard
+            log.warning(
+                "output_guard_judge.typed_decision_error",
+                alias=alias,
+                error=str(exc),
+            )
+            return self._error_verdict(
+                verdict_id, call_id, start, f"typed_decision_error: {exc}"
+            )
+
+        log.info(
+            "output_guard_judge.typed_decision_result",
+            alias=alias,
+            contract=result.contract,
+            provider=result.provider,
+            leg=result.leg or "primary",
+            risk_level=result.risk_level,
+            confidence=result.confidence,
+            risk_score=result.risk_score,
+            backend=result.backend,
+            child_lane=result.child_lane,
+            served_model=result.served_model,
+            requested_model=result.requested_model,
+        )
+        return OutputJudgeVerdict(
+            verdict_id=verdict_id,
+            call_id=call_id,
+            risk_level=result.risk_level,
+            # No free-form semantic flags are manufactured here; the heuristic
+            # stage owns flags and the merge unions them.
+            flags=(),
+            # A typed decision carries no model reasoning. Provenance is recorded
+            # separately and is never presented as reasoning.
+            reasoning="",
+            # The verdict schema requires a float: 0.0 is its sentinel for
+            # unreported confidence. A graded noul risk_score is NOT confidence,
+            # so never copy it into this field.
+            confidence=0.0 if result.confidence is None else result.confidence,
+            judge_model=alias,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            provenance=result.provenance,
+        )
+
     def _evaluate_active(
         self,
         output: str,
@@ -709,6 +912,24 @@ class OutputGuardJudge:
         timeout = max(self._config.output_guard_llm_timeout, 1.0)
         if cancel_event is not None and cancel_event.is_set():
             return self._error_verdict(verdict_id, call_id, start, "cancelled")
+
+        # TYPED-DECISION PATH. Taken before any generative work, so a decisions
+        # backend is never handed to a chat provider and never silently replaced
+        # by the session model.
+        if getattr(self, "_typed_spec", None) is not None:
+            return self._evaluate_typed_decision(
+                output,
+                spec=self._typed_spec,
+                base_url=getattr(self, "_typed_base_url", ""),
+                alias=getattr(self, "_typed_alias", ""),
+                call_id=call_id,
+                func_name=func_name,
+                heuristic_risk=heuristic_risk,
+                cancel_event=cancel_event,
+                timeout=timeout,
+                start=start,
+                verdict_id=verdict_id,
+            )
 
         def _judge_turns(*, numbered: bool) -> list[Turn]:
             return [
@@ -1016,7 +1237,15 @@ class OutputGuardJudge:
             verdict_id=verdict_id,
             call_id=call_id,
             risk_level="none",
-            judge_model=self._judge_model_alias or self._model,
+            # On the TYPED path no alias is ever resolved to a lane, so
+            # ``self._model`` is the SESSION lane's raw model. Recording that as
+            # the judge named the wrong model in the audit trail -- the measured
+            # defect this branch fixes. Prefer the typed alias when this judge is
+            # a typed-decision judge. Fail-closed classification is untouched:
+            # still ``risk_level="none"`` under ``tier="llm_error"``.
+            judge_model=(
+                self._judge_model_alias or getattr(self, "_typed_alias", "") or self._model
+            ),
             latency_ms=int((time.monotonic() - start) * 1000),
             error=reason,
         )

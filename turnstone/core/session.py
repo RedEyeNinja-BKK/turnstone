@@ -29854,7 +29854,7 @@ class ChatSession:
                     # The refusal's own text, so /model and a refused turn agree.
                     info += f"\n{self._model_not_loaded_error(held[0])}"
                 if self._registry and self._registry.count > 1:
-                    avail = ", ".join(self._registry.list_aliases())
+                    avail = ", ".join(self._registry.offered_aliases(None))
                     info += f"\nAvailable: {avail}"
                     if self._registry.agent_model:
                         info += f"\nAgent model: {self._registry.agent_model}"
@@ -29880,7 +29880,9 @@ class ChatSession:
                 else:
                     available = ""
                     if self._registry:
-                        available = f" Available: {', '.join(self._registry.list_aliases())}"
+                        available = (
+                            f" Available: {', '.join(self._registry.offered_aliases(None))}"
+                        )
                     self.ui.on_info(f"Unknown model alias: {arg}.{available}")
 
         elif cmd == "/raw":

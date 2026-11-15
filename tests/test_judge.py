@@ -670,9 +670,8 @@ class TestCancelEventSemantics:
         assert admission.snapshot().in_flight == 0
         assert [verdict.call_id for verdict in results] == ["tc_0", "tc_1", "tc_2"]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all(
-            "judge backend authentication failed" in verdict.reasoning for verdict in results
-        )
+        assert all(verdict.fallback_reason == "provider_error" for verdict in results)
+        assert all("(provider_error)" in verdict.reasoning for verdict in results)
         auth_logs = [
             record
             for record in caplog.records
@@ -851,7 +850,8 @@ class TestParallelEvaluationScheduling:
         assert len(results) == 5
         assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(5)]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all("worker initialization failed" in verdict.reasoning for verdict in results)
+        assert all(verdict.fallback_reason == "worker_init" for verdict in results)
+        assert all("(worker_init)" in verdict.reasoning for verdict in results)
         assert done_count == 1
         assert len(clients) == 1
         assert clients[0].close_count == 1
@@ -894,7 +894,8 @@ class TestParallelEvaluationScheduling:
         assert len(results) == 4
         assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(4)]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all("worker initialization failed" in verdict.reasoning for verdict in results)
+        assert all(verdict.fallback_reason == "worker_init" for verdict in results)
+        assert all("(worker_init)" in verdict.reasoning for verdict in results)
         assert done_count == 1
         assert clients == []
 
@@ -1121,7 +1122,8 @@ class TestParallelEvaluationScheduling:
         assert len(results) == 6
         assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(6)]
         assert all(verdict.tier == "llm_fallback" for verdict in results)
-        assert all("backend authentication failed" in verdict.reasoning for verdict in results)
+        assert all(verdict.fallback_reason == "provider_error" for verdict in results)
+        assert all("(provider_error)" in verdict.reasoning for verdict in results)
         assert len(clients) == 3
         assert all(client.close_count == 1 for client in clients)
 

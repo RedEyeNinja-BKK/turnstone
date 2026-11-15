@@ -1,0 +1,446 @@
+"""Shared SSRF and same-origin validation for OAuth/OIDC endpoint URLs.
+
+Shared by :mod:`turnstone.core.oauth.oidc` and :mod:`turnstone.core.mcp_oauth`
+so both consumers use the same guards without depending on each other's
+protocol or policy code.
+
+The canonical exception is :class:`OAuthSSRFError`. The OIDC module wraps
+calls to these helpers and re-raises ``OIDCError`` so its public API is
+unchanged. The MCP OAuth module catches :class:`OAuthSSRFError` directly.
+
+DNS-rebinding limitation: this module resolves the hostname during
+validation, but the subsequent ``httpx2`` call resolves again. A hostname
+the operator points at could in principle rebind between the two resolves
+to expose an internal address. Callers must ensure the AS / IdP hostname
+is operator-controlled — the SSRF guard prevents private-IP responses for
+hostnames the operator points at, but does not prevent rebinding by a
+hostile DNS authority. Pinning a single resolution into the client's
+transport, as the guarded fetch's ``PinnedTransport``
+(:mod:`turnstone.core._web_transport`) does, is a future hardening step.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import urllib.parse
+
+import httpx2
+
+from turnstone.core.ip_classify import (
+    AddressLane,
+    ResolutionError,
+    describe_address,
+    reaches_only_loopback,
+    resolve_and_classify,
+)
+
+# ---------------------------------------------------------------------------
+# Trusted-host allowlist for well-known multi-origin IdPs / authorization
+# servers whose discovery documents legitimately reference endpoints on
+# hostnames distinct from the issuer hostname. eTLD+1 matching does not
+# work here (e.g. google.com vs googleapis.com), so an explicit allow-map
+# is the only safe option.
+# ---------------------------------------------------------------------------
+
+KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS: dict[str, frozenset[str]] = {
+    "accounts.google.com": frozenset(
+        {
+            "accounts.google.com",
+            "oauth2.googleapis.com",
+            "www.googleapis.com",
+            "openidconnect.googleapis.com",
+        }
+    ),
+    # Microsoft Entra ID (commercial cloud). The tenant issuer is
+    # login.microsoftonline.com/<tenant>/v2.0, but its discovery document
+    # advertises userinfo_endpoint on graph.microsoft.com — a distinct host.
+    # Without this entry, discovery rejects the cross-host userinfo and
+    # disables OIDC, so every Azure AD deployment would need a manual
+    # trusted_endpoint_hosts override to log in. (Sovereign clouds —
+    # login.microsoftonline.us / *.chinacloudapi.cn — use their own graph
+    # hosts and can be added the same way.)
+    "login.microsoftonline.com": frozenset(
+        {
+            "login.microsoftonline.com",
+            "graph.microsoft.com",
+        }
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class OAuthSSRFError(Exception):
+    """Raised when an SSRF/same-origin validation fails.
+
+    OIDC callers wrap this and re-raise as ``OIDCError`` to preserve the
+    existing public API.
+    """
+
+
+class OAuthSSRFAddressError(OAuthSSRFError):
+    """The verdict came from resolving the hostname, not from the URL's text.
+
+    The name did not resolve, or an address it resolved to is refused. DNS decides these verdicts
+    for a host name, so a caller re-checking a URL it accepted before (a pinned issuer) can keep
+    its record and fail the attempt, where a URL refused on its text alone can never pass again.
+    An IP-literal host is refused here too without any DNS query, and a bare ``localhost`` host is
+    refused after resolving when the localhost lane is withheld; no DNS answer changes either, so
+    such a caller treats them as refused on their text.
+    """
+
+
+class OAuthSSRFUnresolvableError(OAuthSSRFAddressError):
+    """The hostname did not resolve to any address."""
+
+
+class OAuthSSRFPrivateAddressError(OAuthSSRFAddressError):
+    """A hostname resolved to a non-public address, specifically.
+
+    A distinct subclass so callers with an operator-facing opt-in can catch
+    this case and name the remedy: ``[oidc] allow_private_network`` for the
+    deployment's own IdP, and ``mcp.oauth_allow_private_network`` for an MCP
+    server. The MCP opt-in reaches only the URLs an operator typed on the
+    server row; a URL that came out of remote-server metadata is validated
+    strictly whatever the setting says, so callers there still catch
+    :class:`OAuthSSRFError` and stay strict on that path.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def is_localhost(hostname: str) -> bool:
+    """Return True if *hostname* refers to the loopback interface."""
+    return hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".localhost")
+
+
+def url_is_localhost(url: str) -> bool:
+    """Return True if *url*'s host is a localhost form, judged on the name the client dials."""
+    try:
+        hostname = urllib.parse.urlparse(str(httpx2.URL(url))).hostname
+    except (httpx2.InvalidURL, ValueError):
+        return False
+    return is_localhost(hostname or "")
+
+
+def sanitize_log_text(text: str, limit: int = 200) -> str:
+    """Escape control characters and truncate untrusted text for log/audit inclusion.
+
+    Untrusted bytes (e.g. an AS error body, ``error_description`` from a
+    callback redirect) embedded in log lines or exception messages must not
+    be able to forge fake log records via CR/LF or hide content via NULs /
+    other control characters. ``unicode_escape`` renders these as visible
+    ``\\r``, ``\\n``, ``\\x00`` etc., and *limit* caps the *rendered* length.
+
+    Shared with the OIDC module — its private ``_sanitize_log_text`` is a
+    legacy alias that forwards here.
+    """
+    if not text:
+        return ""
+    return text.encode("unicode_escape").decode("ascii")[:limit]
+
+
+def effective_port(parsed: urllib.parse.ParseResult) -> int | None:
+    """Return the explicit port if set, else the scheme default."""
+    if parsed.port is not None:
+        return parsed.port
+    return {"http": 80, "https": 443}.get(parsed.scheme)
+
+
+def _dialed_host(host: str) -> str:
+    """Return a bare *host* as the client dials it, the form :func:`validate_url_no_ssrf` returns.
+
+    An operator may write a trusted host in Unicode or as its ``xn--`` name; both are the host the
+    client dials. An entry httpx2 can't read as a bare host (one holding a port, say) is compared
+    as written.
+    """
+    try:
+        url = httpx2.URL(scheme="https", host=host, path="/")
+        return urllib.parse.urlparse(str(url)).hostname or ""
+    except (httpx2.InvalidURL, ValueError):
+        return host.lower()
+
+
+def validate_url_no_ssrf(
+    url: str,
+    *,
+    allow_http: bool,
+    allow_private: bool = False,
+    private_requires_all: bool = False,
+    allow_localhost: bool = True,
+) -> urllib.parse.ParseResult:
+    """Run the scheme/userinfo/SSRF checks shared by issuer and discovered URLs.
+
+    Returns the parsed URL on success. Raises :class:`OAuthSSRFError` on
+    failure. Two knobs: ``allow_http=True`` accepts ``http://`` *if* the
+    hostname is also a localhost form (when ``False``, only ``https://``
+    is accepted); ``allow_private=True`` accepts hostnames resolving to
+    private-range addresses (RFC 1918, ULA, CGNAT, loopback) for
+    operator-trusted URLs — a self-hosted IdP on an internal network.
+    Even with ``allow_private``, link-local, multicast, unspecified, and
+    reserved addresses stay refused: cloud metadata services
+    (169.254.169.254) are the canonical SSRF target, and no legitimate
+    IdP lives in those ranges. Non-public rejections raise the
+    :class:`OAuthSSRFPrivateAddressError` subclass so callers that *have*
+    an opt-in can point the operator at it.
+
+    A verdict reached by resolving the hostname raises :class:`OAuthSSRFAddressError` or a subclass
+    (:class:`OAuthSSRFUnresolvableError` when the name did not resolve), so a caller can tell it from
+    a refusal of the URL's text, which no answer from DNS can change.
+
+    ``private_requires_all=True`` narrows the opt-in to a hostname whose
+    records are ALL non-public. A name answering with both a public and a
+    private address is refused: the request may land on either, chosen by
+    whoever runs that name's DNS, so the opt-in would not describe where
+    the traffic goes and a public record could steer the caller into the
+    operator's network. The tools opt-in refuses the same shape at its
+    approval boundary.
+
+    The private-network knob judges an IPv6 transition address (NAT64,
+    6to4, Teredo, IPv4-mapped, IPv4-compatible) by its IPv4 destinations
+    rather than by the wrapper — see :mod:`turnstone.core.ip_classify`.
+    For local-use NAT64, every valid layout is checked; any destination
+    in a refused range rules out the opt-in.
+
+    ``http://`` on a localhost hostname additionally requires every resolved
+    address to stay on loopback. NAT64, 6to4 and Teredo wrappers cannot prove
+    this even when their IPv4 payload is loopback. ``*.localhost`` is ordinary
+    DNS, so a hostile authority can point it anywhere; the name alone is not
+    evidence, and accepting it would put an OIDC token exchange —
+    ``client_secret`` and authorization code included — on the wire in the
+    clear.
+
+    ``allow_localhost=False`` withholds that localhost development lane (``http://`` on a
+    localhost name, and its loopback addresses) from a URL a remote document named. Such a URL is
+    then judged like any other: https only, and a loopback address refused as non-public unless
+    the private-network opt-in applies.
+
+    A URL the client cannot send is refused before anything else, so a document naming one fails
+    here as a refused endpoint: one holding an ASCII control character, or one httpx2 cannot parse
+    or encode (a host that is not valid IDNA 2008, or a lone surrogate, for example). urllib drops
+    TAB, CR and LF and keeps the other control characters, so the checks below would otherwise
+    judge a different URL from the one sent.
+
+    Every check, and the result returned, reads the URL as httpx2 normalizes it, which is the URL
+    the client sends. Its host is the IDNA 2008 ASCII name the client dials: urllib keeps a Unicode
+    name, which the resolver encodes with IDNA 2003, and the two can name different hosts
+    ("straße" is "strasse" to one and "xn--strae-oqa" to the other), so the addresses checked
+    would not be the ones the client reaches. Callers comparing hosts (same-origin, the localhost
+    lane) compare those dialed names too.
+    """
+    if any(ch.isascii() and not ch.isprintable() for ch in url):
+        raise OAuthSSRFError(
+            f"endpoint URL must not contain control characters: {sanitize_log_text(url)}"
+        )
+    try:
+        parsed = urllib.parse.urlparse(str(httpx2.URL(url)))
+        hostname = parsed.hostname
+        _ = parsed.port  # parsed lazily; raises for an out-of-range value
+        # The client sends the host as ASCII. httpx2 keeps a non-ASCII IPv6 zone id in it, which
+        # fails here as it would when the request is built.
+        (hostname or "").encode("ascii")
+    except (httpx2.InvalidURL, ValueError) as exc:
+        # A lone surrogate raises UnicodeError, a ValueError too. Callers catch OAuthSSRFError
+        # only, and the URL can come from a hostile MCP server's document: anything else here would
+        # escape discovery instead of becoming a clean refusal.
+        raise OAuthSSRFError(
+            f"endpoint URL is malformed ({exc}): {sanitize_log_text(url)}"
+        ) from exc
+
+    if not hostname:
+        raise OAuthSSRFError(f"endpoint URL has no hostname: {url}")
+
+    if parsed.username or parsed.password:
+        raise OAuthSSRFError("endpoint URL must not contain embedded credentials (userinfo)")
+
+    # Cleartext is permitted only for a genuine loopback dev server. The
+    # hostname is not evidence of that — ``*.localhost`` is ordinary DNS a
+    # hostile authority answers however it likes — so the verdict is deferred
+    # until resolution proves loopback below. Deciding it here on the name
+    # alone would send an OIDC token exchange, client_secret and all, in the
+    # clear to whatever address that name happens to return.
+    http_pending_loopback_proof = False
+    if parsed.scheme != "https":
+        if allow_localhost and allow_http and parsed.scheme == "http" and is_localhost(hostname):
+            http_pending_loopback_proof = True
+        else:
+            raise OAuthSSRFError(f"endpoint URL must use HTTPS (got {parsed.scheme}://): {url}")
+
+    # ``resolve_and_classify`` raises rather than returning an empty list, so the
+    # deferred cleartext verdict below cannot be granted by default when a name
+    # answers with nothing.
+    try:
+        classified = resolve_and_classify(hostname)
+    except ResolutionError as exc:
+        raise OAuthSSRFUnresolvableError(f"endpoint {exc}: {url}") from exc
+
+    if allow_private and private_requires_all:
+        lanes = {lane for lane, _addr in classified}
+        # A NEVER record is refused absolutely by the loop below, with the
+        # message that says so. Reporting it here as a mixed private answer
+        # would hand the operator a remedy — enable the opt-in — that is both
+        # already taken and incapable of ever applying.
+        if (
+            AddressLane.NEVER not in lanes
+            and AddressLane.PUBLIC in lanes
+            and lanes != {AddressLane.PUBLIC}
+        ):
+            raise OAuthSSRFPrivateAddressError(
+                f"endpoint URL resolves to both public and non-public addresses, so it "
+                f"cannot be treated as a private-network target: {url}"
+            )
+
+    for lane, addr in classified:
+        # Ordered so the refusal names the real problem. Deciding the scheme
+        # first reports a metadata address as merely "must use HTTPS", and an
+        # operator acting on that re-registers the same endpoint over TLS
+        # without ever learning it pointed at the instance metadata service.
+        if lane is AddressLane.NEVER:
+            raise OAuthSSRFAddressError(
+                f"endpoint URL resolves to a link-local/multicast/unspecified/"
+                f"reserved/metadata address ({describe_address(addr)}), refused "
+                f"even with private addresses allowed: {url}"
+            )
+        # Cleartext must reach loopback and nothing else, on every record.
+        if http_pending_loopback_proof and not reaches_only_loopback(addr):
+            raise OAuthSSRFAddressError(
+                f"endpoint URL must use HTTPS: {hostname} does not resolve to "
+                f"loopback ({describe_address(addr)}): {url}"
+            )
+        if lane is AddressLane.PUBLIC or allow_private:
+            continue
+        # The localhost development lane, gated on the RESOLVED address rather
+        # than the hostname — and on the same predicate as the cleartext gate,
+        # since two spellings of "reaches loopback" disagree for a Teredo
+        # wrapper whose server half is loopback and whose client half is not.
+        if allow_localhost and is_localhost(hostname) and reaches_only_loopback(addr):
+            continue
+        raise OAuthSSRFPrivateAddressError(
+            f"endpoint URL resolves to non-public address ({describe_address(addr)}): {url}"
+        )
+
+    return parsed
+
+
+def validate_discovered_endpoint(
+    url: str,
+    issuer_parsed: urllib.parse.ParseResult,
+    *,
+    allow_http: bool,
+    trusted_endpoint_hosts: frozenset[str],
+    allow_private: bool = False,
+    allow_localhost: bool = True,
+) -> None:
+    """Validate an endpoint URL pulled from an OIDC/OAuth discovery document.
+
+    Applies :func:`validate_url_no_ssrf` plus the same-origin / trusted-host
+    constraint: the endpoint host must equal the issuer host, be in the
+    well-known trust map, or be in the operator-supplied
+    ``trusted_endpoint_hosts``.  Effective port (with scheme defaults
+    applied) and scheme must match the issuer.  ``allow_private`` and
+    ``allow_localhost`` forward to :func:`validate_url_no_ssrf`.
+
+    Raises :class:`OAuthSSRFError` on validation failure.
+    """
+    parsed = validate_url_no_ssrf(
+        url, allow_http=allow_http, allow_private=allow_private, allow_localhost=allow_localhost
+    )
+
+    issuer_hostname = (issuer_parsed.hostname or "").lower()
+    endpoint_hostname = (parsed.hostname or "").lower()
+
+    if parsed.scheme != issuer_parsed.scheme:
+        raise OAuthSSRFError(
+            f"discovered endpoint scheme ({parsed.scheme}) "
+            f"does not match issuer ({issuer_parsed.scheme}): {url}"
+        )
+
+    known_trusted = KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS.get(issuer_hostname, frozenset())
+    host_allowed = (
+        endpoint_hostname == issuer_hostname
+        or endpoint_hostname in known_trusted
+        or any(_dialed_host(host) == endpoint_hostname for host in trusted_endpoint_hosts)
+    )
+    if not host_allowed:
+        raise OAuthSSRFError(
+            f"discovered endpoint host ({endpoint_hostname}) "
+            f"does not match issuer ({issuer_hostname}) and is not trusted: {url}"
+        )
+
+    endpoint_port = effective_port(parsed)
+    issuer_port = effective_port(issuer_parsed)
+    if endpoint_port != issuer_port:
+        raise OAuthSSRFError(
+            f"discovered endpoint port ({endpoint_port}) "
+            f"does not match issuer ({issuer_port}): {url}"
+        )
+
+
+async def validate_url_no_ssrf_async(
+    url: str,
+    *,
+    allow_http: bool,
+    allow_private: bool = False,
+    private_requires_all: bool = False,
+    allow_localhost: bool = True,
+) -> urllib.parse.ParseResult:
+    """Async variant of :func:`validate_url_no_ssrf` for hot-path callers.
+
+    The synchronous variant calls ``socket.getaddrinfo``, which blocks
+    the event loop. Async OAuth flows (notably
+    :mod:`turnstone.core.mcp_oauth`) wrap their validation calls in
+    :func:`asyncio.to_thread` to keep the loop responsive. This wrapper
+    centralises that wrapping so callers don't repeat the idiom.
+    """
+    return await asyncio.to_thread(
+        validate_url_no_ssrf,
+        url,
+        allow_http=allow_http,
+        allow_private=allow_private,
+        private_requires_all=private_requires_all,
+        allow_localhost=allow_localhost,
+    )
+
+
+async def validate_discovered_endpoint_async(
+    url: str,
+    issuer_parsed: urllib.parse.ParseResult,
+    *,
+    allow_http: bool,
+    trusted_endpoint_hosts: frozenset[str],
+    allow_private: bool = False,
+    allow_localhost: bool = True,
+) -> None:
+    """Async variant of :func:`validate_discovered_endpoint`."""
+    await asyncio.to_thread(
+        validate_discovered_endpoint,
+        url,
+        issuer_parsed,
+        allow_http=allow_http,
+        trusted_endpoint_hosts=trusted_endpoint_hosts,
+        allow_private=allow_private,
+        allow_localhost=allow_localhost,
+    )
+
+
+__all__ = [
+    "KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS",
+    "OAuthSSRFAddressError",
+    "OAuthSSRFError",
+    "OAuthSSRFPrivateAddressError",
+    "OAuthSSRFUnresolvableError",
+    "effective_port",
+    "is_localhost",
+    "url_is_localhost",
+    "sanitize_log_text",
+    "validate_discovered_endpoint",
+    "validate_discovered_endpoint_async",
+    "validate_url_no_ssrf",
+    "validate_url_no_ssrf_async",
+]

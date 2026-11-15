@@ -1,0 +1,2102 @@
+// conversation.js — shared conversational-pane substrate (step 5e).
+//
+// Deduplicated helpers used by BOTH the interactive pane
+// (shared_static/interactive.js) and the coordinator pane
+// (console/static/coordinator/coordinator.js).  Both panes are ES modules
+// (interactive since 5a, the coordinator since 5e.0), so this is a plain ESM
+// module they import directly — interactive via `./conversation.js`, the
+// coordinator via the absolute `/shared/conversation.js`.  No window bridge:
+// nothing classic consumes these (the standalone ui/static app.js drives the
+// interactive Pane, which imports them on its behalf).
+//
+// House style holds: programmatic DOM (createElement / textContent / append),
+// never innerHTML.  Builders return a detached element and let the caller append
+// + scroll, so they stay pane- and transport-agnostic.
+
+import {
+  privateKeyBeginIndex,
+  redactCredentials,
+  redactNamedValue,
+} from "./redact_credentials.js";
+
+// ANSI / CSI escape stripper — a tool that emits control sequences (bash through
+// MCP, or a child node) must land as readable text in the result block.
+// Null-safe: a non-string argument coerces to "" rather than throwing.
+export function stripAnsi(s) {
+  return String(s == null ? "" : s).replace(
+    // eslint-disable-next-line no-control-regex
+    /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
+    "",
+  );
+}
+
+// Control characters in the model's own words (a command, a preview, the full
+// call), shown rather than stripped: an escape sequence or carriage return
+// could otherwise hide what follows it from the reader while a shell still
+// runs it.  Each becomes its Control Pictures symbol (ESC shows as U+241B);
+// line feed and tab stay as they are.  Tool output goes through stripAnsi.
+// The terminal client's show_controls (turnstone/ui/colors.py) shows the same
+// symbols, C1 controls as well, which some terminals act on, and lone
+// surrogates as U+FFFD, as a browser shows them anyway.
+function _showControls(text) {
+  return text.replace(
+    // eslint-disable-next-line no-control-regex
+    /[\x00-\x08\x0b-\x1f\x7f]/g,
+    (c) =>
+      String.fromCharCode(c === "\x7f" ? 0x2421 : 0x2400 + c.charCodeAt(0)),
+  );
+}
+
+// A call's text as the cards show it (its command line, preview or approval
+// block): credentials redacted, then the model's control characters shown.
+// `redacted` says whether redaction changed it, so a bash card can say part
+// of its command is hidden.
+export function convShownText(text) {
+  const raw = String(text == null ? "" : text);
+  const hidden = redactCredentials(raw);
+  return { text: _showControls(hidden), redacted: hidden !== raw };
+}
+
+// Structured `.msg.watch-result` card for a `watch_triggered` operator-context
+// system turn — command-preview header + shell-output body + poll-counter footer.
+// `content` is the formatted turn body; `meta` carries the structured fields
+// (watch_name / command / output / poll_count / max_polls / is_final) delivered
+// live on the `system_turn` SSE event and on the `/history` projection.  All text
+// goes through textContent so shell output containing angle brackets / scripts /
+// steering bytes renders inertly.  The caller appends + scrolls.
+export function buildWatchResultCard(meta, content) {
+  const el = document.createElement("div");
+  el.className = "msg watch-result operator-context";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "watch");
+  el.setAttribute("aria-label", "watch");
+  const header = document.createElement("div");
+  header.className = "msg-watch-header";
+  header.textContent =
+    "watch" + (meta.watch_name ? " · " + String(meta.watch_name) : "");
+  el.appendChild(header);
+  if (meta.command) {
+    const cmd = document.createElement("div");
+    cmd.className = "msg-watch-cmd";
+    cmd.textContent = "$ " + String(meta.command);
+    el.appendChild(cmd);
+  }
+  const body = document.createElement("pre");
+  body.className = "msg-watch-body";
+  // Prefer the structured `output` (raw shell output alone) so the body doesn't
+  // re-print the header / `$ command` lines the chrome already shows; fall back to
+  // the full turn `content` for legacy turns predating the `output` meta field
+  // (migration 060 is additive — no backfill).
+  body.textContent = meta.output != null ? String(meta.output) : content || "";
+  el.appendChild(body);
+  if (meta.poll_count != null && meta.max_polls != null) {
+    const footer = document.createElement("div");
+    footer.className = "msg-watch-footer";
+    const finalSuffix = meta.is_final ? " · final" : "";
+    footer.textContent =
+      "poll " +
+      String(meta.poll_count) +
+      "/" +
+      String(meta.max_polls) +
+      finalSuffix;
+    el.appendChild(footer);
+  }
+  return el;
+}
+
+// Compaction result card — the settled state of a context compaction.  Renders
+// from BOTH sources of the same fact: the live `compaction` end event and the
+// `/history` projection of the persisted marker row (role="system",
+// source="compaction"), so a reload paints the identical card.  `meta` carries
+// the structured fields ({before_tokens, after_tokens, trigger}); `summary` is
+// the produced summary text, offered behind a <details> fold rather than
+// inline — it exists for provenance, not for re-reading every visit.
+export function buildCompactionCard(meta, summary) {
+  const m = meta && typeof meta === "object" ? meta : {};
+  const el = document.createElement("div");
+  el.className = "msg compaction-card";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "compaction");
+  el.setAttribute("aria-label", "context compacted");
+  const header = document.createElement("div");
+  header.className = "msg-compaction-header";
+  header.textContent =
+    "context compacted" + (m.trigger === "auto" ? " · auto" : "");
+  el.appendChild(header);
+  const before = Number(m.before_tokens);
+  const after = Number(m.after_tokens);
+  if (Number.isFinite(before) && Number.isFinite(after) && before > 0) {
+    const detail = document.createElement("div");
+    detail.className = "msg-compaction-detail";
+    detail.textContent =
+      "~" +
+      before.toLocaleString() +
+      " → ~" +
+      after.toLocaleString() +
+      " tokens";
+    el.appendChild(detail);
+  }
+  const text = String(summary == null ? "" : summary).trim();
+  if (text) {
+    const fold = document.createElement("details");
+    fold.className = "msg-compaction-fold";
+    const label = document.createElement("summary");
+    label.textContent = "summary";
+    fold.appendChild(label);
+    const body = document.createElement("pre");
+    body.className = "msg-compaction-body";
+    body.textContent = text;
+    fold.appendChild(body);
+    el.appendChild(fold);
+  }
+  return el;
+}
+
+// In-progress compaction card — the transient affordance between the
+// `compaction` start and end events.  Starts with an indeterminate bar
+// (a single-batch summarization emits no progress events); the first
+// part-k-of-N progress event flips it determinate via
+// updateCompactionProgress.  The end event replaces the card with
+// buildCompactionCard (or a failure notice).
+export function buildCompactionProgressCard(isAuto, target) {
+  const taskTarget = target === "task_agent";
+  const el = document.createElement("div");
+  el.className = "msg compaction-card compaction-running";
+  el.setAttribute("role", "status");
+  el.setAttribute("data-ts-role", "compaction");
+  el.setAttribute(
+    "aria-label",
+    taskTarget ? "compacting task-agent context" : "compacting context",
+  );
+  const header = document.createElement("div");
+  header.className = "msg-compaction-header";
+  header.textContent =
+    (taskTarget ? "compacting task context…" : "compacting context…") +
+    (isAuto ? " · auto" : "");
+  el.appendChild(header);
+  const bar = document.createElement("div");
+  bar.className = "msg-compaction-bar indeterminate";
+  const fill = document.createElement("div");
+  fill.className = "msg-compaction-bar-fill";
+  bar.appendChild(fill);
+  el.appendChild(bar);
+  const note = document.createElement("div");
+  note.className = "msg-compaction-note";
+  note.textContent = taskTarget
+    ? "summarizing task-agent context…"
+    : "summarizing conversation…";
+  el.appendChild(note);
+  return el;
+}
+
+// Advance an in-progress compaction card from a `compaction` progress event.
+// Depth 0 = summarizing transcript batches (determinate part k of N); deeper
+// levels merge partial summaries — those update the note ONLY, never the bar:
+// an over-window depth-0 batch subdivides mid-loop (emitting depth>0 events
+// between depth-0 parts), so any width a merge event wrote would snap
+// backwards when the outer loop resumed.  The depth-0 width itself is
+// monotonic (max with the current fill) for the same reason. The truncated-summary
+// warning annotates the note without touching the bar.
+export function updateCompactionProgress(el, evt) {
+  const bar = el.querySelector(".msg-compaction-bar");
+  const fill = el.querySelector(".msg-compaction-bar-fill");
+  const note = el.querySelector(".msg-compaction-note");
+  if (!bar || !fill || !note) return;
+  if (evt.warning === "summary_truncated") {
+    note.textContent = "summary was truncated — continuing…";
+    return;
+  }
+  const part = Number(evt.part);
+  const total = Number(evt.total);
+  if (!Number.isFinite(part) || !Number.isFinite(total) || total < 1) return;
+  if (Number(evt.depth) > 0) {
+    note.textContent = "merging summaries (" + part + " of " + total + ")…";
+    return;
+  }
+  bar.classList.remove("indeterminate");
+  // part is emitted BEFORE its batch summarizes — show the k-1 completed
+  // fraction so the bar never claims work that hasn't happened yet.
+  const pct = Math.max(0, Math.min(100, ((part - 1) / total) * 100));
+  const current = parseFloat(fill.style.width) || 0;
+  fill.style.width = Math.max(current, pct) + "%";
+  note.textContent = "summarizing part " + part + " of " + total + "…";
+}
+
+// Shared compaction-lifecycle reducer — ONE state machine for the
+// interactive pane and the coordinator viewer (each previously carried a
+// hand-synced copy, and they drifted within their first diff).  `holder` is
+// the pane's mutable `{card}` slot (nulled wherever the transcript DOM is
+// wiped); `hooks` supplies the pane-specific seams:
+//   container      — the transcript element to append into
+//   renderedIds    — the pane's rendered-event-id Set (dedups the ok-end
+//                    card against the /history-projected marker row)
+//   onNotice(msg)  — render a lifecycle failure notice
+//   scroll(force)  — the pane's scroll-to-bottom
+//   append(node)   — optional placement override (task cards insert the
+//                    progress node outside their collapsible step body)
+//   renderResult   — false for transient task-agent compaction; its summary
+//                    is model context, not a transcript result card
+// Workstream reason="error" ends carry notice=false because the backend pairs
+// them with a typed `error` event. Task-agent errors have no unscoped twin and
+// carry notice=true; their pane hook renders the message inside the task card.
+export function applyCompactionEvent(holder, evt, hooks) {
+  const append = hooks.append || ((node) => hooks.container.appendChild(node));
+  // Lifecycle ownership: events carry the backend's compaction_id and the
+  // holder remembers which compaction painted the live card, so a stale
+  // event — a force-abandoned compaction retiring after a successor
+  // started — can't animate or tear down the successor's card.  The id
+  // gates only while a live card exists (with no card there is nothing to
+  // protect), and a missing id on either side matches everything so
+  // replays from older backends keep working.
+  const owns =
+    !holder.card ||
+    holder.cid == null ||
+    evt.compaction_id == null ||
+    String(evt.compaction_id) === holder.cid;
+  if (evt.phase === "start") {
+    if (holder.card) holder.card.remove();
+    holder.card = buildCompactionProgressCard(
+      evt.trigger === "auto",
+      evt.target,
+    );
+    holder.cid = evt.compaction_id != null ? String(evt.compaction_id) : null;
+    append(holder.card);
+    hooks.scroll(true);
+    return;
+  }
+  if (evt.phase === "progress") {
+    if (!owns) return;
+    // Defensive create: a fresh connect mid-compaction (dead replay
+    // buffer) can see a progress event with no preceding start.  The
+    // `false` is deliberate: progress events carry no trigger field, so
+    // this card cannot know it should wear the "· auto" suffix —
+    // cosmetic, and threading trigger through the summarize stack for it
+    // is disproportionate.
+    if (!holder.card) {
+      holder.card = buildCompactionProgressCard(false, evt.target);
+      holder.cid = evt.compaction_id != null ? String(evt.compaction_id) : null;
+      append(holder.card);
+    }
+    updateCompactionProgress(holder.card, evt);
+    hooks.scroll(false);
+    return;
+  }
+  if (evt.phase === "end") {
+    if (owns) resetCompactionHolder(holder);
+    if (evt.ok && hooks.renderResult !== false) {
+      // The persisted marker row is stamped with THIS event's id, so
+      // whichever of /history repaint or live/replayed event renders
+      // first wins.  Rendered even for a non-owning end: a completed
+      // compaction's result is real regardless of whose card is live.
+      const eid = evt._event_id != null ? String(evt._event_id) : null;
+      if (eid && hooks.renderedIds.has(eid)) return;
+      hooks.container.appendChild(
+        buildCompactionCard(
+          {
+            before_tokens: evt.before_tokens,
+            after_tokens: evt.after_tokens,
+            trigger: evt.trigger,
+          },
+          evt.summary || "",
+        ),
+      );
+      if (eid) hooks.renderedIds.add(eid);
+      hooks.scroll(true);
+    } else if (owns && evt.notice) {
+      // cancelled / not_enough_messages / irreducible / empty_summary —
+      // informational, not an error state.  Whether the message is shown
+      // is the emitter's call: the backend stamps `notice` on failed ends
+      // (workstream errors use their typed-error twin; task errors use this
+      // nested notice; superseded and cancelled-auto ends stay silent — see
+      // ChatSession._compaction_event, the single policy site), so this arm
+      // stays mechanical. `owns` is the one pane-local clause
+      // the emitter cannot compute — card ownership via compaction_id vs
+      // holder.cid — and it guards a reachable divergence: a /resume
+      // swaps sessions and restarts generation counters, so an abandoned
+      // old-session end can arrive superseded=false against the new
+      // session's live card.  An end without the field (replayed from an
+      // older node) stays silent — these notices are informational.
+      // (A superseded OK end above still renders its result card — the
+      // history swap really happened.)
+      hooks.onNotice(evt.message || "Compaction skipped.");
+      hooks.scroll(true);
+    }
+    // No follow-scroll on the remaining paths: a non-owning failed end
+    // renders nothing (scrolling would yank the view with zero visual
+    // change — the round-7 finding), and an owning teardown only REMOVES
+    // the progress card, which needs no scroll chase.
+  }
+}
+
+// Retire a pane's in-progress compaction card (if any) and clear the
+// holder.  The teardown half of the lifecycle the reducer above owns —
+// exported so the panes' stream_end handlers (force-stop abandons the
+// compaction worker without an end event in flight) and transcript-wipe
+// sites share ONE implementation instead of four hand-synced copies.
+// Element.remove() on an already-detached node (a wipe that
+// replaceChildren()'d the transcript) is a harmless no-op.
+export function resetCompactionHolder(holder) {
+  if (holder.card) holder.card.remove();
+  holder.card = null;
+  holder.cid = null;
+}
+
+// Thin `.msg.user.system-nudge` marker — the visible-but-subtle anchor a
+// wake-driven empty user turn renders, so the operator-context `system` turns
+// that follow it land in the right place.  The caller handles empty-state
+// removal + append.
+export function buildSystemNudgeMarker() {
+  const el = document.createElement("div");
+  el.className = "msg user system-nudge";
+  el.setAttribute("data-source", "system_nudge");
+  el.setAttribute("aria-label", "system nudge");
+  el.textContent = "system nudge";
+  return el;
+}
+
+// Canonical risk-level vocabulary shared by both panes.  RISK_LEVELS is ordinal
+// (index == severity rank); the aliases cover emitters that abbreviate.  An
+// unknown / unrecognized level normalizes to "medium": not "low" (an unlabelled
+// risk must not render benign) and not "high" (medium is the neutral default
+// both panes already displayed; the coordinator's old rank used "high", which
+// step 5e.1b brings to "medium" per the unify decision).
+const RISK_LEVELS = ["low", "medium", "high", "critical"];
+const RISK_ALIASES = { med: "medium", crit: "critical" };
+
+export function normalizeRiskLevel(raw) {
+  let s = String(raw == null ? "" : raw)
+    .trim()
+    .toLowerCase();
+  s = RISK_ALIASES[s] || s;
+  return RISK_LEVELS.indexOf(s) >= 0 ? s : "medium";
+}
+
+// Ordinal rank (low=0 .. critical=3) via the canonical normalize, so an alias or
+// unknown value ranks consistently with how it displays.  Unknown -> medium (1).
+export function riskRank(raw) {
+  return RISK_LEVELS.indexOf(normalizeRiskLevel(raw));
+}
+
+// Pick the item carrying the highest risk_level (judge verdict preferred over
+// heuristic) so a low-risk item[0] can't visually mask a higher-risk item[2].
+// An item with NO verdict ranks below "low" (-1) so it never wins; a verdict
+// with an unknown level ranks "medium" via riskRank.
+export function maxSeverityItem(items) {
+  function rank(it) {
+    const v = it && (it.judge_verdict || it.heuristic_verdict);
+    return v ? riskRank(v.risk_level) : -1;
+  }
+  let best = items[0];
+  let bestRank = rank(best);
+  for (let i = 1; i < items.length; i += 1) {
+    const r = rank(items[i]);
+    if (r > bestRank) {
+      best = items[i];
+      bestRank = r;
+    }
+  }
+  return best;
+}
+
+// Kicker text for a tool-batch head, shared so the interactive pane and the
+// coordinator render byte-identical labels.  `state`: "pending" | "evaluating" |
+// "running" | "done" (default/solo).  `n` = tool count.
+export function batchKicker(state, n) {
+  const par = n >= 2;
+  if (state === "pending")
+    return par ? "⚠ Approval · Parallel " + n : "⚠ Approval";
+  if (state === "evaluating")
+    return par ? "Evaluating · Parallel " + n : "Evaluating";
+  if (state === "running") return par ? "Running · Parallel " + n : "Running";
+  return par ? "Parallel · " + n + " tools" : "Tool";
+}
+
+// "1/3"-style index label for a parallel row; "" for a solo batch.
+export function indexLabel(idx, n) {
+  return n >= 2 ? idx + 1 + "/" + n : "";
+}
+
+// ===========================================================================
+// Shared approval-card builders (step 5e.2)
+//
+// Pure leaf DOM builders for the unified `.conv-*` card (conversation.css).
+// Both panes' (stateful) orchestration ASSEMBLES these; the builders own only
+// the DOM + class vocabulary, so the coordinator and interactive surfaces
+// render the SAME card.  Everything stateful -- the toolRows map, idempotent
+// upgrade-in-place, the early-paint announce shell, SSE routing -- stays in
+// the pane and CALLS these.
+//
+// House style: createElement / textContent, never innerHTML.  Set textContent
+// with NO leading whitespace: the .conv-row-cmd / -result / -diff CSS is
+// white-space:pre-wrap, so HTML/source indentation would render as a phantom
+// left indent (a real bug if a caller passes pre-indented text).
+// ===========================================================================
+
+const OUTPUT_REVIEW_INCOMPLETE_TEXT = "Output review did not complete";
+
+function _reasoningTrace(row) {
+  let trace = row.querySelector(".msg-body");
+  if (trace) return trace;
+  // Normalize the legacy/direct-text shape defensively.  Live callers create
+  // .msg-body themselves, but keeping the shared seam self-contained prevents
+  // a future renderer from putting token mutations back inside the status.
+  const text = row.textContent || "";
+  row.textContent = "";
+  trace = document.createElement("div");
+  trace.className = "msg-body";
+  trace.textContent = text;
+  row.appendChild(trace);
+  return trace;
+}
+
+// One per pane: the pre-token indicator moves into the reasoning row without
+// restarting its clock. The elapsed time describes this browser's observed
+// phase, not provider compute time; cold history has no invented duration.
+export function createReasoningActivity() {
+  let status = null;
+  let elapsed = null;
+  let startedAt = null;
+  let timer = null;
+  let row = null;
+  let trace = null;
+  let traceHidden = null;
+
+  function stopTimer() {
+    if (timer !== null) clearInterval(timer);
+    timer = null;
+  }
+
+  function releaseTrace() {
+    if (!row) return;
+    delete row.dataset.reasoningActive;
+    if (traceHidden === null) trace.removeAttribute("aria-hidden");
+    else trace.setAttribute("aria-hidden", traceHidden);
+    row = trace = null;
+    traceHidden = null;
+  }
+
+  function finish() {
+    stopTimer();
+    releaseTrace();
+    if (status) status.remove();
+    status = elapsed = startedAt = null;
+  }
+
+  function tick() {
+    if (!status.isConnected) {
+      finish();
+      return;
+    }
+    const seconds = Math.max(
+      0,
+      Math.floor((performance.now() - startedAt) / 1000),
+    );
+    const text = seconds + "s";
+    if (elapsed.textContent !== text) elapsed.textContent = text;
+  }
+
+  function mount(parent) {
+    if (!status) {
+      startedAt = performance.now();
+      status = document.createElement("span");
+      status.className = "reasoning-activity-status";
+      const label = document.createElement("span");
+      label.className = "reasoning-activity-label";
+      label.setAttribute("role", "status");
+      label.setAttribute("aria-live", "polite");
+      label.setAttribute("aria-atomic", "true");
+      label.setAttribute("aria-label", "Model reasoning in progress");
+      label.textContent = "Reasoning";
+      elapsed = document.createElement("span");
+      elapsed.className = "reasoning-activity-elapsed";
+      // The clock and streamed trace are outside the live announcement.
+      // Neither tokens nor timer ticks should repeatedly interrupt a reader.
+      elapsed.setAttribute("role", "timer");
+      elapsed.setAttribute("aria-live", "off");
+      elapsed.setAttribute("aria-label", "Elapsed reasoning time");
+      elapsed.textContent = "0s";
+      status.append(label, elapsed);
+    }
+    parent.appendChild(status);
+    if (status.isConnected) tick();
+    if (timer === null) timer = setInterval(tick, 1000);
+  }
+
+  return {
+    start(container) {
+      if (status && status.isConnected) return;
+      finish();
+      mount(container);
+    },
+    hideWaiting() {
+      if (row) return;
+      stopTimer();
+      if (status) status.remove();
+      // thinking_stop precedes the first token. Keep the clock origin for
+      // the reasoning handoff; content/terminal events call finish instead.
+    },
+    attach(nextRow) {
+      if (!nextRow || row === nextRow) return;
+      releaseTrace();
+      row = nextRow;
+      trace = _reasoningTrace(row);
+      traceHidden = trace.getAttribute("aria-hidden");
+      trace.setAttribute("aria-hidden", "true");
+      row.dataset.reasoningActive = "true";
+      mount(row);
+      row.appendChild(trace);
+    },
+    finish,
+  };
+}
+
+const COMPACT_BLOCKER_SELECTOR = [
+  ".conv-actions",
+  ".conv-verdict-spinner",
+  ".conv-warning",
+  ".conv-row.error",
+  ".conv-row-result--error",
+  ".conv-row-status--error",
+  ".conv-status--error",
+  ".conv-batch--pending",
+  ".conv-batch--running",
+  '.conv-row[data-tool-name="task_agent"]',
+  '.conv-agent[data-state="running"]',
+  '[data-agent-step-exceptional="true"]',
+  ".compaction-running",
+  ".conv-agent-compaction-notice",
+  '[data-output-review-incomplete="true"]',
+  '[aria-busy="true"]',
+  ".conv-verdict--high",
+  ".conv-verdict--critical",
+  ".conv-verdict-rec--deny",
+  ".conv-verdict-rec--review",
+].join(", ");
+
+// A judge-pending spinner is provisional. Once the canonical accepted tool
+// result arrives, execution is terminal and that spinner must not remain as a
+// permanent compact blocker. A late intent_verdict can still replace/rebuild
+// the verdict and re-expand the batch when its disposition is exceptional.
+export function clearConvVerdictPending(row) {
+  if (!row) return false;
+  let badge = Array.from(row.children || []).find((child) =>
+    child.classList.contains("conv-verdict"),
+  );
+  if (!badge && row.parentNode) {
+    const siblings = Array.from(row.parentNode.children || []);
+    const start = siblings.indexOf(row);
+    for (let index = start + 1; index < siblings.length; index += 1) {
+      const candidate = siblings[index];
+      if (candidate.classList.contains("conv-row")) break;
+      if (candidate.classList.contains("conv-verdict")) {
+        badge = candidate;
+        break;
+      }
+    }
+  }
+  if (!badge) return false;
+  const spinner = badge.querySelector(".conv-verdict-spinner");
+  if (!spinner) return false;
+  spinner.remove();
+  if (!(badge.children || []).length) badge.remove();
+  return true;
+}
+
+// Cancellation can replace a real executor receipt with controller-authored
+// text because output review never completed. Effect disposition is
+// orthogonal: even a committed effect remains unresolved for presentation,
+// so stamp a dedicated fail-open marker instead of overloading effectStatus.
+export function setToolOutputReviewState(row, output) {
+  if (!row) return false;
+  const incomplete = String(output == null ? "" : output).includes(
+    OUTPUT_REVIEW_INCOMPLETE_TEXT,
+  );
+  if (incomplete) row.dataset.outputReviewIncomplete = "true";
+  else delete row.dataset.outputReviewIncomplete;
+  return incomplete;
+}
+
+function _directConvRows(batch) {
+  return Array.from(batch.children || []).filter((child) =>
+    child.classList.contains("conv-row"),
+  );
+}
+
+function _convBatchHead(batch) {
+  return Array.from(batch.children || []).find((child) =>
+    child.classList.contains("conv-batch-head"),
+  );
+}
+
+function _convBatchDisclosure(batch) {
+  return batch.querySelector(".conv-batch-disclosure");
+}
+
+export function convBatchSummaryText(batch) {
+  const summary = batch.querySelector(".conv-batch-summary");
+  const text = summary ? String(summary.textContent || "").trim() : "";
+  return text || "tool batch";
+}
+
+export function isConvVerdictCompactBlocker(verdict) {
+  if (!verdict) return false;
+  const risk = normalizeRiskLevel(verdict.risk_level);
+  const recommendation = verdict.recommendation || "review";
+  return risk === "high" || risk === "critical" || recommendation !== "approve";
+}
+
+function _playingBatchMedia(batch) {
+  return Array.from(batch.querySelectorAll("audio, video")).filter(
+    (media) => media.paused === false && media.ended !== true,
+  );
+}
+
+function _batchHasProtectedFocus(batch) {
+  const active = document.activeElement;
+  if (!active || !batch.contains(active)) return false;
+  const head = _convBatchHead(batch);
+  return !head || !head.contains(active);
+}
+
+// A full call or result someone opened to read: an automatic fold would hide
+// it, so the fold skips this batch, as it does for focused detail.  Closing it
+// later does not fold the batch; the reader can fold it by hand.
+function _batchHasOpenDetail(batch) {
+  return !!batch.querySelector(
+    '.conv-row[data-full-call="open"], [data-expanded="true"]',
+  );
+}
+
+// Focus a non-interactive element without pre-selecting an answer: a
+// temporary tabindex, so the element takes focus (and a visible ring)
+// while Space and Enter stay unarmed on any action button or link inside
+// it.  The tabindex leaves with the focus, so the element never joins the
+// Tab order.  preventScroll: callers own the viewport (a smooth scroll is
+// usually already running toward the element).
+export function focusTemporarily(el) {
+  if (!el || typeof el.focus !== "function") return;
+  const temporary = !el.hasAttribute("tabindex");
+  if (temporary) el.setAttribute("tabindex", "-1");
+  el.focus({ preventScroll: true });
+  if (temporary) {
+    el.addEventListener(
+      "blur",
+      () => {
+        el.removeAttribute("tabindex");
+      },
+      { once: true },
+    );
+  }
+}
+
+// Focus a batch's head — used when a blocker expansion steals focus from
+// the disclosure, and by the status-bar approval chip's reveal on the
+// coordinator (which has no feedback field to land on).
+export function focusConvBatchHead(batch) {
+  focusTemporarily(_convBatchHead(batch));
+}
+
+function _syncConvBatchDisclosure(batch, expanded) {
+  const disclosure = _convBatchDisclosure(batch);
+  if (!disclosure) return;
+  const action = expanded ? "Hide" : "Show";
+  const summary = convBatchSummaryText(batch);
+  disclosure.setAttribute("aria-expanded", expanded ? "true" : "false");
+  disclosure.setAttribute(
+    "aria-label",
+    action + " completed tool details for " + summary,
+  );
+  disclosure.title = action + " completed tool details";
+  disclosure.textContent = "Completed · " + action + " details";
+}
+
+// Structural compact eligibility is independent of the selected presentation:
+// Default may stage a fold marker without hiding anything so a later switch to
+// Compact is immediate.  Every ambiguous or exceptional state fails open.
+export function isConvBatchCompactEligible(batch) {
+  if (!batch || !batch.classList.contains("conv-batch")) return false;
+  if (batch.dataset.resultsSettled !== "true") return false;
+  if (
+    !batch.classList.contains("conv-batch--approved") &&
+    !batch.classList.contains("conv-batch--auto")
+  ) {
+    return false;
+  }
+  for (const state of [
+    "conv-batch--pending",
+    "conv-batch--running",
+    "conv-batch--denied",
+    "conv-batch--error",
+  ]) {
+    if (batch.classList.contains(state)) return false;
+  }
+  if (batch.getAttribute("aria-busy") === "true") return false;
+  const rows = _directConvRows(batch);
+  if (!rows.length) return false;
+  for (const row of rows) {
+    if (row.dataset.resultSettled !== "true") return false;
+    if (
+      Object.prototype.hasOwnProperty.call(row.dataset, "effectStatus") &&
+      row.dataset.effectStatus !== "committed"
+    ) {
+      return false;
+    }
+  }
+  return !batch.querySelector(COMPACT_BLOCKER_SELECTOR);
+}
+
+// The only disclosure-state mutator.  Automatic folds preserve focused detail
+// and playing media; an explicit fold pauses media first.  A late blocker can
+// make the disclosure itself inapplicable, so its focused button hands off to
+// the surviving batch head before the renderer adds that blocker.
+export function setConvBatchExpanded(batch, expanded, options) {
+  options = options || {};
+  if (!batch || !batch.classList.contains("conv-batch")) return false;
+  const disclosure = _convBatchDisclosure(batch);
+  if (
+    expanded &&
+    options.blocker &&
+    disclosure &&
+    document.activeElement === disclosure
+  ) {
+    focusConvBatchHead(batch);
+  }
+  const playing = _playingBatchMedia(batch);
+  if (!expanded && !options.manual) {
+    if (
+      _batchHasProtectedFocus(batch) ||
+      playing.length ||
+      _batchHasOpenDetail(batch)
+    ) {
+      return false;
+    }
+  }
+  if (!expanded && options.manual) {
+    for (const media of playing) {
+      try {
+        media.pause();
+      } catch (_) {
+        // A detached/broken media element must not strand disclosure state.
+      }
+    }
+  }
+  const wasExpanded = batch.dataset.compactFolded !== "true";
+  if (expanded) delete batch.dataset.compactFolded;
+  else batch.dataset.compactFolded = "true";
+  _syncConvBatchDisclosure(batch, expanded);
+  return wasExpanded !== expanded;
+}
+
+// Project accepted terminal-result truth onto the row/batch DOM.  The caller
+// must apply effect/error/warning/running state before this finalization step.
+export function markConvRowResultSettled(row, options) {
+  options = options || {};
+  const batch =
+    row && row.classList && row.classList.contains("conv-row")
+      ? row.closest(".conv-batch")
+      : null;
+  const result = { becameSettled: false, autoFolded: false, batch };
+  if (!batch) return result;
+  if ((row.parentElement || row.parentNode) !== batch) return result;
+
+  row.dataset.resultSettled = "true";
+  const rows = _directConvRows(batch);
+  if (
+    !rows.length ||
+    rows.some((candidate) => candidate.dataset.resultSettled !== "true")
+  ) {
+    if (batch.dataset.resultsSettled === "true") {
+      delete batch.dataset.resultsSettled;
+      setConvBatchExpanded(batch, true);
+    }
+    return result;
+  }
+  if (batch.dataset.resultsSettled === "true") return result;
+
+  batch.dataset.resultsSettled = "true";
+  result.becameSettled = true;
+  if (options.autoFold !== false && isConvBatchCompactEligible(batch)) {
+    result.autoFolded = setConvBatchExpanded(batch, false);
+  }
+  return result;
+}
+
+export function buildConvBatchDisclosure() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "conv-batch-disclosure";
+  button.setAttribute("aria-expanded", "true");
+  button.setAttribute("aria-label", "Hide completed tool details");
+  button.title = "Hide completed tool details";
+  button.textContent = "Completed · Hide details";
+  button.addEventListener("click", () => {
+    const batch = button.closest(".conv-batch");
+    if (!batch || !isConvBatchCompactEligible(batch)) return;
+    const expanded = batch.dataset.compactFolded === "true";
+    setConvBatchExpanded(batch, expanded, { manual: true });
+  });
+  return button;
+}
+
+// Empty batch shell (.conv-batch) + header strip (kicker / summary / tier).
+// The caller appends rows + actions/status and flips the state modifier
+// (--pending/--auto/--running/--approved/--denied/--error).  opts:
+//   parallel (bool)  -- >=2 calls: rows share the left rail
+//   stateClass (str) -- e.g. "conv-batch--pending" (omit for the neutral shell)
+//   kickerText / summaryText / tierText
+export function buildConvBatchShell(opts) {
+  opts = opts || {};
+  const batch = document.createElement("div");
+  batch.className = "conv-batch";
+  batch.classList.add(
+    opts.parallel ? "conv-batch--parallel" : "conv-batch--solo",
+  );
+  if (opts.stateClass) batch.classList.add(opts.stateClass);
+
+  const head = document.createElement("div");
+  head.className = "conv-batch-head";
+  const kicker = document.createElement("span");
+  kicker.className = "conv-batch-kicker";
+  kicker.textContent = opts.kickerText || "Tool";
+  head.appendChild(kicker);
+  if (opts.summaryText) {
+    const summary = document.createElement("span");
+    summary.className = "conv-batch-summary";
+    summary.textContent = opts.summaryText;
+    head.appendChild(summary);
+  }
+  if (opts.tierText) {
+    const tier = document.createElement("span");
+    tier.className = "conv-batch-tier";
+    tier.textContent = opts.tierText;
+    head.appendChild(tier);
+  }
+  head.appendChild(buildConvBatchDisclosure());
+  batch.appendChild(head);
+  return batch;
+}
+
+// Tool-call row (.conv-row) + call line (idx / name / auto-tag / args).  The
+// caller appends verdict / cmd / warning / result / status children + manages
+// state.  item: {func_name, call_id, auto_approved, auto_approve_reason}.  opts:
+//   indexLabel  -- "1/3" pill for parallel batches (omit -> no pill)
+//   argsText    -- pre-formatted arg summary (coordinator); interactive omits
+//                  this and appends buildConvCmd() instead
+//   first/last  -- rail-tuck markers for parallel batches
+export function buildConvRow(item, opts) {
+  item = item || {};
+  opts = opts || {};
+  const row = document.createElement("div");
+  row.className = "conv-row";
+  if (opts.first) row.classList.add("conv-row--first");
+  if (opts.last) row.classList.add("conv-row--last");
+  if (item.call_id) row.dataset.callId = item.call_id;
+  // Stamp the function name so the metacog dim rule (memory/recall) and the
+  // pane's per-call routing have something to match.
+  if (item.func_name) row.dataset.toolName = item.func_name;
+
+  const call = document.createElement("div");
+  call.className = "conv-row-call";
+  if (opts.indexLabel) {
+    const idx = document.createElement("span");
+    idx.className = "conv-row-idx";
+    idx.textContent = opts.indexLabel;
+    call.appendChild(idx);
+  }
+  const name = document.createElement("span");
+  name.className = "conv-row-name";
+  name.textContent = item.func_name || "(unknown tool)";
+  if (item.auto_approved) {
+    const auto = document.createElement("span");
+    auto.className = "conv-row-auto";
+    const reason = item.auto_approve_reason || "auto_approve_tools";
+    auto.textContent = " auto: " + reason;
+    auto.title = "Tool auto-approved (no operator prompt) -- reason: " + reason;
+    name.appendChild(auto);
+  }
+  call.appendChild(name);
+  let redactedCommand = false;
+  if (opts.argsText) {
+    const args = document.createElement("span");
+    args.className = "conv-row-args";
+    const shown = convShownText(opts.argsText);
+    redactedCommand = shown.redacted && item.func_name === "bash";
+    args.textContent = shown.text;
+    call.appendChild(args);
+  }
+  row.appendChild(call);
+  // A bash card's summary is its command: say when redaction changed it.
+  if (redactedCommand) row.appendChild(_redactionNote("command"));
+  return row;
+}
+
+// Bash `$ cmd` line + optional unified-diff preview (interactive tool rows).
+// Returns a fragment to append into a .conv-row after the call line.  Lifts
+// buildToolDiv's header-clean + diff-parse; textContent only.
+export function buildConvCmd(item) {
+  item = item || {};
+  const frag = document.createDocumentFragment();
+  // The server sends the header and preview as plain text: a control
+  // character in them is the model's, and shows.
+  const headerText = String(item.header || "");
+  const cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
+  const cmdText = cleaned || headerText;
+  let redacted = false;
+  if (cmdText) {
+    const cmd = document.createElement("div");
+    cmd.className = "conv-row-cmd";
+    const shown = convShownText(cmdText);
+    if (shown.redacted) redacted = true;
+    const shownCmd = shown.text;
+    if (item.func_name === "bash") {
+      const dollar = document.createElement("span");
+      dollar.className = "conv-row-cmd-dollar";
+      dollar.textContent = "$ ";
+      cmd.append(dollar, shownCmd);
+    } else {
+      cmd.textContent = shownCmd;
+    }
+    frag.appendChild(cmd);
+  }
+  if (item.preview) {
+    const diff = document.createElement("div");
+    diff.className = "conv-row-diff";
+    // The preview is uncapped upstream (a whole multiline command / one line
+    // per edited line) — cap what we RENDER: past ~400 lines the preview
+    // carries no decision value, the DOM cost is ~2 nodes/line in every
+    // transcript row, and an argument-spread append of an unbounded node
+    // list can throw RangeError mid-paint (engines cap spread arity around
+    // 65k args), killing the tool card — and the approval gate — for the
+    // batch.  Appended incrementally for the same reason.
+    // Redact credentials ONCE on the full text before splitting, rather than
+    // running 7 regex sweeps per line (~2800 passes at 400 lines).
+    const MAX_PREVIEW_LINES = 400;
+    const shown = convShownText(item.preview);
+    if (shown.redacted) redacted = true;
+    let lines = shown.text.split("\n");
+    const omitted = lines.length - MAX_PREVIEW_LINES;
+    if (omitted > 0) lines = lines.slice(0, MAX_PREVIEW_LINES);
+    lines.forEach((line, i) => {
+      if (i > 0) diff.appendChild(document.createTextNode("\n"));
+      const trimmed = line.trim();
+      let cls = null;
+      if (trimmed.startsWith("-")) cls = "conv-diff-del";
+      else if (trimmed.startsWith("+")) cls = "conv-diff-add";
+      else if (trimmed.startsWith("Warning:")) cls = "conv-diff-warn";
+      if (cls) {
+        const span = document.createElement("span");
+        span.className = cls;
+        span.textContent = line;
+        diff.appendChild(span);
+      } else {
+        diff.appendChild(document.createTextNode(line));
+      }
+    });
+    frag.appendChild(diff);
+    // The omission notice sits BELOW the scroll box as a sibling, not as the
+    // diff's last child: .conv-row-diff is a 240px inner scroller, so an
+    // inline marker would sit thousands of pixels below its fold — invisible
+    // exactly at the approval moment, where the operator must know the
+    // preview is partial.  Its own neutral class (not .conv-diff-warn):
+    // an omission is informational, not a command warning, and raw --warn
+    // fails AA on the light panel background.
+    if (omitted > 0) {
+      const more = document.createElement("div");
+      more.className = "conv-diff-omit";
+      more.textContent = "… " + omitted + " more preview lines not shown";
+      frag.appendChild(more);
+    }
+  }
+  if (redacted && item.func_name === "bash") {
+    frag.appendChild(_redactionNote("command"));
+  }
+  return frag;
+}
+
+// What a call awaiting approval does, as the coordinator's children tree
+// shows it: its preview, or its header line when it has none (a one-line
+// bash command), shown as the cards show it.  Whole, not cut at the cards'
+// line count: the block has no full call to open, and its box scrolls.  A
+// bash call whose text redaction changed says part of the command is hidden.
+// Null when the item carries neither.
+export function buildConvApprovalPreview(item) {
+  item = item || {};
+  const shown = convShownText(item.preview || item.header || "");
+  if (!shown.text) return null;
+  const frag = document.createDocumentFragment();
+  const pre = document.createElement("pre");
+  pre.className = "approval-preview";
+  pre.textContent = shown.text;
+  frag.appendChild(pre);
+  if (shown.redacted && item.func_name === "bash") {
+    frag.appendChild(_redactionNote("command"));
+  }
+  return frag;
+}
+
+// Verdict badge (.conv-verdict) + expandable detail.  verdict: the judge /
+// heuristic verdict object (risk_level, recommendation, confidence,
+// intent_summary, reasoning, evidence[], tier, judge_model).  opts.judgePending
+// appends the "judge analyzing" spinner.  When `verdict` is null + judgePending,
+// returns a spinner-only badge (the stripe stays NEUTRAL -- risk isn't known
+// yet -- which is why the --{risk} class is withheld here, not just guarded in
+// CSS).  Returns a fragment [badge] or [badge, detail].
+export function buildConvVerdict(verdict, opts) {
+  opts = opts || {};
+  const frag = document.createDocumentFragment();
+  const badge = document.createElement("div");
+  badge.className = "conv-verdict";
+
+  if (!verdict) {
+    if (opts.judgePending) badge.appendChild(_convSpinner());
+    frag.appendChild(badge);
+    return frag;
+  }
+
+  const risk = normalizeRiskLevel(verdict.risk_level);
+  badge.classList.add("conv-verdict--" + risk);
+  badge.setAttribute("data-risk", risk);
+  if (verdict.call_id) badge.setAttribute("data-call-id", verdict.call_id);
+
+  const riskSpan = document.createElement("span");
+  riskSpan.className = "conv-verdict-risk";
+  riskSpan.textContent = risk.toUpperCase();
+  badge.appendChild(riskSpan);
+
+  const rec = verdict.recommendation || "review";
+  const recSpan = document.createElement("span");
+  recSpan.className =
+    "conv-verdict-rec conv-verdict-rec--" +
+    (rec === "approve" ? "approve" : rec === "deny" ? "deny" : "review");
+  recSpan.textContent = rec;
+  badge.appendChild(recSpan);
+
+  if (verdict.confidence != null) {
+    const conf = document.createElement("span");
+    conf.className = "conv-verdict-conf";
+    const v = verdict.confidence;
+    conf.textContent = (typeof v === "number" ? Math.round(v * 100) : v) + "%";
+    badge.appendChild(conf);
+  }
+
+  if (opts.judgePending) badge.appendChild(_convSpinner());
+
+  const hasDetail = !!(
+    verdict.intent_summary ||
+    verdict.reasoning ||
+    (verdict.evidence && verdict.evidence.length) ||
+    verdict.tier ||
+    verdict.judge_model
+  );
+  let detail = null;
+  if (hasDetail) {
+    const expand = document.createElement("button");
+    expand.type = "button";
+    expand.className = "conv-verdict-expand";
+    expand.textContent = "details";
+    badge.appendChild(expand);
+
+    detail = document.createElement("div");
+    detail.className = "conv-verdict-detail";
+    detail.style.display = "none";
+    if (verdict.intent_summary) {
+      const s = document.createElement("div");
+      s.className = "conv-verdict-summary";
+      s.textContent = verdict.intent_summary;
+      detail.appendChild(s);
+    }
+    if (verdict.reasoning) {
+      const r = document.createElement("div");
+      r.className = "conv-verdict-reasoning";
+      r.textContent = verdict.reasoning;
+      detail.appendChild(r);
+    }
+    const evidence = verdict.evidence || [];
+    if (evidence.length) {
+      const ev = document.createElement("div");
+      ev.className = "conv-verdict-evidence";
+      for (const e of evidence) {
+        const erow = document.createElement("div");
+        erow.textContent = "• " + e;
+        ev.appendChild(erow);
+      }
+      detail.appendChild(ev);
+    }
+    const tier = document.createElement("div");
+    tier.className = "conv-verdict-tier";
+    let t = (verdict.tier || "heuristic") + " tier";
+    if (verdict.judge_model) t += " | " + verdict.judge_model;
+    tier.textContent = t;
+    detail.appendChild(tier);
+
+    expand.addEventListener("click", () => {
+      const shown = detail.style.display !== "none";
+      detail.style.display = shown ? "none" : "block";
+      expand.textContent = shown ? "details" : "hide";
+    });
+  }
+
+  frag.appendChild(badge);
+  if (detail) frag.appendChild(detail);
+  return frag;
+}
+
+function _convSpinner() {
+  const spin = document.createElement("span");
+  spin.className = "conv-verdict-spinner";
+  const dot = document.createElement("span");
+  dot.className = "conv-verdict-spinner-dot";
+  dot.setAttribute("aria-hidden", "true");
+  spin.append(dot, " judge analyzing…");
+  return spin;
+}
+
+// Output-guard warning chip (.conv-warning--{risk}).  assessment: {risk_level,
+// flags[], redacted, tier, judge_risk, confidence, judge_model, reasoning}.
+// Risk is normalized (unknown -> medium), folding the per-site `|| "medium"`
+// fallbacks both panes carried.  Returns the chip element.
+export function buildConvWarning(assessment) {
+  const a = assessment || {};
+  const risk = normalizeRiskLevel(a.risk_level);
+  const flags = a.flags || [];
+  const chip = document.createElement("div");
+  chip.className = "conv-warning conv-warning--" + risk;
+  chip.setAttribute("role", "status");
+  const label = document.createElement("span");
+  label.className = "conv-warning-label";
+  label.textContent = "⚠ " + risk.toUpperCase();
+  chip.appendChild(label);
+  if (flags.length) {
+    chip.appendChild(document.createTextNode(" " + flags.join(", ")));
+  }
+  // An output-guard finding about one of a step's several results names it as
+  // the model's advisory text does: by position, and by tool when the name is
+  // one the session offers.
+  const result = a.result;
+  if (
+    result &&
+    Number.isInteger(result.index) &&
+    Number.isInteger(result.count)
+  ) {
+    let where = " · result " + result.index + " of " + result.count;
+    if (typeof result.tool === "string" && result.tool)
+      where += ", " + result.tool;
+    chip.appendChild(document.createTextNode(where));
+  }
+  if (a.redacted) {
+    const red = document.createElement("span");
+    red.className = "conv-warning-redacted";
+    red.textContent = " (credentials redacted)";
+    chip.appendChild(red);
+  }
+  // LLM-judge attribution -- the judge's OWN verdict when it differs from the
+  // displayed (merged) risk, plus confidence + model, so a regex match reads
+  // apart from a model judgement.
+  if (a.tier === "llm") {
+    const tier = document.createElement("span");
+    tier.className = "conv-warning-tier";
+    let t = "⚖ LLM";
+    if (a.judge_risk && a.judge_risk !== risk) t += ": " + a.judge_risk;
+    if (a.confidence > 0) t += " · " + Math.round(a.confidence * 100) + "%";
+    if (a.judge_model) t += " · " + a.judge_model;
+    tier.textContent = t;
+    chip.appendChild(tier);
+  }
+  if (a.reasoning) {
+    const r = document.createElement("div");
+    r.className = "conv-warning-reasoning";
+    r.textContent = a.reasoning;
+    chip.appendChild(r);
+  }
+  return chip;
+}
+
+// One action button (.conv-btn--{role}).  role: "approve" | "always" | "deny".
+// kbdHint renders as a .conv-kbd chip -- the pane passes its OWN keybinding so
+// muscle memory is preserved (the look converges; the keys stay per-pane).
+export function buildConvButton(role, label, kbdHint, ariaLabel) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "conv-btn conv-btn--" + role;
+  btn.dataset.role = role;
+  btn.appendChild(document.createTextNode(label));
+  if (kbdHint) {
+    const kbd = document.createElement("span");
+    kbd.className = "conv-kbd";
+    kbd.setAttribute("aria-hidden", "true");
+    kbd.textContent = kbdHint;
+    btn.appendChild(kbd);
+  }
+  if (ariaLabel) btn.setAttribute("aria-label", ariaLabel);
+  return btn;
+}
+
+// Action row (.conv-actions) -- Deny / Approve all / Approve, right-aligned via
+// a spacer (the coordinator idiom).  opts:
+//   onApprove / onDeny / onAlways -- click callbacks (pane-specific resolution)
+//   alwaysLabel  -- aria/title for the "always" button; omit -> no Approve-all
+//                   button (nothing to persist)
+//   kbd: {approve, deny, always}  -- per-pane keybinding hints
+//   glowRec      -- "approve"|"deny"|"review" -> recommended-button glow
+//   withFeedback -- append the inline feedback input (interactive affordance)
+// Returns the .conv-actions element; the caller appends it to the batch.
+export function buildConvActions(opts) {
+  opts = opts || {};
+  const kbd = opts.kbd || {};
+  const actions = document.createElement("div");
+  actions.className = "conv-actions";
+  if (opts.glowRec) {
+    const g =
+      opts.glowRec === "approve"
+        ? "approve"
+        : opts.glowRec === "deny"
+          ? "deny"
+          : "review";
+    actions.classList.add("conv-verdict-glow--" + g);
+  }
+  const spacer = document.createElement("div");
+  spacer.className = "conv-actions-spacer";
+  actions.appendChild(spacer);
+
+  const deny = buildConvButton("deny", "Deny", kbd.deny, "Deny");
+  if (opts.onDeny) deny.addEventListener("click", opts.onDeny);
+  actions.appendChild(deny);
+
+  if (opts.alwaysLabel) {
+    const always = buildConvButton(
+      "always",
+      "Approve all",
+      kbd.always,
+      opts.alwaysLabel,
+    );
+    always.title = opts.alwaysLabel;
+    if (opts.onAlways) always.addEventListener("click", opts.onAlways);
+    actions.appendChild(always);
+  }
+
+  const approve = buildConvButton("approve", "Approve", kbd.approve, "Approve");
+  if (opts.onApprove) approve.addEventListener("click", opts.onApprove);
+  actions.appendChild(approve);
+
+  if (opts.withFeedback) {
+    const fb = document.createElement("input");
+    fb.type = "text";
+    fb.className = "conv-feedback";
+    fb.placeholder = "feedback (optional)";
+    actions.appendChild(fb);
+  }
+  return actions;
+}
+
+// Resolved status pill (.conv-status) -- replaces the action row after
+// approve/deny, or prefills on history replay of a resolved batch.  opts:
+//   approved (bool), always (bool), feedback (str), auto (bool).
+export function buildConvStatus(opts) {
+  opts = opts || {};
+  const status = document.createElement("div");
+  status.className = "conv-status";
+  const label = document.createElement("span");
+  if (opts.auto) {
+    status.classList.add("conv-status--auto");
+    label.textContent = "✓ auto-approved";
+  } else if (opts.approved) {
+    status.classList.add("conv-status--approved");
+    label.textContent = opts.always ? "✓ approved · always" : "✓ approved";
+  } else {
+    status.classList.add("conv-status--denied");
+    label.textContent = "✗ denied";
+  }
+  status.appendChild(label);
+  if (opts.feedback) {
+    const fb = document.createElement("span");
+    fb.className = "conv-status-feedback";
+    fb.textContent = "— " + opts.feedback;
+    status.appendChild(fb);
+  }
+  return status;
+}
+
+// Tool result block (.conv-row-result).  output: raw text; opts.isError marks
+// it (lead glyph + colour).  Pretty-prints small JSON payloads (coordinator
+// idiom).  Returns the block; the caller appends it (and may special-case
+// media / MCP-error embeds before falling back to this -- interactive).
+export function buildConvResult(output, opts) {
+  opts = opts || {};
+  const block = document.createElement("div");
+  block.className = "conv-row-result";
+  const lead = document.createElement("span");
+  lead.className = "conv-row-result-lead";
+  lead.textContent = opts.isError ? "✗ error: " : "↳ result: ";
+  block.appendChild(lead);
+  const cleaned = stripAnsi(output || "");
+  let pretty = cleaned;
+  // Pretty-print only small JSON (cap 32 KiB): a large payload can deepen into
+  // a multi-MB graph and stall the main thread; the parent is pre-wrap so raw
+  // text still wraps past the cap.
+  const CAP = 32 * 1024;
+  if (cleaned && cleaned.length <= CAP) {
+    const head = cleaned.charCodeAt(0);
+    if (head === 0x7b || head === 0x5b) {
+      try {
+        const parsed = JSON.parse(cleaned);
+        if (parsed && typeof parsed === "object") {
+          pretty = JSON.stringify(parsed, null, 2);
+        }
+      } catch (_e) {
+        /* not JSON -- fall through to raw text */
+      }
+    }
+  }
+  // Clamp the rendered body — same rationale as the JSON pretty-print cap
+  // above: the server ships tool output verbatim, and a single multi-MB
+  // result (an agent cat-ing a large file) becomes a multi-MB pre-wrap text
+  // node that stalls layout on insert and is rebuilt on every full
+  // re-render.  The transcript shows the head; "show all" renders the rest
+  // when someone asks for it.
+  const isCut = pretty.length > RAW_CAP;
+  const body = document.createElement("span");
+  body.textContent = isCut ? _redactedHead(pretty) : redactCredentials(pretty);
+  block.appendChild(body);
+  // A result longer than its box gets "show all", which also renders the
+  // characters past the cut, on request (convResultExpandControl hands the
+  // control to the caller that places the box).
+  const expand = buildConvResultExpand(block, {
+    text: pretty,
+    boxLines: CONV_RESULT_BOX_LINES,
+    cut: isCut ? { body, full: () => redactCredentials(pretty) } : null,
+  });
+  if (expand) _resultExpands.set(block, expand);
+  return block;
+}
+
+// Text longer than this renders as its head and a note until someone asks for
+// all of it (RAW_CAP: see buildConvResult).
+const RAW_CAP = 64 * 1024;
+// How far past the cut a head is redacted before it is cut: longer than any
+// credential the redaction rules match.
+const REDACT_WINDOW = 16 * 1024;
+
+// The redacted head of text past RAW_CAP, and a note of its length.  The head
+// is redacted over a window reaching REDACT_WINDOW past the cut, so a secret
+// the cut runs through is matched whole.  When the text runs past the window,
+// the head shows nothing the window could not see whole: a secret the
+// window's own end runs through is left as it is, at the very end of the
+// redacted window and shorter than REDACT_WINDOW, so the window's last
+// REDACT_WINDOW characters never show, however much earlier redactions
+// shortened it; and a private-key block still open in the window (neither its
+// END nor another BEGIN in it) may close past it, where show all redacts it,
+// so the head stops before it.
+function _redactedHead(text) {
+  const head = redactCredentials(text.slice(0, RAW_CAP + REDACT_WINDOW));
+  let safe = head.length;
+  if (text.length > RAW_CAP + REDACT_WINDOW) {
+    safe = Math.max(0, head.length - REDACT_WINDOW);
+    const open = privateKeyBeginIndex(head);
+    if (open !== -1) safe = Math.min(safe, open);
+  }
+  return _displayCut(head.slice(0, Math.min(RAW_CAP, safe)), text.length);
+}
+
+// The head of `text` and a note of its length, for text past RAW_CAP.
+// `total`: the length to report when `text` is a window of longer text.
+function _displayCut(text, total) {
+  const length = total == null ? text.length : total;
+  if (length <= RAW_CAP) return text;
+  return (
+    text.slice(0, RAW_CAP) +
+    "\n… (" +
+    length.toLocaleString() +
+    " chars total — truncated for display)"
+  );
+}
+
+// The lines a capped .conv-row-result shows, at 11px type and a 1.5 line
+// height: its cap is 13 lines plus its 12px of padding (conversation.css).
+const CONV_RESULT_BOX_LINES = 13;
+// The same for a capped argument value in an open full call: 14 lines, no
+// padding.
+const CONV_ARG_BOX_LINES = 14;
+
+// ===========================================================================
+// Complete tool call and long results
+//
+// A row's summary (the server's header and preview, or replay's `key: value`
+// lines) shortens long values.  "full call" opens the call's arguments as the
+// model wrote them: live tool events carry that text as `arguments`, and
+// /history serves the same text for the stored call, so a live row and its
+// replay open the same view.  A long result, and a long argument value in an
+// open full call, has its own "show all", so opening one never unfolds
+// another.  A click that opens either tells the pane to stop following new
+// output (the bubbling `conv-detail-open` event), so the next token can't
+// scroll it away.
+// ===========================================================================
+
+let _fullCallSeq = 0;
+// row -> {text, toggle, panel}: the raw text stays off the DOM until opened,
+// and the panel is made on the first open.
+const _fullCalls = new WeakMap();
+
+// The pieces of a row that summarize its call.  The panel goes right after
+// them, ahead of any verdict or result, so it reads as their expansion.
+const _SUMMARY_CLASSES = [
+  "conv-row-call",
+  "conv-row-cmd",
+  "conv-row-diff",
+  "conv-diff-omit",
+  "conv-redaction-note",
+];
+
+function _noteDetailOpened(el) {
+  if (typeof el.dispatchEvent !== "function") return;
+  if (typeof CustomEvent !== "function") return;
+  el.dispatchEvent(new CustomEvent("conv-detail-open", { bubbles: true }));
+}
+
+// No text, or an empty JSON object: a full call would only say so.
+function _noArguments(text) {
+  const trimmed = text.trim();
+  return trimmed === "" || /^\{\s*\}$/.test(trimmed);
+}
+
+// What follows a row's call goes after this: its full-call panel once it has
+// one, else the last piece of its summary.
+export function convCallSummaryEnd(row) {
+  const entry = row ? _fullCalls.get(row) : null;
+  if (entry && entry.panel) return entry.panel;
+  let end = null;
+  for (const child of Array.from((row && row.children) || [])) {
+    if (_SUMMARY_CLASSES.some((cls) => child.classList.contains(cls))) {
+      end = child;
+    }
+  }
+  return end;
+}
+
+// Add the "full call" control to a .conv-row (from buildConvRow).  Anything
+// but a string `argumentsText` with something in it leaves the row as it is,
+// so an event without the field keeps just the summary.  Idempotent: a row
+// keeps the control (and its open state) it already has.
+export function attachConvFullCall(row, argumentsText) {
+  if (!row || typeof argumentsText !== "string" || _fullCalls.has(row)) return;
+  if (_noArguments(argumentsText)) return;
+  const callLine = Array.from(row.children || []).find((child) =>
+    child.classList.contains("conv-row-call"),
+  );
+  if (!callLine) return;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "conv-row-full-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  const name = row.dataset.toolName;
+  toggle.setAttribute("aria-label", name ? "Full call: " + name : "Full call");
+  // Its caret is CSS (::before), turned while the call is closed.
+  toggle.textContent = "full call";
+  toggle.addEventListener("click", () => {
+    const open = row.dataset.fullCall !== "open";
+    setConvFullCallOpen(row, open);
+    if (open) _noteDetailOpened(toggle);
+  });
+  callLine.appendChild(toggle);
+  _fullCalls.set(row, { text: argumentsText, toggle, panel: null });
+}
+
+// A row's full-call panel, made on its first open: right after the summary,
+// and named by its caption, since it does not follow its toggle in the DOM.
+function _makeFullCallPanel(row, toggle) {
+  const panel = document.createElement("div");
+  panel.className = "conv-row-full";
+  panel.id = "conv-row-full-" + (_fullCallSeq += 1);
+  panel.hidden = true;
+  panel.setAttribute("role", "group");
+  panel.setAttribute("aria-labelledby", panel.id + "-caption");
+  const end = convCallSummaryEnd(row);
+  const next = end ? end.nextSibling : null;
+  if (next) row.insertBefore(panel, next);
+  else row.appendChild(panel);
+  toggle.setAttribute("aria-controls", panel.id);
+  return panel;
+}
+
+// Open or close a row's full call.  The panel's content is built on each open
+// and dropped on close, so a closed call holds no DOM.
+export function setConvFullCallOpen(row, open) {
+  const entry = row ? _fullCalls.get(row) : null;
+  if (!entry) return false;
+  if (open && !entry.panel) {
+    entry.panel = _makeFullCallPanel(row, entry.toggle);
+  }
+  const panel = entry.panel;
+  if (open) {
+    const caption = document.createElement("div");
+    caption.className = "conv-full-args-caption";
+    caption.id = panel.id + "-caption";
+    caption.textContent = "arguments · as written";
+    panel.replaceChildren(
+      caption,
+      buildConvFullCallArguments(entry.text, {
+        shell: row.dataset.toolName === "bash",
+      }),
+    );
+    row.dataset.fullCall = "open";
+  } else {
+    if (panel) panel.replaceChildren();
+    delete row.dataset.fullCall;
+  }
+  if (panel) panel.hidden = !open;
+  entry.toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  return true;
+}
+
+function _argControl(arg) {
+  if (!arg) return null;
+  return (
+    Array.from(arg.children).find((child) =>
+      child.classList.contains("conv-result-expand"),
+    ) || null
+  );
+}
+
+// What a reader has open in the full calls under `root`, by call id (with the
+// values they showed in full, by position), and which of those controls has
+// focus: a toggle, or a value's "show all".  A pane that rebuilds a batch in
+// place (the early-paint shell upgrading) hands this to restoreConvFullCalls
+// afterwards, so a call someone is reading stays as they left it.
+export function captureConvFullCalls(root) {
+  const open = new Map();
+  let focused = null;
+  const active = document.activeElement;
+  for (const row of root ? root.querySelectorAll(".conv-row") : []) {
+    const entry = _fullCalls.get(row);
+    const id = row.dataset.callId;
+    if (!entry || !id) continue;
+    if (active === entry.toggle) focused = { id, value: null };
+    if (row.dataset.fullCall !== "open" || !entry.panel) continue;
+    const shown = new Set();
+    entry.panel.querySelectorAll(".conv-full-arg").forEach((arg, index) => {
+      const control = _argControl(arg);
+      if (!control) return;
+      if (control.dataset.expanded === "true") shown.add(index);
+      if (active === control) focused = { id, value: index };
+    });
+    open.set(id, shown);
+  }
+  return { open, focused };
+}
+
+export function restoreConvFullCalls(root, captured) {
+  if (!root || !captured) return;
+  for (const row of root.querySelectorAll(".conv-row")) {
+    const entry = _fullCalls.get(row);
+    const id = row.dataset.callId;
+    if (!entry || !id) continue;
+    const shown = captured.open.get(id);
+    if (shown && row.dataset.fullCall !== "open") {
+      setConvFullCallOpen(row, true);
+    }
+    const args =
+      shown && entry.panel
+        ? entry.panel.querySelectorAll(".conv-full-arg")
+        : [];
+    args.forEach((arg, index) => {
+      if (shown.has(index)) setConvResultShown(_argControl(arg), true);
+    });
+    const focused = captured.focused;
+    if (!focused || focused.id !== id) continue;
+    const target =
+      focused.value === null ? entry.toggle : _argControl(args[focused.value]);
+    if (target) target.focus({ preventScroll: true });
+  }
+}
+
+// While a call awaits approval, both panes read Enter as approve and Escape as
+// deny.  A key aimed at a control in the transcript is that control's: Enter
+// on a button, link, disclosure, select or role=button element (rendered
+// markdown's image placeholder is one) runs it, and Escape on a full call or a
+// "show all" does nothing, so neither key decides the call from there.
+// True when the approval shortcuts should leave `key` alone.  A text field is
+// not such a control: the interactive pane's feedback field approves on
+// Enter.
+const _ENTER_CONTROLS = 'button, a[href], summary, select, [role="button"]';
+const _READING_CONTROLS =
+  ".conv-row-full, .conv-row-full-toggle, .conv-result-expand";
+
+export function convKeyBelongsToControl(key, el) {
+  if (!el || typeof el.closest !== "function") return false;
+  if (key === "Enter") return !!el.closest(_ENTER_CONTROLS);
+  if (key === "Escape") return !!el.closest(_READING_CONTROLS);
+  return false;
+}
+
+// Whether an automatic focus move would take focus from no one: nothing has
+// it, or only the page, the pane's transcript, or the pane's root or something
+// around it (the console's focusable pane section, which a click on transcript
+// text focuses) does.  Anything else focused is someone's (a control in the
+// transcript, a composer, a field in another pane), and moving focus would
+// hand their next key to the card.  Panes check this when the move runs, not
+// when they schedule it.
+export function convFocusIsFree(active, root, transcript) {
+  return (
+    !active ||
+    active === document.body ||
+    active === transcript ||
+    (typeof active.contains === "function" && active.contains(root))
+  );
+}
+
+// A number keeps the digits the model wrote: plain parsing rounds integers
+// past 2^53 (snowflake-style ids) and drops a trailing ".0".  An engine
+// without JSON.rawJSON parses as usual.
+const _keepNumberSource =
+  typeof JSON.rawJSON === "function"
+    ? (_key, value, context) =>
+        typeof value === "number" &&
+        context &&
+        typeof context.source === "string"
+          ? JSON.rawJSON(context.source)
+          : value
+    : undefined;
+
+function _isRawJson(value) {
+  return typeof JSON.isRawJSON === "function" && JSON.isRawJSON(value);
+}
+
+// Said under a bash command, or a value of a bash call's full call, that
+// redaction changed.  A redaction marker can stand for more than a secret (a
+// quote, an escaped space, ";" or "$(", whole arguments inside a key block),
+// so the command shown may not parse as the one that runs.  Said whenever
+// redaction changed it, not only when it can tell: the reader learns that
+// something is hidden, never what.
+function _redactionNote(what) {
+  const note = document.createElement("div");
+  note.className = "conv-redaction-note";
+  note.textContent = "part of this " + what + " is hidden by redaction";
+  return note;
+}
+
+// One string as the full call shows it: redacted alone and by the name it is
+// under ("password": …), then its control characters shown.
+function _redactArgumentString(key, value, state) {
+  let hidden = redactCredentials(value);
+  if (key !== null) hidden = redactNamedValue(key, hidden);
+  if (hidden !== value) state.redacted = true;
+  return _showControls(hidden);
+}
+
+// The parsed arguments with every string redacted on its own, under its
+// nearest key, so no rule runs over text spanning two values and swallows a
+// neighbour.  Keys below the top level print as written.
+function _redactArguments(value, key, state) {
+  if (typeof value === "string") {
+    return _redactArgumentString(key, value, state);
+  }
+  if (value === null || typeof value !== "object" || _isRawJson(value)) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => _redactArguments(item, key, state));
+  }
+  const out = Object.create(null); // a "__proto__" key stays a key
+  for (const name of Object.keys(value)) {
+    out[name] = _redactArguments(value[name], name, state);
+  }
+  return out;
+}
+
+// [{key, text, redacted}, …]: one per top-level value of an object, none for
+// no arguments, one with a null key for anything else (other JSON printed, or
+// text that does not parse, redacted whole as written).
+function _fullCallEntries(raw) {
+  if (!raw.trim()) return [];
+  const entry = (key, value) => {
+    const state = { redacted: false };
+    const shown = _redactArguments(value, key, state);
+    const text =
+      typeof shown === "string" ? shown : JSON.stringify(shown, null, 2);
+    return { key, text, redacted: state.redacted };
+  };
+  let parsed;
+  try {
+    parsed = JSON.parse(raw, _keepNumberSource);
+  } catch (_e) {
+    return [entry(null, raw)];
+  }
+  try {
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      !_isRawJson(parsed)
+    ) {
+      return Object.keys(parsed).map((key) => entry(key, parsed[key]));
+    }
+    return [entry(null, parsed)];
+  } catch (_e) {
+    // A structure too deep to walk or print.
+    return [entry(null, raw)];
+  }
+}
+
+// The call's arguments as labelled values: each top-level key over its value,
+// a string as written (line breaks kept), anything else as indented JSON.  A
+// long value gets a capped box of its own with "show all", like a result, so
+// every name and the approval buttons stay in reach.  Each string is redacted
+// on its own (_redactArguments).  opts.shell: a bash call, whose values say so
+// when redaction changed them.
+export function buildConvFullCallArguments(text, opts) {
+  const shell = !!(opts && opts.shell);
+  const wrap = document.createElement("div");
+  wrap.className = "conv-full-args";
+  const entries = _fullCallEntries(String(text == null ? "" : text));
+  if (!entries.length) {
+    const none = document.createElement("div");
+    none.className = "conv-full-args-none";
+    none.textContent = "(no arguments)";
+    wrap.appendChild(none);
+    return wrap;
+  }
+  for (const { key, text: full, redacted } of entries) {
+    const arg = document.createElement("div");
+    arg.className = "conv-full-arg";
+    if (key !== null) {
+      const name = document.createElement("div");
+      name.className = "conv-full-arg-name";
+      name.textContent = convShownText(key).text;
+      arg.appendChild(name);
+    }
+    const shown = _displayCut(full);
+    const value = document.createElement("div");
+    value.className = "conv-full-arg-value";
+    value.textContent = shown;
+    arg.appendChild(value);
+    const expand = buildConvResultExpand(value, {
+      text: full,
+      boxLines: CONV_ARG_BOX_LINES,
+      cut: shown === full ? null : { body: value, full: () => full },
+    });
+    if (expand) arg.appendChild(expand);
+    if (shell && redacted) arg.appendChild(_redactionNote("value"));
+    wrap.appendChild(arg);
+  }
+  return wrap;
+}
+
+let _resultBoxSeq = 0;
+// How many characters a line of a box is taken to hold when estimating how
+// far text wraps: about a card's width of monospace type.  Text estimated to
+// run past its box is capped behind "show all"; anything shorter shows whole,
+// so no box clips text without a way to open it.  A wide pane may fit capped
+// text in fewer lines, so "show all" there can open little.
+const CONV_LINE_CHARS = 100;
+// box -> its "show all" control, for a caller that places it (buildConvResult).
+const _resultExpands = new WeakMap();
+// control -> show(all), for a pane restoring what someone had shown.
+const _resultShows = new WeakMap();
+
+// Hard lines, a final line break starting none (pre-wrap shows no line after
+// it).
+function _countLines(text) {
+  const end = text.endsWith("\n") ? text.length - 1 : text.length;
+  let lines = 1;
+  for (let i = text.indexOf("\n"); i !== -1 && i < end; ) {
+    lines += 1;
+    i = text.indexOf("\n", i + 1);
+  }
+  return lines;
+}
+
+// Whether text runs past `boxLines` lines, a long line counting as several.
+function _runsPast(text, boxLines) {
+  const end = text.endsWith("\n") ? text.length - 1 : text.length;
+  let lines = 0;
+  for (let start = 0; start <= end; ) {
+    let stop = text.indexOf("\n", start);
+    if (stop === -1 || stop > end) stop = end;
+    lines += Math.max(1, Math.ceil((stop - start) / CONV_LINE_CHARS));
+    if (lines > boxLines) return true;
+    start = stop + 1;
+  }
+  return false;
+}
+
+function _countLabel(n, unit) {
+  return n.toLocaleString() + " " + unit + (n === 1 ? "" : "s");
+}
+
+function _selectingText() {
+  const selection =
+    typeof window !== "undefined" && typeof window.getSelection === "function"
+      ? window.getSelection()
+      : null;
+  return !!selection && String(selection) !== "";
+}
+
+function _scrollParent(el) {
+  if (typeof getComputedStyle !== "function") return null;
+  for (let node = el.parentElement; node; node = node.parentElement) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll") return node;
+  }
+  return null;
+}
+
+// Collapsing a long box above the viewport would yank the page under the
+// reader: keep the control where it was on screen.  `edge` is the side of
+// `el` that stays put: its top, or its bottom for a card folding up from its
+// end.
+function _keepInView(el, change, edge = "top") {
+  const scroller =
+    typeof el.getBoundingClientRect === "function" ? _scrollParent(el) : null;
+  const before = scroller ? el.getBoundingClientRect()[edge] : 0;
+  change();
+  if (scroller) scroller.scrollTop += el.getBoundingClientRect()[edge] - before;
+}
+
+// The "show all" control for a box (the coordinator's .conv-row-result, the
+// interactive pane's .tool-output, an argument value), or null when the text
+// fits.  Text estimated to run past `boxLines` lines, or cut for display, is
+// capped: the box gets data-expanded="false", which its CSS caps, and "show
+// all" lifts the cap (data-expanded="true"), its label turning to "collapse".
+// A box without the control has no cap.  The caller places the control right
+// after the box.  opts:
+//   text      -- the whole text
+//   boxLines  -- the lines the capped box shows (0: any text is capped)
+//   fold      -- the cap is the interactive pane's short preview
+//                (.collapsed); a click on the preview shows all
+//   cut       -- {body, full}: `body` shows a cut of the text; showing all
+//                puts full() there (and collapsing, the cut again)
+export function buildConvResultExpand(box, opts) {
+  opts = opts || {};
+  const text = String(opts.text == null ? "" : opts.text);
+  const boxLines = Math.max(0, Number(opts.boxLines) || 0);
+  const cut = opts.cut || null;
+  if (!cut && (!text || !_runsPast(text, boxLines))) return null;
+  const fold = !!opts.fold;
+  const lines = _countLines(text);
+  if (!box.id) box.id = "conv-result-" + (_resultBoxSeq += 1);
+  const size =
+    lines > boxLines
+      ? _countLabel(lines, "line")
+      : _countLabel(text.length, "char");
+  const control = document.createElement("button");
+  control.type = "button";
+  control.className = "conv-result-expand";
+  control.setAttribute("aria-controls", box.id);
+  const cutText = cut ? cut.body.textContent : null;
+  const show = (all) => {
+    box.dataset.expanded = all ? "true" : "false";
+    control.dataset.expanded = all ? "true" : "false";
+    if (fold) box.classList.toggle("collapsed", !all);
+    if (cut) cut.body.textContent = all ? cut.full() : cutText;
+    control.textContent = all ? "collapse" : "show all · " + size;
+  };
+  show(false);
+  _resultShows.set(control, show);
+  control.addEventListener("click", () => {
+    if (box.dataset.expanded === "true") {
+      _keepInView(control, () => show(false));
+    } else {
+      show(true);
+      _noteDetailOpened(control);
+    }
+  });
+  if (fold) {
+    box.addEventListener("click", () => {
+      if (!box.classList.contains("collapsed") || _selectingText()) return;
+      show(true);
+      _noteDetailOpened(box);
+    });
+  }
+  return control;
+}
+
+// Show all of a box, or collapse it, as its control would but without a
+// click: a pane restoring what someone had shown.  Not an opening by the
+// reader, so it leaves following alone.
+export function setConvResultShown(control, all) {
+  const show = control ? _resultShows.get(control) : null;
+  if (show) show(!!all);
+}
+
+// The "show all" control buildConvResult made for its box, if any.
+export function convResultExpandControl(box) {
+  return (box && _resultExpands.get(box)) || null;
+}
+
+// Shared open-content control for file results and stored previews. Callers
+// supply the destination; labels stay inert text, including paths and URLs.
+function buildContentChip(label, action, title, kind, onOpen) {
+  const chip = document.createElement("button");
+  chip.type = "button";
+  chip.className = "conv-content-chip";
+  chip.setAttribute("aria-label", action + ": " + label);
+  chip.title = title;
+  const glyph = document.createElement("span");
+  glyph.className = "conv-content-glyph";
+  glyph.setAttribute("aria-hidden", "true");
+  glyph.textContent = "▤";
+  chip.appendChild(glyph);
+  const text = document.createElement("span");
+  text.className = "conv-content-title";
+  text.textContent = label;
+  chip.appendChild(text);
+  if (kind) {
+    const badge = document.createElement("span");
+    badge.className = "conv-content-kind";
+    badge.textContent = kind;
+    chip.appendChild(badge);
+  }
+  const arrow = document.createElement("span");
+  arrow.className = "conv-content-glyph";
+  arrow.setAttribute("aria-hidden", "true");
+  arrow.textContent = "↗";
+  chip.appendChild(arrow);
+  if (typeof onOpen === "function") {
+    chip.addEventListener("click", onOpen);
+  }
+  return chip;
+}
+
+export function buildPreviewChip(descriptor, onOpen) {
+  const d = descriptor || {};
+  const label = redactCredentials(d.title || d.source || "preview");
+  const title = d.source
+    ? "Open preview — " + redactCredentials(d.source)
+    : "Open preview";
+  const chip = buildContentChip(label, "Open preview", title, d.kind, () => {
+    if (typeof onOpen === "function") onOpen(d);
+  });
+  chip.classList.add("conv-preview-chip");
+  return chip;
+}
+
+export function buildFileChip(path, onOpen) {
+  const fullPath = redactCredentials(path);
+  const label = fullPath.split("/").pop() || fullPath;
+  const chip = buildContentChip(
+    label, "Open file", "Open file — " + fullPath, "File", () => onOpen(path),
+  );
+  chip.setAttribute("aria-label", "Open file: " + fullPath);
+  chip.classList.add("conv-file-chip");
+  return chip;
+}
+
+// Expandable body for a task_agent row's nested sub-steps (the "agent card").
+// A task agent runs its own sub-tools; this gives that row a collapsible body
+// the pane renders the live step stream into, so the steps nest UNDER the
+// task_agent call instead of scattering at the top level.  The pane appends the
+// returned `wrap` into the task_agent .conv-row and renders step rows (ordinary
+// .conv-row leaves, matched by call_id) into `body`; `label` shows the live
+// step count, `context` the visual token badge, and `toggle` owns their shared
+// accessible name.  House style: programmatic DOM, textContent only.
+let _agentCardSeq = 0;
+
+export function formatAgentContextTokens(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return "";
+  const tokens = Math.floor(numeric);
+  const compact = (divisor, suffix) => {
+    const scaled = tokens / divisor;
+    const digits = scaled < 10 && tokens % divisor !== 0 ? 1 : 0;
+    return Number(scaled.toFixed(digits)).toString() + suffix;
+  };
+  // Promote at the point integer-thousands rounding would otherwise produce
+  // the awkward cross-unit value "1000k".
+  if (tokens >= 999_500) return compact(1_000_000, "m");
+  if (tokens >= 1_000) return compact(1_000, "k");
+  return String(tokens);
+}
+
+export function agentContextIsWarning(promptTokens, contextWindow) {
+  const used = Number(promptTokens);
+  const total = Number(contextWindow);
+  return (
+    Number.isFinite(used) &&
+    used >= 0 &&
+    Number.isFinite(total) &&
+    total > 0 &&
+    used / total >= 0.8
+  );
+}
+
+export function buildAgentCardBody() {
+  const wrap = document.createElement("div");
+  wrap.className = "conv-agent";
+  // Single source of truth for collapse: the data attribute drives BOTH the
+  // body visibility and the caret rotation (in CSS), so a programmatic toggle
+  // (collapse-by-default here, or the auto-expand-on-approval in the pane) can't
+  // desync caret/aria the way per-node textContent did.
+  //
+  // Collapsed by default: a task agent can run 100+ steps, and the parent often
+  // fans out many in parallel — expanded, that's a wall.  The label carries the
+  // live count + state ("12 steps · running"), so you expand on demand.  The
+  // pane force-expands a card when a nested approval is pending (it's blocking —
+  // it can't hide behind the toggle).
+  wrap.dataset.collapsed = "true";
+  const bodyId = "conv-agent-body-" + (_agentCardSeq += 1);
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "conv-agent-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-controls", bodyId);
+  toggle.setAttribute("aria-label", "Show or hide sub-agent steps");
+  const caret = document.createElement("span");
+  caret.className = "conv-agent-caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▾"; // CSS rotates it when collapsed
+  const label = document.createElement("span");
+  label.className = "conv-agent-label";
+  label.textContent = "0 steps";
+  const context = document.createElement("span");
+  context.className = "conv-agent-context";
+  context.hidden = true;
+  context.setAttribute("aria-hidden", "true");
+  const issue = document.createElement("span");
+  issue.className = "conv-agent-step-issue";
+  issue.hidden = true;
+  issue.textContent = "child issue";
+  issue.title = "Contains an exceptional child step";
+  toggle.append(caret, label, context, issue);
+  const body = document.createElement("div");
+  body.className = "conv-agent-body";
+  body.id = bodyId;
+  const setCollapsed = (collapsed) => {
+    wrap.dataset.collapsed = collapsed ? "true" : "false";
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  };
+  // Set by a fold from the card's end, and held through the rest of that
+  // double- or triple-click, which the header lets go (below).
+  let foldedFromEnd = false;
+  toggle.addEventListener("click", (event) => {
+    const echo = foldedFromEnd && event.detail > 1;
+    foldedFromEnd = echo;
+    if (!echo) setCollapsed(wrap.dataset.collapsed !== "true");
+  });
+  // An open card's steps can run far past the screen, so the card's end
+  // repeats the collapse.  CSS shows this control only while the card is open
+  // with a step in it and no step waiting for approval, where it would sit
+  // just under Approve and Deny.  Folding keeps the card's bottom edge where it
+  // was on screen, so what follows doesn't move and the header comes to rest
+  // under the pointer.  The rest of a double- or triple-click lands there, and
+  // the header lets it go, so the card folds once instead of reopening at its
+  // first step.  Pointer only: not a button, so nothing can focus it (a
+  // tabindex="-1" button still takes focus from a click or a find-in-page
+  // match), out of the accessibility tree, and a press leaves focus where it
+  // was.  The header is the keyboard's and a screen reader's way to fold the
+  // card.
+  const foot = document.createElement("div");
+  foot.className = "conv-agent-foot";
+  foot.setAttribute("aria-hidden", "true");
+  const footCaret = document.createElement("span");
+  footCaret.className = "conv-agent-foot-caret";
+  footCaret.textContent = "▴";
+  const footLabel = document.createElement("span");
+  footLabel.textContent = "hide steps";
+  foot.append(footCaret, footLabel);
+  foot.addEventListener("mousedown", (event) => event.preventDefault());
+  foot.addEventListener("click", () => {
+    foldedFromEnd = true;
+    _keepInView(wrap, () => setCollapsed(true), "bottom");
+  });
+  wrap.append(toggle, body, foot);
+  return { wrap, body, label, context, issue, toggle };
+}

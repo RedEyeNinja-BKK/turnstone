@@ -1,0 +1,102 @@
+{
+  "events": [
+    {
+      "kind": "fight",
+      "weight": 82,
+      "text": "Something snarls out of the brush."
+    },
+    {
+      "kind": "gold",
+      "weight": 8,
+      "text": "a rotted coin-purse half-buried in moss",
+      "min": 4,
+      "max": 12
+    },
+    {
+      "kind": "gold",
+      "weight": 7,
+      "text": "a few coins spilled from some luckless traveller",
+      "min": 2,
+      "max": 9
+    },
+    {
+      "kind": "gold",
+      "weight": 2,
+      "text": "a hoard-cache prised from beneath a toppled menhir",
+      "min": 40,
+      "max": 80
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a clearwater spring",
+      "min": 5,
+      "max": 12
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a quiet fae blessing",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a moss-bed where weary travellers mend",
+      "min": 6,
+      "max": 14
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "a snare of old briars",
+      "min": 3,
+      "max": 9
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "loose stones twist your ankle",
+      "min": 2,
+      "max": 8
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "a hidden pit-deadfall, its cover long rotted through",
+      "min": 4,
+      "max": 11
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "an old waystone, its rune worn to a coiled, scaled shape."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "the wind carries a low note from the east, like something vast turning in its sleep."
+    },
+    {
+      "kind": "lore",
+      "weight": 4,
+      "text": "a charcoal sketch nailed to a tree: a stair of stone descending into a great open mouth."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "a scorched ring in the grass where no plant grows, the soil still faintly warm."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "a ranger's cairn marking the dungeon road, three skulls set facing the deep as warning."
+    },
+    {
+      "kind": "lore",
+      "weight": 4,
+      "text": "fishermen swear the vale lake has no bottom, and that on still nights it breathes."
+    }
+  ]
+}

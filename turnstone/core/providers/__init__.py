@@ -1,0 +1,385 @@
+"""LLM provider adapters — pluggable backends for different APIs."""
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Any
+
+from turnstone.core.http_headers import checked_header_value
+from turnstone.core.providers._http_client import shutdown_on_close
+from turnstone.core.providers._openai import OpenAIProvider
+from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+from turnstone.core.providers._protocol import (
+    CompletionResult,
+    ContextWindowExceededError,
+    IncompleteStreamError,
+    LLMProvider,
+    ModelCapabilities,
+    StreamChunk,
+    ToolCallDelta,
+    UsageInfo,
+    accumulate_tool_call_delta,
+    drain_stream,
+    merge_usage,
+    refuse_credential_headers,
+    thinking_off_template_kwargs,
+    transport_guarded,
+)
+from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
+
+__all__ = [
+    "ANTHROPIC_PROTOCOL_PROVIDERS",
+    "ANTHROPIC_WORKSPACE_HEADER",
+    "CompletionResult",
+    "ContextWindowExceededError",
+    "IncompleteStreamError",
+    "LLMProvider",
+    "ModelCapabilities",
+    "OpenAIChatCompletionsProvider",
+    "OpenAIProvider",
+    "OpenAIResponsesProvider",
+    "StreamChunk",
+    "ToolCallDelta",
+    "UsageInfo",
+    "XAIProvider",
+    "accumulate_tool_call_delta",
+    "create_client",
+    "create_provider",
+    "drain_stream",
+    "list_known_models",
+    "lookup_model_capabilities",
+    "merge_usage",
+    "refuse_credential_headers",
+    "thinking_off_template_kwargs",
+    "transport_guarded",
+]
+
+# Singleton instances (stateless, safe to share).
+# ``_openai_compat_responses_provider`` serves ``openai-compatible``
+# pinned to ``api_surface="responses"``: same request shape as cloud
+# OpenAI, but compat mode skips the commercial capability table — the
+# whole openai-compatible lane is operator-owned regardless of surface.
+# ``_xai_provider`` is its own singleton because it overrides
+# ``_build_kwargs`` to add ``*_call_output`` includes for xAI's hidden
+# server-tool outputs.
+_provider_lock = threading.Lock()
+_openai_provider = OpenAIResponsesProvider()
+_openai_compat_provider = OpenAIChatCompletionsProvider()
+_openai_compat_responses_provider = OpenAIResponsesProvider(compat=True)
+_xai_provider = XAIProvider()
+_anthropic_provider: LLMProvider | None = None
+_anthropic_compat_provider: LLMProvider | None = None
+_google_provider: LLMProvider | None = None
+
+
+_VALID_API_SURFACES = ("chat", "responses")
+
+
+def create_provider(
+    provider_name: str,
+    *,
+    api_surface: str | None = None,
+) -> LLMProvider:
+    """Return a provider adapter for the given provider name. Thread-safe.
+
+    *api_surface* selects the OpenAI-compatible API surface for
+    ``provider_name="openai-compatible"``:
+
+    - ``"chat"`` (default) → Chat Completions (vLLM, llama.cpp, SGLang).
+    - ``"responses"``      → Responses API (commercial OpenAI-compat
+      endpoints like Mistral cloud, or local servers that expose the
+      Responses surface).
+
+    Ignored for non-OpenAI providers — both Anthropic lanes
+    (``"anthropic"`` and ``"anthropic-compatible"``) talk to the
+    Messages API regardless of *api_surface*.
+    ``provider_name="anthropic-compatible"`` returns the Anthropic
+    adapter in compat mode (local servers exposing ``/v1/messages``,
+    e.g. vLLM).  ``provider_name="openai"`` always uses the Responses
+    API regardless of *api_surface*.
+
+    Note: ``openai-compatible`` + responses is served by a compat-mode
+    ``OpenAIResponsesProvider`` (operator-owned capabilities, no
+    commercial table), whose ``provider_name`` still reports
+    ``"openai"``.  Code that needs to distinguish the two must read
+    ``ModelConfig.provider`` and ``server_compat["api_surface"]``
+    rather than ``provider.provider_name``.
+    """
+    global _anthropic_provider, _anthropic_compat_provider, _google_provider  # noqa: PLW0603
+    if provider_name == "openai":
+        return _openai_provider
+    if provider_name == "openai-compatible":
+        normalised = (api_surface or "").strip().lower()
+        if normalised and normalised not in _VALID_API_SURFACES:
+            raise ValueError(
+                f"Unknown api_surface: {api_surface!r}. Supported: {', '.join(_VALID_API_SURFACES)}"
+            )
+        if normalised == "responses":
+            return _openai_compat_responses_provider
+        return _openai_compat_provider
+    if provider_name == "xai":
+        return _xai_provider
+    if provider_name == "anthropic":
+        with _provider_lock:
+            if _anthropic_provider is None:
+                from turnstone.core.providers._anthropic import AnthropicProvider
+
+                _anthropic_provider = AnthropicProvider()
+            return _anthropic_provider
+    if provider_name == "anthropic-compatible":
+        with _provider_lock:
+            if _anthropic_compat_provider is None:
+                from turnstone.core.providers._anthropic import AnthropicProvider
+
+                _anthropic_compat_provider = AnthropicProvider(compat=True)
+            return _anthropic_compat_provider
+    if provider_name == "google":
+        with _provider_lock:
+            if _google_provider is None:
+                from turnstone.core.providers._google import GoogleProvider
+
+                _google_provider = GoogleProvider()
+            return _google_provider
+    raise ValueError(
+        f"Unknown provider: {provider_name!r}. "
+        "Supported: openai, anthropic, google, openai-compatible, anthropic-compatible, xai"
+    )
+
+
+# Providers whose models live on an operator-run server: no capability
+# table, the window comes from the endpoint, and a bearer is optional.
+LOCAL_PROVIDERS: frozenset[str] = frozenset({"openai-compatible", "anthropic-compatible"})
+
+
+# Providers whose wire protocol is the Messages API: one provider class under two names (its
+# ``provider_name`` is only its compat flag) with one converter, so a native lane produced under
+# either name replays, verbatim, to a lane under the other; also the only lanes on which
+# ``server_compat.anthropic_workspace_id`` is ever sent.  The model registry re-exports this
+# for the console.
+ANTHROPIC_PROTOCOL_PROVIDERS: frozenset[str] = frozenset({"anthropic", "anthropic-compatible"})
+
+
+def replay_family(producer: str) -> str:
+    """The provider class that replays a native lane produced under *producer*'s name.
+
+    The members of :data:`ANTHROPIC_PROTOCOL_PROVIDERS` are one family: a match on the name
+    alone would drop a lane's charge to zero across a switch between them while the payload
+    stayed the same.  The estimators compare families, not names.  Every other name is its own
+    family.
+    """
+    return "anthropic" if producer in ANTHROPIC_PROTOCOL_PROVIDERS else producer
+
+
+# Bearer an SDK client is built with for a local provider when the
+# definition has no key and the SDK's environment variable is unset. vLLM /
+# llama.cpp ignore it unless started with an API key; the SDKs refuse to
+# construct with neither a key nor their env var.
+LOCAL_PLACEHOLDER_API_KEY = "dummy"
+
+
+# Header that scopes an organization-level Anthropic API key to one workspace.
+# The SDK treats it as a client-level header: set once via ``default_headers``
+# it rides every request the client (and every ``with_options`` copy of it)
+# makes — messages, model listing, the doctor probe — and survives the SDK's
+# per-request header merge.
+ANTHROPIC_WORKSPACE_HEADER = "anthropic-workspace-id"
+
+
+# The variables each SDK reads its credential from when it is passed none, and the client
+# argument each one goes in when passed explicitly.
+_OPENAI_SDK_VARIABLES = {"OPENAI_API_KEY": "api_key"}
+_ANTHROPIC_SDK_VARIABLES = {"ANTHROPIC_API_KEY": "api_key", "ANTHROPIC_AUTH_TOKEN": "auth_token"}
+
+
+def _sdk_variable_credentials(variables: dict[str, str]) -> dict[str, str]:
+    """The SDK's credential variable, cleaned, as a client argument; ``{}`` when it needs none.
+
+    The SDK uses only the first of its *variables* that is set (the Anthropic SDK holds one
+    credential, ``ANTHROPIC_API_KEY`` before ``ANTHROPIC_AUTH_TOKEN``) and reads it verbatim, and
+    a value read from a file keeps a line break no header can carry, so such a value follows the
+    rule every key does (:func:`~turnstone.core.http_headers.checked_header_value`) and goes to
+    the SDK explicitly. A value that already fits, or none set, stays the SDK's to read. A value
+    the rule refuses raises :class:`~turnstone.core.http_headers.HeaderValueError` (a
+    ``ValueError``) naming the variable.
+    """
+    for variable, argument in variables.items():
+        value = os.environ.get(variable, "")
+        if value:
+            cleaned = checked_header_value(value, variable)
+            return {argument: cleaned} if cleaned != value else {}
+    return {}
+
+
+def create_client(
+    provider_name: str, *, base_url: str, api_key: str, workspace_id: str = ""
+) -> Any:
+    """Create an SDK client for the given provider.
+
+    An empty *api_key* is converted to ``None`` so that the underlying
+    SDK can fall back to its own environment-variable lookup (e.g.
+    ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``).  Passing an empty
+    string would short-circuit the SDK's env-var check and raise a
+    "Missing credentials" error even when the env var is set.
+
+    A local provider with neither a key nor the env var gets
+    :data:`LOCAL_PLACEHOLDER_API_KEY` so the client still constructs; a
+    commercial provider in that state fails the way the SDK dictates. An env
+    var a header cannot carry as it is gets the rule every key follows
+    (:func:`_sdk_variable_credentials`).
+
+    *workspace_id* (the definition's ``server_compat.anthropic_workspace_id``)
+    pins the :data:`ANTHROPIC_WORKSPACE_HEADER` on the Anthropic-protocol
+    lanes; an organization-level key in a multi-workspace organization is
+    refused by the API without it.  Ignored for every other provider — the
+    console refuses to store it there.
+    """
+    resolved_key: str | None = api_key if api_key else None
+    if provider_name in ("openai", "openai-compatible", "google", "xai"):
+        from openai import DefaultHttpxClient, OpenAI
+
+        if provider_name == "openai-compatible" and not base_url:
+            # The lane targets an operator-run server; without a base_url the
+            # SDK would default to https://api.openai.com/v1 and send the
+            # prompts meant for that server to the commercial API. Same
+            # posture as the anthropic-compatible arm below.
+            raise ValueError(
+                "openai-compatible requires base_url (the server's /v1 root, "
+                "e.g. http://your-vllm-host:8000/v1)"
+            )
+        if not base_url and provider_name == "google":
+            from turnstone.core.providers._google import GOOGLE_DEFAULT_BASE_URL
+
+            base_url = GOOGLE_DEFAULT_BASE_URL
+        elif not base_url and provider_name == "xai":
+            base_url = XAI_DEFAULT_BASE_URL
+        local_without_key = provider_name in LOCAL_PROVIDERS and not os.environ.get(
+            "OPENAI_API_KEY"
+        )
+        if resolved_key is None and local_without_key:
+            resolved_key = LOCAL_PLACEHOLDER_API_KEY
+        openai_key = resolved_key or _sdk_variable_credentials(_OPENAI_SDK_VARIABLES).get("api_key")
+        http_client = shutdown_on_close(DefaultHttpxClient())
+        if base_url:
+            return OpenAI(base_url=base_url, api_key=openai_key, http_client=http_client)
+        return OpenAI(api_key=openai_key, http_client=http_client)
+    if provider_name in ("anthropic", "anthropic-compatible"):
+        from turnstone.core.providers._anthropic import (
+            _ensure_anthropic,
+            send_api_key_as_x_api_key,
+        )
+
+        anthropic = _ensure_anthropic()
+        local_without_key = provider_name in LOCAL_PROVIDERS and not os.environ.get(
+            "ANTHROPIC_API_KEY"
+        )
+        if resolved_key is None and local_without_key:
+            resolved_key = LOCAL_PLACEHOLDER_API_KEY
+        kwargs: dict[str, Any] = {}
+        if resolved_key is not None:
+            kwargs["api_key"] = resolved_key
+        else:
+            kwargs.update(_sdk_variable_credentials(_ANTHROPIC_SDK_VARIABLES))
+        if workspace_id:
+            kwargs["default_headers"] = {ANTHROPIC_WORKSPACE_HEADER: workspace_id}
+        if provider_name == "anthropic-compatible":
+            # The lane targets local /v1/messages servers; without a
+            # base_url the SDK would default to https://api.anthropic.com
+            # and send compat-shaped requests to the commercial API.
+            if not base_url:
+                raise ValueError(
+                    "anthropic-compatible requires base_url (the server root, "
+                    "e.g. http://your-vllm-host:8000)"
+                )
+            # The Anthropic SDK appends /v1/... to base_url, so a
+            # /v1-suffixed URL (the openai-compatible convention) would
+            # request /v1/v1/messages and 404.  Tolerate the suffix.
+            # Keep the verbatim value when stripping would empty it
+            # (base_url of exactly "/v1") so the typo still fails loudly
+            # instead of silently retargeting the SDK's prod default.
+            stripped = base_url.rstrip("/").removesuffix("/v1")
+            base_url = stripped or base_url
+        if base_url and base_url != "https://api.anthropic.com":
+            kwargs["base_url"] = base_url
+        # An API key, passed here or read by the SDK from ANTHROPIC_API_KEY, keeps the header
+        # SDK 1.x sent it in (send_api_key_as_x_api_key); an auth token, a profile or workload
+        # identity keeps the SDK's bearer.  A redirect would carry X-Api-Key to its target, even
+        # on another host (the HTTP client strips only Authorization there), so a client holding
+        # an API key follows none: a 3xx surfaces as an error.
+        sends_api_key = "api_key" in kwargs or (
+            "auth_token" not in kwargs and bool(os.environ.get("ANTHROPIC_API_KEY"))
+        )
+        if sends_api_key:
+            http_client = anthropic.DefaultHttpxClient(
+                auth=send_api_key_as_x_api_key, follow_redirects=False
+            )
+        else:
+            http_client = anthropic.DefaultHttpxClient()
+        kwargs["http_client"] = shutdown_on_close(http_client)
+        return anthropic.Anthropic(**kwargs)
+    raise ValueError(
+        f"Unknown provider: {provider_name!r}. "
+        "Supported: openai, anthropic, google, openai-compatible, anthropic-compatible, xai"
+    )
+
+
+def _capabilities_dict(caps: ModelCapabilities) -> dict[str, Any]:
+    """*caps* as a dict with JSON-friendly values (tuples converted to lists)."""
+    import dataclasses
+
+    result = dataclasses.asdict(caps)
+    for key, val in result.items():
+        if isinstance(val, tuple):
+            result[key] = list(val)
+    return result
+
+
+def lookup_model_capabilities(provider: str, model: str) -> dict[str, Any] | None:
+    """Return static capabilities for a known model, or ``None`` if unknown.
+
+    The returned dict has JSON-friendly values (tuples converted to lists).
+    Returns ``None`` for ``openai-compatible`` and ``anthropic-compatible``
+    (no static table for local models).
+    """
+    if provider in LOCAL_PROVIDERS:
+        return None
+    prov = create_provider(provider)
+    caps = prov.get_capabilities(model)
+    default = prov.get_capabilities("")
+    if caps is default:
+        return None
+    return _capabilities_dict(caps)
+
+
+def static_model_capabilities(provider: str, model: str) -> dict[str, Any] | None:
+    """The provider's static row for *model*, as a JSON-friendly dict, for display.
+
+    Unlike :func:`lookup_model_capabilities`, an id with no table row gets the
+    provider's default row rather than ``None``.  Operator capability overrides
+    are not applied; a stored definition's effective capabilities come from
+    :func:`turnstone.core.model_turn.resolve_capabilities`.  Returns ``None``
+    for ``openai-compatible`` and ``anthropic-compatible`` (no static table for
+    local models).
+    """
+    if provider in LOCAL_PROVIDERS:
+        return None
+    return _capabilities_dict(create_provider(provider).get_capabilities(model))
+
+
+def list_known_models(provider: str) -> list[str]:
+    """Return the model name prefixes in the static capability table."""
+    if provider == "openai":
+        from turnstone.core.providers._openai_common import OPENAI_CAPABILITIES
+
+        return sorted(OPENAI_CAPABILITIES.keys())
+    if provider == "anthropic":
+        from turnstone.core.providers._anthropic import _ANTHROPIC_CAPABILITIES
+
+        return sorted(_ANTHROPIC_CAPABILITIES.keys())
+    if provider == "xai":
+        from turnstone.core.providers._xai import GROK_CAPABILITIES
+
+        return sorted(GROK_CAPABILITIES.keys())
+    # Google models change frequently — no static table.
+    return []

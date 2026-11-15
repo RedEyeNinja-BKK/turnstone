@@ -1,0 +1,8160 @@
+"""Tests for turnstone.core.providers — protocol, OpenAI provider, Anthropic provider."""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, ClassVar
+from unittest.mock import MagicMock, PropertyMock, patch
+
+import pytest
+
+from tests._sdk_clients import anthropic_module_mock, assert_built_with
+from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
+from turnstone.core.compaction import resolve_context_usage
+from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+from turnstone.core.lowering import repair_wire_messages
+from turnstone.core.providers import create_provider
+from turnstone.core.providers._openai import OpenAIProvider
+from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._openai_common import (
+    OPENAI_CAPABILITIES,
+    OPENAI_COMPAT_DEFAULT,
+    apply_cache_retention,
+    apply_temperature_and_effort,
+    apply_tool_search,
+    extract_usage,
+    format_citations,
+    lookup_openai_capabilities,
+    sanitize_messages,
+)
+from turnstone.core.providers._protocol import (
+    CompletionResult,
+    LLMProvider,
+    ModelCapabilities,
+    ProviderRequestMetrics,
+    StreamChunk,
+    ToolCallDelta,
+    UsageInfo,
+    drain_stream,
+    request_uses_native_tools,
+    serialized_tool_chars,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Prepared request facts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", ["openai-compatible", "openai", "anthropic-compatible"])
+@pytest.mark.parametrize(
+    "mode", ["none", "client", "search", "deferred", "extra_native", "extra_disable", "mcp"]
+)
+def test_prepared_request_reports_native_tool_posture(family, mode):
+    provider = create_provider(family)
+    client = MagicMock()
+    client.chat.completions.create.return_value = iter([])
+    client.responses.create.return_value = iter([])
+    client.messages.stream.return_value.__enter__.return_value = iter([])
+    tool_name = "web_search" if mode in ("search", "extra_disable") else "lookup"
+    tools = (
+        None
+        if mode == "none"
+        else [
+            {
+                "type": "function",
+                "function": {"name": tool_name, "parameters": {}},
+            }
+        ]
+    )
+    extra = None
+    if mode == "extra_native":
+        extra = {"tools": [{"type": "code_interpreter"}]}
+    elif mode == "extra_disable":
+        extra = {"tools": None, "web_search_options": None}
+    elif mode == "mcp":
+        extra = {
+            "mcp_servers": [{"type": "url", "name": "remote", "url": "https://example.com/mcp"}]
+        }
+    metrics = []
+    stream = provider.create_streaming(
+        client=client,
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        capabilities=ModelCapabilities(
+            supports_web_search=True,
+            supports_tool_search=True,
+        ),
+        deferred_names=frozenset({"lookup"}) if mode == "deferred" else None,
+        extra_params=extra,
+        request_metrics_ref=metrics,
+    )
+    list(stream)
+    # The Responses adapter does not forward extra_params. Its metrics must
+    # describe what was actually prepared, not the caller's requested override.
+    native = mode == "search" or (mode == "deferred" and family != "openai-compatible")
+    if family == "openai":
+        native = native or mode == "extra_disable"
+    elif family == "openai-compatible":
+        # Search-model capability is intrinsic on the Chat surface, even when
+        # the final request has no search option or explicitly sends null.
+        native = True
+    else:
+        native = native or mode in ("extra_native", "mcp")
+    assert len(metrics) == 1
+    assert metrics[0].native_tools_enabled is native
+
+
+@pytest.mark.parametrize(
+    "body,native",
+    [
+        ({"tools": [{"type": "function"}]}, False),
+        ({"tools": [{"type": "function", "defer_loading": True}]}, False),
+        ({"extra_body": None}, False),
+        ({"tools": [{}]}, True),
+        ({"tools": ["unknown"]}, True),
+        ({"tools": {"type": "function"}}, True),
+        ({"web_search_options": {}}, True),
+        ({"tools": [{"type": "code_exec"}], "extra_body": {"tools": None}}, False),
+    ],
+)
+def test_native_tool_posture_handles_overrides_and_unknown_shapes(body, native):
+    assert request_uses_native_tools(body) is native
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _openai_stream_chunk(
+    *,
+    content: str | None = None,
+    reasoning: str | None = None,
+    reasoning_content: str | None = None,
+    tool_calls: list[MagicMock] | None = None,
+    finish_reason: str | None = None,
+    usage: MagicMock | None = None,
+    empty_choices: bool = False,
+) -> MagicMock:
+    """Build a mock OpenAI streaming chunk.
+
+    Shape twin of ``tests/_session_helpers.fake_chat_stream`` (which
+    builds whole scripted streams on SimpleNamespace); consolidate onto
+    one fake when either next changes shape.
+    """
+    chunk = MagicMock()
+    if empty_choices:
+        chunk.choices = []
+        chunk.usage = usage
+        return chunk
+
+    delta = MagicMock()
+    delta.content = content
+    delta.tool_calls = tool_calls
+
+    # Reasoning attributes accessed via getattr
+    type(delta).reasoning = PropertyMock(return_value=reasoning)
+    type(delta).reasoning_content = PropertyMock(return_value=reasoning_content)
+
+    choice = MagicMock()
+    choice.delta = delta
+    choice.finish_reason = finish_reason
+
+    chunk.choices = [choice]
+    chunk.usage = usage
+    return chunk
+
+
+def _openai_tool_call_delta(
+    *,
+    index: int = 0,
+    tc_id: str | None = None,
+    name: str | None = None,
+    arguments: str | None = None,
+) -> MagicMock:
+    """Build a mock OpenAI tool call delta within a streaming chunk."""
+    tcd = MagicMock()
+    tcd.index = index
+    tcd.id = tc_id
+    tcd.function = MagicMock()
+    tcd.function.name = name
+    tcd.function.arguments = arguments
+    return tcd
+
+
+def _anthropic_event(
+    event_type: str,
+    **kwargs: Any,
+) -> MagicMock:
+    """Build a mock Anthropic streaming event."""
+    event = MagicMock()
+    event.type = event_type
+
+    if event_type == "content_block_start":
+        block = MagicMock()
+        block.type = kwargs.get("block_type", "text")
+        block.id = kwargs.get("block_id", "")
+        block.name = kwargs.get("block_name", "")
+        event.content_block = block
+        event.index = kwargs.get("index", 0)
+
+    elif event_type == "content_block_delta":
+        delta = MagicMock()
+        delta.type = kwargs.get("delta_type", "text_delta")
+        delta.text = kwargs.get("text", "")
+        delta.thinking = kwargs.get("thinking", "")
+        delta.signature = kwargs.get("signature", "")
+        delta.partial_json = kwargs.get("partial_json", "")
+        event.delta = delta
+        event.index = kwargs.get("index", 0)
+
+    elif event_type == "message_delta":
+        if "usage_output_tokens" in kwargs:
+            usage = MagicMock()
+            usage.input_tokens = kwargs.get("usage_input_tokens", 0)
+            usage.output_tokens = kwargs.get("usage_output_tokens", 0)
+            event.usage = usage
+        else:
+            event.usage = None
+        stop_delta = MagicMock()
+        stop_delta.stop_reason = kwargs.get("stop_reason")
+        event.delta = stop_delta
+
+    elif event_type == "content_block_stop":
+        event.index = kwargs.get("index", 0)
+
+    elif event_type == "message_start":
+        msg = MagicMock()
+        if "usage_input_tokens" in kwargs:
+            msg_usage = MagicMock()
+            msg_usage.input_tokens = kwargs.get("usage_input_tokens", 0)
+            msg_usage.cache_creation_input_tokens = 0
+            msg_usage.cache_read_input_tokens = 0
+            msg.usage = msg_usage
+        else:
+            msg.usage = None
+        event.message = msg
+
+    return event
+
+
+# ===========================================================================
+# TestOpenAIProvider
+# ===========================================================================
+
+
+class TestOpenAIProvider:
+    """Tests for the OpenAI Chat Completions provider adapter."""
+
+    def setup_method(self) -> None:
+        self.provider = OpenAIProvider()
+
+    def test_provider_name(self) -> None:
+        assert self.provider.provider_name == "openai-compatible"
+
+    def test_abort_during_request_metrics_prevents_dispatch(self) -> None:
+        """The last abort read follows final-native metrics preparation."""
+        client = MagicMock()
+        cancel_ref = StreamAbortRef()
+
+        class _AbortOnAppend(list[ProviderRequestMetrics]):
+            def append(self, item: ProviderRequestMetrics) -> None:
+                super().append(item)
+                cancel_ref.abort()
+
+        with pytest.raises(DeadlineCancelledError):
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+                request_metrics_ref=_AbortOnAppend(),
+            )
+
+        client.chat.completions.create.assert_not_called()
+
+    # -- reasoning template kwargs (_finalize_extra_body) ---------------------
+
+    def test_thinking_mode_none_does_nothing(self) -> None:
+        """No toggle injected when thinking_mode is 'none'; operator keys pass."""
+        caps = ModelCapabilities(thinking_mode="none")
+        extra_params = {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        eb = self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert eb is not None
+        assert "enable_thinking" not in eb["chat_template_kwargs"]
+        assert eb["chat_template_kwargs"]["reasoning_effort"] == "medium"
+
+    def test_thinking_mode_manual_injects_param(self) -> None:
+        """Manual thinking mode injects enable_thinking into chat_template_kwargs."""
+        caps = ModelCapabilities(thinking_mode="manual")
+        extra_params = {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        eb = self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert eb is not None
+        assert eb["chat_template_kwargs"]["enable_thinking"] is True
+        assert eb["chat_template_kwargs"]["reasoning_effort"] == "medium"
+
+    def test_thinking_mode_manual_knob_none_disables(self) -> None:
+        """Effort knob "none" turns the template toggle off, not just quiet."""
+        caps = ModelCapabilities(thinking_mode="manual")
+        eb = self.provider._finalize_extra_body(None, caps, "none")
+        assert eb == {"chat_template_kwargs": {"enable_thinking": False}}
+
+    def test_thinking_mode_custom_param(self) -> None:
+        """Custom thinking_param (e.g. Granite's 'thinking') is used."""
+        caps = ModelCapabilities(thinking_mode="manual", thinking_param="thinking")
+        eb = self.provider._finalize_extra_body(None, caps, "medium")
+        assert eb == {"chat_template_kwargs": {"thinking": True}}
+
+    def test_thinking_mode_does_not_override_explicit(self) -> None:
+        """If operator explicitly set the param to False, provider respects it."""
+        caps = ModelCapabilities(thinking_mode="manual")
+        extra_params = {"chat_template_kwargs": {"enable_thinking": False}}
+        eb = self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert eb is not None
+        assert eb["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_thinking_mode_adaptive_never_knob_disables(self) -> None:
+        """Adaptive = model self-regulates; knob "none" must not force false."""
+        caps = ModelCapabilities(thinking_mode="adaptive")
+        for knob in ("high", "none", ""):
+            eb = self.provider._finalize_extra_body(None, caps, knob)
+            assert eb == {"chat_template_kwargs": {"enable_thinking": True}}
+
+    def test_effort_param_suppresses_flat_reasoning_effort(self) -> None:
+        """Declaring the ctk effort channel must not double-send the flat param."""
+        from turnstone.core.providers._openai_common import apply_temperature_and_effort
+
+        caps = ModelCapabilities(
+            effort_param="reasoning_effort",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, 0.5, "medium")
+        assert "reasoning_effort" not in kwargs
+        # Without effort_param the flat param still flows (commercial path).
+        flat_caps = ModelCapabilities(reasoning_effort_values=("low", "medium", "high"))
+        kwargs = {}
+        apply_temperature_and_effort(kwargs, flat_caps, 0.5, "medium")
+        assert kwargs["reasoning_effort"] == "medium"
+
+    def test_effort_param_injects_knob_value(self) -> None:
+        """effort_param carries the knob into chat_template_kwargs (gpt-oss);
+        a knob above the declared ceiling rides the ceiling, not the default."""
+        caps = ModelCapabilities(
+            thinking_mode="none",
+            effort_param="reasoning_effort",
+            reasoning_effort_values=("low", "medium", "high"),
+            default_reasoning_effort="medium",
+        )
+        eb = self.provider._finalize_extra_body(None, caps, "xhigh")
+        assert eb == {"chat_template_kwargs": {"reasoning_effort": "high"}}
+        assert self.provider._finalize_extra_body(None, caps, "none") is None
+
+    def test_caller_extra_params_not_mutated(self) -> None:
+        """The session dict and its ctk sub-dict survive injection untouched."""
+        caps = ModelCapabilities(thinking_mode="manual")
+        extra_params = {"chat_template_kwargs": {"foo": 1}}
+        self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert extra_params == {"chat_template_kwargs": {"foo": 1}}
+
+    # -- _sanitize_messages ---------------------------------------------------
+
+    def test_sanitize_messages_none_content_no_tool_calls(self) -> None:
+        msgs = [{"role": "assistant", "content": None}]
+        assert sanitize_messages(msgs) == [{"role": "assistant", "content": ""}]
+
+    def test_sanitize_messages_none_content_with_tool_calls(self) -> None:
+        msgs = [{"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]}]
+        result = sanitize_messages(msgs)
+        assert result[0]["content"] is None
+        assert result[0]["tool_calls"] == [{"id": "1"}]
+
+    def test_sanitize_messages_empty_string_passthrough(self) -> None:
+        msgs = [{"role": "assistant", "content": ""}]
+        assert sanitize_messages(msgs) == msgs
+
+    def test_sanitize_messages_non_assistant_unchanged(self) -> None:
+        msgs = [{"role": "user", "content": None}]
+        result = sanitize_messages(msgs)
+        assert result[0]["content"] is None
+
+    def test_sanitize_messages_does_not_mutate_original(self) -> None:
+        original = {"role": "assistant", "content": None}
+        sanitize_messages([original])
+        assert original["content"] is None
+
+    def test_sanitize_messages_strips_underscore_sibling_keys(self) -> None:
+        """Internal sibling metadata (``_reminders``, ``_reminders_delivered``,
+        ``_attachments_meta``, ``_provider_content``) must be stripped
+        before the wire — the OpenAI-compat APIs reject unknown fields."""
+        msgs = [
+            {
+                "role": "user",
+                "content": "hi",
+                "_reminders": [{"type": "correction", "text": "watch"}],
+                "_reminders_delivered": True,
+                "_attachments_meta": [{"kind": "image"}],
+            }
+        ]
+        result = sanitize_messages(msgs)
+        assert result == [{"role": "user", "content": "hi"}]
+        assert "_reminders" not in result[0]
+        assert "_reminders_delivered" not in result[0]
+        assert "_attachments_meta" not in result[0]
+
+    # -- sanitize_messages: orphan detection -----------------------------------
+
+    def test_sanitize_orphaned_tool_call_synthesized(self) -> None:
+        """Tool_call with no matching tool result gets a synthetic error result."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "user", "content": "next"},
+        ]
+        result = sanitize_messages(repair_wire_messages(msgs))
+        assert len(result) == 3
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_1"
+        assert "cancelled" in result[1]["content"]
+        assert result[2]["role"] == "user"
+
+    def test_sanitize_partial_results(self) -> None:
+        """Only the missing tool_call gets a synthetic result."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        result = sanitize_messages(repair_wire_messages(msgs))
+        assert len(result) == 3
+        assert result[1]["tool_call_id"] == "call_1"
+        assert result[1]["content"] == "ok"
+        assert result[2]["role"] == "tool"
+        assert result[2]["tool_call_id"] == "call_2"
+        assert "cancelled" in result[2]["content"]
+
+    def test_sanitize_complete_results_unchanged(self) -> None:
+        """All tool_calls paired → no changes."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "user", "content": "thanks"},
+        ]
+        result = sanitize_messages(msgs)
+        assert len(result) == 3
+        assert result[0]["tool_calls"][0]["id"] == "call_1"
+        assert result[1]["content"] == "ok"
+        assert result[2]["role"] == "user"
+
+    def test_sanitize_trailing_orphan(self) -> None:
+        """Orphaned tool_call at end of conversation (no following messages)."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+        ]
+        result = sanitize_messages(repair_wire_messages(msgs))
+        assert len(result) == 2
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_1"
+
+    def test_sanitize_orphaned_tool_result_dropped(self) -> None:
+        """Tool result with no matching tool_call in preceding assistant → dropped."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_ORPHAN", "content": "stale"},
+        ]
+        result = sanitize_messages(msgs)
+        assert len(result) == 2
+        assert result[1]["tool_call_id"] == "call_1"
+
+    def test_sanitize_empty_tool_call_id_filled(self) -> None:
+        """Empty tool_call IDs get synthetic values; tool results are remapped to match."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "", "content": "ok"},
+        ]
+        result = sanitize_messages(msgs)
+        new_id = result[0]["tool_calls"][0]["id"]
+        assert new_id.startswith("call_")
+        assert len(new_id) > 10
+        # Tool result must have been remapped to match
+        assert result[1]["tool_call_id"] == new_id
+        # No synthetic result needed — the pairing is complete
+        assert len(result) == 2
+
+    def test_sanitize_empty_tool_call_id_orphan_synthesized(self) -> None:
+        """An empty-id tool_call with no result: sanitize back-fills the id AND
+        synthesizes its cancellation (the upstream repair can't see an id-less
+        call, so this lane owns it)."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                ],
+            },
+            {"role": "user", "content": "never mind"},
+        ]
+        result = sanitize_messages(msgs)
+        new_id = result[0]["tool_calls"][0]["id"]
+        assert new_id.startswith("call_")
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == new_id  # paired to the back-filled id
+        assert "cancelled" in tool_msgs[0]["content"].lower()
+
+    def test_sanitize_stale_result_with_orphan(self) -> None:
+        """Stale tool results are dropped even when orphaned calls are present."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_STALE", "content": "stale"},
+        ]
+        result = sanitize_messages(repair_wire_messages(msgs))
+        result_tc_ids = [m["tool_call_id"] for m in result if m.get("role") == "tool"]
+        assert "call_STALE" not in result_tc_ids
+        assert "call_1" in result_tc_ids
+        assert "call_2" in result_tc_ids  # synthesized
+
+    def test_sanitize_orphan_no_mutation(self) -> None:
+        """Original messages and dicts are not mutated by orphan detection."""
+        tc = {"id": "", "type": "function", "function": {"name": "a", "arguments": "{}"}}
+        msg = {"role": "assistant", "content": None, "tool_calls": [tc]}
+        sanitize_messages([msg])
+        assert tc["id"] == ""  # original dict untouched
+        assert msg["tool_calls"][0]["id"] == ""
+
+    def test_sanitize_repeated_ids_across_turns(self) -> None:
+        """Reused tool_call IDs across turns are handled per-turn, not globally."""
+        msgs = [
+            # Turn 1: call_1 fully paired
+            {"role": "user", "content": "do A"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            # Turn 2: reuses call_1 but has no result → must be synthesized
+            {"role": "user", "content": "do B"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+        ]
+        result = sanitize_messages(repair_wire_messages(msgs))
+        # Turn 2's orphaned call_1 should get a synthetic result
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2  # one real from turn 1, one synthetic from turn 2
+
+    def test_sanitize_drops_is_error_from_tool_messages(self) -> None:
+        """``is_error`` is the neutral error flag (Anthropic renders it); the
+        OpenAI-compatible tool message has no such field, so it is dropped."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "boom", "is_error": True},
+        ]
+        result = sanitize_messages(msgs)
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        assert "is_error" not in tool_msg
+        assert tool_msg["content"] == "boom"  # payload otherwise intact
+
+    # -- convert_tools --------------------------------------------------------
+
+    def test_convert_tools_passthrough(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ]
+        assert self.provider.convert_tools(tools) is tools
+
+    def test_streaming_content(self) -> None:
+        chunks = [
+            _openai_stream_chunk(content="Hello"),
+            _openai_stream_chunk(content=" world"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        # No synthesized finish chunk: the lax-server shim is disarmed by
+        # default (``finish_reason_optional=False``), so a clean finish-less
+        # end stays visibly finish-less for the drain gate to catch.
+        assert len(results) == 2
+        assert results[0].content_delta == "Hello"
+        assert results[1].content_delta == " world"
+
+    def test_streaming_reasoning(self) -> None:
+        chunks = [
+            _openai_stream_chunk(reasoning_content="thinking..."),
+            _openai_stream_chunk(reasoning_content="more thought"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="qwen3-32b",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert len(results) == 2
+        assert results[0].reasoning_delta == "thinking..."
+        assert results[1].reasoning_delta == "more thought"
+
+    def test_streaming_tool_calls(self) -> None:
+        tc1 = _openai_tool_call_delta(index=0, tc_id="call_1", name="read_file")
+        tc2 = _openai_tool_call_delta(index=0, arguments='{"path":')
+        tc3 = _openai_tool_call_delta(index=0, arguments='"foo.py"}')
+
+        chunks = [
+            _openai_stream_chunk(tool_calls=[tc1]),
+            _openai_stream_chunk(tool_calls=[tc2]),
+            _openai_stream_chunk(tool_calls=[tc3]),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "read a file"}],
+            )
+        )
+        # No synthesized finish chunk: the lax-server shim is disarmed by
+        # default (``finish_reason_optional=False``).
+        assert len(results) == 3
+        assert results[0].tool_call_deltas[0].id == "call_1"
+        assert results[0].tool_call_deltas[0].name == "read_file"
+        assert results[1].tool_call_deltas[0].arguments_delta == '{"path":'
+        assert results[2].tool_call_deltas[0].arguments_delta == '"foo.py"}'
+
+    def test_streaming_usage(self) -> None:
+        usage = MagicMock()
+        usage.prompt_tokens = 10
+        usage.completion_tokens = 20
+        usage.total_tokens = 30
+
+        chunks = [
+            _openai_stream_chunk(content="Hi"),
+            _openai_stream_chunk(empty_choices=True, usage=usage),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        # Last yielded chunk should carry usage
+        usage_chunk = [r for r in results if r.usage is not None]
+        assert len(usage_chunk) == 1
+        assert usage_chunk[0].usage is not None
+        assert usage_chunk[0].usage.prompt_tokens == 10
+        assert usage_chunk[0].usage.completion_tokens == 20
+        assert usage_chunk[0].usage.total_tokens == 30
+
+    def test_streaming_finish_reason(self) -> None:
+        chunks = [
+            _openai_stream_chunk(content="done"),
+            _openai_stream_chunk(finish_reason="stop"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        finish_chunks = [r for r in results if r.finish_reason is not None]
+        assert len(finish_chunks) == 1
+        assert finish_chunks[0].finish_reason == "stop"
+
+    def test_streaming_finish_reason_tool_calls(self) -> None:
+        tc = _openai_tool_call_delta(index=0, tc_id="call_1", name="fn")
+        chunks = [
+            _openai_stream_chunk(tool_calls=[tc]),
+            _openai_stream_chunk(finish_reason="tool_calls"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        finish_chunks = [r for r in results if r.finish_reason is not None]
+        assert finish_chunks[0].finish_reason == "tool_calls"
+
+    def test_streaming_is_first(self) -> None:
+        chunks = [
+            _openai_stream_chunk(content="A"),
+            _openai_stream_chunk(content="B"),
+            _openai_stream_chunk(content="C"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert results[0].is_first is True
+        assert results[1].is_first is False
+        assert results[2].is_first is False
+
+    def test_drained_stream_basic(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = fake_chat_stream(content="Hello world")
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert isinstance(result, CompletionResult)
+        assert result.content == "Hello world"
+        assert result.tool_calls is None
+        assert result.finish_reason == "stop"
+
+    def test_drained_stream_with_tools(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = fake_chat_stream(
+            tool_calls=[{"id": "call_abc", "name": "read_file", "arguments": '{"path": "foo.py"}'}],
+            finish_reason="tool_calls",
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "read"}],
+            )
+        )
+        assert result.content == ""
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_abc"
+        assert result.tool_calls[0]["type"] == "function"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "foo.py"}'
+        assert result.finish_reason == "tool_calls"
+
+    def _drain_chunks(self, chunks: list[Any], capabilities: ModelCapabilities | None = None):
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+        return drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="m",
+                messages=[{"role": "user", "content": "x"}],
+                capabilities=capabilities,
+            )
+        )
+
+    def test_streaming_remaps_index_degenerate_parallel_calls(self) -> None:
+        # Historical compat servers (older vLLM, some llama.cpp builds)
+        # stream every parallel call at index 0 as whole deltas.  The
+        # iterator opens a new slot when a delta's id contradicts its
+        # index's current call, so BOTH consumers (drain_stream and the
+        # chat loop's accumulator) see distinct calls; id-less argument
+        # fragments keep following their index's current slot.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="a", name="read", arguments='{"p": 1}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="b", name="write", arguments='{"p": 2}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["id"] for tc in result.tool_calls] == ["a", "b"]
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": 1}'
+        assert result.tool_calls[1]["function"]["arguments"] == '{"p": 2}'
+
+    def test_streaming_splits_idless_degenerate_parallel_calls(self) -> None:
+        # The same degenerate servers may omit ids entirely: a delta that
+        # ANNOUNCES a name for a slot that already accumulated arguments is
+        # a second whole call, not a fragment — without the split, two
+        # id-less calls fuse into one with concatenated garbage arguments.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='{"a": 1}')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="write", arguments='{"b": 2}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["read", "write"]
+        assert result.tool_calls[0]["function"]["arguments"] == '{"a": 1}'
+        assert result.tool_calls[1]["function"]["arguments"] == '{"b": 2}'
+
+    def test_repeated_id_and_name_header_fragments_stay_one_call(self) -> None:
+        # Some compat servers repeat the full id+name header on EVERY
+        # argument fragment.  Id equality proves same call — the
+        # reannounce split applies only to ID-LESS deltas, so this shape
+        # merges into one call with valid arguments (round-5 regression:
+        # the ungated heuristic split it into duplicate half-JSON calls).
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="call_A", name="read_file", arguments='{"path": '
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="call_A", name="read_file", arguments='"/tmp/x"}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/x"}'
+
+    def test_finishless_stream_raises_by_default(self) -> None:
+        # On a default lane a clean finish-less end is indistinguishable
+        # from a generation that died behind a clean-closing proxy/ASGI
+        # layer — the drain refuses to bless possibly-truncated text and
+        # raises (retryable) instead of storing half an answer.
+        from turnstone.core.providers import IncompleteStreamError
+
+        with pytest.raises(IncompleteStreamError):
+            self._drain_chunks([_openai_stream_chunk(content="half an ans")])
+
+    def test_finishless_stream_completes_with_declared_tolerance(self) -> None:
+        # ``finish_reason_optional`` (operator-declared: this server never
+        # sends finish reasons) re-arms the deleted non-streaming
+        # `or "stop"` default for clean ends that delivered output.
+        result = self._drain_chunks(
+            [_openai_stream_chunk(content="complete answer")],
+            capabilities=ModelCapabilities(finish_reason_optional=True),
+        )
+        assert result.content == "complete answer"
+        assert result.finish_reason == "stop"
+
+    def test_finishless_reasoning_only_stream_completes_with_tolerance(self) -> None:
+        # Reasoning counts as delivered output: a thinking model that spent
+        # its budget before emitting content is a completed generation on a
+        # lax server (the retired non-streaming path returned it with empty
+        # content and the reasoning captured), not a doomed retry loop.
+        result = self._drain_chunks(
+            [_openai_stream_chunk(reasoning_content="thought hard")],
+            capabilities=ModelCapabilities(finish_reason_optional=True),
+        )
+        assert result.content == ""
+        assert result.reasoning == "thought hard"
+        assert result.finish_reason == "stop"
+
+    def test_finishless_stream_with_no_output_still_raises(self) -> None:
+        # The shim is output-gated even when ARMED: an empty clean-close
+        # stream (dead generation, zero-chunk fakes) still hits the
+        # drain's complete-or-error gate.
+        from turnstone.core.providers import IncompleteStreamError
+
+        with pytest.raises(IncompleteStreamError):
+            self._drain_chunks([], capabilities=ModelCapabilities(finish_reason_optional=True))
+
+    def test_fragmented_single_call_does_not_split(self) -> None:
+        # The normal well-behaved shape — name announced once, arguments
+        # streamed in fragments — must stay ONE call.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, tc_id="a", name="read")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='{"p": ')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='"x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_idless_zero_arg_parallel_calls_split(self) -> None:
+        # Two id-less whole-delta announcements with NO arguments are two
+        # zero-argument parallel calls (the empty-args twin of the
+        # whole-delta shape) — fusing them would silently drop an action.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == [
+            "refresh_state",
+            "refresh_state",
+        ]
+
+    def test_idless_redundant_name_fragments_merge(self) -> None:
+        # An id-less server that repeats the name header on every argument
+        # fragment: mid-JSON the re-announce is a header, not a new call —
+        # the slotter consults argument completeness, so the fragments
+        # reassemble instead of splitting into malformed half-JSON calls.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='{"p": ')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='"x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_idless_name_mismatch_always_splits(self) -> None:
+        # A different name can never be the same call, whatever the
+        # argument state — catches a zero-arg call followed by an arg-ful
+        # sibling at the same wire index.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="read", arguments='{"p": "x"}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["refresh_state", "read"]
+        assert result.tool_calls[1]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_id_first_fragmented_call_stays_one_call(self) -> None:
+        # id → name → args across three fragments (the later two id-less):
+        # a slot with a KNOWN id never splits on id-less continuations —
+        # the call's first name fragment is not a re-announcement (round-7
+        # regression: it split into an unnamed id-bearing call plus a
+        # nameless-id twin).
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(tool_calls=[_openai_tool_call_delta(index=0, tc_id="call_1")]),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="get_weather")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='{"city": "x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_1"
+        assert result.tool_calls[0]["function"]["name"] == "get_weather"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"city": "x"}'
+
+    def test_idless_bare_name_footer_after_complete_args_merges(self) -> None:
+        # A bare same-name delta after the argument JSON closed is a
+        # redundant footer, not a second zero-argument call — splitting
+        # would run the side-effecting tool twice.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="write_file", arguments='{"x": 1}')
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="write_file")]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
+    def test_idless_name_first_then_args_with_repeated_name_merges(self) -> None:
+        # Name announced first (no arguments), then arguments arrive
+        # carrying the SAME name again: one call whose arguments are
+        # starting, not a zero-arg call plus an arg-ful twin.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(tool_calls=[_openai_tool_call_delta(index=0, name="read")]),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="read", arguments='{"p": "x"}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_drained_stream_usage(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = fake_chat_stream(
+            content="ok", prompt_tokens=100, completion_tokens=50
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 100
+        assert result.usage.completion_tokens == 50
+        assert result.usage.total_tokens == 150
+
+    def test_retryable_errors(self) -> None:
+        errors = self.provider.retryable_error_names
+        assert isinstance(errors, frozenset)
+        assert "APIError" in errors
+        assert "APIConnectionError" in errors
+        assert "RateLimitError" in errors
+        assert "Timeout" in errors
+        assert "APITimeoutError" in errors
+
+
+# ===========================================================================
+# TestAnthropicProvider
+# ===========================================================================
+
+
+class TestAnthropicProvider:
+    """Tests for the Anthropic native provider adapter."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_provider_name(self) -> None:
+        assert self.provider.provider_name == "anthropic"
+
+    def test_abort_after_lazy_manager_creation_prevents_dispatch(self) -> None:
+        """Anthropic performs its HTTP request in the manager's enter hook."""
+        client = MagicMock()
+        cancel_ref = StreamAbortRef()
+        manager = MagicMock()
+
+        def _build_manager(**_kwargs: Any) -> MagicMock:
+            cancel_ref.abort()
+            return manager
+
+        client.messages.stream.side_effect = _build_manager
+
+        with pytest.raises(DeadlineCancelledError):
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+            )
+
+        manager.__enter__.assert_not_called()
+
+    def test_convert_tools(self) -> None:
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file from disk",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        ]
+        result = self.provider.convert_tools(openai_tools)
+        assert len(result) == 2
+        assert result[0]["name"] == "read_file"
+        assert result[0]["description"] == "Read a file from disk"
+        assert result[0]["input_schema"]["type"] == "object"
+        assert "path" in result[0]["input_schema"]["properties"]
+        # No "type": "function" wrapper
+        assert "function" not in result[0]
+        assert "type" not in result[0]
+
+        assert result[1]["name"] == "write_file"
+
+    def test_message_conversion_basic(self) -> None:
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "How are you?"},
+        ]
+        system, converted = self.provider._convert_messages(messages)
+        assert system == "You are helpful."
+        assert len(converted) == 3
+        assert converted[0]["role"] == "user"
+        assert converted[0]["content"] == "Hello"
+        assert converted[1]["role"] == "assistant"
+        assert converted[1]["content"] == [{"type": "text", "text": "Hi there!"}]
+        assert converted[2]["role"] == "user"
+        assert converted[2]["content"] == "How are you?"
+
+    def test_message_conversion_tool_calls(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Let me check that.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "foo.py"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        assert len(converted) == 2
+        blocks = converted[0]["content"]
+        assert len(blocks) == 2
+        assert blocks[0] == {"type": "text", "text": "Let me check that."}
+        assert blocks[1]["type"] == "tool_use"
+        assert blocks[1]["id"] == "call_1"
+        assert blocks[1]["name"] == "read_file"
+        assert blocks[1]["input"] == {"path": "foo.py"}
+        # Tool result in user message
+        assert converted[1]["role"] == "user"
+
+    def test_message_conversion_tool_results(self) -> None:
+        messages = [
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents here"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "another result"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        assert len(converted) == 1
+        assert converted[0]["role"] == "user"
+        blocks = converted[0]["content"]
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "tool_result"
+        assert blocks[0]["tool_use_id"] == "call_1"
+        assert blocks[0]["content"] == "file contents here"
+        assert blocks[1]["type"] == "tool_result"
+        assert blocks[1]["tool_use_id"] == "call_2"
+        assert blocks[1]["content"] == "another result"
+
+    def test_message_conversion_alternating_merge(self) -> None:
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "user", "content": "Are you there?"},
+            {"role": "assistant", "content": "Yes"},
+            {"role": "assistant", "content": "I am here"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        assert len(converted) == 2
+        # First merged user message
+        assert converted[0]["role"] == "user"
+        assert converted[0]["content"] == [
+            {"type": "text", "text": "Hello"},
+            {"type": "text", "text": "Are you there?"},
+        ]
+        # Second merged assistant message
+        assert converted[1]["role"] == "assistant"
+        assert converted[1]["content"] == [
+            {"type": "text", "text": "Yes"},
+            {"type": "text", "text": "I am here"},
+        ]
+
+    def test_message_conversion_developer_role_as_system(self) -> None:
+        messages = [
+            {"role": "developer", "content": "System prompt via developer role."},
+            {"role": "user", "content": "Hi"},
+        ]
+        system, converted = self.provider._convert_messages(messages)
+        assert system == "System prompt via developer role."
+        assert len(converted) == 1
+        assert converted[0]["role"] == "user"
+
+    def test_message_conversion_multiple_system(self) -> None:
+        messages = [
+            {"role": "system", "content": "Part 1."},
+            {"role": "system", "content": "Part 2."},
+            {"role": "user", "content": "Go."},
+        ]
+        system, _ = self.provider._convert_messages(messages)
+        assert system == "Part 1.\n\nPart 2."
+
+    def test_mid_conversation_system_hoisted_when_not_native(self) -> None:
+        # Default (supports_mid_conversation_system=False): a system message
+        # after a user turn still hoists — non-native models rely on the fold
+        # pass having stripped operator turns before the converter sees them.
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "operator note"},
+        ]
+        system, converted = self.provider._convert_messages(messages)
+        assert "operator note" in system
+        assert all(m["role"] != "system" for m in converted)
+
+    def test_leading_system_hoists_even_when_native(self) -> None:
+        messages = [
+            {"role": "system", "content": "base prompt"},
+            {"role": "user", "content": "hi"},
+        ]
+        system, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert system == "base prompt"
+        assert [m["role"] for m in converted] == ["user"]
+
+    def test_mid_conversation_system_inline_when_native(self) -> None:
+        # The API rejects a system message right after an ordinary assistant
+        # turn (an idle wake leaves one there), so the converter keeps it inline
+        # behind a placeholder user turn.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        messages = [
+            {"role": "user", "content": "review this"},
+            {"role": "assistant", "content": "done"},
+            {"role": "system", "content": "from now on, add type hints"},
+        ]
+        system, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert system == ""  # nothing leading to hoist
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
+        assert converted[-1]["content"] == "from now on, add type hints"
+
+    def test_leading_empty_assistant_then_system_hoists_when_native(self) -> None:
+        # An assistant turn that converts to nothing (empty content, no
+        # tool_calls, no provider_content) still flips seen_non_system, but it
+        # appended nothing — so a following operator system turn must NOT become
+        # messages[0] (the API requires messages[0]=user).  It hoists into the
+        # system param instead.  Guards the bug where ``seen_non_system`` alone
+        # gated inline emission.
+        messages = [
+            {"role": "assistant", "content": ""},
+            {"role": "system", "content": "operator note"},
+            {"role": "user", "content": "hi"},
+        ]
+        system, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert "operator note" in system
+        assert converted[0]["role"] == "user"
+        assert not any(m["role"] == "system" for m in converted)
+
+    def test_consecutive_mid_conversation_system_coalesced_when_native(self) -> None:
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "system", "content": "first"},
+            {"role": "system", "content": "second"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        # _merge_consecutive coalesces the two system turns into one message
+        # (the API forbids consecutive system messages).
+        assert [m["role"] for m in converted] == ["user", "system"]
+        body = converted[1]["content"]
+        flat = (
+            body
+            if isinstance(body, str)
+            else " ".join(p.get("text", "") for p in body if isinstance(p, dict))
+        )
+        assert "first" in flat and "second" in flat
+
+    def test_mid_conversation_system_after_tool_result_when_native(self) -> None:
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "system", "content": "user said: also update changelog"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        # The operator turn lands after the tool_result user turn — a valid slot.
+        roles = [m["role"] for m in converted]
+        assert roles[-1] == "system"
+        assert roles[-2] == "user"  # the packed tool_result turn
+        assert converted[-1]["content"] == "user said: also update changelog"
+
+    @staticmethod
+    def _assert_system_placement_legal(converted: list[dict[str, Any]]) -> None:
+        """Every inline system message follows a user turn and precedes an
+        assistant turn or ends the array, as the Messages API requires."""
+        for i, msg in enumerate(converted):
+            if msg["role"] != "system":
+                continue
+            assert i > 0 and converted[i - 1]["role"] == "user", converted
+            assert i == len(converted) - 1 or converted[i + 1]["role"] == "assistant", converted
+
+    def test_system_before_user_turn_moves_after_it_when_native(self) -> None:
+        # Approval feedback appended after an advisory would put a user turn
+        # right after the system message, which the API rejects: the operator
+        # turn moves after the feedback and the two user turns merge, tool
+        # results first.
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "exit 1"},
+            {"role": "system", "content": "the tool failed"},
+            {"role": "user", "content": "approved; also check y"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        blocks = converted[2]["content"]
+        assert [b["type"] for b in blocks] == ["tool_result", "text"]
+        assert blocks[1]["text"] == "approved; also check y"
+        assert converted[3]["content"] == "the tool failed"
+        self._assert_system_placement_legal(converted)
+
+    def test_system_left_by_failed_wake_moves_after_next_user_turn_when_native(self) -> None:
+        # A wake whose request failed leaves its operator turn right after the
+        # assistant turn; the user's next message then lands after it.  The
+        # operator turn moves after that message, so no placeholder is needed.
+        messages = [
+            {"role": "user", "content": "start the job"},
+            {"role": "assistant", "content": "started"},
+            {"role": "system", "content": "the job finished"},
+            {"role": "user", "content": "status?"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == "status?"
+        assert converted[3]["content"] == "the job finished"
+        self._assert_system_placement_legal(converted)
+
+    def test_system_after_server_tool_result_keeps_position_when_native(self) -> None:
+        # The API also accepts a system message after an assistant turn that
+        # ends in a server tool result, so no placeholder goes there.
+        messages = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": [],
+                    },
+                ],
+            },
+            {"role": "system", "content": "note"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "system"]
+
+    def test_system_after_web_search_answer_gets_placeholder_when_native(self) -> None:
+        # A web-search turn usually ends in the model's text rather than the
+        # tool result, so a system message after it still needs the placeholder.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        messages = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": [],
+                    },
+                    {"type": "text", "text": "found it"},
+                ],
+            },
+            {"role": "system", "content": "note"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
+
+    @pytest.mark.parametrize(
+        "history",
+        [
+            [
+                {"role": "user", "content": "start the job"},
+                {"role": "assistant", "content": "started"},
+                {"role": "system", "content": "the job finished"},
+            ],
+            [
+                {"role": "user", "content": "run it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "run", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "exit 1"},
+                {"role": "system", "content": "the tool failed"},
+                {"role": "user", "content": "approved; also check y"},
+            ],
+        ],
+        ids=["wake", "approval_feedback"],
+    )
+    def test_system_placement_keeps_wire_prefix_as_history_grows_when_native(
+        self, history: list[dict[str, Any]]
+    ) -> None:
+        # Preserved thinking binds each thinking block to the wire prefix before
+        # it, so moving system messages must not change the wire before an
+        # assistant turn as later turns (the reply, then the next user message)
+        # are appended.
+        reply = {"role": "assistant", "content": "reply"}
+        _, before = self.provider._convert_messages(history, supports_mid_conversation_system=True)
+        _, after_reply = self.provider._convert_messages(
+            [*history, reply], supports_mid_conversation_system=True
+        )
+        _, after_next = self.provider._convert_messages(
+            [*history, reply, {"role": "user", "content": "next"}],
+            supports_mid_conversation_system=True,
+        )
+        assert after_reply[: len(before)] == before
+        assert after_next[: len(after_reply)] == after_reply
+        self._assert_system_placement_legal(after_next)
+
+    @staticmethod
+    def _unrun_search_history() -> list[dict[str, Any]]:
+        # A response that called a client tool and web search together: the API
+        # returns the search unrun, runs it on the next request, and opens the
+        # next assistant turn with its result.
+        return [
+            {"role": "user", "content": "build the digest"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {"type": "thinking", "thinking": "fetch and search", "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}},
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "out"},
+        ]
+
+    @staticmethod
+    def _block_types(msg: dict[str, Any]) -> list[str]:
+        return [b["type"] for b in msg["content"]]
+
+    @pytest.mark.parametrize("trailing_system", [False, True])
+    def test_unrun_server_tool_call_kept_while_turn_continues(self, trailing_system: bool) -> None:
+        # Only tool results (and a system note) follow, so this request still
+        # continues the turn and the API runs the search now.
+        history = self._unrun_search_history()
+        if trailing_system:
+            history.append({"role": "system", "content": "a tool failed"})
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert converted[1]["content"] is history[1]["_provider_content"]
+        assert self._block_types(converted[-1 - trailing_system]) == ["tool_result"]
+
+    _UNAVAILABLE = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+    }
+
+    @pytest.mark.parametrize(
+        ("tool", "result_type"),
+        [
+            ("web_search", "web_search_tool_result"),
+            ("tool_search_tool_bm25", "tool_search_tool_result"),
+        ],
+    )
+    @pytest.mark.parametrize("native", [False, True])
+    def test_unrun_server_tool_call_answered_unavailable_after_user_text(
+        self, native: bool, tool: str, result_type: str
+    ) -> None:
+        # The continuation failed (an exhausted credit balance, say) and the user
+        # wrote again: the text ends the turn, so the search can never run and the
+        # API would reject every request that still carries it unanswered.  It is
+        # answered with the API's own "unavailable" error, the pair moved ahead of
+        # the client call (the API wants client calls after every server result).
+        history = [
+            *self._unrun_search_history(),
+            {"role": "system", "content": "a tool failed"},
+            {"role": "user", "content": "please recover"},
+        ]
+        history[1]["_provider_content"][2]["name"] = tool
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=native
+        )
+        native_lane = history[1]["_provider_content"]
+        assert converted[1]["content"] == [
+            native_lane[0],
+            native_lane[2],
+            {
+                "type": result_type,
+                "tool_use_id": "srvtoolu_1",
+                "content": {"type": f"{result_type}_error", "error_code": "unavailable"},
+            },
+            native_lane[1],
+        ]
+        assert converted[1]["content"][0] is native_lane[0]
+        assert self._block_types(converted[2])[0] == "tool_result"
+        assert converted[2]["content"][-1] == {"type": "text", "text": "please recover"}
+
+    def test_answered_server_tool_call_kept_after_user_text(self) -> None:
+        # The continuation succeeded, so the next assistant turn opens with the
+        # result and the call stays on the wire.
+        history = [
+            *self._unrun_search_history(),
+            {
+                "role": "assistant",
+                "content": "found it",
+                "_provider_content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    {"type": "text", "text": "found it"},
+                ],
+            },
+            {"role": "user", "content": "thanks"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert converted[1]["content"] is history[1]["_provider_content"]
+
+    def test_repair_is_logged_once_per_call(self, caplog) -> None:
+        # The repair recurs on every request that replays the turn; operators get
+        # one INFO line per call, not one per request.
+        history = [*self._unrun_search_history(), {"role": "user", "content": "please recover"}]
+        history[1]["_provider_content"][2]["id"] = "srvtoolu_logged_once"
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            self.provider._convert_messages(history)
+            self.provider._convert_messages(history)
+        lines = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "srvtoolu_logged_once" in r.getMessage()
+        ]
+        assert len(lines) == 1
+
+    def test_unrun_server_tool_call_answered_when_later_turn_lacks_result(self) -> None:
+        # A later assistant turn without the result also ends the turn.
+        history = [
+            *self._unrun_search_history(),
+            {"role": "assistant", "content": "done"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert self._block_types(converted[1]) == [
+            "thinking",
+            "server_tool_use",
+            "web_search_tool_result",
+            "tool_use",
+        ]
+        assert converted[-1]["content"] == [{"type": "text", "text": "done"}]
+
+    def test_paused_search_answered_unavailable_after_user_text(self) -> None:
+        # A paused turn (no client calls) left its search unrun; it stays in place.
+        call = {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "q"},
+        }
+        history = [
+            {"role": "user", "content": "search"},
+            {"role": "assistant", "content": "", "_provider_content": [call]},
+            {"role": "user", "content": "anything?"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert converted[1]["content"] == [call, self._UNAVAILABLE]
+
+    def test_several_unrun_searches_are_answered_as_one_parallel_group(self) -> None:
+        # The incident's shape: client calls, then two searches, then a client call.
+        # The calls go first, then their results, the API's own shape for parallel
+        # searches; interleaved, the second search would read as a retry after the
+        # first result said not to use the tool again.
+        calls = [
+            {"type": "tool_use", "id": f"toolu_{n}", "name": "run", "input": {}} for n in (1, 2, 3)
+        ]
+        searches = [
+            {
+                "type": "server_tool_use",
+                "id": f"srvtoolu_{n}",
+                "name": "web_search",
+                "input": {"query": f"q{n}"},
+            }
+            for n in (1, 2)
+        ]
+        last = {"type": "tool_use", "id": "toolu_4", "name": "run", "input": {}}
+        thinking = {"type": "thinking", "thinking": "gather", "signature": "sig"}
+        history = [
+            {"role": "user", "content": "digest"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [thinking, *calls, *searches, last],
+                "tool_calls": [
+                    {
+                        "id": c["id"],
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                    for c in [*calls, last]
+                ],
+            },
+            *[{"role": "tool", "tool_call_id": c["id"], "content": "done"} for c in [*calls, last]],
+            {"role": "user", "content": "please recover"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        results = [
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": s["id"],
+                "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+            }
+            for s in searches
+        ]
+        assert converted[1]["content"] == [
+            thinking,
+            searches[0],
+            searches[1],
+            results[0],
+            results[1],
+            *calls,
+            last,
+        ]
+
+    def test_unrun_call_of_other_server_tool_is_dropped(self, caplog) -> None:
+        # Only server tools with a registered result type can be answered; a missing
+        # registration is loud, not a silent drop.
+        history = [*self._unrun_search_history(), {"role": "user", "content": "please recover"}]
+        history[1]["_provider_content"][2]["name"] = "code_execution"
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.providers._anthropic"):
+            _, converted = self.provider._convert_messages(history)
+        assert self._block_types(converted[1]) == ["thinking", "tool_use"]
+        assert any("code_execution" in r.getMessage() for r in caplog.records)
+
+    @staticmethod
+    def _compacted_with_orphan_result(tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mid-turn compaction kept only the in-flight turn, which opens with the
+        # result of a search whose call was summarized away.
+        return [
+            {"role": "user", "content": "[Conversation summary]"},
+            {"role": "assistant", "content": "Summary."},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    *tail,
+                ],
+            },
+        ]
+
+    def test_server_tool_result_without_its_call_is_dropped(self) -> None:
+        history = [
+            *self._compacted_with_orphan_result(
+                [
+                    {"type": "thinking", "thinking": "next", "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_2", "name": "run", "input": {}},
+                ]
+            ),
+            {"role": "tool", "tool_call_id": "toolu_2", "content": "out"},
+        ]
+        history[2]["tool_calls"] = [
+            {"id": "toolu_2", "type": "function", "function": {"name": "run", "arguments": "{}"}}
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert self._block_types(converted[1]) == ["text", "thinking", "tool_use"]
+
+    def test_dropped_result_reruns_system_placement_when_native(self) -> None:
+        # The kept turn ended in the result, so the note needed no placeholder;
+        # without the result it ends in plain text and now does.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        history = [*self._compacted_with_orphan_result([]), {"role": "system", "content": "note"}]
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
+        self._assert_system_placement_legal(converted)
+
+    def test_turn_left_empty_by_dropped_result_is_removed(self) -> None:
+        history = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []}
+                ],
+            },
+            {"role": "system", "content": "note"},
+            {"role": "user", "content": "anything?"},
+        ]
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "system"]
+        assert self._block_types(converted[0]) == ["text", "text"]
+        self._assert_system_placement_legal(converted)
+
+    def test_unrun_call_before_orphan_result_settles_after_placement_reruns(self) -> None:
+        # Dropping the result leaves the turn ending in the unrun call, so the note
+        # needs a placeholder user turn; that placeholder ends the turn, so the next
+        # pass answers the call.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        call = {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "q"},
+        }
+        history = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    call,
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_9", "content": []},
+                ],
+            },
+            {"role": "system", "content": "note"},
+        ]
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[1]["content"] == [call, self._UNAVAILABLE]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
+        self._assert_system_placement_legal(converted)
+
+    def test_pairing_returns_a_paired_wire_unchanged(self) -> None:
+        from turnstone.core.providers._anthropic import _pair_server_tool_blocks
+
+        wire = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    {"type": "text", "text": "found it"},
+                ],
+            },
+            {"role": "user", "content": "thanks"},
+        ]
+        paired, dropped = _pair_server_tool_blocks(wire)
+        assert paired is wire
+        assert dropped is False
+
+    def test_answered_unrun_call_keeps_wire_prefix_as_history_grows(self) -> None:
+        history = [*self._unrun_search_history(), {"role": "user", "content": "please recover"}]
+        reply = {"role": "assistant", "content": "recovered"}
+        _, before = self.provider._convert_messages(history)
+        _, after_next = self.provider._convert_messages(
+            [*history, reply, {"role": "user", "content": "next"}]
+        )
+        assert after_next[: len(before)] == before
+
+    @staticmethod
+    def _tool_search_history() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        # A native tool-search turn (search, its result, a call to the found tool)
+        # and its tool result.
+        search_turn = [
+            {"type": "thinking", "thinking": "find a weather tool", "signature": "sig"},
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "tool_search_tool_bm25",
+                "input": {"query": "weather"},
+            },
+            {
+                "type": "tool_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": {
+                    "type": "tool_search_tool_search_result",
+                    "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}],
+                },
+            },
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}},
+        ]
+        history = [
+            {"role": "user", "content": "weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": search_turn,
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "18C"},
+        ]
+        return search_turn, history
+
+    def test_tool_search_turn_keeps_its_result_and_wire_prefix(self) -> None:
+        # Native tool search: the result must be passed back unchanged, so the turn
+        # replays whole and reads the same on every later request.
+        search_turn, history = self._tool_search_history()
+        _, before = self.provider._convert_messages(history)
+        _, after_next = self.provider._convert_messages(
+            [
+                *history,
+                {"role": "assistant", "content": "It is 18C."},
+                {"role": "user", "content": "And Rome?"},
+            ]
+        )
+        assert before[1]["content"] is search_turn
+        assert after_next[: len(before)] == before
+
+    def test_second_result_for_an_answered_call_is_dropped(self) -> None:
+        # A converter that dropped the search's result made the API run the search
+        # again, so the stored reply opens with a second result for the same call.
+        search_turn, history = self._tool_search_history()
+        rerun = {**search_turn[2]}
+        _, converted = self.provider._convert_messages(
+            [
+                *history,
+                {
+                    "role": "assistant",
+                    "content": "It is 18C.",
+                    "_provider_content": [rerun, {"type": "text", "text": "It is 18C."}],
+                },
+                {"role": "user", "content": "And Rome?"},
+            ]
+        )
+        assert converted[1]["content"] is search_turn
+        assert converted[3]["content"] == [{"type": "text", "text": "It is 18C."}]
+        results = [
+            b
+            for m in converted
+            if isinstance(m["content"], list)
+            for b in m["content"]
+            if b.get("type") == "tool_search_tool_result"
+        ]
+        assert len(results) == 1
+
+    def _tool_search_converted(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        search_turn, history = self._tool_search_history()
+        _, converted = self.provider._convert_messages(
+            [
+                *history,
+                {"role": "assistant", "content": "It is 18C."},
+                {"role": "user", "content": "And Rome?"},
+            ]
+        )
+        return search_turn, converted
+
+    def _kwargs_with(
+        self,
+        converted: list[dict[str, Any]],
+        tools: list[str] | None,
+        deferred: frozenset[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.provider._build_thinking_and_kwargs(
+            caps=self.provider.get_capabilities("claude-opus-5-5"),
+            reasoning_effort=None,
+            extra_params=None,
+            max_tokens=1024,
+            temperature=None,
+            converted_msgs=converted,
+            system_prompt="",
+            model="claude-opus-5-5",
+            tools=None
+            if tools is None
+            else [
+                {"type": "function", "function": {"name": tool, "parameters": {}}} for tool in tools
+            ],
+            deferred_names=deferred,
+        )
+
+    _STUB: ClassVar[dict[str, Any]] = {
+        "name": "get_weather",
+        "description": "This tool is no longer available.",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+
+    # None: the stub is the request's only tool, which is why it is a plain definition (the
+    # API rejects a tool list in which every tool is deferred).
+    @pytest.mark.parametrize("tools", [None, ["run"], ["run", "get_weather"]])
+    def test_reference_to_a_tool_no_longer_offered_gets_a_stub(self, tools) -> None:
+        # The API expands every reference in history from this request's tools and
+        # rejects one it cannot resolve (live 400), as when the tool's MCP server is
+        # offline. History keeps what the search loaded; a stub says the tool is gone.
+        search_turn, converted = self._tool_search_converted()
+        kwargs = self._kwargs_with(converted, tools)
+        assert converted[1]["content"] is search_turn
+        offered = tools is not None and "get_weather" in tools
+        assert (self._STUB in kwargs["tools"]) is not offered
+        assert [tool["name"] for tool in kwargs["tools"]].count("get_weather") == 1
+
+    def test_deferred_tool_a_search_loaded_needs_no_stub(self) -> None:
+        # The shape production sends: the loaded tool deferred, beside the search tool.
+        _, converted = self._tool_search_converted()
+        kwargs = self._kwargs_with(converted, ["run", "get_weather"], frozenset({"get_weather"}))
+        assert self._STUB not in kwargs["tools"]
+        assert {"defer_loading": True}.items() <= next(
+            t for t in kwargs["tools"] if t["name"] == "get_weather"
+        ).items()
+
+    @staticmethod
+    def _search(call_id: str, content: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "server_tool_use",
+                "id": call_id,
+                "name": "tool_search_tool_bm25",
+                "input": {"query": "weather"},
+            },
+            {"type": "tool_search_tool_result", "tool_use_id": call_id, "content": content},
+        ]
+
+    def test_two_searches_for_one_missing_tool_get_one_stub(self, caplog) -> None:
+        # Tool names must be unique, so a second stub of the same name would bring the 400
+        # back. Each search is still logged once.
+        from turnstone.core.providers._anthropic import _log_repair_once
+
+        _log_repair_once.cache_clear()
+        found = {
+            "type": "tool_search_tool_search_result",
+            "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}],
+        }
+        converted = [
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": [*self._search("srvtoolu_a", found)]},
+            {"role": "user", "content": "and Rome?"},
+            {"role": "assistant", "content": [*self._search("srvtoolu_b", found)]},
+            {"role": "user", "content": "and Berlin?"},
+        ]
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            for _ in range(2):
+                kwargs = self._kwargs_with(converted, ["run"])
+                assert [t["name"] for t in kwargs["tools"]].count("get_weather") == 1
+        lines = [r.getMessage() for r in caplog.records if "no longer available" in r.getMessage()]
+        assert len(lines) == 2
+        assert any("srvtoolu_a" in line for line in lines)
+        assert any("srvtoolu_b" in line for line in lines)
+
+    def test_failed_search_needs_no_stub(self) -> None:
+        failed = {"type": "tool_search_tool_result_error", "error_code": "unavailable"}
+        converted = [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [*self._search("srvtoolu_c", failed)]},
+            {"role": "user", "content": "go on"},
+        ]
+        assert [t["name"] for t in self._kwargs_with(converted, ["run"])["tools"]] == ["run"]
+
+    def test_reasoning_params_mapping(self) -> None:
+        assert self.provider._reasoning_params("low", None, max_tokens=32768) == {
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        }
+        assert self.provider._reasoning_params("medium", None, max_tokens=32768) == {
+            "thinking": {"type": "enabled", "budget_tokens": 4096}
+        }
+        assert self.provider._reasoning_params("high", None, max_tokens=32768) == {
+            "thinking": {"type": "enabled", "budget_tokens": 16384}
+        }
+
+    def test_reasoning_params_override(self) -> None:
+        result = self.provider._reasoning_params(
+            "low", {"thinking_budget_tokens": 8192}, max_tokens=32768
+        )
+        assert result == {"thinking": {"type": "enabled", "budget_tokens": 8192}}
+
+    def test_reasoning_params_unknown_effort(self) -> None:
+        # Unknown effort falls back to 4096
+        result = self.provider._reasoning_params("turbo", None, max_tokens=32768)
+        assert result == {"thinking": {"type": "enabled", "budget_tokens": 4096}}
+
+    def test_reasoning_params_budget_clamped(self) -> None:
+        # Budget >= max_tokens gets clamped to leave room for response
+        result = self.provider._reasoning_params("high", None, max_tokens=4096)
+        assert result == {"thinking": {"type": "enabled", "budget_tokens": 3072}}
+
+    def test_finish_reason_normalization(self) -> None:
+        from turnstone.core.providers._anthropic import _normalize_finish_reason
+
+        assert _normalize_finish_reason("end_turn") == "stop"
+        assert _normalize_finish_reason("tool_use") == "tool_calls"
+        assert _normalize_finish_reason("max_tokens") == "length"
+        assert _normalize_finish_reason("other_reason") == "other_reason"
+
+    def test_refusal_normalized_to_content_filter(self) -> None:
+        """Safety-classifier declines (Opus 5 / Fable 5) arrive as a 200 with
+        stop_reason="refusal".  It must NOT fall through as the raw string: the
+        drain gate only errors on an ABSENT finish reason, so an unmapped
+        "refusal" lands a declined turn as a complete result.  content_filter
+        is the OpenAI-vocabulary equivalent both consumers already handle."""
+        from turnstone.core.providers._anthropic import _normalize_finish_reason
+
+        assert _normalize_finish_reason("refusal") == "content_filter"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_refusal_logs_the_providers_own_word(self, mock_ensure: MagicMock, caplog) -> None:
+        """Normalization is lossy, so this log is the only site that still holds
+        the raw stop reason — a classifier decline is indistinguishable from an
+        ordinary content filter once collapsed onto ``content_filter``."""
+        events = [
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="partial"),
+            _anthropic_event("message_delta", stop_reason="refusal"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-opus-5",
+                    messages=[{"role": "user", "content": "go"}],
+                )
+            )
+
+        assert any("anthropic.refusal" in r.message for r in caplog.records)
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_ordinary_turn_logs_no_refusal(self, mock_ensure: MagicMock, caplog) -> None:
+        """Non-vacuity, and the defect the RAW-value gate exists to prevent.
+
+        Normalization rewrites ``end_turn`` and ``tool_use`` as well, so gating
+        the log on ``normalized != raw`` fires on every ordinary turn in every
+        lane rather than only on a decline.
+        """
+        events = [
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="hello"),
+            _anthropic_event("message_delta", stop_reason="end_turn"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-opus-5",
+                    messages=[{"role": "user", "content": "go"}],
+                )
+            )
+
+        assert not any("anthropic.refusal" in r.message for r in caplog.records)
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_basic(self, mock_ensure: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="Hello world")]
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert isinstance(result, CompletionResult)
+        assert result.content == "Hello world"
+        assert result.tool_calls is None
+        assert result.finish_reason == "stop"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_terminal_signal_less_stream_raises_by_default(self, mock_ensure: MagicMock) -> None:
+        # No message_delta stop_reason and no message_stop: on a
+        # signal-disciplined server (the real API always sends both) this
+        # is a generation that died mid-response — the drain refuses to
+        # bless possibly-truncated content.
+        from turnstone.core.providers import IncompleteStreamError
+
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="full answer")], stop_reason=None
+        )
+        with pytest.raises(IncompleteStreamError):
+            drain_stream(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-sonnet-4-20250514",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            )
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_terminal_signal_less_stream_completes_with_declared_tolerance(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        # ``finish_reason_optional`` (operator-declared: this gateway never
+        # sends terminal signals) restores the retired non-streaming
+        # path's absent-stop_reason tolerance — the raw blocks ride the
+        # shimmed finish chunk.
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="full answer")], stop_reason=None
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+                capabilities=ModelCapabilities(finish_reason_optional=True),
+            )
+        )
+        assert result.content == "full answer"
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks
+
+    @staticmethod
+    def _whole_block_stream(events: list[Any]) -> MagicMock:
+        # A lax gateway emitting pre-populated content_block_start events
+        # (whole-block emission, no deltas) — fake_anthropic_stream
+        # deliberately strips start blocks to the real API's empty shape,
+        # so these are built raw.
+        mgr = MagicMock()
+        mgr.__enter__ = MagicMock(return_value=events)
+        mgr.__exit__ = MagicMock(return_value=False)
+        return mgr
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_whole_block_start_text_reaches_content(self, mock_ensure: MagicMock) -> None:
+        # Text delivered inside content_block_start with no text_delta
+        # events: the retired non-streaming path (SDK get_final_message)
+        # returned it, so the drained lane must too — not a clean-looking
+        # empty result.
+        client = MagicMock()
+        client.messages.stream.return_value = self._whole_block_stream(
+            [
+                SimpleNamespace(
+                    type="content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(type="text", text="whole answer"),
+                ),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(type="message_stop"),
+            ]
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "whole answer"
+        assert result.finish_reason == "stop"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_whole_block_start_tool_use_reaches_arguments(self, mock_ensure: MagicMock) -> None:
+        # A tool_use block whose input arrives pre-populated in the start
+        # event (no input_json_delta events) must still produce a call
+        # with arguments — a fused-empty call is an action that silently
+        # never executes.
+        client = MagicMock()
+        client.messages.stream.return_value = self._whole_block_stream(
+            [
+                SimpleNamespace(
+                    type="content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(
+                        type="tool_use", id="toolu_1", name="read_file", input={"path": "x"}
+                    ),
+                ),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(
+                    type="message_delta",
+                    usage=None,
+                    delta=SimpleNamespace(stop_reason="tool_use"),
+                ),
+            ]
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "toolu_1"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert json.loads(result.tool_calls[0]["function"]["arguments"]) == {"path": "x"}
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_with_tool_use(self, mock_ensure: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="text", text="Let me read that."),
+                SimpleNamespace(
+                    type="tool_use", id="toolu_abc", name="read_file", input={"path": "foo.py"}
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "read foo.py"}],
+            )
+        )
+        assert result.content == "Let me read that."
+        assert result.finish_reason == "tool_calls"
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        tc = result.tool_calls[0]
+        assert tc["id"] == "toolu_abc"
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "read_file"
+        assert json.loads(tc["function"]["arguments"]) == {"path": "foo.py"}
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_separates_text_blocks(self, mock_ensure: MagicMock) -> None:
+        # The retired non-streaming lane joined text blocks with "\n"; the
+        # iterator now emits the separator at each subsequent text block
+        # start, so drained content keeps the block boundary (web-search
+        # responses interleave text / server-tool / text).
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="text", text="Before the search."),
+                SimpleNamespace(type="text", text="After the results."),
+            ]
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "Before the search.\nAfter the results."
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_captures_text_block_citations(self, mock_ensure: MagicMock) -> None:
+        # citations_delta events must land on the raw block: Anthropic
+        # requires citations to replay unmodified alongside their
+        # web_search_tool_result blocks on later turns, and the retired
+        # non-streaming lane preserved them via model_dump.
+        start = _anthropic_event("content_block_start", block_type="text", index=0)
+        # A real dict from model_dump so the raw block accepts the
+        # citations append (a MagicMock auto-dict would swallow it).
+        start.content_block.model_dump.return_value = {"type": "text", "text": ""}
+        cite = _anthropic_event("content_block_delta", delta_type="citations_delta", index=0)
+        cite.delta.citation = {"type": "web_search_result_location", "url": "https://x.test"}
+        text = _anthropic_event(
+            "content_block_delta", delta_type="text_delta", text="cited claim", index=0
+        )
+        finish = _anthropic_event("message_delta", stop_reason="end_turn", usage_output_tokens=1)
+
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter([start, cite, text, finish]))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.provider_blocks, "expected the text block in provider_blocks"
+        citations = result.provider_blocks[0].get("citations")
+        assert citations == [{"type": "web_search_result_location", "url": "https://x.test"}]
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_message_stop_supplies_missing_stop_reason(self, mock_ensure: MagicMock) -> None:
+        # Compat tolerance: a /v1/messages shim that streams content and
+        # message_stop but never a message_delta stop_reason.  message_stop
+        # is a genuine terminal marker, so the drained stream completes
+        # (blocks intact) instead of failing a generation that arrived.
+        events = [
+            _anthropic_event("content_block_start", block_type="text", index=0),
+            _anthropic_event(
+                "content_block_delta", delta_type="text_delta", text="intact", index=0
+            ),
+            _anthropic_event("content_block_stop", index=0),
+            _anthropic_event("message_stop"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "intact"
+        assert result.finish_reason == "stop"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_usage(self, mock_ensure: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="ok")],
+            usage=SimpleNamespace(
+                input_tokens=100,
+                output_tokens=50,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            ),
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 100
+        assert result.usage.completion_tokens == 50
+        assert result.usage.total_tokens == 150
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_text_delta(self, mock_ensure: MagicMock) -> None:
+        events = [
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="Hello"),
+            _anthropic_event("content_block_delta", delta_type="text_delta", text=" world"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert len(results) == 2
+        assert results[0].content_delta == "Hello"
+        assert results[0].is_first is True
+        assert results[1].content_delta == " world"
+        assert results[1].is_first is False
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_thinking_delta(self, mock_ensure: MagicMock) -> None:
+        events = [
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="thinking_delta",
+                thinking="reasoning step 1",
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="thinking_delta",
+                thinking="reasoning step 2",
+            ),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "think"}],
+            )
+        )
+        assert len(results) == 2
+        assert results[0].reasoning_delta == "reasoning step 1"
+        assert results[1].reasoning_delta == "reasoning step 2"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_tool_use(self, mock_ensure: MagicMock) -> None:
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="tool_use",
+                block_id="toolu_123",
+                block_name="read_file",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"path":',
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='"foo.py"}',
+                index=0,
+            ),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "read a file"}],
+            )
+        )
+        assert len(results) == 3
+        # First chunk: content_block_start with tool id and name
+        assert results[0].tool_call_deltas[0].id == "toolu_123"
+        assert results[0].tool_call_deltas[0].name == "read_file"
+        assert results[0].tool_call_deltas[0].index == 0
+        # Subsequent chunks: argument fragments
+        assert results[1].tool_call_deltas[0].arguments_delta == '{"path":'
+        assert results[2].tool_call_deltas[0].arguments_delta == '"foo.py"}'
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_message_delta_usage(self, mock_ensure: MagicMock) -> None:
+        events = [
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi"),
+            _anthropic_event(
+                "message_delta",
+                stop_reason="end_turn",
+                usage_input_tokens=0,
+                usage_output_tokens=12,
+            ),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        # The message_delta event should carry usage and finish_reason
+        delta_chunks = [r for r in results if r.finish_reason is not None]
+        assert len(delta_chunks) == 1
+        assert delta_chunks[0].finish_reason == "stop"
+        assert delta_chunks[0].usage is not None
+        assert delta_chunks[0].usage.completion_tokens == 12
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_message_start_usage(self, mock_ensure: MagicMock) -> None:
+        events = [
+            _anthropic_event("message_start", usage_input_tokens=42),
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        # message_start with usage should be yielded
+        start_chunks = [r for r in results if r.usage is not None and r.usage.prompt_tokens == 42]
+        assert len(start_chunks) == 1
+        assert start_chunks[0].usage is not None
+        assert start_chunks[0].usage.prompt_tokens == 42
+
+    def test_retryable_errors(self) -> None:
+        errors = self.provider.retryable_error_names
+        assert isinstance(errors, frozenset)
+        assert "RateLimitError" in errors
+        assert "APITimeoutError" in errors
+        assert "APIConnectionError" in errors
+        assert "InternalServerError" in errors
+        assert "APIError" in errors
+        assert "OverloadedError" in errors
+
+
+# ===========================================================================
+# TestAnthropicHelpers
+# ===========================================================================
+
+
+class TestAnthropicHelpers:
+    """Tests for Anthropic module-level helper functions."""
+
+    def test_merge_consecutive(self) -> None:
+        from turnstone.core.providers._anthropic import _merge_consecutive
+
+        messages = [
+            {"role": "user", "content": "A"},
+            {"role": "user", "content": "B"},
+            {"role": "assistant", "content": "C"},
+            {"role": "user", "content": "D"},
+        ]
+        merged = _merge_consecutive(messages)
+        assert len(merged) == 3
+        assert merged[0]["role"] == "user"
+        assert merged[0]["content"] == [
+            {"type": "text", "text": "A"},
+            {"type": "text", "text": "B"},
+        ]
+        assert merged[1]["role"] == "assistant"
+        assert merged[2]["role"] == "user"
+
+    def test_merge_consecutive_empty(self) -> None:
+        from turnstone.core.providers._anthropic import _merge_consecutive
+
+        assert _merge_consecutive([]) == []
+
+    def test_merge_consecutive_no_duplicates(self) -> None:
+        from turnstone.core.providers._anthropic import _merge_consecutive
+
+        messages = [
+            {"role": "user", "content": "A"},
+            {"role": "assistant", "content": "B"},
+            {"role": "user", "content": "C"},
+        ]
+        merged = _merge_consecutive(messages)
+        assert len(merged) == 3
+
+    def test_to_blocks_string(self) -> None:
+        from turnstone.core.providers._anthropic import _to_blocks
+
+        result = _to_blocks("hello")
+        assert result == [{"type": "text", "text": "hello"}]
+
+    def test_to_blocks_list(self) -> None:
+        from turnstone.core.providers._anthropic import _to_blocks
+
+        blocks = [{"type": "text", "text": "already a block"}]
+        result = _to_blocks(blocks)
+        assert result == blocks
+
+    def test_to_blocks_other(self) -> None:
+        from turnstone.core.providers._anthropic import _to_blocks
+
+        result = _to_blocks(42)
+        assert result == [{"type": "text", "text": "42"}]
+
+    def test_capabilities_lookup_exact(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-4-6")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+
+    def test_capabilities_lookup_prefix(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        # Prefix match: "claude-sonnet-4-6" matches dated variants
+        caps = provider.get_capabilities("claude-sonnet-4-6-20260101")
+        assert caps.context_window == 1000000
+        assert caps.token_param == "max_tokens"
+        assert caps.thinking_mode == "adaptive"
+
+    def test_capabilities_fable_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert "xhigh" in caps.effort_levels
+        assert "max" in caps.effort_levels
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_fable_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-20260815")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_mid_conversation_system is True
+        # A dated fable-5 snapshot must not slide onto the fable-5-1 row.
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_fable_5_1(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-1")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_fable_5_1_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-1-20260901")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_opus_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert "xhigh" in caps.effort_levels
+        assert "max" in caps.effort_levels
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+
+    def test_capabilities_opus_5_dated(self) -> None:
+        """A dated snapshot resolves via longest-prefix match onto its row, and
+        must NOT fall back to _ANTHROPIC_DEFAULT (200K context, no native
+        mid-conversation system messages)."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5-20260724")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_effort is True
+        assert caps.supports_mid_conversation_system is True
+        # A dated opus-5 snapshot must not slide onto the opus-5-5 row.
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_opus_5_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_opus_5_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5-5-20260922")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_sonnet_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5")
+        assert caps.context_window == 1000000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_mid_conversation_system is False
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_sonnet_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5-20260601")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        # A dated sonnet-5 snapshot must not slide onto the sonnet-5-5 row.
+        assert caps.supports_mid_conversation_system is False
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_sonnet_5_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_sonnet_5_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5-5-20260928")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_haiku_5_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-haiku-5-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_opus_4_8(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-4-8")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert "xhigh" in caps.effort_levels
+        assert "max" in caps.effort_levels
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+
+    def test_capabilities_opus_4_8_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-4-8-20260601")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+
+    def test_capabilities_opus_4_7(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-4-7")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert "xhigh" in caps.effort_levels
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+
+    def test_capabilities_opus_4_7_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-4-7-20260416")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+
+    def test_capabilities_lookup_unknown(self) -> None:
+        """#1366: an id with no row gets the default, shaped to what every
+        adaptive Claude model accepts.  Limits stay conservative and the
+        features some models lack stay off."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("unknown-model-xyz")
+        assert caps.context_window == 200000
+        assert caps.max_output_tokens == 64000
+        assert caps.token_param == "max_tokens"
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.server_parses_reasoning is True
+        assert caps.supports_tool_search is False
+        assert caps.supports_mid_conversation_system is False
+        assert caps.thinking_prefix_bound is False
+
+
+# ===========================================================================
+# TestProviderFactory
+# ===========================================================================
+
+
+_SDK_KEY_VARIABLES = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+_ANTHROPIC_OTHER_CREDENTIAL_VARIABLES = (
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_SCOPE",
+)
+_OPENAI_LANES = ("openai", "openai-compatible", "google", "xai")
+_ANTHROPIC_LANES = ("anthropic", "anthropic-compatible")
+_LANE_URL = {
+    "openai-compatible": "http://llm.example.com/v1",
+    "anthropic-compatible": "http://llm.example.com",
+}
+_LF = chr(10)
+_UNFIT = "bad" + chr(1)
+
+
+def _sent_credential_headers(monkeypatch: pytest.MonkeyPatch, lane: str) -> dict[str, str]:
+    """The credential headers one request from ``create_client(lane, ...)``'s client carries.
+
+    The transport is mounted on the HTTP client ``create_client`` builds, so the Anthropic lanes'
+    ``auth`` hook runs as in production; the SDK's ``auth_headers`` would show only its own view.
+    """
+    import anthropic
+    import httpx2
+    import openai
+
+    from turnstone.core.providers import create_client
+
+    sent: dict[str, str] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sent.update(
+            (name, request.headers[name])
+            for name in ("authorization", "x-api-key")
+            if name in request.headers
+        )
+        body = {"object": "list", "data": [], "has_more": False, "first_id": None, "last_id": None}
+        return httpx2.Response(200, json=body, request=request)
+
+    for sdk in (anthropic, openai):
+
+        class TransportClient(sdk.DefaultHttpxClient):  # type: ignore[name-defined,misc]
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(transport=httpx2.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr(sdk, "DefaultHttpxClient", TransportClient)
+    client = create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
+    try:
+        client.with_options(max_retries=0).models.list()
+    finally:
+        client.close()
+    return sent
+
+
+class TestProviderFactory:
+    """Tests for create_provider and create_client factory functions."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sdk_key_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # With no key passed, create_client reads the SDKs' own variables; tests set what they use.
+        for name in _SDK_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+
+    def test_create_provider_openai(self) -> None:
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
+
+        provider = create_provider("openai")
+        assert isinstance(provider, OpenAIResponsesProvider)
+        assert provider.provider_name == "openai"
+
+    def test_create_provider_anthropic(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider("anthropic")
+        assert provider.provider_name == "anthropic"
+
+    def test_create_provider_unknown(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        with pytest.raises(ValueError, match="Unknown provider"):
+            create_provider("gemini")
+
+    @patch("openai.OpenAI")
+    def test_create_client_openai(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_openai_cls.return_value = MagicMock()
+        client = create_client("openai", base_url="http://localhost:8000/v1", api_key="test-key")
+        assert_built_with(mock_openai_cls, base_url="http://localhost:8000/v1", api_key="test-key")
+        assert client is mock_openai_cls.return_value
+
+    @patch("openai.OpenAI")
+    def test_create_client_empty_api_key_passes_none(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("openai", base_url="http://localhost:8000/v1", api_key="")
+        assert_built_with(mock_openai_cls, base_url="http://localhost:8000/v1", api_key=None)
+
+    @patch("openai.OpenAI")
+    def test_create_client_empty_api_key_no_base_url(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("openai", base_url="", api_key="")
+        assert_built_with(mock_openai_cls, api_key=None)
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_create_client_anthropic_empty_api_key_omits_kwarg(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_anthropic_cls = MagicMock()
+        mock_mod = anthropic_module_mock()
+        mock_mod.Anthropic = mock_anthropic_cls
+        mock_ensure.return_value = mock_mod
+
+        create_client("anthropic", base_url="", api_key="")
+        assert_built_with(
+            mock_anthropic_cls,
+        )
+
+    @pytest.fixture
+    def real_sdk(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Keep the Anthropic SDK off this machine's profiles and other credential sources.
+
+        An empty home, not ANTHROPIC_CONFIG_DIR, which the SDK reads as a chosen profile.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        for name in (*_ANTHROPIC_OTHER_CREDENTIAL_VARIABLES, "ANTHROPIC_CONFIG_DIR"):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(
+        ("lane", "env", "headers"),
+        [
+            # The other SDK's variables, unfit, are never read on these lanes.
+            *[
+                (
+                    lane,
+                    {"OPENAI_API_KEY": "sk" + _LF, "ANTHROPIC_API_KEY": _UNFIT},
+                    {"Authorization": "Bearer sk"},
+                )
+                for lane in _OPENAI_LANES
+            ],
+            # The Anthropic SDK holds one credential, ANTHROPIC_API_KEY before the token, which
+            # is then never read; the key rides X-Api-Key, cleaned.
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk" + _LF, "ANTHROPIC_AUTH_TOKEN": tok},
+                    {"X-Api-Key": "sk"},
+                )
+                for lane in _ANTHROPIC_LANES
+                for tok in ("tok", "tok" + _LF, _UNFIT)
+            ],
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": tok},
+                    {"X-Api-Key": "sk"},
+                )
+                for lane in _ANTHROPIC_LANES
+                for tok in ("tok" + _LF, _UNFIT)
+            ],
+            # A token, the only credential set, keeps the SDK's bearer.
+            ("anthropic", {"ANTHROPIC_AUTH_TOKEN": "tok" + _LF}, {"Authorization": "Bearer tok"}),
+            ("anthropic", {"ANTHROPIC_AUTH_TOKEN": "tok"}, {"Authorization": "Bearer tok"}),
+            # An API key the SDK reads itself rides X-Api-Key too.
+            *[
+                (lane, {"ANTHROPIC_API_KEY": "sk"}, {"X-Api-Key": "sk"})
+                for lane in _ANTHROPIC_LANES
+            ],
+            # No ANTHROPIC_API_KEY: the placeholder goes, and the SDK never reads the token.
+            ("anthropic-compatible", {"ANTHROPIC_AUTH_TOKEN": _UNFIT}, {"X-Api-Key": "dummy"}),
+        ],
+    )
+    def test_create_client_sends_the_sdk_variables_cleaned(
+        self,
+        real_sdk: None,
+        monkeypatch: pytest.MonkeyPatch,
+        lane: str,
+        env: dict[str, str],
+        headers: dict[str, str],
+    ) -> None:
+        """Through the real SDK clients, on the wire: a variable read from a file keeps its line
+        break, which the SDK would send as it is."""
+        for name in _SDK_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        sent = _sent_credential_headers(monkeypatch, lane)
+        assert sent == {name.lower(): value for name, value in headers.items()}
+
+    @pytest.mark.parametrize(
+        ("lane", "env", "variable"),
+        [
+            *[(lane, {"OPENAI_API_KEY": _UNFIT}, "OPENAI_API_KEY") for lane in _OPENAI_LANES],
+            # Empty once the line break is dropped, it would no longer be the variable's key.
+            ("openai", {"OPENAI_API_KEY": _LF}, "OPENAI_API_KEY"),
+            *[
+                (lane, {"ANTHROPIC_API_KEY": _UNFIT}, "ANTHROPIC_API_KEY")
+                for lane in _ANTHROPIC_LANES
+            ],
+            # The token is sent only with no ANTHROPIC_API_KEY, on the lane without a placeholder.
+            ("anthropic", {"ANTHROPIC_AUTH_TOKEN": _UNFIT}, "ANTHROPIC_AUTH_TOKEN"),
+        ],
+    )
+    def test_create_client_refuses_an_sdk_variable_it_would_send(
+        self,
+        real_sdk: None,
+        monkeypatch: pytest.MonkeyPatch,
+        lane: str,
+        env: dict[str, str],
+        variable: str,
+    ) -> None:
+        from turnstone.core.http_headers import UNFIT_HEADER_VALUE, HeaderValueError
+        from turnstone.core.providers import create_client
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with pytest.raises(HeaderValueError) as excinfo:
+            create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
+        assert str(excinfo.value) == f"{variable} is {UNFIT_HEADER_VALUE}"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_create_client_anthropic_nonempty_api_key_passes_kwarg(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_anthropic_cls = MagicMock()
+        mock_mod = anthropic_module_mock()
+        mock_mod.Anthropic = mock_anthropic_cls
+        mock_ensure.return_value = mock_mod
+
+        create_client("anthropic", base_url="", api_key="sk-ant-test")
+        assert_built_with(mock_anthropic_cls, api_key="sk-ant-test")
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_create_client_anthropic_empty_api_key_with_custom_base_url(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_anthropic_cls = MagicMock()
+        mock_mod = anthropic_module_mock()
+        mock_mod.Anthropic = mock_anthropic_cls
+        mock_ensure.return_value = mock_mod
+
+        create_client("anthropic", base_url="http://my-proxy:8000", api_key="")
+        assert_built_with(mock_anthropic_cls, base_url="http://my-proxy:8000")
+
+    def test_create_client_unknown(self) -> None:
+        from turnstone.core.providers import create_client
+
+        with pytest.raises(ValueError, match="Unknown provider"):
+            create_client("gemini", base_url="http://x", api_key="k")
+
+    def test_is_llm_provider(self) -> None:
+        """Verify runtime_checkable protocol works with isinstance."""
+        provider = OpenAIProvider()
+        assert isinstance(provider, LLMProvider)
+
+    def test_non_provider_not_instance(self) -> None:
+        """A plain object should not satisfy LLMProvider protocol check."""
+
+        class NotAProvider:
+            pass
+
+        assert not isinstance(NotAProvider(), LLMProvider)
+
+    def test_create_provider_openai_compatible(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider("openai-compatible")
+        assert isinstance(provider, OpenAIChatCompletionsProvider)
+        assert provider.provider_name == "openai-compatible"
+
+    def test_create_provider_openai_vs_compatible_distinct(self) -> None:
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
+
+        openai_prov = create_provider("openai")
+        compat = create_provider("openai-compatible")
+        assert openai_prov is not compat
+        assert isinstance(openai_prov, OpenAIResponsesProvider)
+        assert isinstance(compat, OpenAIChatCompletionsProvider)
+        assert openai_prov.provider_name == "openai"
+        assert compat.provider_name == "openai-compatible"
+
+    def test_openai_compatible_never_consults_commercial_registry(self) -> None:
+        """Local-lane model ids are operator-chosen strings — a prefix
+        collision with a cloud model id must not inherit that model's
+        sampling/effort contract, on either API surface.  Cloud lookups
+        are unaffected."""
+        from turnstone.core.providers import create_provider
+
+        compat = create_provider("openai-compatible")
+        compat_responses = create_provider("openai-compatible", api_surface="responses")
+        for name in ("gpt-5.5-my-finetune", "o3-distill", "deepseek-v4-flash", ""):
+            assert compat.get_capabilities(name) is OPENAI_COMPAT_DEFAULT
+            assert compat_responses.get_capabilities(name) is OPENAI_COMPAT_DEFAULT
+        # The commercial lane keeps resolving its registry rows — through
+        # the factory AND through the non-compat class default.
+        cloud = create_provider("openai").get_capabilities("gpt-5.5")
+        assert cloud.default_reasoning_effort == "medium"
+        assert "xhigh" in cloud.reasoning_effort_values
+        assert create_provider("openai") is not compat_responses
+
+    def test_create_provider_returns_singleton(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        p1 = create_provider("openai")
+        p2 = create_provider("openai")
+        assert p1 is p2
+
+    def test_create_provider_compat_responses_surface(self) -> None:
+        """openai-compatible + api_surface=responses returns the Responses provider."""
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
+
+        provider = create_provider("openai-compatible", api_surface="responses")
+        assert isinstance(provider, OpenAIResponsesProvider)
+
+    def test_create_provider_compat_chat_surface_default(self) -> None:
+        """openai-compatible defaults to Chat Completions."""
+        from turnstone.core.providers import create_provider
+
+        for surface in (None, "", "chat"):
+            provider = create_provider("openai-compatible", api_surface=surface)
+            assert isinstance(provider, OpenAIChatCompletionsProvider)
+
+    def test_create_provider_invalid_api_surface(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        with pytest.raises(ValueError, match="Unknown api_surface"):
+            create_provider("openai-compatible", api_surface="bogus")
+
+    def test_create_provider_openai_ignores_api_surface(self) -> None:
+        """Cloud OpenAI is always Responses regardless of api_surface."""
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
+
+        provider = create_provider("openai", api_surface="chat")
+        assert isinstance(provider, OpenAIResponsesProvider)
+
+    # -- Google provider -------------------------------------------------------
+
+    def test_create_provider_google(self) -> None:
+        from turnstone.core.providers import create_provider
+        from turnstone.core.providers._google import GoogleProvider
+
+        provider = create_provider("google")
+        assert isinstance(provider, GoogleProvider)
+        assert provider.provider_name == "google"
+
+    def test_create_provider_google_singleton(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        p1 = create_provider("google")
+        p2 = create_provider("google")
+        assert p1 is p2
+
+    @patch("openai.OpenAI")
+    def test_create_client_google_default_base_url(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+        from turnstone.core.providers._google import GOOGLE_DEFAULT_BASE_URL
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("google", base_url="", api_key="test-key")
+        assert_built_with(mock_openai_cls, base_url=GOOGLE_DEFAULT_BASE_URL, api_key="test-key")
+
+    @patch("openai.OpenAI")
+    def test_create_client_google_custom_base_url(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("google", base_url="http://custom:8080/v1", api_key="k")
+        assert_built_with(mock_openai_cls, base_url="http://custom:8080/v1", api_key="k")
+
+    def test_google_capabilities_defaults(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider("google")
+        caps = provider.get_capabilities("gemini-2.5-pro")
+        assert caps.context_window == 2_000_000
+        assert caps.max_output_tokens == 65_536
+        assert caps.token_param == "max_tokens"
+        assert caps.supports_temperature is True
+        assert caps.supports_vision is True
+
+    def test_google_capabilities_same_for_all_models(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider("google")
+        c1 = provider.get_capabilities("gemini-2.5-pro")
+        c2 = provider.get_capabilities("gemini-2.0-flash")
+        c3 = provider.get_capabilities("")
+        assert c1 is c2 is c3
+
+    def test_list_known_models_google_empty(self) -> None:
+        from turnstone.core.providers import list_known_models
+
+        assert list_known_models("google") == []
+
+    def test_lookup_model_capabilities_google_returns_none(self) -> None:
+        from turnstone.core.providers import lookup_model_capabilities
+
+        assert lookup_model_capabilities("google", "gemini-2.5-pro") is None
+
+    def test_resolve_openai_provider_googleapis(self) -> None:
+        from turnstone.core.model_registry import _resolve_openai_provider
+
+        assert (
+            _resolve_openai_provider(
+                "openai",
+                "https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
+            == "google"
+        )
+
+    def test_resolve_openai_provider_not_spoofable(self) -> None:
+        from turnstone.core.model_registry import _resolve_openai_provider
+
+        # evil-googleapis.com must NOT match — requires the dot prefix
+        assert (
+            _resolve_openai_provider("openai", "https://evil-googleapis.com/v1")
+            == "openai-compatible"
+        )
+
+    def test_resolve_openai_provider_api_openai_unchanged(self) -> None:
+        from turnstone.core.model_registry import _resolve_openai_provider
+
+        assert _resolve_openai_provider("openai", "https://api.openai.com/v1") == "openai"
+
+
+# ===========================================================================
+# Google provider fidelity
+# ===========================================================================
+
+
+class TestGoogleEffortKnob:
+    """The session effort knob reaches Gemini as a flat reasoning_effort."""
+
+    def _create_kwargs(self, reasoning_effort: str) -> dict[str, Any]:
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter([])
+        list(
+            prov.create_streaming(
+                client=client,
+                model="gemini-3-flash",
+                messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort=reasoning_effort,
+            )
+        )
+        return client.chat.completions.create.call_args[1]
+
+    def test_knob_values_forward_verbatim(self) -> None:
+        for knob in ("minimal", "low", "medium", "high"):
+            assert self._create_kwargs(knob)["reasoning_effort"] == knob
+
+    def test_off_list_knob_snaps_to_high(self) -> None:
+        """xhigh/max are not in Gemini's vocabulary — snap down to high."""
+        for knob in ("xhigh", "max"):
+            assert self._create_kwargs(knob)["reasoning_effort"] == "high"
+
+    def test_none_omits_the_param(self) -> None:
+        """Knob none never sends "none" — 2.5 Pro / 3.x reject disabling."""
+        assert "reasoning_effort" not in self._create_kwargs("none")
+
+
+class TestGoogleProviderFidelity:
+    """Tests for thought_signature round-trip via provider_blocks."""
+
+    def test_prepare_messages_strips_provider_content(self) -> None:
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig123",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        # _provider_content must be stripped
+        for m in cleaned:
+            assert "_provider_content" not in m
+        # tool_calls must be reconstructed with thought_signature
+        tc = cleaned[0]["tool_calls"][0]
+        assert tc["thought_signature"] == "sig123"
+
+    def test_prepare_messages_passthrough_without_provider_content(self) -> None:
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert len(cleaned) == 2
+        assert cleaned[0]["content"] == "hello"
+
+    def test_prepare_messages_swap_cannot_resurrect_malformed_arguments(self) -> None:
+        # The raw fidelity dicts carry the model's ORIGINAL arguments string;
+        # the sanitized top-level mirror is what the swap replaces.  A raw
+        # dict whose arguments are malformed must be legalized during the
+        # swap (thought_signature and id untouched) — otherwise every replay
+        # resurrects the malformed string the upstream sanitize pass fixed.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    # Mirror already legalized upstream.
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": '{"ok": 1}'},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        # Raw, unterminated — the model's original output.
+                        "function": {"name": "f", "arguments": '{"path": "/tmp'},
+                        "thought_signature": "sig123",
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": '{"ok": 1}'},
+                        "thought_signature": "sig456",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tcs = cleaned[0]["tool_calls"]
+        assert tcs[0]["function"]["arguments"] == "{}"  # legalized
+        assert tcs[0]["thought_signature"] == "sig123"  # fidelity preserved
+        assert tcs[0]["id"] == "c1"
+        # The valid sibling passes through byte-identical.
+        assert tcs[1]["function"]["arguments"] == '{"ok": 1}'
+        assert tcs[1]["thought_signature"] == "sig456"
+
+    def test_prepare_messages_swap_serializes_dict_arguments(self) -> None:
+        # The internal-shape case the shared legalize helper handles: a raw
+        # fidelity dict whose arguments landed as an unserialized dict is
+        # json.dumps'd — content preserved, not collapsed to "{}".
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": {"path": "/tmp/x"}},
+                        "thought_signature": "sig1",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tc = cleaned[0]["tool_calls"][0]
+        assert json.loads(tc["function"]["arguments"]) == {"path": "/tmp/x"}
+        assert tc["thought_signature"] == "sig1"
+
+    def test_prepare_messages_blank_id_raw_row_keeps_sanitized_mirror(self) -> None:
+        # A historical fidelity row whose raw dict carries a blank id (saved
+        # before the capture-time blank-id gate existed): swapping it in
+        # would resurrect the blank id on every replay, so the swap is
+        # skipped and the sanitized mirror — with its back-filled id — stays.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_backfilled",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_backfilled", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tc = cleaned[0]["tool_calls"][0]
+        assert tc["id"] == "call_backfilled"  # mirror kept, raw lane not swapped
+        assert "thought_signature" not in tc
+
+    def test_prepare_messages_ignores_non_dict_provider_content_elements(self) -> None:
+        # A corrupted persisted lane with a non-dict element must not crash
+        # the request build.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "_provider_content": ["garbage-string"],
+            },
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["content"] == "x"
+        assert "_provider_content" not in cleaned[0]
+
+    def test_prepare_messages_partial_lane_keeps_sanitized_mirror(self) -> None:
+        # A partially-corrupted lane (one valid raw dict + one garbage
+        # element) must not swap a SHORTER list over the mirror — that would
+        # drop a mirrored call whose tool result remains in history and
+        # orphan it.  The sanitized mirror stays.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_A",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_B",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": "{}"},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "call_A",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig",
+                    },
+                    "garbage-string",
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_A", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_B", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        ids = [tc["id"] for tc in cleaned[0]["tool_calls"]]
+        assert ids == ["call_A", "call_B"]  # mirror kept — no orphaned call_B
+
+    def test_prepare_messages_swap_passes_non_dict_function_through(self) -> None:
+        # A degenerate fidelity block with function=None must pass through
+        # untouched (the prior behaviour), not raise.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {"id": "c1", "type": "function", "function": None},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["tool_calls"][0]["function"] is None
+
+    def test_prepare_messages_base_class_unchanged(self) -> None:
+        """Base class _prepare_messages just calls sanitize_messages."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        prov = OpenAIChatCompletionsProvider()
+        msgs = [
+            {"role": "assistant", "content": None},  # should get content=""
+            {"role": "user", "content": "hi"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["content"] == ""
+
+    def test_streaming_captures_thought_signature(self) -> None:
+        """Streaming _iter_stream taps raw deltas and emits provider_blocks."""
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+
+        # Build a minimal mock stream with 2 chunks:
+        # chunk 1: tool call header with thought_signature
+        # chunk 2: finish reason
+        mock_fn = MagicMock()
+        mock_fn.name = "write_file"
+        mock_fn.arguments = '{"path":"test.txt"}'
+
+        mock_tc_delta = MagicMock()
+        mock_tc_delta.index = 0
+        mock_tc_delta.id = "call_abc"
+        mock_tc_delta.function = mock_fn
+        mock_tc_delta.__pydantic_extra__ = {"thought_signature": "sig_stream"}
+
+        mock_delta1 = MagicMock()
+        mock_delta1.content = None
+        mock_delta1.tool_calls = [mock_tc_delta]
+        mock_delta1.annotations = None
+        # reasoning fields
+        mock_delta1.reasoning = None
+        mock_delta1.reasoning_content = None
+
+        mock_choice1 = MagicMock()
+        mock_choice1.finish_reason = None
+        mock_choice1.delta = mock_delta1
+
+        mock_chunk1 = MagicMock()
+        mock_chunk1.choices = [mock_choice1]
+        mock_chunk1.usage = None
+
+        # Finish chunk
+        mock_delta2 = MagicMock()
+        mock_delta2.content = None
+        mock_delta2.tool_calls = None
+        mock_delta2.annotations = None
+        mock_delta2.reasoning = None
+        mock_delta2.reasoning_content = None
+
+        mock_choice2 = MagicMock()
+        mock_choice2.finish_reason = "tool_calls"
+        mock_choice2.delta = mock_delta2
+
+        mock_chunk2 = MagicMock()
+        mock_chunk2.choices = [mock_choice2]
+        mock_chunk2.usage = None
+
+        chunks = list(prov._iter_stream([mock_chunk1, mock_chunk2]))
+
+        # Find the chunk with finish_reason
+        finish_chunks = [c for c in chunks if c.finish_reason]
+        assert len(finish_chunks) == 1
+        fc = finish_chunks[0]
+        assert len(fc.provider_blocks) == 1
+        assert fc.provider_blocks[0]["thought_signature"] == "sig_stream"
+        assert fc.provider_blocks[0]["id"] == "call_abc"
+        assert fc.provider_blocks[0]["function"]["name"] == "write_file"
+
+    def test_tap_slots_degenerate_calls_like_the_mirror(self) -> None:
+        # The raw fidelity tap and the base iterator slot the SAME delta
+        # sequence identically: two wire-index-0 calls with distinct ids
+        # yield TWO raw dicts, each keeping its own thought_signature — a
+        # fused single dict would fail _prepare_messages' length gate and
+        # silently drop the signature lane from the replay.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+
+        def _tc(tc_id: str, name: str, args: str, sig: str) -> MagicMock:
+            tcd = _openai_tool_call_delta(index=0, tc_id=tc_id, name=name, arguments=args)
+            tcd.__pydantic_extra__ = {"thought_signature": sig}
+            return tcd
+
+        chunks = [
+            _openai_stream_chunk(tool_calls=[_tc("c1", "read", '{"a": 1}', "sig_a")]),
+            _openai_stream_chunk(tool_calls=[_tc("c2", "write", '{"b": 2}', "sig_b")]),
+            _openai_stream_chunk(finish_reason="tool_calls"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+
+        result = drain_stream(
+            prov.create_streaming(
+                client=client, model="gemini-2.5-pro", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+        assert len(result.tool_calls) == 2
+        assert len(result.provider_blocks) == 2
+        assert [b["thought_signature"] for b in result.provider_blocks] == ["sig_a", "sig_b"]
+        assert [b["id"] for b in result.provider_blocks] == ["c1", "c2"]
+
+    def test_base_chat_lane_emits_no_provider_blocks(self) -> None:
+        """The base chat lane carries NO provider_blocks for tool calls —
+        only the Google subclass's tap captures raw dicts.  Pinned on the
+        drained stream (the one transport) so a base-lane regression that
+        started manufacturing blocks would surface here."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        prov = OpenAIChatCompletionsProvider()
+        client = MagicMock()
+        client.chat.completions.create.return_value = fake_chat_stream(
+            tool_calls=[{"id": "c1", "name": "test", "arguments": "{}"}],
+            finish_reason="tool_calls",
+        )
+        result = drain_stream(
+            prov.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+        assert result.tool_calls is not None and len(result.tool_calls) == 1
+        assert result.provider_blocks == []
+
+
+# ===========================================================================
+# TestDataclasses
+# ===========================================================================
+
+
+class TestDataclasses:
+    """Tests for protocol dataclass construction and defaults."""
+
+    def test_stream_chunk_defaults(self) -> None:
+        sc = StreamChunk()
+        assert sc.content_delta == ""
+        assert sc.reasoning_delta == ""
+        assert sc.tool_call_deltas == []
+        assert sc.usage is None
+        assert sc.finish_reason is None
+        assert sc.is_first is False
+
+    def test_tool_call_delta_defaults(self) -> None:
+        tcd = ToolCallDelta(index=0)
+        assert tcd.index == 0
+        assert tcd.id == ""
+        assert tcd.name == ""
+        assert tcd.arguments_delta == ""
+
+    def test_usage_info(self) -> None:
+        u = UsageInfo(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        assert u.prompt_tokens == 10
+        assert u.completion_tokens == 5
+        assert u.total_tokens == 15
+
+    def test_completion_result_defaults(self) -> None:
+        cr = CompletionResult(content="hello")
+        assert cr.content == "hello"
+        assert cr.tool_calls is None
+        assert cr.finish_reason == "stop"
+        assert cr.usage is None
+
+    def test_stream_chunk_info_delta_default(self) -> None:
+        sc = StreamChunk()
+        assert sc.info_delta == ""
+
+    def test_model_capabilities_web_search_default(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_web_search is False
+
+
+# ===========================================================================
+# TestParameterGating — model capability parameter gating
+# ===========================================================================
+
+
+class TestOpenAIParameterGating:
+    """Verify _apply_model_params gates temperature and reasoning_effort correctly."""
+
+    def setup_method(self) -> None:
+        self.provider = OpenAIProvider()
+
+    def test_local_model_effort_forwarded_verbatim(self) -> None:
+        """Local-lane models receive the session knob verbatim on the flat
+        param (effort_passthrough) — the user's effort setting always
+        reaches the wire; "none" stays omitted (nothing to disable
+        beyond the template toggle)."""
+        caps = self.provider.get_capabilities("my-local-model")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        assert kwargs["reasoning_effort"] == "medium"
+        assert kwargs["temperature"] == 0.7
+        kwargs = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert "reasoning_effort" not in kwargs
+
+    def test_always_reasoning_row_no_temperature_effort_sent(self) -> None:
+        """Always-reasoning rows (gpt-5.4-pro): no temperature ever, the
+        knob's effort value reaches the wire."""
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_gpt54_temperature_when_effort_none(self) -> None:
+        """GPT-5.4: temperature only when reasoning_effort='none'; the
+        declared "none" level is forwarded explicitly (knob = off)."""
+        caps = lookup_openai_capabilities("gpt-5.4")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["reasoning_effort"] == "none"
+
+    def test_gpt54_no_temperature_when_reasoning_active(self) -> None:
+        """GPT-5.4: no temperature when reasoning is active."""
+        caps = lookup_openai_capabilities("gpt-5.4")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_no_effort_vocabulary_row_drops_the_knob(self) -> None:
+        """A commercial row with an EMPTY effort vocabulary (the search-api
+        model) drops the session knob — nothing valid to send."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        assert "reasoning_effort" not in kwargs
+
+    def test_pro_row_off_list_effort_snaps_onto_floor(self) -> None:
+        """gpt-5.4-pro declares medium/high/xhigh; an off-list low value
+        rounds UP onto the declared floor."""
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "medium"
+
+    def test_pro_row_supported_effort_passes_through(self) -> None:
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_gpt54_1m_context_and_effort(self) -> None:
+        """GPT-5.4: 1M context, temperature when effort=none, xhigh supported."""
+        caps = lookup_openai_capabilities("gpt-5.4")
+        assert caps.context_window == 1050000
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["reasoning_effort"] == "none"  # declared level, forwarded
+        kwargs2: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
+        assert "temperature" not in kwargs2
+        assert kwargs2["reasoning_effort"] == "xhigh"
+
+    def test_gpt54_pro_no_temperature_always_reasoning(self) -> None:
+        """GPT-5.4 pro: no temperature, medium/high/xhigh only."""
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
+        assert caps.context_window == 1050000
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
+
+    def test_gpt55_1m_context_and_effort(self) -> None:
+        """GPT-5.5: 1M context, temperature when effort=none, xhigh supported."""
+        caps = lookup_openai_capabilities("gpt-5.5")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["reasoning_effort"] == "none"  # declared level, forwarded
+        kwargs2: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
+        assert "temperature" not in kwargs2
+        assert kwargs2["reasoning_effort"] == "xhigh"
+
+    def test_gpt55_pro_no_temperature_always_reasoning(self) -> None:
+        """GPT-5.5 pro: no temperature, medium/high/xhigh only."""
+        caps = lookup_openai_capabilities("gpt-5.5-pro")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
+
+    def test_gpt56_sol_max_effort_and_temperature(self) -> None:
+        """GPT-5.6 (Sol / bare alias): 1M context + tool search; accepts
+        the NEW "max" reasoning effort verbatim (first commercial OpenAI
+        model to use it); temperature only at reasoning_effort="none"."""
+        caps = lookup_openai_capabilities("gpt-5.6")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert "max" in caps.reasoning_effort_values
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="max")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "max"
+        none_kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(none_kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert none_kwargs["temperature"] == 0.7
+        assert none_kwargs["reasoning_effort"] == "none"
+
+    def test_gpt56_sol_id_resolves_by_prefix(self) -> None:
+        """The explicit "gpt-5.6-sol" id and dated Sol snapshots inherit
+        the Sol/alias row (incl. "max") by longest-prefix match."""
+        assert "max" in lookup_openai_capabilities("gpt-5.6-sol").reasoning_effort_values
+        assert "max" in lookup_openai_capabilities("gpt-5.6-2026-07-09").reasoning_effort_values
+
+    def test_gpt56_terra_luna_support_max_effort(self) -> None:
+        """Every GPT-5.6 tier accepts the documented "max" effort."""
+        for tier in ("gpt-5.6-terra", "gpt-5.6-luna"):
+            caps = lookup_openai_capabilities(tier)
+            assert "max" in caps.reasoning_effort_values, tier
+            kwargs: dict[str, Any] = {}
+            apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="max")
+            assert kwargs["reasoning_effort"] == "max", tier
+
+    def test_gpt6_sol_luna_rows(self) -> None:
+        """GPT-6 Sol and Luna: 1.05M context / 128K output, the none..max
+        ladder with a medium default, and the documented Responses surface.
+        Neither id prefix-matches the Astra row."""
+        for model in ("gpt-6-sol", "gpt-6-luna", "gpt-6-sol-2026-09-01"):
+            caps = lookup_openai_capabilities(model)
+            assert caps.context_window == 1050000, model
+            assert caps.max_output_tokens == 128000, model
+            assert caps.reasoning_effort_values == (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ), model
+            assert caps.default_reasoning_effort == "medium", model
+            assert caps.supports_tool_search is True, model
+            assert caps.supports_vision is True, model
+            assert caps.supports_pdf is True, model
+            assert caps.supports_reasoning_replay is True, model
+            assert caps.supports_verbosity is True, model
+            assert caps.supports_pro_mode is True, model
+            assert caps.supports_mid_conversation_system is False, model
+
+    def test_gpt6_sol_luna_temperature_only_at_effort_none(self) -> None:
+        """Sampling parameters ride only when reasoning is explicitly off;
+        every effort level, including none and max, reaches the wire."""
+        for model in ("gpt-6-sol", "gpt-6-luna"):
+            caps = lookup_openai_capabilities(model)
+            for effort in ("low", "high", "max"):
+                kwargs: dict[str, Any] = {}
+                apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort=effort)
+                assert "temperature" not in kwargs, (model, effort)
+                assert kwargs["reasoning_effort"] == effort, (model, effort)
+            unset: dict[str, Any] = {}
+            apply_temperature_and_effort(unset, caps, temperature=0.7, reasoning_effort=None)
+            assert "temperature" not in unset, model
+            none_kwargs: dict[str, Any] = {}
+            apply_temperature_and_effort(
+                none_kwargs, caps, temperature=0.7, reasoning_effort="none"
+            )
+            assert none_kwargs["temperature"] == 0.7, model
+            assert none_kwargs["reasoning_effort"] == "none", model
+
+    def test_gpt6_astra_row_unchanged_by_sol_luna(self) -> None:
+        """Astra keeps its own contract: no none effort, never a temperature."""
+        caps = lookup_openai_capabilities("gpt-6-astra")
+        assert "none" not in caps.reasoning_effort_values
+        assert caps.supports_temperature is False
+        assert caps.supports_mid_conversation_system is True
+
+    def test_gpt6_1_sol_row(self) -> None:
+        """GPT-6.1 Sol: the GPT-6 limits and surface with Astra's always-on
+        reasoning (no none level, never a temperature) and a documented
+        medium default.  The dotted id must neither fall to the default row
+        nor inherit the gpt-6-sol row's none level."""
+        for model in ("gpt-6.1-sol", "gpt-6.1-sol-2026-09-29"):
+            caps = lookup_openai_capabilities(model)
+            assert caps.context_window == 1050000, model
+            assert caps.max_output_tokens == 128000, model
+            assert caps.supports_temperature is False, model
+            assert caps.reasoning_effort_values == ("low", "medium", "high", "xhigh", "max"), model
+            assert caps.default_reasoning_effort == "medium", model
+            assert caps.supports_tool_search is True, model
+            assert caps.supports_vision is True, model
+            assert caps.supports_pdf is True, model
+            assert caps.supports_reasoning_replay is True, model
+            assert caps.supports_verbosity is True, model
+            assert caps.supports_pro_mode is True, model
+            assert caps.supports_mid_conversation_system is False, model
+
+
+class TestAnthropicOrphanedToolUse:
+    """Verify _convert_messages synthesizes tool_results for orphaned tool_use."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_orphaned_tool_use_gets_synthetic_result(self) -> None:
+        """Assistant has tool_calls but next message is user (no tool results)."""
+        messages = [
+            {"role": "user", "content": "do something"},
+            {
+                "role": "assistant",
+                "content": "I'll run that.",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                    }
+                ],
+            },
+            {"role": "user", "content": "never mind, do something else"},
+        ]
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
+        # Should have: user, assistant(tool_use), user(synthetic tool_result), user
+        # After _merge_consecutive, the two user messages may merge.
+        # Find the synthetic tool_result
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "call_abc"
+        assert tool_results[0]["is_error"] is True
+        assert "cancelled" in tool_results[0]["content"].lower()
+
+    def test_multiple_orphaned_tool_calls(self) -> None:
+        """Assistant has 3 tool_calls, none have results."""
+        messages = [
+            {"role": "user", "content": "do three things"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "c2", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "c3", "function": {"name": "write_file", "arguments": "{}"}},
+                ],
+            },
+            {"role": "user", "content": "skip all that"},
+        ]
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 3
+        result_ids = {r["tool_use_id"] for r in tool_results}
+        assert result_ids == {"c1", "c2", "c3"}
+
+    def test_partial_results_only_orphans_synthesized(self) -> None:
+        """2 tool_calls, only 1 has a result — synthesize for the missing one."""
+        messages = [
+            {"role": "user", "content": "do two things"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "c2", "function": {"name": "write_file", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "file1.txt"},
+            {"role": "user", "content": "skip the write"},
+        ]
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
+        # c1 should have a real result, c2 should have a synthetic one
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        # Real result should come before synthetic (ordering matters for Anthropic)
+        assert len(tool_results) == 2
+        assert tool_results[0]["tool_use_id"] == "c1"
+        assert tool_results[0]["content"] == "file1.txt"  # real result
+        assert tool_results[0].get("is_error") is not True
+        assert tool_results[1]["tool_use_id"] == "c2"
+        assert tool_results[1]["is_error"] is True  # synthetic
+
+    def test_complete_results_no_synthesis(self) -> None:
+        """All tool_calls have results — no synthesis needed."""
+        messages = [
+            {"role": "user", "content": "do it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "done"},
+            {"role": "user", "content": "thanks"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # No synthetic results — only the real one (no is_error flag)
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "c1"
+        assert tool_results[0].get("is_error") is not True
+
+    def test_trailing_orphan(self) -> None:
+        """Orphaned tool_use at end of conversation (no following messages)."""
+        messages = [
+            {"role": "user", "content": "do it"},
+            {
+                "role": "assistant",
+                "content": "Running...",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+            },
+        ]
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "c1"
+        assert tool_results[0]["is_error"] is True
+
+    def test_provider_content_orphan(self) -> None:
+        """Orphaned tool_use inside _provider_content (Anthropic raw blocks)."""
+        messages = [
+            {"role": "user", "content": "run something"},
+            {
+                "role": "assistant",
+                "content": "Running...",
+                "_provider_content": [
+                    {"type": "text", "text": "Running..."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_abc",
+                        "name": "bash",
+                        "input": {"command": "sleep 30"},
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "id": "toolu_abc",
+                        "function": {"name": "bash", "arguments": '{"command": "sleep 30"}'},
+                    },
+                ],
+            },
+            {"role": "user", "content": "never mind"},
+        ]
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
+        # Should synthesize a tool_result for the orphaned tool_use in provider_content
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "toolu_abc"
+        assert tool_results[0]["is_error"] is True
+
+
+class TestAnthropicReasoningNone:
+    """Verify 'none' effort disables thinking for manual-thinking models."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_none_effort_disables_thinking(self) -> None:
+        result = self.provider._reasoning_params("none", None, max_tokens=4096)
+        assert result == {}
+
+    def test_empty_effort_disables_thinking(self) -> None:
+        result = self.provider._reasoning_params("", None, max_tokens=4096)
+        assert result == {}
+
+    def test_low_effort_enables_thinking(self) -> None:
+        result = self.provider._reasoning_params("low", None, max_tokens=4096)
+        assert "thinking" in result
+        assert result["thinking"]["budget_tokens"] == 1024
+
+    def test_map_xhigh_effort(self) -> None:
+        from turnstone.core.providers._anthropic import _map_reasoning_to_effort
+
+        result = _map_reasoning_to_effort("xhigh", ("low", "medium", "high", "xhigh", "max"))
+        assert result == "xhigh"
+
+    def test_map_xhigh_snaps_up_through_gap_to_max(self) -> None:
+        """Levels with a hole (no xhigh) round the knob UP to the next
+        declared level rather than dropping output_config entirely."""
+        from turnstone.core.providers._anthropic import _map_reasoning_to_effort
+
+        result = _map_reasoning_to_effort("xhigh", ("low", "medium", "high", "max"))
+        assert result == "max"
+
+    def test_map_above_ceiling_rides_ceiling(self) -> None:
+        from turnstone.core.providers._anthropic import _map_reasoning_to_effort
+
+        assert _map_reasoning_to_effort("max", ("low", "medium", "high")) == "high"
+        assert _map_reasoning_to_effort("minimal", ("low", "medium", "high")) == "low"
+        assert _map_reasoning_to_effort("none", ("low", "medium", "high")) is None
+
+
+# ===========================================================================
+# TestWebSearch — provider-native web search
+# ===========================================================================
+
+
+class TestAnthropicWebSearch:
+    """Tests for Anthropic native web search tool injection and streaming."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_web_search_capability_flag(self) -> None:
+        """All Anthropic models should support native web search."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        assert caps.supports_web_search is True
+        caps = self.provider.get_capabilities("claude-sonnet-4-6")
+        assert caps.supports_web_search is True
+        # Unknown models use default which also has web search
+        caps = self.provider.get_capabilities("claude-unknown-99")
+        assert caps.supports_web_search is True
+
+    def test_inject_web_search_replaces_function_tool(self) -> None:
+        """web_search function tool should be replaced with native server-side tool."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        tools = [
+            {"name": "bash", "description": "Run bash", "input_schema": {"type": "object"}},
+            {"name": "web_search", "description": "Search web", "input_schema": {"type": "object"}},
+        ]
+        result = self.provider._inject_web_search(tools, caps)
+        names = [t.get("name") for t in result]
+        assert "bash" in names
+        assert "web_search" in names
+        # The web_search entry should be the native tool, not the function tool
+        ws_tool = next(t for t in result if t.get("name") == "web_search")
+        from turnstone.core.providers._anthropic import _WEB_SEARCH_TOOL_TYPE
+
+        assert ws_tool["type"] == _WEB_SEARCH_TOOL_TYPE
+        assert "input_schema" not in ws_tool
+
+    def test_inject_web_search_no_op_without_tool(self) -> None:
+        """If no web_search tool in list, no injection happens."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        tools = [
+            {"name": "bash", "description": "Run bash", "input_schema": {"type": "object"}},
+        ]
+        result = self.provider._inject_web_search(tools, caps)
+        assert result is tools  # Unchanged
+
+    def test_streaming_server_tool_use_emits_search_info(self) -> None:
+        """server_tool_use block should emit info_delta with search query."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_123",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "python web frameworks"}',
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+        ]
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "python web frameworks" in info_chunks[0].info_delta
+        assert "Searching" in info_chunks[0].info_delta
+
+    def test_streaming_web_search_result_emits_count(self) -> None:
+        """web_search_tool_result block should emit result count info."""
+        # Build mock search results
+        result1 = MagicMock()
+        result1.type = "web_search_result"
+        result2 = MagicMock()
+        result2.type = "web_search_result"
+
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="web_search_tool_result",
+                index=1,
+            ),
+        ]
+        # Set up the content attribute with search results
+        events[0].content_block.content = [result1, result2]
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "Found 2 results" in info_chunks[0].info_delta
+
+    def test_streaming_web_search_error_emits_info(self) -> None:
+        """web_search_tool_result with error should emit error info."""
+        error_content = MagicMock()
+        error_content.type = "web_search_tool_result_error"
+        error_content.error_code = "too_many_requests"
+
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="web_search_tool_result",
+                index=1,
+            ),
+        ]
+        events[0].content_block.content = error_content
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "too_many_requests" in info_chunks[0].info_delta
+
+    def test_streaming_server_tool_use_not_emitted_as_tool_call(self) -> None:
+        """server_tool_use should NOT produce tool_call_deltas (it's server-side)."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_123",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "test"}',
+                index=0,
+            ),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        tool_chunks = [c for c in chunks if c.tool_call_deltas]
+        assert len(tool_chunks) == 0
+
+    def test_streaming_mixed_text_and_search(self) -> None:
+        """Full sequence: text + server search + results + more text."""
+        events = [
+            # Initial text
+            _anthropic_event(
+                "content_block_start",
+                block_type="text",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="text_delta",
+                text="Let me search.",
+                index=0,
+            ),
+            # Server tool use
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=1,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "test query"}',
+                index=1,
+            ),
+            _anthropic_event("content_block_stop", index=1),
+            # Response text
+            _anthropic_event(
+                "content_block_start",
+                block_type="text",
+                index=3,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="text_delta",
+                text="Based on the results...",
+                index=3,
+            ),
+            # Finish
+            _anthropic_event("message_delta", stop_reason="end_turn"),
+        ]
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        text_chunks = [c for c in chunks if c.content_delta]
+        info_chunks = [c for c in chunks if c.info_delta]
+        # Three content chunks: the second text BLOCK opens with the "\n"
+        # separator (matching the retired non-streaming join), then its text.
+        assert [c.content_delta for c in text_chunks] == [
+            "Let me search.",
+            "\n",
+            "Based on the results...",
+        ]
+        assert len(info_chunks) == 1
+        assert "test query" in info_chunks[0].info_delta
+
+    def test_pause_turn_preserved(self) -> None:
+        """A server-tool continuation is distinct from an ordinary stop."""
+        from turnstone.core.providers._anthropic import _normalize_finish_reason
+
+        assert _normalize_finish_reason("pause_turn") == "pause_turn"
+
+    def test_drained_stream_skips_server_blocks(self) -> None:
+        """Server-side blocks surface as transient info (dropped by the
+        drain), never as content or client tool calls."""
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="server_tool_use", id="srvtoolu_1", name="web_search"),
+                SimpleNamespace(type="web_search_tool_result"),
+                SimpleNamespace(type="text", text="Here are the results."),
+            ]
+        )
+
+        with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
+            result = drain_stream(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-opus-4-6",
+                    messages=[{"role": "user", "content": "search test"}],
+                )
+            )
+        assert result.content == "Here are the results."
+        assert result.tool_calls is None
+
+    def test_streaming_multiple_searches(self) -> None:
+        """Multiple server_tool_use blocks in one response should each emit info."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "first search"}',
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_2",
+                block_name="web_search",
+                index=2,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "second search"}',
+                index=2,
+            ),
+            _anthropic_event("content_block_stop", index=2),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 2
+        assert "first search" in info_chunks[0].info_delta
+        assert "second search" in info_chunks[1].info_delta
+
+    def test_streaming_interleaved_tool_use_and_server_tool_use(self) -> None:
+        """Regular tool_use and server_tool_use at different indices."""
+        events = [
+            # Regular tool call at index 0
+            _anthropic_event(
+                "content_block_start",
+                block_type="tool_use",
+                block_id="toolu_1",
+                block_name="bash",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"command": "ls"}',
+                index=0,
+            ),
+            # Server tool at index 1
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=1,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "test"}',
+                index=1,
+            ),
+            _anthropic_event("content_block_stop", index=1),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        tool_chunks = [c for c in chunks if c.tool_call_deltas]
+        info_chunks = [c for c in chunks if c.info_delta]
+        # Regular tool_use should produce tool_call_deltas
+        assert len(tool_chunks) == 2  # start + delta
+        assert tool_chunks[0].tool_call_deltas[0].name == "bash"
+        # Server tool_use should produce info_delta only
+        assert len(info_chunks) == 1
+        assert "test" in info_chunks[0].info_delta
+
+    def test_streaming_malformed_server_tool_json(self) -> None:
+        """Malformed JSON in server tool input should emit fallback info."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json="{bad json",
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert info_chunks[0].info_delta == "[Searching...]"
+
+    def test_web_search_result_empty_list(self) -> None:
+        """Empty search results list should report 0 results."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="web_search_tool_result",
+                index=0,
+            ),
+        ]
+        events[0].content_block.content = []
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "Found 0 results" in info_chunks[0].info_delta
+
+    def test_content_block_stop_for_text_block_no_spurious_info(self) -> None:
+        """content_block_stop for a text block should not emit info_delta."""
+        events = [
+            _anthropic_event("content_block_start", block_type="text", index=0),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="text_delta",
+                text="hello",
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 0
+
+
+class TestOpenAIWebSearch:
+    """Tests for OpenAI native web search with search models."""
+
+    def setup_method(self) -> None:
+        self.provider = OpenAIProvider()
+
+    def test_search_model_capability(self) -> None:
+        """Search models should have supports_web_search=True."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
+        assert caps.supports_web_search is True
+
+    def test_non_search_model_no_web_search(self) -> None:
+        """Regular models should not have supports_web_search."""
+        caps = lookup_openai_capabilities("gpt-5")
+        assert caps.supports_web_search is False
+        caps = lookup_openai_capabilities("gpt-5.2")
+        assert caps.supports_web_search is False
+
+    def test_apply_web_search_injects_options(self) -> None:
+        """For search models, web_search_options should be added to kwargs."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {"model": "gpt-5-search-api"}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "bash", "description": "Run bash"}},
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        # web_search_options should be in kwargs
+        assert "web_search_options" in kwargs
+        # web_search tool should be removed
+        assert result is not None
+        names = [t["function"]["name"] for t in result]
+        assert "web_search" not in names
+        assert "bash" in names
+
+    def test_apply_web_search_no_op_for_regular_models(self) -> None:
+        """For non-search models, no web_search_options, tools unchanged."""
+        caps = lookup_openai_capabilities("gpt-5")
+        kwargs: dict[str, Any] = {"model": "gpt-5"}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert "web_search_options" not in kwargs
+        assert result is tools  # Unchanged
+
+    def test_apply_web_search_returns_none_when_only_web_search(self) -> None:
+        """If web_search was the only tool, return None after removing it."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert result is None
+
+    def test_apply_web_search_no_op_when_client_def_absent(self) -> None:
+        """Replace-only: a search model with a NON-EMPTY toolset that never
+        advertised web_search (a persona visibility set or coordinator
+        toolset) must NOT gain native search — the option stays off and the
+        tools pass through untouched.  Contrast test_apply_web_search_with_
+        no_tools, which covers the tool-less utility-call case."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
+        assert caps.supports_web_search is True
+        kwargs: dict[str, Any] = {"model": "gpt-5-search-api"}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "bash", "description": "Run bash"}},
+            {"type": "function", "function": {"name": "read_file", "description": "Read"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert "web_search_options" not in kwargs
+        assert result is tools  # unchanged, not filtered or replaced
+
+    def test_format_citations_appends_sources(self) -> None:
+        """url_citation annotations should be formatted as footnote sources."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        citation = MagicMock()
+        citation.title = "Example Page"
+        citation.url = "https://example.com"
+        ann.url_citation = citation
+
+        content = "Some search result text."
+        result = format_citations(content, [ann])
+        assert "Sources:" in result
+        assert "[Example Page](https://example.com)" in result
+
+    def test_format_citations_deduplicates(self) -> None:
+        """Duplicate URLs should not appear twice in sources."""
+        ann1 = MagicMock()
+        ann1.type = "url_citation"
+        ann1.url_citation = MagicMock(title="Page", url="https://example.com")
+
+        ann2 = MagicMock()
+        ann2.type = "url_citation"
+        ann2.url_citation = MagicMock(title="Page Again", url="https://example.com")
+
+        content = "Text."
+        result = format_citations(content, [ann1, ann2])
+        assert result.count("example.com") == 1
+
+    def test_format_citations_skips_non_url_citation(self) -> None:
+        """Non-url_citation annotations should be ignored."""
+        ann = MagicMock()
+        ann.type = "something_else"
+
+        content = "Text."
+        result = format_citations(content, [ann])
+        assert "Sources:" not in result
+
+    def test_format_citations_empty_title(self) -> None:
+        """Citation with empty title should show plain URL."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="", url="https://example.com")
+
+        result = format_citations("Text.", [ann])
+        assert "https://example.com" in result
+        # Should not have markdown link format when title is empty
+        assert "[](https://example.com)" not in result
+
+    def test_format_citations_none_citation(self) -> None:
+        """Citation with None url_citation should be skipped."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = None
+
+        result = format_citations("Text.", [ann])
+        assert "Sources:" not in result
+
+    def test_apply_web_search_with_no_tools(self) -> None:
+        """No client web_search def ⇒ no injection (replace-only semantics).
+
+        A request that never advertised the web_search tool — persona
+        visibility set, coordinator toolset, or a tool-less utility call —
+        must not gain native search at the provider layer.
+        """
+        caps = lookup_openai_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {}
+        result = self.provider._apply_web_search(kwargs, caps, None)
+        assert "web_search_options" not in kwargs
+        assert result is None
+
+    def test_apply_web_search_replaces_client_def(self) -> None:
+        """With the client def present, it is filtered and the option set."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {}
+        tools = [{"type": "function", "function": {"name": "web_search"}}]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert "web_search_options" in kwargs
+        assert result is None  # the lone def was filtered away
+
+    def test_streaming_creates_with_web_search_options(self) -> None:
+        """Streaming with a search model should pass web_search_options."""
+        client = MagicMock()
+        request_metrics: list[ProviderRequestMetrics] = []
+        client.chat.completions.create.return_value = iter(
+            [
+                _openai_stream_chunk(content="Result text"),
+            ]
+        )
+        list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search something"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {"name": "web_search", "description": "Search"},
+                    },
+                ],
+                # The local lane resolves no commercial rows — the search
+                # model's capabilities ride in explicitly, as the session
+                # layer would pass them.
+                capabilities=lookup_openai_capabilities("gpt-5-search-api"),
+                request_metrics_ref=request_metrics,
+            )
+        )
+        call_kwargs = client.chat.completions.create.call_args[1]
+        assert "web_search_options" in call_kwargs
+        # web_search tool should not be in the tools
+        assert "tools" not in call_kwargs or not any(
+            t.get("function", {}).get("name") == "web_search" for t in call_kwargs.get("tools", [])
+        )
+        assert request_metrics == [
+            ProviderRequestMetrics(
+                serialized_tool_chars=serialized_tool_chars(call_kwargs.get("tools")),
+                native_tools_enabled=True,
+            )
+        ]
+        assert request_metrics[0].serialized_tool_chars == 0
+
+    def test_drained_stream_folds_citations_into_content(self) -> None:
+        """The trailing citation info chunk folds back into drained content —
+        the #831 parity rule for what non-streaming citation embedding did."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Test", url="https://test.com")
+
+        chunks = fake_chat_stream(content="Found information.")
+        chunks[0].choices[0].delta.annotations = [ann]
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search test"}],
+            )
+        )
+        assert "Found information." in result.content
+        assert "Sources:" in result.content
+        assert "[Test](https://test.com)" in result.content
+
+    def test_streaming_emits_citations_as_info_delta(self) -> None:
+        """Streaming with search model should emit citations as final info_delta."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Result", url="https://example.com")
+
+        # Content chunk, then a chunk with annotation, then finish
+        content_chunk = _openai_stream_chunk(content="Search result text.")
+        content_chunk.choices[0].delta.annotations = None
+
+        ann_chunk = _openai_stream_chunk(content=None)
+        ann_chunk.choices[0].delta.annotations = [ann]
+
+        finish_chunk = _openai_stream_chunk(finish_reason="stop")
+        finish_chunk.choices[0].delta.annotations = None
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter([content_chunk, ann_chunk, finish_chunk])
+        chunks = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search test"}],
+            )
+        )
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "Sources:" in info_chunks[0].info_delta
+        assert "[Result](https://example.com)" in info_chunks[0].info_delta
+
+
+class TestClientSearchFallback:
+    """Tests for the client-side web_search fallback when providers lack native search."""
+
+    def test_local_model_no_web_search(self) -> None:
+        """Local/vLLM models should not have supports_web_search."""
+        provider = OpenAIProvider()
+        caps = provider.get_capabilities("my-local-model")
+        assert caps.supports_web_search is False
+
+    def test_web_search_tool_preserved_for_local_models(self) -> None:
+        """For local models, web_search function tool stays in the tools list."""
+        provider = OpenAIProvider()
+        caps = provider.get_capabilities("llama-3-70b")
+        kwargs: dict[str, Any] = {}
+        tools = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = provider._apply_web_search(kwargs, caps, tools)
+        assert result is tools
+        assert "web_search_options" not in kwargs
+
+
+# ===========================================================================
+# Anthropic provider_blocks / _provider_content round-trip tests
+# ===========================================================================
+
+
+class TestAnthropicProviderBlocks:
+    """Tests for multi-turn web search content preservation."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_convert_messages_uses_provider_content(self) -> None:
+        """Assistant message with _provider_content passes through verbatim."""
+        provider_content = [
+            {"type": "text", "text": "Here is what I found."},
+            {
+                "type": "server_tool_use",
+                "id": "stu_123",
+                "name": "web_search",
+                "input": {"query": "turnstone bird"},
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "stu_123",
+                "content": [{"type": "web_search_result", "url": "https://example.com"}],
+                "encrypted_content": "abc123encrypted",
+                "encrypted_index": "idx456encrypted",
+            },
+        ]
+        messages = [
+            {"role": "user", "content": "Search for turnstone bird"},
+            {
+                "role": "assistant",
+                "content": "Here is what I found.",
+                "_provider_content": provider_content,
+            },
+            {"role": "user", "content": "Tell me more"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # The assistant message should use provider_content verbatim
+        assistant_msg = converted[1]
+        assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["content"] is provider_content
+        assert assistant_msg["content"][2]["encrypted_content"] == "abc123encrypted"
+
+    def test_convert_messages_without_provider_content_unchanged(self) -> None:
+        """Assistant message without _provider_content uses normal reconstruction."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        assistant_msg = converted[1]
+        assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["content"] == [{"type": "text", "text": "Hi there"}]
+
+    def test_agent_native_lane_with_restore_map_is_wire_consistent(self) -> None:
+        """The sub-agent wire shape: an assistant Turn carrying the provider-
+        native lane, its minted tool id restored to the provider original by
+        the lowering map.  The native blocks replay verbatim (thinking +
+        signature untouched) and the native tool_use id, the top-level
+        mirror, and the tool_result all agree."""
+        from turnstone.core.lowering import restore_provider_tool_ids
+        from turnstone.core.trajectory import (
+            ProviderNative,
+            ToolCall,
+            Turn,
+            dicts_from_turns,
+        )
+
+        thinking = {"type": "thinking", "thinking": "look first", "signature": "sig_1"}
+        tool_use = {"type": "tool_use", "id": "toolu_01X", "name": "f", "input": {}}
+        minted = "task-1::r1s1::toolu_01X"
+        turns = [
+            Turn.user("go"),
+            Turn.assistant(
+                "using f",
+                tool_calls=(ToolCall(id=minted, name="f", arguments="{}"),),
+                native=ProviderNative(
+                    producer="anthropic",
+                    blocks=(thinking, {"type": "text", "text": "using f"}, tool_use),
+                ),
+            ),
+            Turn.tool(minted, "out"),
+        ]
+        wire = restore_provider_tool_ids(dicts_from_turns(turns), {minted: "toolu_01X"})
+        _, converted = self.provider._convert_messages(wire, replay_reasoning_to_model=True)
+        assistant = converted[1]
+        assert [b["type"] for b in assistant["content"]] == ["thinking", "text", "tool_use"]
+        assert assistant["content"][0]["signature"] == "sig_1"
+        assert assistant["content"][2]["id"] == "toolu_01X"
+        tool_results = [b for b in converted[2]["content"] if b.get("type") == "tool_result"]
+        assert tool_results and tool_results[0]["tool_use_id"] == "toolu_01X"
+
+    def test_agent_native_lane_without_restore_map_orphans_the_result(self) -> None:
+        """Documents why the id map is a PREREQUISITE of carrying the native
+        lane, not hygiene: without it the tool_result arrives with the minted
+        id, matches no native tool_use, and the converter drops it as an
+        orphan — leaving an unanswered tool_use on the wire (a provider
+        rejection)."""
+        from turnstone.core.trajectory import (
+            ProviderNative,
+            ToolCall,
+            Turn,
+            dicts_from_turns,
+        )
+
+        tool_use = {"type": "tool_use", "id": "toolu_01X", "name": "f", "input": {}}
+        minted = "task-1::r1s1::toolu_01X"
+        turns = [
+            Turn.user("go"),
+            Turn.assistant(
+                "",
+                tool_calls=(ToolCall(id=minted, name="f", arguments="{}"),),
+                native=ProviderNative(producer="anthropic", blocks=(tool_use,)),
+            ),
+            Turn.tool(minted, "out"),
+        ]
+        _, converted = self.provider._convert_messages(
+            dicts_from_turns(turns), replay_reasoning_to_model=True
+        )
+        all_results = [
+            b
+            for m in converted
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert all_results == []
+
+    def test_block_to_dict_with_model_dump(self) -> None:
+        """_block_to_dict uses model_dump(exclude_none=True) when available."""
+        from turnstone.core.providers._anthropic import _block_to_dict
+
+        class FakeBlock:
+            def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+                d = {"type": "text", "text": "hello", "extra": True, "nullable": None}
+                if kwargs.get("exclude_none"):
+                    return {k: v for k, v in d.items() if v is not None}
+                return d
+
+        result = _block_to_dict(FakeBlock())
+        assert result == {"type": "text", "text": "hello", "extra": True}
+        assert "nullable" not in result
+
+    def test_block_to_dict_fallback(self) -> None:
+        """_block_to_dict extracts known attributes as fallback."""
+        from turnstone.core.providers._anthropic import _block_to_dict
+
+        class FakeBlock:
+            type = "web_search_tool_result"
+            content = [{"type": "web_search_result"}]
+            encrypted_content = "enc123"
+            encrypted_index = "idx456"
+
+        result = _block_to_dict(FakeBlock())
+        assert result["type"] == "web_search_tool_result"
+        assert result["encrypted_content"] == "enc123"
+        assert result["encrypted_index"] == "idx456"
+
+    def test_streaming_captures_provider_blocks(self) -> None:
+        """Streaming events produce provider_blocks on the final chunk."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+
+        # Build mock stream events
+        events = []
+
+        # Text block
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = ""
+        text_block.model_dump.return_value = {"type": "text", "text": ""}
+        events.append(MagicMock(type="content_block_start", index=0, content_block=text_block))
+
+        events.append(
+            MagicMock(
+                type="content_block_delta",
+                index=0,
+                delta=MagicMock(type="text_delta", text="Hello"),
+            )
+        )
+        events.append(MagicMock(type="content_block_stop", index=0))
+
+        # Server tool use block
+        stu_block = MagicMock()
+        stu_block.type = "server_tool_use"
+        stu_block.name = "web_search"
+        stu_block.model_dump.return_value = {
+            "type": "server_tool_use",
+            "id": "stu_1",
+            "name": "web_search",
+            "input": {},
+        }
+        events.append(MagicMock(type="content_block_start", index=1, content_block=stu_block))
+        events.append(
+            MagicMock(
+                type="content_block_delta",
+                index=1,
+                delta=MagicMock(type="input_json_delta", partial_json='{"query":"test"}'),
+            )
+        )
+        events.append(MagicMock(type="content_block_stop", index=1))
+
+        # Web search tool result block
+        wsr_block = MagicMock()
+        wsr_block.type = "web_search_tool_result"
+        wsr_block.model_dump.return_value = {
+            "type": "web_search_tool_result",
+            "tool_use_id": "stu_1",
+            "content": [{"type": "web_search_result", "url": "https://example.com"}],
+            "encrypted_content": "enc_data",
+            "encrypted_index": "idx_data",
+        }
+        # Make content iterable for count
+        fake_result = MagicMock()
+        fake_result.type = "web_search_result"
+        wsr_block.content = [fake_result]
+        events.append(MagicMock(type="content_block_start", index=2, content_block=wsr_block))
+        events.append(MagicMock(type="content_block_stop", index=2))
+
+        # Message delta with stop
+        msg_delta = MagicMock(type="message_delta")
+        msg_delta.delta = MagicMock(stop_reason="end_turn")
+        msg_delta.usage = MagicMock(input_tokens=100, output_tokens=50)
+        events.append(msg_delta)
+
+        chunks = list(provider._iter_anthropic_stream(iter(events)))
+
+        # Find the final chunk with provider_blocks
+        final_chunks = [c for c in chunks if c.provider_blocks]
+        assert len(final_chunks) == 1
+        blocks = final_chunks[0].provider_blocks
+        assert len(blocks) == 3
+        assert blocks[0]["type"] == "text"
+        assert blocks[1]["type"] == "server_tool_use"
+        assert blocks[1]["input"] == {"query": "test"}  # parsed from accumulated JSON
+        assert blocks[2]["type"] == "web_search_tool_result"
+        assert blocks[2]["encrypted_content"] == "enc_data"
+
+    def test_streaming_thinking_block_captures_signature(self) -> None:
+        """Streaming thinking block accumulates signature from signature_delta events."""
+        thinking_block = MagicMock()
+        thinking_block.type = "thinking"
+        thinking_block.model_dump.return_value = {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "",
+        }
+
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.model_dump.return_value = {"type": "text", "text": ""}
+
+        events = [
+            MagicMock(type="content_block_start", index=0, content_block=thinking_block),
+            _anthropic_event(
+                "content_block_delta", delta_type="thinking_delta", thinking="step 1", index=0
+            ),
+            _anthropic_event(
+                "content_block_delta", delta_type="thinking_delta", thinking=" step 2", index=0
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="signature_delta",
+                signature="sig_part1",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="signature_delta",
+                signature="sig_part2",
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+            MagicMock(type="content_block_start", index=1, content_block=text_block),
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="Hello", index=1),
+            _anthropic_event("content_block_stop", index=1),
+            _anthropic_event("message_delta", stop_reason="end_turn", usage_output_tokens=50),
+        ]
+
+        chunks = list(self.provider._iter_anthropic_stream(iter(events)))
+        final_chunks = [c for c in chunks if c.provider_blocks]
+        assert len(final_chunks) == 1
+        blocks = final_chunks[0].provider_blocks
+        assert blocks[0]["type"] == "thinking"
+        assert blocks[0]["thinking"] == "step 1 step 2"
+        assert blocks[0]["signature"] == "sig_part1sig_part2"
+
+    def test_thinking_block_multiturn_roundtrip(self) -> None:
+        """Thinking block with signature survives _convert_messages round-trip."""
+        provider_content = [
+            {
+                "type": "thinking",
+                "thinking": "Let me reason...",
+                "signature": "ErUBCkYIAxgCIkD_valid_sig",
+            },
+            {"type": "text", "text": "Here is my answer."},
+        ]
+        messages = [
+            {"role": "user", "content": "Question"},
+            {
+                "role": "assistant",
+                "content": "Here is my answer.",
+                "_provider_content": provider_content,
+            },
+            {"role": "user", "content": "Follow up"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        assistant_msg = converted[1]
+        assert assistant_msg["content"] is provider_content
+        assert assistant_msg["content"][0]["signature"] == "ErUBCkYIAxgCIkD_valid_sig"
+        assert assistant_msg["content"][0]["type"] == "thinking"
+
+    def test_block_to_dict_preserves_thinking_signature(self) -> None:
+        """_block_to_dict preserves signature on thinking blocks."""
+        from turnstone.core.providers._anthropic import _block_to_dict
+
+        class FakeThinkingBlock:
+            def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "type": "thinking",
+                    "thinking": "reasoning...",
+                    "signature": "abc123sig",
+                }
+
+        result = _block_to_dict(FakeThinkingBlock())
+        assert result["signature"] == "abc123sig"
+
+        # Also test fallback path (no model_dump)
+        class FallbackBlock:
+            type = "thinking"
+            thinking = "reasoning..."
+            signature = "abc123sig"
+
+        result2 = _block_to_dict(FallbackBlock())
+        assert result2["signature"] == "abc123sig"
+
+
+# ---------------------------------------------------------------------------
+# Tool search tests
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicToolSearch:
+    """Test Anthropic provider tool search injection."""
+
+    @pytest.fixture()
+    def provider(self):
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        return AnthropicProvider()
+
+    def test_tool_search_capability_flag(self, provider):
+        caps = provider.get_capabilities("claude-opus-4-6-20260101")
+        assert caps.supports_tool_search is True
+
+    def test_tool_search_not_supported_on_haiku(self, provider):
+        caps = provider.get_capabilities("claude-haiku-4-5-20251001")
+        assert caps.supports_tool_search is False
+
+    def test_inject_tool_search_marks_deferred(self, provider):
+        caps = provider.get_capabilities("claude-opus-4-6-20260101")
+        tools = [
+            {"name": "bash", "description": "Run commands", "input_schema": {}},
+            {
+                "name": "mcp__github__create_issue",
+                "description": "Create issue",
+                "input_schema": {},
+            },
+        ]
+        deferred = frozenset(["mcp__github__create_issue"])
+        result = provider._inject_tool_search(tools, caps, deferred)
+        # bash should not be deferred
+        assert result[0].get("defer_loading") is None or result[0].get("defer_loading") is False
+        # MCP tool should be deferred
+        assert result[1]["defer_loading"] is True
+        # Search tool should be appended
+        assert result[-1]["type"] == "tool_search_tool_bm25"
+        assert result[-1]["name"] == "tool_search_tool_bm25"
+
+    def test_inject_tool_search_no_op_without_deferred(self, provider):
+        caps = provider.get_capabilities("claude-opus-4-6-20260101")
+        tools = [{"name": "bash", "description": "Run commands", "input_schema": {}}]
+        result = provider._inject_tool_search(tools, caps, None)
+        assert result == tools
+
+    def test_inject_tool_search_no_op_on_unsupported_model(self, provider):
+        caps = provider.get_capabilities("claude-haiku-4-5-20251001")
+        tools = [{"name": "bash", "description": "Run commands", "input_schema": {}}]
+        deferred = frozenset(["some_tool"])
+        result = provider._inject_tool_search(tools, caps, deferred)
+        assert result == tools
+
+
+class TestOpenAIToolSearch:
+    """Test OpenAI tool search injection (registry rows + shared helper)."""
+
+    def test_tool_search_capability_on_gpt54(self):
+        caps = lookup_openai_capabilities("gpt-5.4")
+        assert caps.supports_tool_search is True
+
+    def test_tool_search_not_supported_on_gpt5(self):
+        caps = lookup_openai_capabilities("gpt-5")
+        assert caps.supports_tool_search is False
+
+    def test_apply_tool_search_marks_deferred(self):
+        caps = lookup_openai_capabilities("gpt-5.4")
+        tools = [
+            {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
+            {
+                "type": "function",
+                "function": {"name": "mcp__slack__send", "description": "Send message"},
+            },
+        ]
+        deferred = frozenset(["mcp__slack__send"])
+        result = apply_tool_search(caps, tools, deferred)
+        assert result is not None
+        # bash not deferred
+        assert result[0].get("defer_loading") is None or result[0].get("defer_loading") is False
+        # slack tool deferred
+        assert result[1]["defer_loading"] is True
+
+    def test_apply_tool_search_no_op_without_deferred(self):
+        caps = lookup_openai_capabilities("gpt-5.4")
+        tools = [
+            {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
+        ]
+        result = apply_tool_search(caps, tools, None)
+        assert result == tools
+
+    def test_apply_tool_search_no_op_on_unsupported_model(self):
+        caps = lookup_openai_capabilities("gpt-5")
+        tools = [
+            {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
+        ]
+        deferred = frozenset(["some_tool"])
+        result = apply_tool_search(caps, tools, deferred)
+        assert result == tools
+
+
+class TestModelCapabilitiesToolSearch:
+    """Test supports_tool_search defaults and values."""
+
+    def test_default_is_false(self):
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_tool_search is False
+
+    def test_public_positional_prefix_remains_stable(self) -> None:
+        """New optional fields must not shift the exported constructor's existing slots."""
+        caps = ModelCapabilities(
+            100000,
+            10000,
+            False,
+            False,
+            False,
+            "max_tokens",
+            "manual",
+            "thinking",
+            "reasoning_effort",
+            True,
+            ("low",),
+            ("low",),
+            "low",
+            True,
+            True,
+            True,
+            True,
+        )
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+
+
+class TestMidConversationSystemCapability:
+    """supports_mid_conversation_system: set on rows whose model accepts it."""
+
+    def test_default_is_false(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_mid_conversation_system is False
+
+    def test_opus_4_8_supports_it(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        for model in ("claude-opus-4-8", "claude-opus-4-8-20260601"):
+            caps = provider.get_capabilities(model)
+            assert caps.supports_mid_conversation_system is True, model
+
+    def test_other_claude_models_do_not(self) -> None:
+        """Older Claude rows and the Anthropic default leave it off."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        for model in (
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-5",
+            "claude-unknown-9",  # Anthropic default
+        ):
+            caps = provider.get_capabilities(model)
+            assert caps.supports_mid_conversation_system is False, model
+
+
+# ---------------------------------------------------------------------------
+# Vision support
+# ---------------------------------------------------------------------------
+
+
+class TestVisionCapabilities:
+    """Test supports_vision flag across providers."""
+
+    def test_default_is_false(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_vision is False
+
+    def test_openai_commercial_supports_vision(self) -> None:
+        for model in ("gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-5.6-luna"):
+            caps = lookup_openai_capabilities(model)
+            assert caps.supports_vision is True, f"{model} should support vision"
+
+    def test_openai_default_no_vision(self) -> None:
+        """Local-lane models (any name) default to no vision."""
+        provider = OpenAIProvider()
+        caps = provider.get_capabilities("some-local-model")
+        assert caps.supports_vision is False
+
+    def test_anthropic_supports_vision(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        for model in ("claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"):
+            caps = provider.get_capabilities(model)
+            assert caps.supports_vision is True, f"{model} should support vision"
+
+    def test_anthropic_default_supports_vision(self) -> None:
+        """Anthropic default (unknown Claude model) supports vision."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-unknown-9")
+        assert caps.supports_vision is True
+
+
+class TestAnthropicVisionConversion:
+    """Test image content conversion in _convert_messages."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_tool_result_with_image_content(self) -> None:
+        """Tool result with list content converts image_url to Anthropic image."""
+        messages = [
+            {"role": "user", "content": "Read this image"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path": "img.png"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "Image file: img.png (1024 bytes)"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+                    },
+                ],
+            },
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # Tool result should be in a user message
+        tool_user_msg = converted[2]
+        assert tool_user_msg["role"] == "user"
+        tool_result = tool_user_msg["content"][0]
+        assert tool_result["type"] == "tool_result"
+        assert tool_result["tool_use_id"] == "call_1"
+        # Content should be a list with converted image block
+        content = tool_result["content"]
+        assert isinstance(content, list)
+        assert content[0] == {"type": "text", "text": "Image file: img.png (1024 bytes)"}
+        assert content[1]["type"] == "image"
+        assert content[1]["source"]["type"] == "base64"
+        assert content[1]["source"]["media_type"] == "image/png"
+        assert content[1]["source"]["data"] == "iVBORw0KGgo="
+
+    def test_tool_result_with_string_content_unchanged(self) -> None:
+        """Tool result with plain string content is unchanged."""
+        messages = [
+            {"role": "user", "content": "Read file"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_2",
+                        "function": {"name": "read_file", "arguments": '{"path": "f.py"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "   1\tprint('hello')",
+            },
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        tool_result = converted[2]["content"][0]
+        assert tool_result["content"] == "   1\tprint('hello')"
+
+    def test_convert_content_parts_static_method(self) -> None:
+        """_convert_content_parts handles both image_url and text."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        parts = [
+            {"type": "text", "text": "description"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"},
+            },
+        ]
+        result = AnthropicProvider._convert_content_parts(parts)
+        assert result[0] == {"type": "text", "text": "description"}
+        assert result[1]["type"] == "image"
+        assert result[1]["source"]["media_type"] == "image/jpeg"
+        assert result[1]["source"]["data"] == "/9j/4AAQ"
+
+
+# ===========================================================================
+# TestPromptCaching
+# ===========================================================================
+
+
+class TestAnthropicPromptCaching:
+    """Tests for Anthropic prompt caching (cache_control)."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_cache_control_set_in_kwargs(self) -> None:
+        """_build_thinking_and_kwargs includes cache_control: ephemeral."""
+        caps = self.provider.get_capabilities("claude-sonnet-4-6")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="medium",
+            extra_params=None,
+            max_tokens=4096,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="You are helpful.",
+            model="claude-sonnet-4-6",
+            tools=None,
+        )
+        assert "cache_control" in kwargs
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+
+    def test_opus_4_7_no_temperature_in_kwargs(self) -> None:
+        """Opus 4.7 rejects temperature — must not appear in kwargs."""
+        caps = self.provider.get_capabilities("claude-opus-4-7")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-7",
+            tools=None,
+        )
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
+
+    @pytest.mark.parametrize("reasoning_effort", ["high", None])
+    @pytest.mark.parametrize("model", ["claude-opus-4-6", "claude-haiku-4-5"])
+    @pytest.mark.parametrize("claimed", [False, True])
+    def test_hosted_lane_sends_no_temperature(
+        self, model: str, reasoning_effort: str | None, claimed: bool
+    ) -> None:
+        """API version 2026-10-21 refuses temperature on every model, even the
+        1.0 thinking used to require: the hosted lane sends none, with thinking
+        on or off, even when a definition's capabilities claim support."""
+        caps = self.provider.get_capabilities(model)
+        assert caps.supports_temperature is False
+        if claimed:
+            caps = dataclasses.replace(caps, supports_temperature=True)
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort=reasoning_effort,
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model=model,
+            tools=None,
+        )
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_opus_4_7_thinking_display_summarized(self) -> None:
+        """Opus 4.7 must opt in to thinking display with 'summarized'."""
+        caps = self.provider.get_capabilities("claude-opus-4-7")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-7",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+
+    def test_opus_4_6_thinking_no_display(self) -> None:
+        """Opus 4.6 adaptive thinking should not include display key."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-6",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {"type": "adaptive"}
+
+    def test_opus_4_7_xhigh_effort(self) -> None:
+        """Opus 4.7 xhigh effort passes through to output_config."""
+        caps = self.provider.get_capabilities("claude-opus-4-7")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="xhigh",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-7",
+            tools=None,
+        )
+        assert kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_opus_5_max_effort_still_sends_explicit_adaptive_thinking(self) -> None:
+        """Opus 5's two breaking changes are unreachable ONLY because this lane
+        always writes thinking explicitly.  Observe the artefact directly: at
+        effort=max the payload must carry an explicit adaptive thinking dict
+        (never omitted -> the changed on-by-default default cannot bite) and
+        must never carry type="disabled" (which 400s at xhigh/max).  If a
+        future edit adds a disabled branch, this fails instead of shipping a
+        400 to production."""
+        caps = self.provider.get_capabilities("claude-opus-5")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="max",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-5",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "max"}
+        # Sampling params are a 400 on this model — the row declares
+        # supports_temperature=False, so temperature must not reach the wire
+        # by either channel.
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_haiku_5_5_sends_adaptive_thinking_and_no_temperature(self) -> None:
+        """#1362: with no row of its own, Haiku 5.5 took the manual default row,
+        so an effort sent ``thinking.type="enabled"`` with a budget, and with no
+        effort set a configured temperature reached the wire; the model rejects
+        both with a 400.  The row sends adaptive thinking, and no temperature
+        even when one is configured."""
+        caps = self.provider.get_capabilities("claude-haiku-5-5")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.7,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-haiku-5-5",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["output_config"] == {"effort": "high"}
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_unlisted_id_sends_adaptive_thinking_and_no_temperature(self) -> None:
+        """#1366: an id with no row took a default that sent a thinking budget
+        for any configured effort and, with no effort set, a configured
+        temperature; adaptive-only models reject both with a 400.  The default
+        sends adaptive thinking with or without a knob (unset: no
+        ``output_config``; ``max`` rides ``high``) and never a temperature, a
+        configured one included."""
+        caps = self.provider.get_capabilities("claude-unknown-9")
+        for knob, effort in ((None, None), ("max", "high")):
+            kwargs = self.provider._build_thinking_and_kwargs(
+                caps=caps,
+                reasoning_effort=knob,
+                extra_params=None,
+                max_tokens=8192,
+                temperature=0.7,
+                converted_msgs=[{"role": "user", "content": "hi"}],
+                system_prompt="",
+                model="claude-unknown-9",
+                tools=None,
+            )
+            assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}, knob
+            assert kwargs.get("output_config") == ({"effort": effort} if effort else None), knob
+            assert "temperature" not in kwargs, knob
+            assert "extra_body" not in kwargs, knob
+            assert "extra_headers" not in kwargs, knob
+
+    def test_budget_models_keep_their_manual_rows(self) -> None:
+        """#1366: the default row thinks adaptively, so the models that take a
+        thinking budget must reach their own rows, bare and dated, or a request
+        with an effort would send adaptive thinking, which they reject."""
+        for model in (
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+        ):
+            kwargs = self.provider._build_thinking_and_kwargs(
+                caps=self.provider.get_capabilities(model),
+                reasoning_effort="high",
+                extra_params=None,
+                max_tokens=32768,
+                temperature=None,
+                converted_msgs=[{"role": "user", "content": "hi"}],
+                system_prompt="",
+                model=model,
+                tools=None,
+            )
+            assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16384}, model
+
+    def test_documented_override_reproduces_each_budget_row(self) -> None:
+        """#1366: a budget model under a name no row matches, such as a gateway's,
+        takes the adaptive default.  The capabilities override the CHANGELOG and
+        docs/architecture.md give for it must build the request its own row
+        builds, for every knob, with and without a configured temperature."""
+        from turnstone.core.model_turn import apply_capability_overrides
+        from turnstone.core.providers._anthropic import _ANTHROPIC_DEFAULT
+
+        manual = {"thinking_mode": "manual", "supports_temperature": True}
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "t",
+                    "description": "d",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        for model, override in (
+            ("claude-haiku-4-5", {**manual, "supports_effort": False}),
+            ("claude-sonnet-4-5", {**manual, "supports_effort": False}),
+            ("claude-opus-4-5", manual),
+        ):
+            gateway_name = "gateway/" + model.replace("-4-5", "-4.5")
+            assert self.provider.get_capabilities(gateway_name) is _ANTHROPIC_DEFAULT
+            fixed = apply_capability_overrides(_ANTHROPIC_DEFAULT, override)
+            for knob in (None, "none", "minimal", "low", "medium", "high", "xhigh", "max"):
+                for temperature in (None, 0.7):
+                    requests = []
+                    for caps, name in (
+                        (self.provider.get_capabilities(model), model),
+                        (fixed, gateway_name),
+                    ):
+                        kwargs = self.provider._build_thinking_and_kwargs(
+                            caps=caps,
+                            reasoning_effort=knob,
+                            extra_params=None,
+                            max_tokens=32768,
+                            temperature=temperature,
+                            converted_msgs=[{"role": "user", "content": "hi"}],
+                            system_prompt="",
+                            model=name,
+                            tools=tools,
+                        )
+                        kwargs.pop("model")
+                        requests.append(kwargs)
+                    assert requests[0] == requests[1], (model, knob, temperature)
+
+    def test_xhigh_effort_snaps_to_max_on_opus_4_6(self) -> None:
+        """Opus 4.6 declares (low, medium, high, max) — a knob of xhigh
+        rounds up to max instead of silently dropping output_config."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="xhigh",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-6",
+            tools=None,
+        )
+        assert kwargs["output_config"] == {"effort": "max"}
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_message_start_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """Cache metrics from message_start flow into UsageInfo."""
+        msg_start = MagicMock()
+        msg_start.type = "message_start"
+        msg_usage = MagicMock()
+        msg_usage.input_tokens = 100
+        msg_usage.cache_creation_input_tokens = 80
+        msg_usage.cache_read_input_tokens = 0
+        msg_start.message = MagicMock()
+        msg_start.message.usage = msg_usage
+
+        text_event = _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi")
+
+        events = [msg_start, text_event]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        # prompt_tokens = input_tokens (100) + cache_creation (80) + cache_read (0) = 180
+        start_chunks = [r for r in results if r.usage is not None and r.usage.prompt_tokens == 180]
+        assert len(start_chunks) == 1
+        assert start_chunks[0].usage is not None
+        assert start_chunks[0].usage.cache_creation_tokens == 80
+        assert start_chunks[0].usage.cache_read_tokens == 0
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_message_delta_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """Cache metrics from message_delta flow into UsageInfo."""
+        text_event = _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi")
+
+        delta_event = MagicMock()
+        delta_event.type = "message_delta"
+        delta_usage = MagicMock()
+        delta_usage.input_tokens = 0
+        delta_usage.output_tokens = 50
+        delta_usage.cache_creation_input_tokens = 0
+        delta_usage.cache_read_input_tokens = 120
+        delta_event.usage = delta_usage
+        delta_event.delta = MagicMock()
+        delta_event.delta.stop_reason = "end_turn"
+
+        events = [text_event, delta_event]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        delta_chunks = [r for r in results if r.finish_reason is not None]
+        assert len(delta_chunks) == 1
+        u = delta_chunks[0].usage
+        assert u is not None
+        assert u.cache_read_tokens == 120
+        assert u.cache_creation_tokens == 0
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """The drained transport carries cache metrics through the max-merge."""
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="Hello")],
+            usage=SimpleNamespace(
+                input_tokens=200,
+                output_tokens=30,
+                cache_creation_input_tokens=150,
+                cache_read_input_tokens=50,
+            ),
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        u = result.usage
+        assert u is not None
+        assert u.cache_creation_tokens == 150
+        assert u.cache_read_tokens == 50
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_cache_metrics_missing_gracefully(self, mock_ensure: MagicMock) -> None:
+        """When cache attributes are absent, tokens default to 0."""
+        import types
+
+        msg_start = MagicMock()
+        msg_start.type = "message_start"
+        # SimpleNamespace with only input_tokens — no cache attributes at all
+        msg_usage = types.SimpleNamespace(input_tokens=50)
+        msg_start.message = MagicMock()
+        msg_start.message.usage = msg_usage
+
+        text_event = _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi")
+
+        events = [msg_start, text_event]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        start_chunks = [r for r in results if r.usage is not None]
+        assert len(start_chunks) >= 1
+        u = start_chunks[0].usage
+        assert u is not None
+        assert u.cache_creation_tokens == 0
+        assert u.cache_read_tokens == 0
+
+    @staticmethod
+    def _usage_stream(
+        opening: tuple[int, int, int] | None,
+        closing: tuple[int, int, int],
+        *,
+        output_tokens: int,
+        server_tool: bool = False,
+    ) -> MagicMock:
+        """Scripted stream: opening usage, optional server tool block, one text
+        delta, closing usage + end_turn.
+
+        Both usages are ``(input, cache_creation, cache_read)``; ``opening=None``
+        omits the ``message_start`` event altogether.  ``server_tool`` scripts a
+        ``server_tool_use`` block, the adapter's evidence that the server ran
+        its own sampling loop inside the message.
+        """
+        events: list[Any] = []
+        if opening is not None:
+            msg_start = MagicMock()
+            msg_start.type = "message_start"
+            msg_start.message = MagicMock()
+            msg_start.message.usage = SimpleNamespace(
+                input_tokens=opening[0],
+                cache_creation_input_tokens=opening[1],
+                cache_read_input_tokens=opening[2],
+            )
+            events.append(msg_start)
+        if server_tool:
+            events.append(
+                _anthropic_event(
+                    "content_block_start",
+                    block_type="server_tool_use",
+                    block_id="srvtoolu_1",
+                    block_name="web_search",
+                    index=0,
+                )
+            )
+            events.append(_anthropic_event("content_block_stop", index=0))
+        events.append(
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi", index=1)
+        )
+        delta_event = MagicMock()
+        delta_event.type = "message_delta"
+        delta_event.usage = SimpleNamespace(
+            input_tokens=closing[0],
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=closing[1],
+            cache_read_input_tokens=closing[2],
+        )
+        delta_event.delta = MagicMock()
+        delta_event.delta.stop_reason = "end_turn"
+        events.append(delta_event)
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        return stream_ctx
+
+    def _drained_usage(self, stream_ctx: MagicMock) -> UsageInfo:
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.usage is not None
+        return result.usage
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_loop_cached_usage_reports_context_not_billing(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """Live shape (2026-09-18): three native searches on a cached prefix.
+
+        The opening pass read the 23,745-token prefix; the closing usage
+        summed a prefix re-read per pass into ``cache_read`` (47,622) while
+        ``cache_creation`` grew by the server-cached search results.  A real
+        follow-up request measured the next context at 54,392, so folding
+        every closing field (77,668) yields a billing total, not a context.
+        """
+        usage = self._drained_usage(
+            self._usage_stream(
+                (4, 132, 23_745), (6, 30_040, 47_622), output_tokens=772, server_tool=True
+            )
+        )
+        # The provider's counters ride through as reported ...
+        assert usage.prompt_tokens == 77_668
+        assert usage.total_tokens == 77_668 + 772
+        assert usage.completion_tokens == 772
+        assert usage.cache_read_tokens == 47_622
+        assert usage.cache_creation_tokens == 30_040
+        # ... with the facts that say what they mean: the opening pass is what
+        # the request carried, the growth since it (new input 2 + new cache
+        # creation 29,908) is what the server appended, and the sum is flagged.
+        assert usage.served_prompt_tokens == 23_881
+        assert usage.appended_prompt_tokens == 29_910
+        assert usage.prompt_tokens_cumulative is True
+        # The shared rule anchors on what the request carried and reports the
+        # appended results beside it: the assistant turn's own cost.
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 0)
+        assert (context.anchor, context.served) == (23_881, 23_881)
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_loop_uncached_usage_keeps_closing_input(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """Without caching there are no summed re-reads: the closing input
+        already approximates the next context (35,546 vs 33,083 measured)."""
+        usage = self._drained_usage(
+            self._usage_stream((2_820, 0, 0), (35_546, 0, 0), output_tokens=598, server_tool=True)
+        )
+        assert usage.prompt_tokens == 35_546
+        assert usage.served_prompt_tokens == 2_820
+        assert usage.appended_prompt_tokens == 32_726
+        assert usage.prompt_tokens_cumulative is True
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 0)
+        assert context.anchor == 2_820
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_plain_closing_usage_repeating_the_opening_is_not_doubled(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """A plain response repeats the opening counts in the closing event."""
+        usage = self._drained_usage(
+            self._usage_stream((4, 87, 23_745), (4, 87, 23_745), output_tokens=4)
+        )
+        assert usage.prompt_tokens == 23_836
+        assert usage.served_prompt_tokens == 23_836
+        assert usage.cache_read_tokens == 23_745
+        assert usage.prompt_tokens_cumulative is False
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 0)
+        assert (context.anchor, context.served) == (23_836, 23_836)
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_without_a_server_tool_the_closing_fold_stands(self, mock_ensure: MagicMock) -> None:
+        """No server tool block, no derivation: a closing event that outgrows the
+        opening (a gateway reporting its cache read late) is folded whole, cache
+        read included, exactly as before."""
+        usage = self._drained_usage(
+            self._usage_stream((50, 0, 0), (50, 0, 20_000), output_tokens=5)
+        )
+        assert usage.prompt_tokens == 20_050
+        assert usage.served_prompt_tokens == 20_050
+        assert usage.prompt_tokens_cumulative is False
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 20_050
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_closing_without_input_counts_keeps_opening_total(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """A gateway whose closing usage carries only output keeps the opening
+        context: nothing was appended, so the anchor is the opening total.  The
+        clamps are pinned by the two tests that follow."""
+        usage = self._drained_usage(
+            self._usage_stream((100, 0, 0), (0, 0, 0), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 100
+        assert usage.completion_tokens == 5
+        assert usage.appended_prompt_tokens == 0
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 100
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_input_delta_clamps_at_zero(self, mock_ensure: MagicMock) -> None:
+        """A closing input below the opening input must not subtract from what
+        the server appended: 500 appended with the clamp, 400 without."""
+        usage = self._drained_usage(
+            self._usage_stream((100, 0, 0), (0, 500, 0), output_tokens=5, server_tool=True)
+        )
+        assert usage.appended_prompt_tokens == 500
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 100
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_cache_creation_delta_clamps_at_zero(self, mock_ensure: MagicMock) -> None:
+        """Same pin for the cache-creation delta: 500 appended clamped, 400 unclamped."""
+        usage = self._drained_usage(
+            self._usage_stream((0, 100, 0), (500, 0, 0), output_tokens=5, server_tool=True)
+        )
+        assert usage.appended_prompt_tokens == 500
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 100
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_empty_opening_usage_falls_back_to_closing_totals(self, mock_ensure: MagicMock) -> None:
+        """An all-zero opening usage is no single-pass figure: after a server
+        tool block the closing counts are still reported whole, cache read
+        included, but flagged cumulative with nothing served, so the consumer's
+        own estimate of what it sent stands in for the anchor."""
+        usage = self._drained_usage(
+            self._usage_stream((0, 0, 0), (50, 0, 20), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 70
+        assert usage.cache_read_tokens == 20
+        assert usage.served_prompt_tokens == 0
+        assert usage.prompt_tokens_cumulative is True
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 1_234)
+        assert (context.anchor, context.served) == (1_234, None)
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_missing_opening_event_falls_back_to_closing_totals(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """A gateway that reports usage only at the end gives no single-pass
+        figure: the closing counts are reported whole and flagged cumulative
+        with nothing served, so the consumer's own estimate stands in."""
+        usage = self._drained_usage(
+            self._usage_stream(None, (50, 0, 20), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 70
+        assert usage.cache_read_tokens == 20
+        assert usage.served_prompt_tokens == 0
+        assert usage.prompt_tokens_cumulative is True
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 1_234).anchor == 1_234
+
+
+class TestOpenAIPromptCaching:
+    """Tests for OpenAI prompt caching (automatic + extended retention)."""
+
+    def setup_method(self) -> None:
+        self.provider = OpenAIProvider()
+
+    @pytest.mark.parametrize(
+        "model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora", "gpt-6-astra-local-lora")
+    )
+    def test_chat_compat_streaming_omits_commercial_cache_params(self, model: str) -> None:
+        """A local model name must not activate commercial OpenAI cache controls."""
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(())
+
+        list(
+            self.provider.create_streaming(
+                client=client,
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+
+        sent = client.chat.completions.create.call_args.kwargs
+        assert "prompt_cache_retention" not in sent
+        assert "prompt_cache_options" not in sent
+
+    def test_cache_retention_set_for_pre_gpt56_models(self) -> None:
+        """Pre-5.6 GPT-5 models retain the legacy 24-hour cache policy."""
+        for model in (
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5-mini",
+            "gpt-5-pro",
+        ):
+            kwargs: dict[str, Any] = {}
+            apply_cache_retention(kwargs, model)
+            assert kwargs.get("prompt_cache_retention") == "24h", f"Failed for {model}"
+            assert "prompt_cache_options" not in kwargs
+
+    def test_gpt56_uses_prompt_cache_options(self) -> None:
+        """GPT-5.6 uses the replacement cache API introduced in SDK 2.45."""
+        for model in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            kwargs: dict[str, Any] = {}
+            apply_cache_retention(kwargs, model)
+            assert kwargs.get("prompt_cache_options") == {"ttl": "30m"}, model
+            assert "prompt_cache_retention" not in kwargs
+
+    def test_gpt6_uses_prompt_cache_options(self) -> None:
+        """Every GPT-6 family row in the table, point releases included, uses
+        the replacement cache API."""
+        tiers = [name for name in OPENAI_CAPABILITIES if name.startswith("gpt-6")]
+        assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"} <= set(tiers)
+        for model in tiers:
+            kwargs: dict[str, Any] = {}
+            apply_cache_retention(kwargs, model)
+            assert kwargs.get("prompt_cache_options") == {"ttl": "30m"}, model
+            assert "prompt_cache_retention" not in kwargs, model
+
+    def test_cache_retention_not_set_for_non_gpt5(self) -> None:
+        """Non-GPT-5 models do not get cache retention."""
+        for model in ("o3", "o4-mini", "local-model", "gpt-4o"):
+            kwargs: dict[str, Any] = {}
+            apply_cache_retention(kwargs, model)
+            assert "prompt_cache_retention" not in kwargs, f"Unexpected retention for {model}"
+            assert "prompt_cache_options" not in kwargs, f"Unexpected options for {model}"
+
+    def test_cache_write_tokens_from_responses_usage(self) -> None:
+        """GPT-5.6 cache writes flow into normalized usage accounting."""
+        usage = MagicMock()
+        usage.prompt_tokens = None
+        usage.input_tokens = 100
+        usage.completion_tokens = None
+        usage.output_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = None
+        usage.input_tokens_details = MagicMock(cached_tokens=30, cache_write_tokens=70)
+
+        normalized = extract_usage(usage)
+
+        assert normalized is not None
+        assert normalized.cache_read_tokens == 30
+        assert normalized.cache_creation_tokens == 70
+
+    def test_cache_write_tokens_from_chat_usage(self) -> None:
+        """The Chat Completions usage shape reports the same cache-write metric."""
+        usage = MagicMock()
+        usage.prompt_tokens = 100
+        usage.completion_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = MagicMock(cached_tokens=30, cache_write_tokens=70)
+
+        normalized = extract_usage(usage)
+
+        assert normalized is not None
+        assert normalized.cache_read_tokens == 30
+        assert normalized.cache_creation_tokens == 70
+
+    def test_streaming_cached_tokens_from_usage(self) -> None:
+        """Streaming usage extracts cached_tokens from prompt_tokens_details."""
+        usage = MagicMock()
+        usage.prompt_tokens = 100
+        usage.completion_tokens = 20
+        usage.total_tokens = 120
+        ptd = MagicMock()
+        ptd.cached_tokens = 80
+        usage.prompt_tokens_details = ptd
+
+        chunks = [
+            _openai_stream_chunk(content="Hi"),
+            _openai_stream_chunk(empty_choices=True, usage=usage),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        usage_chunks = [r for r in results if r.usage is not None]
+        assert len(usage_chunks) == 1
+        u = usage_chunks[0].usage
+        assert u is not None
+        assert u.cache_read_tokens == 80
+        assert u.cache_creation_tokens == 0
+
+    def test_drained_stream_cached_tokens(self) -> None:
+        """Cached-token details on the trailing usage chunk survive the drain."""
+        chunks = fake_chat_stream(content="hi", prompt_tokens=200, completion_tokens=30)
+        chunks[-1].usage.prompt_tokens_details = SimpleNamespace(cached_tokens=150)
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        u = result.usage
+        assert u is not None
+        assert u.cache_read_tokens == 150
+        assert u.cache_creation_tokens == 0
+
+    def test_streaming_no_prompt_tokens_details(self) -> None:
+        """When prompt_tokens_details is absent, cache_read_tokens defaults to 0."""
+        usage = MagicMock()
+        usage.prompt_tokens = 100
+        usage.completion_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = None
+
+        chunks = [
+            _openai_stream_chunk(content="Hi"),
+            _openai_stream_chunk(empty_choices=True, usage=usage),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        usage_chunks = [r for r in results if r.usage is not None]
+        assert len(usage_chunks) == 1
+        u = usage_chunks[0].usage
+        assert u is not None
+        assert u.cache_read_tokens == 0
+
+
+class TestUsageInfoCacheFields:
+    """Tests for cache fields on UsageInfo dataclass."""
+
+    def test_default_cache_fields(self) -> None:
+        u = UsageInfo(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        assert u.cache_creation_tokens == 0
+        assert u.cache_read_tokens == 0
+
+    def test_explicit_cache_fields(self) -> None:
+        u = UsageInfo(
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cache_creation_tokens=80,
+            cache_read_tokens=20,
+        )
+        assert u.cache_creation_tokens == 80
+        assert u.cache_read_tokens == 20
+
+
+class TestMetricsCacheTokens:
+    """Tests for cache token recording in MetricsCollector."""
+
+    def test_record_cache_tokens(self) -> None:
+        from turnstone.core.metrics import MetricsCollector
+
+        m = MetricsCollector()
+        m.record_cache_tokens(100, 200)
+        m.record_cache_tokens(50, 300)
+        assert m._tokens["cache_creation"] == 150
+        assert m._tokens["cache_read"] == 500
+
+    def test_prometheus_output_includes_cache_tokens(self) -> None:
+        from turnstone.core.metrics import MetricsCollector
+
+        m = MetricsCollector()
+        m.record_tokens(1000, 500)
+        m.record_cache_tokens(800, 200)
+        text = m.generate_text(workstream_states={}, total_workstreams=0)
+        assert 'turnstone_tokens_total{type="cache_creation"} 800' in text
+        assert 'turnstone_tokens_total{type="cache_read"} 200' in text
+        assert 'turnstone_tokens_total{type="prompt"} 1000' in text
+
+
+# ===========================================================================
+# TestOpenAIResponsesProvider — Responses API provider
+# ===========================================================================
+
+
+class TestOpenAIResponsesProvider:
+    """Tests for the OpenAI Responses API provider."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_provider_name(self) -> None:
+        assert self.provider.provider_name == "openai"
+
+    def test_abort_during_request_metrics_prevents_dispatch(self) -> None:
+        """Responses rechecks cancellation after final-native metrics."""
+        client = MagicMock()
+        cancel_ref = StreamAbortRef()
+
+        class _AbortOnAppend(list[ProviderRequestMetrics]):
+            def append(self, item: ProviderRequestMetrics) -> None:
+                super().append(item)
+                cancel_ref.abort()
+
+        with pytest.raises(DeadlineCancelledError):
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+                request_metrics_ref=_AbortOnAppend(),
+            )
+
+        client.responses.create.assert_not_called()
+
+    @staticmethod
+    def _completed_with_items(items: list[dict[str, Any]], usage: SimpleNamespace) -> list[Any]:
+        """Scripted stream: each item announced done, then the completed event with usage."""
+        done_items = [
+            SimpleNamespace(type=d["type"], model_dump=lambda d=d: dict(d)) for d in items
+        ]
+        events: list[Any] = [
+            SimpleNamespace(type="response.output_item.done", item=item) for item in done_items
+        ]
+        events.append(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=usage, output=done_items),
+            )
+        )
+        return events
+
+    def test_hosted_search_flags_usage_cumulative(self) -> None:
+        """Live shape (2026-09-19): three hosted searches reported 22,508 input
+        tokens where the next request carried 11,052.  Only the completed event
+        carries usage, so the adapter cannot derive the context; it flags the
+        counters and the shared rule falls back to the caller's own estimate."""
+        usage = SimpleNamespace(
+            input_tokens=22_508,
+            output_tokens=624,
+            total_tokens=23_132,
+            input_tokens_details=SimpleNamespace(cached_tokens=10_391),
+        )
+        items = [{"type": "web_search_call", "id": "ws_1", "status": "completed"}] * 3 + [
+            {"type": "message", "id": "msg_1", "role": "assistant", "content": []}
+        ]
+        result = drain_stream(
+            self.provider._iter_stream(iter(self._completed_with_items(items, usage)))
+        )
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 22_508
+        assert result.usage.cache_read_tokens == 10_391
+        assert result.usage.prompt_tokens_cumulative is True
+        context = resolve_context_usage(result.usage, local_request_estimate=lambda: 11_000)
+        assert (context.anchor, context.served) == (11_000, None)
+
+    def test_plain_response_usage_is_not_cumulative(self) -> None:
+        usage = SimpleNamespace(
+            input_tokens=10_474,
+            output_tokens=5,
+            total_tokens=10_479,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        items = [{"type": "message", "id": "msg_1", "role": "assistant", "content": []}]
+        result = drain_stream(
+            self.provider._iter_stream(iter(self._completed_with_items(items, usage)))
+        )
+        assert result.usage is not None
+        assert result.usage.prompt_tokens_cumulative is False
+        assert (
+            resolve_context_usage(result.usage, local_request_estimate=lambda: 0).anchor == 10_474
+        )
+
+    def test_get_capabilities(self) -> None:
+        caps = self.provider.get_capabilities("gpt-5.4")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+
+
+class TestOpenAIChatReasoningCapture:
+    """The drained stream surfaces the Chat-Completions lane's non-canonical
+    reasoning (vLLM ``--reasoning-parser``, llama.cpp ``reasoning_format``)
+    as ``CompletionResult.reasoning`` — the shared ``_reasoning_text``
+    extractor owns the attribute pair and precedence, so delta and message
+    shapes cannot drift."""
+
+    @staticmethod
+    def _client(*, reasoning: Any = None, reasoning_content: Any = None) -> MagicMock:
+        chunks = fake_chat_stream(
+            content="ok", reasoning=reasoning, reasoning_content=reasoning_content
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+        return client
+
+    def _complete(self, client: MagicMock):
+        provider = OpenAIChatCompletionsProvider()
+        return drain_stream(
+            provider.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "hi"}]
+            )
+        )
+
+    def test_reasoning_content_captured(self) -> None:
+        result = self._complete(self._client(reasoning_content="thought text"))
+        assert result.reasoning == "thought text"
+
+    def test_reasoning_attribute_takes_precedence(self) -> None:
+        result = self._complete(self._client(reasoning="direct", reasoning_content="parsed"))
+        assert result.reasoning == "direct"
+
+    def test_absent_reasoning_is_empty(self) -> None:
+        result = self._complete(self._client())
+        assert result.reasoning == ""
+
+    def test_non_string_reasoning_collapses_to_empty(self) -> None:
+        # A server surfacing a structured reasoning object (not text) must not
+        # leak a non-str into the result.
+        result = self._complete(self._client(reasoning={"odd": True}))
+        assert result.reasoning == ""
+
+    def test_structured_reasoning_does_not_shadow_reasoning_content(self) -> None:
+        # A truthy non-string in ``reasoning`` must not shadow valid text in
+        # ``reasoning_content`` — the first non-empty STRING wins.
+        result = self._complete(
+            self._client(reasoning={"content": "structured"}, reasoning_content="parsed text")
+        )
+        assert result.reasoning == "parsed text"
+
+    def test_streaming_delta_shares_the_same_guard(self) -> None:
+        # The streaming twin: a structured object in ``reasoning`` must not
+        # leak into reasoning_delta (it would TypeError the session's
+        # ``"".join`` accumulator) nor shadow the parsed string.
+        provider = OpenAIChatCompletionsProvider()
+        chunk = _openai_stream_chunk(
+            reasoning={"content": "structured"},  # type: ignore[arg-type] — the hostile input under test
+            reasoning_content="parsed text",
+            finish_reason="stop",
+        )
+        chunks = list(provider._iter_stream(iter([chunk])))
+        assert any(c.reasoning_delta == "parsed text" for c in chunks)
+        assert all(isinstance(c.reasoning_delta, str) for c in chunks)
+
+
+class TestResponsesMessageConversion:
+    """Tests for _convert_messages — Chat Completions format to Responses API."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_system_message_to_instructions(self) -> None:
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ]
+        instructions, items = self.provider._convert_messages(messages)
+        assert instructions == "You are helpful."
+        assert len(items) == 1
+        assert items[0]["role"] == "user"
+        assert items[0]["content"] == "Hello"
+
+    def test_multiple_system_messages_concatenated(self) -> None:
+        messages = [
+            {"role": "system", "content": "Rule 1"},
+            {"role": "developer", "content": "Rule 2"},
+            {"role": "user", "content": "Hi"},
+        ]
+        instructions, items = self.provider._convert_messages(messages)
+        assert instructions == "Rule 1\n\nRule 2"
+        assert len(items) == 1
+
+    def test_assistant_text_message(self) -> None:
+        messages = [
+            {"role": "assistant", "content": "Hello back"},
+        ]
+        _, items = self.provider._convert_messages(messages)
+        assert len(items) == 1
+        assert items[0]["type"] == "message"
+        assert items[0]["role"] == "assistant"
+        assert items[0]["content"] == "Hello back"
+
+    def test_assistant_tool_calls(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path": "/tmp"}'},
+                    }
+                ],
+            },
+        ]
+        _, items = self.provider._convert_messages(repair_wire_messages(messages))
+        # repair_wire_messages synthesizes the missing tool result; the translator renders it
+        assert len(items) == 2
+        assert items[0]["type"] == "function_call"
+        assert items[0]["call_id"] == "call_1"
+        assert items[0]["name"] == "read_file"
+        assert items[0]["arguments"] == '{"path": "/tmp"}'
+        assert items[1]["type"] == "function_call_output"
+        assert items[1]["call_id"] == "call_1"
+
+    def test_tool_result(self) -> None:
+        messages = [
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        ]
+        _, items = self.provider._convert_messages(messages)
+        assert len(items) == 1
+        assert items[0]["type"] == "function_call_output"
+        assert items[0]["call_id"] == "call_1"
+        assert items[0]["output"] == "file contents"
+
+    def test_provider_content_ignored_with_store_false(self) -> None:
+        """With store=False, provider_content is ignored — rebuild from content."""
+        provider_items = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi"}],
+            },
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+        ]
+        messages = [
+            {"role": "assistant", "content": "Hi", "_provider_content": provider_items},
+        ]
+        _, items = self.provider._convert_messages(messages)
+        # Should rebuild from content, not passthrough provider_content
+        assert len(items) == 1
+        assert items[0]["type"] == "message"
+        assert items[0]["content"] == "Hi"
+
+    def test_no_system_returns_none_instructions(self) -> None:
+        messages = [{"role": "user", "content": "Hello"}]
+        instructions, _ = self.provider._convert_messages(messages)
+        assert instructions is None
+
+    def test_assistant_with_content_and_tool_calls(self) -> None:
+        """Assistant message with both text and tool calls emits separate items."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I'll read that file",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path": "/tmp"}'},
+                    }
+                ],
+            },
+        ]
+        _, items = self.provider._convert_messages(repair_wire_messages(messages))
+        # repair_wire_messages synthesizes the missing tool result; the translator renders it
+        assert len(items) == 3
+        assert items[0]["type"] == "message"
+        assert items[0]["content"] == "I'll read that file"
+        assert items[1]["type"] == "function_call"
+        assert items[1]["name"] == "read_file"
+        assert items[2]["type"] == "function_call_output"
+        assert items[2]["call_id"] == "call_1"
+
+
+class TestResponsesToolConversion:
+    """Tests for _convert_tools — Chat Completions tool format to Responses API."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_function_tool_conversion(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ]
+        caps = ModelCapabilities()
+        result = self.provider._convert_tools(tools, caps)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["type"] == "function"
+        assert result[0]["name"] == "read_file"
+        assert result[0]["description"] == "Read a file"
+        assert result[0]["strict"] is False
+
+    def test_web_search_replaced_with_native(self) -> None:
+        tools = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+            {"type": "function", "function": {"name": "read_file", "description": "Read"}},
+        ]
+        caps = ModelCapabilities(supports_web_search=True)
+        result = self.provider._convert_tools(tools, caps)
+        assert result is not None
+        names = [t.get("name", t.get("type")) for t in result]
+        assert "web_search" in names  # native web_search tool
+        assert "read_file" in names
+
+    def test_none_tools_returns_none(self) -> None:
+        caps = ModelCapabilities()
+        assert self.provider._convert_tools(None, caps) is None
+
+    def test_defer_loading_preserved(self) -> None:
+        tools = [
+            {"type": "function", "function": {"name": "f"}, "defer_loading": True},
+        ]
+        caps = ModelCapabilities()
+        result = self.provider._convert_tools(tools, caps)
+        assert result is not None
+        assert result[0].get("defer_loading") is True
+
+
+class TestResponsesParamBuilding:
+    """Tests for _build_kwargs — parameter construction for Responses API."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_reasoning_effort_as_dict(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="high",
+            deferred_names=None,
+        )
+        assert kwargs["reasoning"] == {"effort": "high"}
+        assert "reasoning_effort" not in kwargs
+
+    def test_none_effort_sends_declared_none_level(self) -> None:
+        """gpt-5.4 declares an explicit "none" level — the knob's off
+        position forwards it rather than omitting (omission would leave
+        the server default in charge on models like gpt-5.5)."""
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        assert kwargs["reasoning"] == {"effort": "none"}
+
+    def test_store_is_false(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+        )
+        assert kwargs["store"] is False
+
+    def _build(self, caps: ModelCapabilities, reasoning_effort: str = "medium") -> dict[str, Any]:
+        return self.provider._build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort=reasoning_effort,
+            deferred_names=None,
+            capabilities=caps,
+        )
+
+    def test_verbosity_emitted_under_text_when_supported(self) -> None:
+        """Operator-declared verbosity nests under text.verbosity (never
+        top-level, which 400s on the Responses API)."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity="low"))
+        assert kwargs["text"] == {"verbosity": "low"}
+
+    def test_verbosity_omitted_when_unsupported(self) -> None:
+        """A verbosity value on a model that doesn't support it is dropped."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=False, verbosity="low"))
+        assert "text" not in kwargs
+
+    def test_verbosity_omitted_when_value_empty(self) -> None:
+        """Supported but unset (the default) → nothing sent, server default."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity=""))
+        assert "text" not in kwargs
+
+    def test_pro_mode_folds_into_reasoning(self) -> None:
+        """reasoning.mode='pro' rides alongside the effort in one dict."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode="pro",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high", "mode": "pro"}
+
+    def test_pro_mode_rejected_when_unsupported(self) -> None:
+        """A pro mode on a model without reasoning-mode support is dropped."""
+        caps = ModelCapabilities(
+            supports_pro_mode=False,
+            reasoning_mode="pro",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_pro_mode_without_effort_sends_mode_only(self) -> None:
+        """No declared effort (param omitted) but pro mode set → the
+        reasoning dict carries mode alone (effort defaults server-side)."""
+        caps = ModelCapabilities(supports_pro_mode=True, reasoning_mode="pro")
+        kwargs = self._build(caps, reasoning_effort="medium")
+        assert kwargs["reasoning"] == {"mode": "pro"}
+
+    def test_standard_reasoning_mode_is_accepted(self) -> None:
+        """The SDK's explicit standard mode is valid even though omission is equivalent."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode="standard",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high", "mode": "standard"}
+
+    def test_verbosity_unknown_value_dropped(self) -> None:
+        """A verbosity outside {low,medium,high} is dropped, not sent — an
+        operator typo must not 400 every request."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity="verbose"))
+        assert "text" not in kwargs
+
+    def test_pro_mode_unknown_value_dropped(self) -> None:
+        """An unknown reasoning_mode is dropped; a valid effort still rides."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode="ultra",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_verbosity_non_string_value_dropped(self) -> None:
+        """Malformed operator JSON must not crash request construction."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity=["low"]))
+        assert "text" not in kwargs
+
+    def test_pro_mode_non_string_value_dropped(self) -> None:
+        """Malformed operator JSON must not crash request construction."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode=["pro"],
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_gpt56_terra_max_reaches_responses_wire(self) -> None:
+        """Terra sends the documented max effort on the actual Responses path."""
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.6-terra",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="max",
+            deferred_names=None,
+        )
+        assert kwargs["reasoning"] == {"effort": "max"}
+
+    def test_gpt56_verbosity_and_pro_flags(self) -> None:
+        """Every GPT-5.6 tier supports verbosity and pro reasoning mode."""
+        for tier in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            caps = lookup_openai_capabilities(tier)
+            assert caps.supports_verbosity is True
+            assert caps.supports_pro_mode is True
+
+    def _kwargs_with(self, tools: list[dict[str, Any]], caps: ModelCapabilities) -> dict[str, Any]:
+        return self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+            capabilities=caps,
+        )
+
+    def test_server_side_web_search_needs_surviving_client_def(self) -> None:
+        caps = ModelCapabilities(supports_web_search=True)
+        # Client def present (unrestricted / allowlisted) → native injected.
+        with_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "web_search"}}], caps
+        )
+        assert {"type": "web_search"} in (with_def.get("tools") or [])
+        # Client def hidden by the persona/coordinator envelope → suppressed.
+        without_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "read_file"}}], caps
+        )
+        assert {"type": "web_search"} not in (without_def.get("tools") or [])
+
+    def test_server_side_injection_generalizes_beyond_web_search(self) -> None:
+        # The replace-only rule applies to EVERY server-side tool: a provider-
+        # specific one injects only with a same-named client def, so a restricted
+        # persona that never allowlisted it can't get it injected past the wire.
+        caps = ModelCapabilities(server_side_tools=("code_exec",))
+        without_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "read_file"}}], caps
+        )
+        assert {"type": "code_exec"} not in (without_def.get("tools") or [])
+        with_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "code_exec"}}], caps
+        )
+        assert {"type": "code_exec"} in (with_def.get("tools") or [])
+
+    def test_cache_retention_for_gpt5(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+        )
+        assert kwargs["prompt_cache_retention"] == "24h"
+
+    def test_compat_responses_omits_commercial_cache_params(self) -> None:
+        provider = type(self.provider)(compat=True)
+        for model in ("gpt-5.5-local-lora", "gpt-5.6-local-lora", "gpt-6-astra-local-lora"):
+            kwargs = provider._build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=None,
+                max_tokens=4096,
+                temperature=0.5,
+                reasoning_effort="medium",
+                deferred_names=None,
+            )
+            assert "prompt_cache_retention" not in kwargs, model
+            assert "prompt_cache_options" not in kwargs, model
+
+    def test_cache_options_for_gpt56(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+        )
+        assert kwargs["prompt_cache_options"] == {"ttl": "30m"}
+        assert "prompt_cache_retention" not in kwargs
+
+    def test_instructions_from_system_messages(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[
+                {"role": "system", "content": "Be helpful"},
+                {"role": "user", "content": "Hi"},
+            ],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        assert kwargs["instructions"] == "Be helpful"
+
+    def test_web_search_not_injected_with_no_tools(self) -> None:
+        """No client web_search def ⇒ no server-side web_search entry.
+
+        Replace-only semantics: a request whose envelope hides web_search
+        (persona visibility set, coordinator toolset, tool-less utility
+        call) must not gain native search at the provider layer.
+        """
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5-search-api",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        tool_types = [t.get("type") for t in kwargs.get("tools") or []]
+        assert "web_search" not in tool_types
+
+    def test_web_search_injected_with_client_def(self) -> None:
+        """The server-side entry stands in for a surviving client def."""
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5-search-api",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        assert "tools" in kwargs
+        tool_types = [t.get("type") for t in kwargs["tools"]]
+        assert "web_search" in tool_types
+
+    def test_web_search_not_injected_for_nonempty_toolset_without_def(self) -> None:
+        """A non-empty toolset lacking web_search gains no native search.
+
+        Guards the _convert_tools lane: capability alone must not inject —
+        a persona visibility set or the coordinator toolset that hides
+        web_search stays search-free on search-capable models.
+        """
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5-search-api",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{"type": "function", "function": {"name": "read_file"}}],
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        tool_types = [t.get("type") for t in kwargs.get("tools") or []]
+        assert "web_search" not in tool_types
+
+
+class TestResponsesCitationFormat:
+    """Test format_citations handles Responses API flat annotation format."""
+
+    def test_responses_api_flat_annotation(self) -> None:
+        """Responses API annotations have title/url directly on the object."""
+
+        class FlatAnnotation:
+            type = "url_citation"
+            url_citation = None  # Not present in Responses API
+            title = "Example"
+            url = "https://example.com"
+
+        result = format_citations("Text.", [FlatAnnotation()])
+        assert "Sources:" in result
+        assert "[Example](https://example.com)" in result
+
+
+class TestResponsesStreaming:
+    """Tests for Responses API streaming event handling."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def _make_event(self, event_type: str, **attrs: Any) -> MagicMock:
+        event = MagicMock()
+        event.type = event_type
+        for k, v in attrs.items():
+            setattr(event, k, v)
+        return event
+
+    def test_text_delta(self) -> None:
+        events = [
+            self._make_event("response.output_text.delta", delta="Hello"),
+            self._make_event("response.output_text.delta", delta=" world"),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        text_chunks = [c for c in chunks if c.content_delta]
+        assert len(text_chunks) == 2
+        assert text_chunks[0].content_delta == "Hello"
+        assert text_chunks[0].is_first is True
+        assert text_chunks[1].content_delta == " world"
+
+    def test_reasoning_delta(self) -> None:
+        events = [
+            self._make_event("response.reasoning_text.delta", delta="thinking..."),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        reasoning = [c for c in chunks if c.reasoning_delta]
+        assert len(reasoning) == 1
+        assert reasoning[0].reasoning_delta == "thinking..."
+        assert reasoning[0].is_first is True
+
+    def test_tool_call_streaming(self) -> None:
+        item = MagicMock()
+        item.type = "function_call"
+        item.id = "fc_abc123"
+        item.call_id = "call_1"
+        item.name = "read_file"
+
+        events = [
+            self._make_event("response.output_item.added", item=item),
+            self._make_event(
+                "response.function_call_arguments.delta",
+                item_id="fc_abc123",
+                delta='{"path":',
+            ),
+            self._make_event(
+                "response.function_call_arguments.delta",
+                item_id="fc_abc123",
+                delta='"/tmp"}',
+            ),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        tc_chunks = [c for c in chunks if c.tool_call_deltas]
+        assert len(tc_chunks) == 3
+        # First chunk: tool call added with name
+        assert tc_chunks[0].tool_call_deltas[0].name == "read_file"
+        assert tc_chunks[0].tool_call_deltas[0].id == "call_1"
+        # Argument deltas
+        assert tc_chunks[1].tool_call_deltas[0].arguments_delta == '{"path":'
+        assert tc_chunks[2].tool_call_deltas[0].arguments_delta == '"/tmp"}'
+
+    def test_completed_event_with_usage(self) -> None:
+        usage = MagicMock()
+        usage.input_tokens = 100
+        usage.output_tokens = 50
+        usage.total_tokens = 150
+        usage.input_tokens_details = MagicMock(cached_tokens=80)
+        # Ensure Chat Completions attributes are not present
+        del usage.prompt_tokens
+        del usage.completion_tokens
+        del usage.prompt_tokens_details
+
+        events = [
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=usage,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        final = [c for c in chunks if c.finish_reason]
+        assert len(final) == 1
+        assert final[0].finish_reason == "stop"
+        assert final[0].usage is not None
+        assert final[0].usage.prompt_tokens == 100
+        assert final[0].usage.completion_tokens == 50
+        assert final[0].usage.cache_read_tokens == 80
+
+    def test_web_search_events(self) -> None:
+        events = [
+            self._make_event("response.web_search_call.searching"),
+            self._make_event("response.web_search_call.completed"),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        info = [c for c in chunks if c.info_delta]
+        assert len(info) == 2
+        assert "Searching" in info[0].info_delta
+        assert "complete" in info[1].info_delta
+
+
+class TestResponsesDrainedStream:
+    """The drained Responses stream reproduces what ``_parse_response`` used
+    to extract from a whole ``Response`` object — content, tool calls,
+    provider_blocks, status→finish mapping (``response.incomplete`` is the
+    real truncation terminal), and usage."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    @staticmethod
+    def _make_events(
+        text: str = "",
+        tool_calls: list[dict[str, str]] | None = None,
+        status: str = "completed",
+    ) -> list[Any]:
+        events: list[Any] = []
+        if text:
+            events.append(SimpleNamespace(type="response.output_text.delta", delta=text))
+            msg_item = SimpleNamespace(type="message", content=[])
+            msg_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}],
+            }
+            events.append(SimpleNamespace(type="response.output_item.done", item=msg_item))
+        for tc in tool_calls or []:
+            item = SimpleNamespace(
+                type="function_call",
+                call_id=tc["id"],
+                id=f"item_{tc['id']}",
+                name=tc["name"],
+            )
+            item.model_dump = lambda tc=tc, **_kw: {  # type: ignore[method-assign]
+                "type": "function_call",
+                "call_id": tc["id"],
+                "name": tc["name"],
+                "arguments": tc["arguments"],
+            }
+            events.append(SimpleNamespace(type="response.output_item.added", item=item))
+            events.append(
+                SimpleNamespace(
+                    type="response.function_call_arguments.delta",
+                    item_id=f"item_{tc['id']}",
+                    delta=tc["arguments"],
+                )
+            )
+            events.append(SimpleNamespace(type="response.output_item.done", item=item))
+        terminal_type = "response.completed" if status == "completed" else "response.incomplete"
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events.append(
+            SimpleNamespace(
+                type=terminal_type,
+                response=SimpleNamespace(status=status, usage=usage),
+            )
+        )
+        return events
+
+    def _drain(self, events: list[Any], capabilities: ModelCapabilities | None = None):
+        client = MagicMock()
+        client.responses.create.return_value = events
+        return drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+                capabilities=capabilities,
+            )
+        )
+
+    def test_basic_text_completion(self) -> None:
+        result = self._drain(self._make_events(text="Hello world"))
+        assert result.content == "Hello world"
+        assert result.tool_calls is None
+        assert result.finish_reason == "stop"
+
+    def test_completion_with_tool_calls(self) -> None:
+        result = self._drain(
+            self._make_events(
+                tool_calls=[{"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp"}'}]
+            )
+        )
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_1"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+
+    def test_provider_blocks_captured(self) -> None:
+        result = self._drain(self._make_events(text="Hello"))
+        assert len(result.provider_blocks) > 0
+        assert result.provider_blocks[0]["type"] == "message"
+
+    def test_incomplete_status_maps_to_length(self) -> None:
+        # ``response.incomplete`` terminal event: finish maps to length and
+        # the final usage/blocks still attach (the un-widened handler used
+        # to drop all three on truncated runs).
+        result = self._drain(self._make_events(text="Partial", status="incomplete"))
+        assert result.finish_reason == "length"
+        assert result.usage is not None
+        assert result.provider_blocks
+
+    def test_terminal_event_less_stream_raises_by_default(self) -> None:
+        # No response.completed/incomplete ever arrived: on an
+        # event-disciplined server this is a generation that died
+        # mid-response — the drain refuses to bless possibly-truncated
+        # content.
+        from turnstone.core.providers import IncompleteStreamError
+
+        events = self._make_events(text="Hello")[:-1]  # drop the terminal event
+        with pytest.raises(IncompleteStreamError):
+            self._drain(events)
+
+    def test_terminal_event_less_stream_completes_with_declared_tolerance(self) -> None:
+        # ``finish_reason_optional`` (operator-declared: this server never
+        # sends terminal events) completes the clean output-bearing end —
+        # the .done-collected blocks ride the shimmed finish chunk.
+        events = self._make_events(text="Hello")[:-1]
+        result = self._drain(events, capabilities=ModelCapabilities(finish_reason_optional=True))
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks
+
+    def test_post_terminal_error_event_keeps_completed_result(self) -> None:
+        # A trailing in-band error frame after response.completed is
+        # teardown noise — raising would discard a generation already in
+        # hand (the in-band twin of drain_stream's post-finish
+        # transport-blip tolerance).
+        events = self._make_events(text="Hello")
+        events.append(SimpleNamespace(type="error", code="server_error", message="boom"))
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_post_terminal_failed_event_keeps_completed_result(self) -> None:
+        events = self._make_events(text="Hello")
+        events.append(
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    error=SimpleNamespace(code="server_error", message="boom")
+                ),
+            )
+        )
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_orphan_argument_deltas_route_to_last_announced_call(self) -> None:
+        # A lax server whose argument deltas reference an item_id that was
+        # never announced: they belong to the call most recently opened,
+        # not hardwired slot 0.
+        item_a = SimpleNamespace(type="function_call", call_id="call_a", id="item_a", name="alpha")
+        item_a.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_a",
+            "name": "alpha",
+        }
+        item_b = SimpleNamespace(type="function_call", call_id="call_b", id="item_b", name="beta")
+        item_b.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_b",
+            "name": "beta",
+        }
+        events = [
+            SimpleNamespace(type="response.output_item.added", item=item_a),
+            SimpleNamespace(type="response.output_item.added", item=item_b),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="bogus",
+                delta='{"x": 1}',
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        by_name = {tc["function"]["name"]: tc["function"]["arguments"] for tc in result.tool_calls}
+        assert by_name["beta"] == '{"x": 1}'
+        assert by_name["alpha"] == ""
+
+    def test_orphan_deltas_do_not_collide_with_terminal_harvest(self) -> None:
+        # Reproduced round-9 regression: argument deltas streamed without
+        # any output_item.added announcement accumulate at slot 0, and the
+        # terminal harvest (gated on "no tool calls streamed") re-emitted
+        # the same call onto the same slot — concatenating the arguments
+        # into '{"x": 1}{"x": 1}'.  Orphan deltas ARE a streamed tool-call
+        # signal, so the harvest must stand down.
+        terminal_item = SimpleNamespace(type="function_call")
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "do_thing",
+            "arguments": '{"x": 1}',
+        }
+        events = [
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="never_announced",
+                delta='{"x": 1}',
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
+    def test_orphan_only_tool_stream_completes_with_declared_tolerance(self) -> None:
+        # Orphan argument deltas must count as delivered output for the
+        # finish shim exactly as they count as a streamed signal for the
+        # terminal harvest: a lax server that never announces items AND
+        # never sends a terminal event still delivered its tool call —
+        # with the tolerance declared, that is a completion, not an
+        # IncompleteStreamError.
+        events = [
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="never_announced",
+                delta='{"x": 1}',
+            ),
+        ]
+        result = self._drain(events, capabilities=ModelCapabilities(finish_reason_optional=True))
+        assert result.finish_reason == "stop"
+        assert result.tool_calls is not None
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
+    def test_duplicate_item_ids_keep_distinct_slots(self) -> None:
+        # Slot numbering must survive duplicate/empty item ids: len(dict)
+        # numbering collided the third call onto the second's slot once an
+        # overwrite kept the dict size flat.
+        def _item(call_id: str, item_id: str, name: str) -> SimpleNamespace:
+            item = SimpleNamespace(type="function_call", call_id=call_id, id=item_id, name=name)
+            item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+            }
+            return item
+
+        events = [
+            SimpleNamespace(type="response.output_item.added", item=_item("call_a", "", "alpha")),
+            SimpleNamespace(type="response.output_item.added", item=_item("call_b", "", "beta")),
+            SimpleNamespace(
+                type="response.output_item.added", item=_item("call_c", "item_c", "gamma")
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["alpha", "beta", "gamma"]
+
+    def test_terminal_only_text_reaches_content(self) -> None:
+        # A buffering gateway that emits NO output_text.delta /
+        # output_item.done events and delivers the whole output only in
+        # the terminal payload: the retired non-streaming path read
+        # content off this same payload, so the drain must too — not
+        # return a clean-looking empty success.
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Full answer"}],
+        }
+        events = [
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.content == "Full answer"
+        assert result.finish_reason == "stop"
+
+    def test_terminal_only_tool_calls_reach_result(self) -> None:
+        # Same under-streaming shape for tool calls: a function_call item
+        # present only in the terminal payload must reach
+        # CompletionResult.tool_calls, or the action is silently never
+        # executed.
+        terminal_item = SimpleNamespace(type="function_call")
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_9",
+            "name": "read_file",
+            "arguments": '{"path": "/tmp/x"}',
+        }
+        events = [
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_9"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/x"}'
+
+    def test_status_less_completed_payload_maps_to_stop(self) -> None:
+        # A slim compat payload that omits ``status`` on response.completed:
+        # the event type itself says the run completed — labeling it
+        # "length" would fire truncation policies on complete output.
+        events = self._make_events(text="Hello")[:-1]
+        events.append(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(usage=None),  # no status attribute
+            )
+        )
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_completed_terminal_keeps_done_items_without_rebuild(self) -> None:
+        # Happy path: every item got its ``output_item.done`` and the
+        # terminal payload carries the same number of items — the rebuild
+        # (a full re-serialization of every output item plus a second
+        # annotations walk) is skipped and the ``.done``-collected blocks
+        # are kept as-is.
+        done_item = SimpleNamespace(type="message", content=[])
+        done_item.model_dump = lambda **_kw: {"type": "message", "origin": "done"}  # type: ignore[method-assign]
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "origin": "terminal",
+        }
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+            SimpleNamespace(type="response.output_item.done", item=done_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.provider_blocks == [{"type": "message", "origin": "done"}]
+
+    def test_completed_terminal_rebuilds_when_done_events_missing(self) -> None:
+        # A lax server that drops ``output_item.done`` events: the terminal
+        # output holds more items than were collected, so the blocks are
+        # rebuilt from the terminal payload (count mismatch — the same
+        # repair path as truncation's never-done'd trailing item).
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "origin": "terminal",
+        }
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.provider_blocks == [{"type": "message", "origin": "terminal"}]
+
+    def test_usage_extraction(self) -> None:
+        result = self._drain(self._make_events(text="Hi"))
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 10
+        assert result.usage.completion_tokens == 5
+
+    @pytest.mark.parametrize("refusal", ["cannot help with that", ""])
+    def test_refusal_renders_in_content(self, refusal: str) -> None:
+        # The response.refusal.done handler (CHANGELOG "refusals render in
+        # content") — the event identifies a refusal even when its text is empty.
+        events = [
+            SimpleNamespace(type="response.refusal.done", refusal=refusal),
+            *self._make_events(),
+        ]
+        result = self._drain(events)
+        assert result.content == f"[Refused: {refusal}]"
+
+    def test_truncation_rebuilds_blocks_from_terminal_response_output(self) -> None:
+        # The item being generated at max_output_tokens truncation never
+        # receives output_item.done; only the terminal response.output has
+        # it.  Storing the .done-collected list alone would keep a
+        # reasoning item without its required following item — the next
+        # turn's replay 400s.  The terminal event's own output wins.
+        def _item(d: dict) -> SimpleNamespace:
+            item = SimpleNamespace(**{k: v for k, v in d.items() if k != "model_dump"})
+            item.model_dump = lambda d=d, **_kw: d  # type: ignore[method-assign]
+            return item
+
+        reasoning_item = _item({"type": "reasoning", "id": "rs_1", "summary": []})
+        partial_msg = _item({"type": "message", "content": [], "status": "incomplete"})
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events = [
+            # Only the reasoning item completed before truncation.
+            SimpleNamespace(type="response.output_item.done", item=reasoning_item),
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(
+                    status="incomplete",
+                    usage=usage,
+                    output=[reasoning_item, partial_msg],
+                ),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "length"
+        assert [b["type"] for b in result.provider_blocks] == ["reasoning", "message"]
+
+    def test_error_event_surfaces_real_api_message(self) -> None:
+        # The SDK YIELDS in-band `error` SSE events (ResponseErrorEvent)
+        # rather than raising; without a branch the stream exhausts
+        # finish-less and the real API message hides behind a misleading
+        # IncompleteStreamError.  Deterministic codes stop retries.
+        events = [SimpleNamespace(type="error", code="invalid_request", message="bad tool schema")]
+        with pytest.raises(RuntimeError, match="bad tool schema"):
+            self._drain(events)
+
+    def test_terminal_without_payload_keeps_collected_blocks(self) -> None:
+        # The collected output_item.done blocks came from the stream, not
+        # the missing terminal payload — a payload-less terminal must not
+        # drop them (reasoning items lost = replay degradation).
+        item = SimpleNamespace(type="reasoning", summary=[])
+        item.model_dump = lambda **_kw: {"type": "reasoning", "summary": []}  # type: ignore[method-assign]
+        events = [
+            SimpleNamespace(type="response.output_item.done", item=item),
+            SimpleNamespace(type="response.completed", response=None),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks == [{"type": "reasoning", "summary": []}]
+
+    def test_truncation_rebuild_recovers_annotations(self) -> None:
+        # The message item open at truncation never got output_item.done,
+        # so its annotations were never collected — the terminal rebuild
+        # walks them so truncated web-search turns keep their Sources.
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Cite", url="https://cite.test")
+        part = SimpleNamespace(type="output_text", text="truncated bod", annotations=[ann])
+        msg_item = SimpleNamespace(type="message", content=[part], status="incomplete")
+        msg_item.model_dump = lambda **_kw: {"type": "message", "content": []}  # type: ignore[method-assign]
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="truncated bod"),
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(status="incomplete", usage=usage, output=[msg_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "length"
+        assert "Sources:" in result.content
+        assert "[Cite](https://cite.test)" in result.content
+
+    def test_transient_error_event_is_retryable(self) -> None:
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [SimpleNamespace(type="error", code="server_error", message="overloaded")]
+        with pytest.raises(ResponsesStreamFailedError, match="overloaded"):
+            self._drain(events)
+
+    def test_terminal_event_without_payload_still_finishes(self) -> None:
+        # A lax compat server may emit the terminal event with no response
+        # payload — it is still a terminal signal, so the drained stream
+        # completes (without usage/blocks) instead of raising
+        # IncompleteStreamError over a generation that fully arrived.
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="all here"),
+            SimpleNamespace(type="response.completed", response=None),
+        ]
+        result = self._drain(events)
+        assert result.content == "all here"
+        assert result.finish_reason == "stop"
+        assert result.usage is None
+
+    def test_transient_failed_event_raises_typed_retryable_error(self) -> None:
+        # A TRANSIENT in-band response.failed (server_error / rate limit)
+        # raises the typed error the provider advertises as retryable —
+        # retry loops re-run it like the wire errors it stands in for.
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    status="failed",
+                    error=SimpleNamespace(message="model overloaded", code="server_error"),
+                ),
+            )
+        ]
+        with pytest.raises(ResponsesStreamFailedError, match="model overloaded"):
+            self._drain(events)
+        assert "ResponsesStreamFailedError" in self.provider.retryable_error_names
+
+    def test_deterministic_failed_event_is_not_retryable(self) -> None:
+        # Deterministic in-band rejections (invalid prompt, image fetch,
+        # policy) re-fail identically on every attempt — they surface as
+        # plain RuntimeError so retry loops stop on attempt zero instead
+        # of running the whole backoff ladder against a doomed request.
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    status="failed",
+                    error=SimpleNamespace(message="prompt was rejected", code="invalid_prompt"),
+                ),
+            )
+        ]
+        with pytest.raises(RuntimeError, match="invalid_prompt") as excinfo:
+            self._drain(events)
+        assert not isinstance(excinfo.value, ResponsesStreamFailedError)
+        assert type(excinfo.value).__name__ not in self.provider.retryable_error_names
+
+
+class TestTransportRetryability:
+    """Every provider must advertise the shared transport error as
+    retryable — the drain raises IncompleteStreamError for ALL lanes, so a
+    provider omitting it silently loses retry-on-dead-stream (the
+    complete-or-error contract's second half)."""
+
+    @pytest.mark.parametrize(
+        "provider_name",
+        ["openai", "openai-compatible", "anthropic", "anthropic-compatible", "google", "xai"],
+    )
+    def test_incomplete_stream_error_is_retryable(self, provider_name: str) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider(provider_name)
+        assert "IncompleteStreamError" in provider.retryable_error_names
+
+
+def test_sanitize_keeps_empty_content_assistant_turn_with_tool_calls():
+    # A think-only assistant turn drains to empty content beside its tool
+    # calls — the exact shape every prose-less tool-call turn already has.
+    # The chat-lane sanitizer must pass it through unmangled.
+    msgs = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "out"},
+    ]
+    out = sanitize_messages(msgs)
+    assert out[1]["content"] == ""
+    assert out[1]["tool_calls"][0]["id"] == "c1"
+    assert out[2]["tool_call_id"] == "c1"
+
+
+def test_commercial_lanes_declare_server_parses_reasoning():
+    """Finding-of-record for the scan-off capability: every REAL commercial
+    lane segregates reasoning natively (thinking blocks / reasoning items /
+    ``reasoning_content``), so its static caps declare the flag — known
+    models and table-miss defaults alike — while the local compat lanes
+    keep the passthrough default the tag scan exists for."""
+    from turnstone.core.providers import create_provider
+
+    for name, model in [
+        ("anthropic", "claude-opus-5"),
+        ("anthropic", "claude-unknown-future"),
+        ("openai", "gpt-5.4"),
+        ("openai", "some-unknown-model"),
+        ("google", "gemini-3-pro"),
+        ("xai", "grok-4"),
+        ("xai", "grok-unknown"),
+    ]:
+        caps = create_provider(name).get_capabilities(model)
+        assert caps.server_parses_reasoning is True, (name, model)
+    for name, model in [
+        ("anthropic-compatible", "qwen3.6-27b"),
+        ("openai-compatible", "qwen3.6-27b"),
+        ("openai-compatible", "gpt-5.4-my-finetune"),
+    ]:
+        caps = create_provider(name).get_capabilities(model)
+        assert caps.server_parses_reasoning is False, (name, model)
+
+
+# ===========================================================================
+# TestAnthropicThinkingPrefixBinding
+# ===========================================================================
+
+
+class TestAnthropicThinkingPrefixBinding:
+    """``thinking_prefix_bound`` rows opt into drop_block + the controls beta."""
+
+    _BETA = "thinking-binding-controls-2026-08-01"
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def _kwargs(self, model: str) -> dict[str, Any]:
+        caps = self.provider.get_capabilities(model)
+        return self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=None,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model=model,
+            tools=None,
+        )
+
+    def test_fable_5_1_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-fable-5-1")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_fable_5_sends_neither(self) -> None:
+        kwargs = self._kwargs("claude-fable-5")
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert "extra_headers" not in kwargs
+
+    def test_opus_5_5_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-opus-5-5")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_opus_5_sends_neither(self) -> None:
+        kwargs = self._kwargs("claude-opus-5")
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert "extra_headers" not in kwargs
+
+    def test_sonnet_5_5_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-sonnet-5-5")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_sonnet_5_sends_neither(self) -> None:
+        kwargs = self._kwargs("claude-sonnet-5")
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert "extra_headers" not in kwargs
+
+    def test_haiku_5_5_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-haiku-5-5")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_caller_beta_header_is_joined_not_replaced(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5-1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"anthropic-beta": "other-beta-2026-01-01", "x-trace": "t1"},
+        )
+        gen.close()
+        headers = client.captured["payload"]["extra_headers"]
+        assert headers == {
+            "anthropic-beta": f"{self._BETA},other-beta-2026-01-01",
+            "x-trace": "t1",
+        }
+
+    def test_caller_beta_header_joins_case_insensitively(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5-1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"Anthropic-Beta": "other-beta-2026-01-01"},
+        )
+        gen.close()
+        headers = client.captured["payload"]["extra_headers"]
+        assert headers == {"anthropic-beta": f"{self._BETA},other-beta-2026-01-01"}
+
+    def test_caller_headers_pass_through_on_unbound_rows(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"x-trace": "t1"},
+        )
+        gen.close()
+        assert client.captured["payload"]["extra_headers"] == {"x-trace": "t1"}
+
+    def test_real_sdk_puts_control_on_the_wire(self) -> None:
+        """Drive the real SDK: the untyped control must reach the HTTP body
+        verbatim and the beta must land as a request header (the SDK types
+        ``block_binding`` only in its beta namespace, and this lane calls the
+        non-beta Messages resource)."""
+        from tests._wire_capture import anthropic_body_capture_client
+
+        captured: dict[str, Any] = {}
+        client = anthropic_body_capture_client(captured)
+        try:
+            chunks = list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-fable-5-1",
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=64,
+                )
+            )
+        finally:
+            client.close()
+        beta = captured["headers"].get("anthropic-beta")
+        assert beta == self._BETA
+        assert captured["body"]["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        finishes = [c.finish_reason for c in chunks if c.finish_reason]
+        assert finishes == ["stop"]

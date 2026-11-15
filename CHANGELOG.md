@@ -1,0 +1,3743 @@
+# Changelog
+
+All notable changes to turnstone are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for
+version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
+
+All development now integrates on `main`. Supported release lines are maintained
+on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
+The separate `dev` branch is retired. See [the release process](docs/releasing.md).
+
+## [1.9.4]
+
+> **Before upgrading:** the database stays at migration 088.
+>
+> - A config file named by `--config` or `TURNSTONE_CONFIG` must exist, and a
+>   config.toml that can't be read or parsed now stops the process instead of
+>   running without its settings. Check that each service starts.
+> - With `tools.web_fetch_alias` empty, a task agent's `web_fetch` reads pages
+>   with the task agent's model, so a task agent on its own model sends the
+>   pages it fetches to that model's endpoint. See **Changed** below.
+> - The Helm chart needs Kubernetes 1.29 or newer and a JWT signing secret
+>   (`auth.existingSecret` or `auth.jwtSecret`), and its pods no longer share a
+>   process namespace, so `kubectl debug` needs `--target`.
+
+### Added
+
+- **Pick the model `web_fetch` reads pages with (#1590).** Models → Roles → Web
+  fetch (`tools.web_fetch_alias`) names the model that reads a fetched page or
+  PDF and answers the question, in conversations and task agents; empty keeps
+  the model that called `web_fetch`. A set alias that can't be used makes
+  `web_fetch` refuse the call before approval rather than read with another
+  model. This model reads the untrusted page itself, so it has to ignore
+  instructions planted in it; smaller models do that less reliably. See
+  [the settings guide](docs/settings.md#web_fetch-model).
+- **`[auth] jwt_secret` and `[oidc] client_secret` may be `secret://`
+  references (#1335).** In config.toml or in `TURNSTONE_JWT_SECRET` and
+  `TURNSTONE_OIDC_CLIENT_SECRET`. Each is resolved once at startup: the server,
+  console and channel gateway stop when it can't be, and a tool warns and goes
+  on without it. A rotated value takes effect at the next start, and the JWT
+  secret must match everywhere, so restart the console, every node and the
+  gateway together. A model key or MCP header reference that resolves to either
+  secret is refused, so a bootstrap secret kept in the store stays out of reach
+  of anyone who can write a reference. `tls list` and `/cluster` now read the
+  JWT secret from `[auth] jwt_secret` as well as the environment.
+- **Helm: a configuration file and secret mounts.** `config.file` holds a
+  config.toml, rendered into a Secret and mounted read-only in the server and
+  console pods, and a change rolls them; `config.existingSecret` mounts your own
+  Secret instead, and `config.secretMounts` mounts Kubernetes Secrets at the
+  paths you give. Together they turn on `secret://` references on Kubernetes
+  and give startup secrets the chart could not take before, such as the
+  `[security]` encryption keys, a place. See
+  [the chart README](deploy/helm/turnstone/README.md#configuration-file).
+- **Helm: single sign-on from values.** `oidc.issuer`, `oidc.clientId`,
+  `oidc.redirectBase` and the client secret (`oidc.clientSecret` or
+  `oidc.existingSecret`, which may be a `secret://` reference) turn on login
+  through an OpenID Connect provider; `oidc.scopes` and `oidc.providerName` are
+  optional, and `oidc.redirectBase` alone serves per-user MCP authorization
+  without single sign-on. The render stops when a required value is missing.
+  Rarer `[oidc]` settings go in `config.file`, which may not repeat the keys the
+  values set. See
+  [the chart README](deploy/helm/turnstone/README.md#single-sign-on).
+- **Helm: MCP servers as sidecars of the server pod (#1326).** `server.sidecars`
+  lists containers that share the server pod's `/workspace` with the model's
+  shell and file tools, each a container spec plus the `port` it listens on; the
+  install notes print the localhost URL to register in the console. Sidecars
+  get none of the chart's secret env and no service-account token. Read
+  [the chart README](deploy/helm/turnstone/README.md#mcp-servers) first: it says
+  what a sidecar can reach and what reaches it.
+
+### Changed
+
+- **A config file that is missing or broken stops the process.** A path named
+  by `--config` or `TURNSTONE_CONFIG` that doesn't exist, or a config.toml that
+  can't be read or parsed, used to run as an empty configuration with at most a
+  warning; every service now stops at startup with the path and reason logged.
+  Only the default path may be absent. `turnstone-doctor` notes a missing named
+  path and reads the configuration files it discovered instead.
+- **A task agent's `web_fetch` reads with the task agent's model.** With
+  `tools.web_fetch_alias` empty, it used the conversation's model. A task agent
+  on its own model (`model.task_alias`, `[model].task_model` or
+  `[model].agent_model` in config.toml, or the call's `model=`) now sends the
+  raw pages it fetches, approved private-network pages included, to that
+  model's endpoint, against its bill and context window, and that model has to
+  ignore instructions planted in them. A task agent on the conversation's model
+  reads at the task effort when one is set. Set `tools.web_fetch_alias` to
+  choose the model that reads pages.
+- **Helm: Kubernetes 1.29 or newer.** Sidecars render as native sidecars, which
+  need it; `kubeVersion` stops an install or upgrade on an older cluster.
+- **Helm: a render without a JWT signing secret stops.** With
+  `auth.existingSecret` and `auth.jwtSecret` both empty, the server used to exit
+  at startup; the render now stops with the reason.
+- **Helm: the server and console run under tini as PID 1.** The chart's
+  `command:` replaced the image's entrypoint, so the pods shared a process
+  namespace to have orphaned processes, such as a stdio MCP server's helpers,
+  reaped. Each container's command now names tini, as the image's entrypoint
+  does, and the pods no longer share a process namespace, so `kubectl debug`
+  needs `--target` to see a service's processes.
+
+### Removed
+
+- **The startup warning that config.toml is group- or world-readable.** A
+  read-only container mount is root-owned and readable by design, and a process
+  that doesn't own the file can't change its mode.
+
+### Fixed
+
+- **PDF and audio files can be attached when starting a workstream.** The
+  dashboard composer, the New workstream dialog and the console launcher refused
+  them, and a create held every file to the 4 MiB image cap. Each file now has
+  its own type's cap (PDF 32 MiB, audio 25 MiB, images 4 MiB, text 512 KiB), one
+  create's files may total 64 MiB, and a file the server refuses stops the
+  create before anything is created.
+- **A refused file no longer hides or drops the rest of a drop.** The files
+  dropped before it went out with the create without showing, and the files
+  after it were lost. All three composers now say why a file was refused and
+  still stage and show the others.
+- **The dashboard clears after starting a workstream.** Its message and staged
+  files stayed and went out again with the next create. A file staged while the
+  create runs is kept.
+- **A speech-to-text alias that can't run no longer hands audio to perception
+  (#1572).** When `audio.stt_model_alias` names an alias that is missing, can't
+  transcribe or fails, an audio attachment gets a placeholder naming the alias,
+  and an empty transcript gets one saying the alias found no speech. Perception
+  still takes audio attachments when the setting is empty.
+
+### Security
+
+- **A `[secrets.file]` root may not contain the pod's service-account token.**
+  Where Kubernetes mounts one, such a root is refused at startup, as a root
+  holding config.toml or the Vault login credential already was; a
+  `secret://file` reference under it could have sent the token to a URL of its
+  author's choosing.
+
+## [1.9.3]
+
+> **Before upgrading:** the database advances from migration 086 to 088.
+> Migrations run automatically; upgrade every process that shares the database
+> together.
+>
+> - 087 deletes the retired `coordinator.max_active` setting, since coordinators
+>   no longer have a session cap.
+> - 088 gives the built-in admin and operator roles the new `files.write`
+>   permission. Holders can upload files into a node's workspace, `/data` and
+>   `/tmp` from the Files pane. Revoke it with a role override where that is too
+>   broad; viewer and custom roles are unchanged.
+> - A `judge.model`, `judge.output_guard_model` or per-workstream `judge_model`
+>   that names a model that isn't loaded, such as a raw model id or a removed
+>   alias, no longer runs on another model: that judge stays off until it names
+>   a loaded model. Check these settings after upgrading.
+> - The `wait_ended` event no longer carries the children's messages, and a
+>   session create that fails for any reason but a full node answers `500`
+>   instead of `429`. See **Changed** and **Fixed** below.
+
+### Added
+
+- **Upload files from the Files pane.** Select **Upload**, or drag files onto the
+  directory browser, to upload them to the directory shown. Uploads need
+  `files.write` as well as browsing access, never replace an existing name
+  (`409`), take up to 100 files per batch and 64 MiB per file, and don't create
+  directories. The console streams the bytes to private staging on the node, and
+  a file appears once its upload completes. See
+  [Files pane](docs/console.md#files-pane) and
+  [its API](docs/api-reference.md#workspace-files).
+- **Large text files preview in part.** Text and Markdown previews in the Files
+  pane start with the first 256 KiB, and **Load more** extends them in 256 KiB
+  steps up to 2 MiB; above 512 KiB they used to be refused. **Copy shown text**
+  copies the visible part, and **Download** still saves the whole file. The
+  preview API takes `limit` for a prefix and reports it in `X-Preview-Truncated`,
+  `X-Preview-Bytes` and `X-File-Size`.
+- **Tool cards show the whole call and the whole result.** Each card's call line
+  has a **full call** button that opens the arguments exactly as the model wrote
+  them, credentials redacted, on live cards, after a reload, in sub-agent cards
+  and on calls awaiting approval, so a call can be read in full before it is
+  approved. A result too long for its box gets a **show all** button, which also
+  shows past the 64 KiB display cut. The `tool_pending`, `tool_info` and
+  `approve_request` events now carry each call's `arguments`. Sub-agent cards
+  rebuilt after a reload keep each call's arguments whole instead of cutting
+  them at 2,000 characters; the store they come from is capped at 16 MB of text
+  per open workstream.
+- **Coordinators and `task_agent` are no longer offered models meant for other
+  jobs (#1529).** A new setting, `model.hide_utility_aliases`, on by default,
+  keeps an alias set for Judge, Output guard judge, Speech-to-text,
+  Text-to-speech, Perception or Reranker out of a coordinator's `list_nodes` and
+  `task_agent`'s alias list. Rerankers and speech-only models, which can't hold a
+  chat, are never listed. The default alias stays listed, naming a hidden alias
+  still works, and the admin console still shows every alias. Rows in
+  `node_metadata`'s `models` entry gain an `offered` flag.
+- **A task agent's open step list closes from its end.** A **hide steps** control
+  under the last step folds the card back to its "N steps" bar. It is absent
+  while a step in the card waits for approval.
+- **Expand all on the admin Settings and Nodes tabs.** A toolbar button opens
+  every section, then reads **collapse all**. A node with one metadata key now
+  reads "(1 key)", not "(1 keys)".
+
+### Changed
+
+- **`wait_ended` carries each child's state without its message.** Its per-child
+  `results` hold `state`, `tokens`, `updated` and `name`, as `wait_progress`
+  does; a consumer that read messages there reads them from the wait's tool
+  result instead.
+- **The container image runs npx-based MCP servers on Node.js 26** (was 24).
+
+### Fixed
+
+- **A judge model that can't be used is never replaced by another model
+  (#1529).** A set `judge.model`, `judge.output_guard_model` or per-workstream
+  `judge_model` whose alias isn't loaded, or whose client can't be built, used to
+  run on another model, such as the session's own, so the model doing the work
+  could approve its own tool calls through Smart Approvals. That judge now
+  doesn't run: tool calls get no verdict, each waits for a person unless a
+  policy or blanket approval covers it, and the output guard's regex stage
+  judges alone. Each try logs `judge.model_unavailable`, the web UI and terminal
+  show a one-time note, and the judge tries again after Sync to Nodes, a
+  settings edit or a model reload.
+- **Judge settings stay visible and in force (#1529).** The Models tab refuses to
+  delete, disable or rename a model that `judge.model` or
+  `judge.output_guard_model` names (`409 model_in_use`); the model pickers show
+  an unloaded `judge.model` as configured instead of blank; an edit of
+  `judge.model` reaches open workstreams at their next judge batch; and a stored
+  setting that stops decoding keeps the value that last loaded instead of its
+  default. `task_agent` says why a model it named can't run and no longer
+  suggests others.
+- **Opening more coordinators no longer evicts idle ones.** The five-session
+  coordinator cap is removed, so opening coordinators no longer evicts idle
+  sessions and churns the sidebar across browsers. Idle cleanup still applies.
+- **A session create reports a full node only when every slot is busy.** Any
+  other failure answered `429` with the raw error text, which the browser
+  retried as a rate limit; it now answers `500` with a correlation id, and a
+  scheduled task records the firing as unresolved instead of retrying it.
+- **An MCP tool with an invalid input schema no longer breaks the conversations
+  that offer it.** A provider that checks tool schemas refused every request
+  offering such a tool. A tool whose input schema is not valid JSON Schema, or
+  holds NaN or an infinity, is now left out of its server's catalog, and the
+  server's other tools stay available. The log, the server's status
+  (`skipped_tools`), the admin console's MCP Servers list (**tools skipped**) and
+  the connection test name each tool left out and the field that is wrong.
+  Provider rules beyond JSON Schema are not checked. `jsonschema` is now a
+  direct dependency.
+- **`wait_for_workstream` brings a child's message whole when the coordinator
+  has room for it.** It cut every message at 10 KiB, and on a small context a
+  large wait could be cut mid-JSON, losing children's ids and states. The result
+  is now fitted to the room the coordinator's context grants it: when the
+  messages don't all fit, as many as fit stay whole, smallest first, and the
+  rest share what is left, each cut from the end and marked `truncated` with
+  `message_chars`.
+- **`web_fetch` keeps the links on a page.** Each link now reads `[text](url)`,
+  its target resolved to an absolute URL, so the extraction model no longer has
+  to guess a link it was asked for; a target that could mislead keeps only its
+  text. The page and PDF extraction prompts tell the model to give URLs exactly
+  as the content has them and never invent one. Links lengthen a page's text, so
+  a long page reaches its extraction budget sooner. The HTML conversion also
+  drops comments and iframe content, keeps the text after a stray `<`, and no
+  longer spills markup from attribute values into the text.
+- **HTML handling in `web_fetch` and `open_preview` takes linear time (#1568).**
+  On some malformed markup, converting a page, or finding its title and where its
+  `<base href>` goes, took time growing with the square of its size.
+- **The output guard reads an `inspect_workstream` result's text, not its JSON
+  (#1522).** Every inspect raised a role-injection advisory from the child's own
+  system turns, while secrets and injection text escaped inside the JSON went
+  unseen. A value that is exactly a redaction marker also no longer counts as a
+  new credential leak each time a child's redacted result is read.
+
+### Security
+
+- **Keys and focus no longer approve a call no one meant to approve.** In the
+  interactive and coordinator panes, Enter on a focused **Deny** button approved
+  the call, and a newly arrived approval card or verdict took focus from
+  wherever it was, a text field included, so the next keys typed approved or
+  denied it. A focused control now handles its own Enter, focus moves to a card
+  only when nothing holds it and never in a pane scrolled back, and in the
+  interactive pane Ctrl, Cmd and Alt combinations no longer approve or deny.
+- **Control characters a model or tool writes are shown, not obeyed (#1559).**
+  Tool cards, the approval preview and full call, the terminal client and the
+  coordinator's children tree show them as symbols (an escape as `␛`), so a
+  carriage return or escape sequence can no longer make a command read `ls -la`
+  when it goes on to fetch and run a script. An MCP server's error text, log
+  messages and skipped tool names show every unprintable character, direction
+  overrides and zero-width characters included, as a space.
+- **The children tree redacts a call awaiting approval.** Its preview, the
+  verdict and the policy-block banner showed credentials in the clear, and a
+  one-line bash command showed no command at all; it now shows the call's
+  header line.
+- **More secrets are redacted.** Passwords in `postgres://` URLs, and DSA,
+  encrypted and PGP private keys, are redacted in tool results, the judge's
+  input, logs and the web cards. A private key cut by the coordinator's 64 KiB
+  display limit no longer shows its first lines, and redacting `.env`-style lines
+  or private keys no longer takes time growing with the square of the text's
+  length (9 seconds for 320 KB on the server).
+- **Discord and Slack approval cards show model-written text as written.**
+  Markdown in a command or the judge's summary is escaped, so it can't hide part
+  of a command or add a verdict line or link beneath the real one; the summary
+  is one line of at most 400 characters. On Slack, a call with no preview shows
+  its header line instead of only the tool's name.
+
+## [1.9.2]
+
+> **Before upgrading:** the database advances from migration 084 to 086.
+> Migrations run automatically; upgrade every process that shares the database
+> together.
+>
+> - 085 records what each pending MCP sign-in was started against. A sign-in
+>   begun before the upgrade fails as expired; connecting again works.
+> - 086 gives the built-in admin and operator roles the `files.read` permission.
+>   Holders can read and download any file the node's process can read under its
+>   workspace (its working directory when none is set), `/data` and `/tmp`, with
+>   no model turn or tool approval. Revoke it with a role override where that is
+>   too broad; viewer and custom roles are unchanged.
+> - A user whose MCP grant was recorded before 1.8.2 with a templated
+>   (`{tenantid}`) issuer is asked to connect again at its next refresh.
+> - The consent callback compares `iss` exactly. A server whose Authorization
+>   Server URL names a multi-tenant alias (such as `.../organizations/v2.0`)
+>   can't complete a new consent with an authorization server that sends `iss`
+>   naming the tenant. Set the tenant's own issuer; changing that URL asks the
+>   server's users to connect again.
+> - A caller holding only `read` scope (a read-only API token, a session
+>   exchanged from one, or a viewer) can no longer make a request under
+>   `/api/workstreams/` other than GET or HEAD, and a coordinator's `trust` route
+>   now needs `approve` scope. See **Security** below.
+>
+> Custom storage backends must:
+> - accept and return the new pending-flow fields (`as_issuer`,
+>   `iss_parameter_supported`, `server_id`, `server_url`, `audience`);
+> - purge an MCP server's name-keyed OAuth rows inside the transaction that
+>   creates, updates or deletes it, and take `purge_oauth_rows`,
+>   `oauth_client_secret_ct` (written in the same statement; the
+>   `MCP_SECRET_UNCHANGED` default leaves it and `None` clears it) and `expected`
+>   (write only while those columns hold those values) on `update_mcp_server`; a
+>   rename purges the old and new names' rows whatever `purge_oauth_rows` says;
+> - take `expected_as_issuer` and `expected_access_token_ct` on
+>   `update_oauth_token_after_refresh`, writing only while the row still holds
+>   them, and provide `delete_oauth_token_if_unchanged`;
+> - provide `unlink_oidc_identity`, `replace_consented_oauth_token`,
+>   `replace_delegated_oauth_token` (with `obo_server`, answering
+>   `binding_changed` when that server is no longer an on-behalf-of server),
+>   `upsert_oidc_user_credential_for_identity` and
+>   `delete_prompt_template_if_enabled`, each as one transaction;
+>   `delete_oidc_identity` and `delete_oidc_user_credential` are gone (an
+>   identity and its credential now go through `unlink_oidc_identity`, or with
+>   the account in `delete_user`, which deletes the credential before the
+>   delegated rows);
+> - return only enabled servers' grants from
+>   `list_mcp_user_token_reconcile_targets`;
+> - raise `StorageUnavailableError` or SQLAlchemy's `DBAPIError` when a write
+>   fails, which is what the console answers as `503`.
+
+### Added
+
+- **Files pane.** Browse and retrieve files on a conversation's node without a
+  model turn: select **Files** above an interactive conversation's composer to
+  open its workspace, `/data` or `/tmp`, preview HTML, images, PDFs, Markdown,
+  tables and text, copy source, and download. Successful `write_file` and
+  `edit_file` cards link to the file. The pane is read-only, stays inside the
+  selected location and does not follow symlinks. It requires `files.read`,
+  `write` scope and an active session. These locations are shared by the node's
+  workstreams, so project access does not make them private. See
+  [Files pane](docs/console.md#files-pane) and
+  [its API](docs/api-reference.md#workspace-files).
+
+### Changed
+
+- **`oauth_registration_mode` accepts only `preregistered` and `dcr`.** The
+  documented `dynamic` never registered a client; setting it now answers `400`,
+  while a row that stores it keeps it until changed.
+- **An MCP server update answers `409` when another request changed the server's
+  name, auth type, URL, Authorization Server URL, audience, scopes or
+  registration mode meanwhile.** Nothing is written in that case.
+- **The OIDC unlink reply reports memory eviction per host.**
+  `model_memo_nodes_invalidated` and `model_memo_nodes_failed` give way to
+  `model_memo` (the console's result and the nodes evicted, failed and not
+  reached) and `model_memo_unconfirmed`; deleting a user replies the same way.
+  The unlink and the deletion are audited as soon as they commit
+  (`oidc_identity.delete`, `user.delete`), and the eviction's outcome follows as
+  `oidc_identity.delete.memo_eviction` or `user.delete.memo_eviction`. A write
+  whose commit was cut off but took effect answers `incomplete` with the unlink's
+  counts `null`; when that can't be told, the reply is a `503` saying the change
+  may have been saved.
+- **Skills mirrored from an MCP server cannot be unlocked or renamed.** Unlocking
+  one answers `400`. A locked skill's update applies only its runtime config and
+  ignores every other field, and renaming a mirrored skill unlocked before this
+  release answers `400`.
+- **A skill update treats `null` as "leave unchanged" for optional fields such as
+  the name, content, tags and priority.** It used to store the text `None` in the
+  name or content, clear the tags, or reset the priority. `description`, `kind`,
+  `enabled`, `auto_approve` and `allowed_tools` answer `400` to `null`.
+
+### Fixed
+
+- **A coordinator no longer reads a child it just messaged as finished.** A
+  `wait_for_workstream` right after `spawn_workstream`, `spawn_batch` or
+  `send_to_workstream` could return at once with an empty result or the child's
+  previous answer, and a fast model resent the brief. Wait and inspect now report
+  a child that hasn't started a spawn's first message, or a send to it while
+  idle, as `starting`, and as `stalled` after 120 seconds, with `dispatch_age_s`;
+  the first wait that sees a stall returns early and lists it in `stalled`. The
+  report lapses after 10 minutes, and a console restart or a send from elsewhere
+  shows none. Spawn results say when the node didn't take the first message
+  (`initial_message_status`). A response that includes a wait now runs its tool
+  calls one at a time, in order.
+- **A `wait_for_workstream` given `since` no longer reports `complete` early.**
+  It returned `complete: true` as soon as a listed child changed, even one that
+  had only started working. `complete` now means the any/all condition held; the
+  new `changed` field lists the children whose change ended the wait.
+- **Dictation can't hold speech capacity through long retries (#1509).** HTTP
+  dictation makes one backend attempt with a 25-second budget shared by
+  preparation, credential minting, DNS, connection setup, upload and response
+  I/O. A backend error or timeout answers `502`, or ends a streamed transcript
+  that has already begun, and a long clip may now fail where it used to succeed
+  late. In-turn transcription keeps its timeout and retries.
+- **A configuration-file MCP server with a `url` and no `type` shows its real
+  transport (#1494).** It connects over Streamable HTTP, but the console showed
+  it as stdio with an empty command and no URL.
+
+### Security
+
+- **MCP sign-ins check the authorization server's `iss` (#1408).** The consent
+  callback compares `iss` with the issuer the user was sent to, and refuses a
+  missing one when the authorization server advertises it (RFC 9207); one that
+  neither sends nor advertises `iss` gets no protection from this check. The
+  callback also refuses when the server's URL, audience, auth type or
+  authorization server changed since Connect was clicked, before the code
+  exchange and again when storing the token. A response that repeats any
+  parameter is refused.
+- **An MCP server's authorization server stays pinned.** Once discovered, it
+  moves only when an operator changes the server's URL or Authorization Server
+  URL or takes it off `oauth_user`, or when a value stored by an earlier version
+  is refused on its text alone (an IP-literal host, or a bare `localhost` host
+  for a remote server). A lookup of its host that fails or answers with a refused
+  address now fails the connect or refresh. A refresh or disconnect sends a
+  stored refresh token only to the authorization server that issued it; a grant
+  from any other is removed, and the user is asked to connect again. A refresh
+  that finishes or fails after the user consented again no longer overwrites or
+  removes the new grant.
+- **An MCP server change and the purge of its sign-ins land together.** A change
+  that rebinds a server's tokens (its name, auth type, URL, authorization server
+  or audience, or an on-behalf-of server's scopes), and every deletion, purge its
+  per-user tokens and pending sign-ins in one transaction; when that fails, the
+  change answers `503` and nothing is changed. A write whose commit was cut off
+  reads the server again, and when that can't tell, the reply says the change may
+  have been saved. Creating or renaming a server also clears tokens left under
+  its new name.
+- **A dynamically registered client never keeps an earlier secret.** Registration
+  saves the client id and secret in one write that applies only while no other
+  registration has saved a client and the server still points where discovery
+  found it. Changing the Server URL or Authorization Server URL of a server that
+  registers dynamically drops both, so that secret never reaches another
+  authorization server.
+- **Unlinking an OIDC identity takes its delegated access with it, in one step.**
+  The captured credential and the user's on-behalf-of MCP and delegated model
+  tokens are deleted in the identity's transaction; when storage fails, the
+  unlink answers `503` and changes nothing. The console and every node registered
+  within the last hour then drop the user's cached model tokens, which no host
+  keeps in memory longer than that hour, and a host that can't confirm it is
+  named in the reply (`status: "incomplete"`), the audit and the admin page.
+  Deleting a user evicts the same way. An admin can no longer unlink their own
+  identity.
+- **A delegated token minted while its user is unlinked is never used.**
+  On-behalf-of MCP and model tokens are stored only while the credential that
+  minted them still exists (and an MCP server is still sign-in passthrough),
+  checked in the same transaction. A token whose store fails is discarded, and
+  that user's next mint for the server or model waits 30 seconds. A sign-in in
+  progress when its identity is unlinked now fails instead of storing the
+  credential again.
+- **A disabled per-user MCP server is no longer called.** Every tool call,
+  resource read and prompt get for an `oauth_user` or `oauth_obo` server checks
+  that the server is still enabled, before any token refresh or mint, and a
+  disabled one answers `mcp_server_disabled` on every host without waiting for
+  the reload. The first refused call takes the server out of the user's live
+  sessions, and each refusal is logged. Connect for a disabled server answers
+  `404`, a consent in progress when it is disabled stores no grant, and session
+  starts and the token sweep no longer refresh its grants.
+- **A disabled MCP prompt stays disabled.** When its server stops listing a prompt
+  an admin has disabled, the skill is kept, still disabled, and the prompt returns
+  to it if the server lists it again. An update to a skill deleted meanwhile
+  answers `404` in the admin API, and the `skills` tool reports it to the model.
+- **Streamed dictation needs write scope.** `POST
+  /api/workstreams/{ws_id}/speech-to-text/stream`, the route the browser's
+  microphone uses, accepted a read-only token, directly and through the console
+  proxy. A read-only caller can no longer spend the speech-to-text model's
+  capacity or have a backend credential minted for it.
+- **Coordinator governance routes check token scope (#1517).** `POST
+  /api/workstreams/{ws_id}/trust`, `/restrict` and `/close_all_children` accepted
+  a read-only token held by a user with the coordinator permissions. `trust` now
+  requires `approve` scope, and the other two `write`. Password and SSO sessions
+  of users with these permissions are unaffected, since those permissions give
+  them `approve`; an API token limited to `read,write`, or a session exchanged
+  from one, can no longer turn trust on or off.
+- **Workstream routes take their scope from the HTTP method.** Every request under
+  `/api/workstreams/` other than GET or HEAD now requires at least `write`, so a
+  route added there can no longer fall through to `read`.
+
+## [1.9.1]
+
+> **Before upgrading:** the database advances from migration 083 to 084, which
+> adds the MCP certificate setting below, off for every existing server.
+> Migrations run automatically; upgrade every process that shares the database
+> together. Custom storage backends must accept `tls_skip_verify` in
+> `create_mcp_server` and return whether it inserted a row, and
+> `update_mcp_server` must raise `StorageConflictError` when a new name is
+> taken.
+
+### Added
+
+- **Skip certificate verification for one MCP server.** A Streamable HTTP server
+  whose certificate cannot be added to the trust store, such as a device's own
+  self-signed one, can be reached with `tls_skip_verify = true` in its
+  configuration entry or **Skip certificate verification** in the console's
+  server form. Anyone who can intercept the connection can then pose as the
+  server. It is off by default and refused for per-user OAuth and stdio
+  servers; the console's server list marks it, and the audit log records it.
+  See [Servers with self-signed certificates](docs/tools.md#servers-with-self-signed-certificates).
+- **MCP audit events name the server's host.** Creating, importing or installing
+  a Streamable HTTP server records its `scheme://host:port`, so the log keeps
+  the host after the server is deleted.
+- **`/model` in coordinator sessions.** `/model` and `/model <alias>` show or
+  switch a coordinator's model, as in an interactive workstream, instead of
+  going to the model as a message; other text still does. The console serves it
+  at `POST /v1/api/workstreams/{ws_id}/command`, gated on `admin.coordinator`.
+
+### Fixed
+
+- **MCP servers that refuse the protocol probe connect again (#1489).** In
+  1.9.0, a Streamable HTTP server that answered `server/discover` with HTTP 400
+  and error -32000, as many servers predating the 2026-07-28 revision do, failed
+  with "The connection closed before the server answered". It now falls back to
+  the `initialize` handshake.
+- **A speech model's `max_concurrency` applies to dictation and read-aloud
+  (#1485).** Dictation waits up to 15 seconds for a free slot and read-aloud
+  takes one only if it is free; when none is, the node answers 429 with
+  `Retry-After`, which the browser retries. An alias that serves both chat and
+  dictation now shares its slots between them, and a node runs at most four
+  dictations at once.
+- **Strict booleans for MCP servers, skills and schedules.** `auto_approve` and
+  `enabled` must be `true`, `false`, `0` or `1`; the string `"false"` used to
+  count as true. MCP servers and skills also refuse these flags as `null`, as
+  schedules already did, and a skill refuses a `null` `allowed_tools`, which
+  stored a tool named `None`. The Python SDK's `create_mcp_server` now sends
+  these values as given, so the console refuses a `None` or a string the SDK
+  used to coerce.
+- **Concurrent MCP server saves.** Creating or installing a server whose name,
+  or registry server, another save takes at the same moment answers `409`, and
+  an import lists it as skipped; these used to report success and audit a
+  server that was never stored. An edit of a server another admin deletes at
+  the same moment answers `404` instead of reporting success, and a rename
+  that loses the race answers `409` instead of 500.
+- **MCP server saves that failed part-way.** An import entry that is not an
+  object is listed among the import's errors; one with a new name used to fail
+  the import with a 500 after the entries before it were saved. An OAuth client
+  secret over 1024 characters is refused before anything is saved, not after
+  the server's row was written. Neither left an audit event or node reload.
+- **Audit tab.** An object value in an event's summary, such as a created
+  server's header references, shows as JSON instead of `[object Object]`.
+
+### Security
+
+- **MCP server edit audits no longer record URL paths or stdio arguments.** The
+  update event records a changed URL, and an OAuth audience or authorization
+  server given as an http(s) URL, as `scheme://host:port`, and stdio arguments
+  only as `(updated)`. A URL's path or query, or an API key passed as an
+  argument, used to be recorded in full. Earlier entries are not rewritten.
+
+## [1.9.0]
+
+Turnstone 1.9 focuses on predictable workstream ownership, explicit model
+selection, simpler skills, and more capable MCP connections. It also makes
+coordinators easier to interrupt, saved conversations easier to find, and tool
+approvals harder to bypass. This entry describes the change from 1.8.7; fixes
+already shipped on the 1.8 line are not repeated here.
+
+> **Before upgrading:** native installations require Python 3.13 or newer.
+> Recreate environments running Python 3.11 or 3.12 before upgrading; container
+> images include Python 3.14. The database advances from migration 076 to 083.
+> Back it up, then upgrade every node, console, CLI, and SDK client that shares
+> it together. Older processes cannot safely share the migrated database.
+>
+> Migration 080 permanently removes skill model settings, activation modes,
+> task-agent turn limits, and token budgets. Export any values you need first.
+> Move model settings to aliases, default instructions to prompt policies or
+> personas, and task-agent limits to `tools.agent_max_turns`. Review completion
+> notification targets too: invalid lists are reset. The **Removed** section
+> below explains the new behavior.
+>
+> HTTP clients now use the operating system's certificate trust store. Install
+> private CA roots there, or configure `SSL_CERT_FILE` / `SSL_CERT_DIR` with a
+> complete trust bundle. Refresh system and custom CA bundles before restarting.
+> Custom session hosts and storage backends also need the lease and saved-session
+> interface updates described below.
+
+### Added
+
+- **One live owner per workstream.** A database-backed lease prevents two nodes
+  from writing to the same conversation. Opens route to the owner, concurrent
+  opens share one session, and a process that loses ownership stops generating
+  and writing. A crashed owner's workstream can be recovered after its lease
+  expires, normally within 30 seconds. The CLI opens resumed workstreams in
+  their own tabs and reports ownership changes without closing the whole shell.
+  See [Workstream Owner Lease](docs/architecture.md#workstream-owner-lease).
+- **MCP protocol 2026-07-28 support (#679).** Connections negotiate the newer
+  protocol when offered and retain the older initialization handshake for
+  existing servers. Catalog subscriptions reconnect and refresh, resource reads
+  honor cache hints, and structured-only tool results reach the model as JSON.
+  Optional server logging and resource subscriptions are documented in
+  [MCP settings](docs/tools.md#optional-2026-07-28-settings).
+- **Images from MCP tools (#1158).** Supported image results reach vision models
+  and appear in live and reopened conversations. They use the same attachment
+  storage and access boundaries as uploaded images.
+- **Test MCP connections before saving (#1328).** The server editor can test an
+  unauthenticated or static-header HTTP connection and show its tools, resource
+  and prompt counts, or a useful connection error. The test saves nothing and
+  runs from the console, whose network may differ from a node's.
+- **Secret references for credentials (#1329).** Model API keys and MCP HTTP
+  headers can use `secret://` references to mounted files or a configured secret
+  store. Values stay out of the database, model keys refresh on the configured
+  interval, and MCP headers pick up rotations on reconnect. Adding or probing a
+  reference requires the dedicated admin permission. See
+  [Secret References](docs/security.md#secret-references).
+- **User avatars (#997).** Accounts have a distinct initial and color, with an
+  option to upload a picture. Avatars appear in the user menu and Users table;
+  admins can remove uploaded pictures. Image uploads are bounded and normalized
+  before storage.
+- **A separate approval-evaluation state (#1325).** Dashboards distinguish
+  waiting for the intent judge from waiting for a person. The new `evaluation`
+  state appears in events, metrics, coordinator trees, and CLI cluster views;
+  API and SDK consumers that enumerate states should add it.
+- **Output-guard and attachment evaluations (#1291).** `turnstone-eval` can
+  measure injection detection, advisory accuracy, and task-agent behavior,
+  retain transcripts for later grading, and exercise attachments through the
+  same path as real uploads.
+
+### Changed
+
+- **Model selection is explicit (#1359).** A missing, disabled, or unreadable
+  model is no longer silently replaced. New work that depends on it fails with
+  a useful error; an existing workstream keeps its selected model and waits for
+  it to return or for an explicit `/model` change. Default, task, coordinator,
+  and channel aliases follow the same rule. Nodes report a missing default
+  model as degraded, and model administration identifies settings that still
+  refer to an alias before allowing its removal.
+  - Migration 082 seeds `model.default_alias` from existing enabled chat models
+    when no default is stored. This setting takes precedence over per-node
+    configuration; clear it in Settings to restore configuration-based selection.
+- **The client transport and SDK contracts have changed (#679, #1011).** MCP
+  requires SDK 2.3, and the Python client SDK accepts an `httpx2.AsyncClient` for
+  `httpx_client`. Callers should catch `turnstone.sdk.REQUEST_FAILURES` for
+  transport failures. Helpers that import the removed `httpx`, `httpx_sse`, or
+  `certifi` dependencies must install them themselves. Event streams now reject
+  a single event larger than 16 MiB. See [SDK error handling](docs/sdk.md#error-handling).
+- **The native provider API uses version 2026-10-21.** Its SDK is now 2.x, and
+  that API rejects `temperature`, `top_p`, and `top_k`. Remove those overrides
+  from native model definitions and ensure gateways accept the new API version.
+  The compatible lane retains its temperature behavior. API keys retain their
+  key header, bearer tokens retain theirs, and clients carrying an API key no
+  longer follow redirects: configure the final gateway address directly. See
+  [provider configuration](docs/architecture.md#provider-adapter-layer).
+- **Stored model definitions contain values or secret references.** Definitions
+  saved in the console no longer expand `${VAR}` in API keys or base URLs;
+  environment expansion remains available in `config.toml`. Update older stored
+  placeholders before syncing models. Empty key expansions and keys with
+  surrounding whitespace are rejected instead of falling back to another
+  credential. Workspace-scoped definitions also carry their workspace header
+  through detection, diagnostics, and delegated authentication.
+- **Saved conversations are paged and searched on the server (#1268).** Both
+  dashboards can reach the full saved history, including coordinators, rather
+  than only the newest rows. Search and sort apply across the stored results.
+  A conversation's `updated` time now reflects message changes; opening,
+  renaming, or closing it no longer moves it to the top or restarts retention.
+  Custom storage backends must implement `list_saved_workstreams` and adopt the
+  revised history-list and timestamp contracts.
+- **Coordinators respond sooner (#1339, #1457).** User messages interrupt a
+  pending wait immediately, and batch spawns create children concurrently so a
+  stalled node does not delay every later child. The CLI keeps background
+  approval output away from the active prompt, and the first Ctrl-C stops a
+  parallel tool batch.
+- **The output guard inherits the workstream's judge model (#1291).** When
+  `judge.output_guard_model` is unset, it uses `judge.model`, then the session
+  model. Set a dedicated output-guard alias to keep its capacity separate from
+  intent approvals. Judge usage is included in recorded costs.
+- **OAuth storage and lifecycle are shared.** Model and MCP authentication use
+  one process-owned runtime for token requests, rotation, and durable writes.
+  Model authentication no longer depends on an MCP manager. Migration 077
+  renames the token table and key column while preserving encrypted credentials;
+  keyring configuration is unchanged. See [Shared OAuth storage](docs/oauth-storage.md).
+- **Development now stays on `main`.** The former `main` is `stable/1.8`, the
+  former `dev` is `main`, and `dev` is retired. Features and user escalations
+  follow the same development loop. Source downloads and the installer target
+  `main`; supported stable lines receive focused backports.
+
+### Removed
+
+- **Skill-owned model settings and implicit activation (#1292).** Skills no
+  longer choose a model, sampling settings, output limits, task-agent turn cap,
+  or token budget. Default and search-activated skills are gone: a workstream
+  names a skill explicitly, or the model finds one with `skills(find)`.
+  `turnstone-server --skill` is removed; the CLI's per-workstream `--skill`
+  remains. Move default instructions to a prompt policy or persona, noting that
+  those instructions also apply when a workstream uses a named skill. Prompt
+  policies reach existing workstreams; persona prompts are copied when a new
+  workstream is created. Token budgets no longer hold a turn for approval.
+  Update SDK clients and custom
+  storage implementations that expect the removed skill fields or methods.
+- **Automatic cross-model failover (#1359).** `[model].fallback` is ignored
+  with a warning. A failed turn stays on its chosen model instead of trying
+  other aliases or providers; custom registry integrations must remove their
+  `fallback` argument.
+- **In-place session resume.** `ChatSession.resume()` is replaced by opening
+  through `SessionManager.open()`, which loads the session with `rehydrate()`.
+  Custom session factories must pass `workstream_lease`; embedded managers must
+  start their lease keeper and release leases at shutdown. Custom storage
+  implementations must support lease acquisition, renewal, release, and fenced
+  session writes. The [architecture guide](docs/architecture.md#workstream-owner-lease)
+  describes the lifecycle contract.
+- **Repeat-call and tool-error memory nudges (#1339, #1454).** Legitimate polling
+  no longer receives an identical-call warning, and a failed tool call no longer
+  injects a separate instruction to search memory. Actual tool results and
+  previously saved transcript entries remain available.
+
+### Fixed
+
+- **Stopping and closing coordinators reaches every child (#1465, #1471).**
+  Cancellation includes children whose creation notifications have not arrived.
+  Force-cancel also ends a pending `wait_for_workstream` instead of leaving it
+  attached to an obsolete cancellation signal.
+- **Failed reads stay failures.** Storage outages no longer masquerade as empty
+  task lists, missing workstreams, default settings, or a changed child state.
+  Workstream opens report a retryable failure rather than replacing saved
+  configuration, and processes that cannot read startup settings stop instead
+  of starting with defaults.
+- **MCP connections recover without leaving work behind.** Catalogs are read
+  beyond their first page; malformed tools do not cause reconnect loops; pooled
+  TLS and network failures count toward the circuit breaker; and shutdown or
+  server removal settles waiting calls. A failed initial connection remains
+  registered so it can be diagnosed and retried.
+- **Provider replay and recovery preserve the conversation.** Hosted searches
+  and citations survive replay, native search keeps working across rounds, and
+  history edits retain the right reasoning and system-message behavior.
+  Context meters account for server-side tools without inflating later turns.
+  Closing a client or failing a callback no longer strands its stream, and
+  bounded recovery reports incomplete task results instead of success.
+- **Approvals and rate limits leave the operator in control (#1325, #1338,
+  #1342, #1464).** Automatic evaluation moves to human attention as soon as a
+  decision requires it. Background CLI agents wait only for calls that actually
+  need a person. API rate limits are per signed-in user, exclude page assets,
+  and preserve the ability to stop running work.
+- **Attachments and speech fail clearly.** Transparent images are flattened
+  before model input, and binary web responses are refused as page content.
+  Local PDF processing works on supported desktop environments and reports
+  unavailable worker limits clearly. Speech synthesis uses bounded workers,
+  cancels abandoned requests, and reports oversized output without pretending
+  the node is unreachable.
+- **Malformed data is rejected at the boundary (#1456, #1458, #1459).** Deeply
+  nested JSON, oversized integers, recursive schemas, invalid model values,
+  and request bodies of the wrong shape produce bounded, useful errors rather
+  than recursion failures or partially processed requests.
+- **Everyday UI interactions are steadier.** Saved workstreams retain their
+  selected skill and settings; skill search reaches beyond the first page;
+  dialogs do not cover a new sign-in screen; typing in dialogs and shelves no
+  longer lags; and warning messages and narrow-pane forms remain readable.
+- **Deployment errors are actionable.** Database credentials and certificate
+  paths with punctuation work, migrations read the same settings as services,
+  and enabling TLS after startup takes effect. Literal SQLite paths now open
+  the filename they name: if a configured path contains `%` escapes or `?`,
+  verify the existing database's actual path before upgrading.
+
+### Security
+
+- **Skills cannot grant themselves approvals.** Skills with `auto_approve` or
+  `allowed_tools` require an operator to load them, as high-risk skills do.
+  Activations recheck the skill after approval, and a batch cannot both change
+  and activate skills. The scanner examines current text, placeholder-expanded
+  variants, and complete hostnames without pathological slowdowns. Old reports
+  are rescanned at startup, so the first upgraded start may take longer.
+- **Output-guard advisories retain their trust boundary (#1291).** Models see
+  fixed, framework-written findings instead of the judge's free-form prose.
+  Task agents receive the same findings, judges see already-redacted content,
+  and incoming text cannot smuggle trusted session markers into history. The
+  model's own text and reasoning replay unchanged.
+- **Approvals apply only to approved actions.** Unreadable tool policies refuse
+  the batch, and an "Always" choice does not grant permissions to calls a deny
+  rule blocked. URL tools resolve hostnames only after approval and connect only
+  to the addresses they screened. Guarded fetches require a direct route;
+  deployments using a proxy must provide an appropriate `NO_PROXY` exclusion.
+- **Outbound credentials and URLs are checked consistently.** Per-user MCP
+  credentials replace operator Authorization headers regardless of casing.
+  Extra headers cannot override provider credentials. OAuth and thumbnail
+  guards validate the hostname actually used by the client, and remote metadata
+  cannot inherit the localhost development exception.
+- **Untrusted bodies stay bounded.** Compressed OAuth responses are limited
+  during download and decompression, and uploads without a Content-Length stop
+  at their size limit. Dependency and container updates address decompression
+  vulnerabilities and compromised trust roots. Native installations and custom
+  trust bundles must receive the corresponding CA updates too.
+- **Less sensitive data leaves the process.** Database errors omit bound values,
+  request logs remove control characters and secret-bearing URL components,
+  and browser fonts ship locally instead of contacting an external font host.
+
+### Documentation and verification
+
+- The architecture, SDK, OAuth storage, secret-reference, MCP, and deployment
+  guides describe the new ownership, transport, and configuration contracts.
+- Evaluation tools cover attached content, output-guard findings, and task-agent
+  behavior through the real runtime paths, with saved transcripts for review.
+- Contribution and release instructions now use `main`. Release helpers,
+  dependency updates, CI branch filters, and stable publication aliases follow
+  the single development branch. Stable aliases follow the newest final tag,
+  independently of the version under development on `main`.
+
+## [1.8.3]
+
+Turnstone 1.8.3 makes scheduled work easier to launch, keeps conversations and node placement intact
+across restarts, strengthens sign-in and session permissions, and improves the everyday browser
+controls. It also adds GPT-6 Astra support and downloadable previews.
+
+> **Before upgrading:** this release advances the database schema from migration 072 to 076, adding
+> schedule time zones, correcting stored one-shot times, and recording channel owners and required
+> execution nodes. Migrations run automatically. Existing recurring schedules keep their UTC timing;
+> edit their time zone to switch to local time. Older Discord threads without a saved invoker need
+> a new `/ask` conversation. An administrator must assign roles to local accounts that have none.
+
+### Added
+
+- **Scheduled tasks from the dashboard (#1090).** Choose Scheduled in the launcher, enter the task,
+  and pick Daily, Weekly, Monthly, Interval, Once, or Cron. The launcher and Admin Schedules share
+  a timing builder showing upcoming runs in your local time; saving confirms the first run.
+- **Recurring schedules in your time zone (#1091, #1097).** Schedules created in the browser use its
+  time zone and retain it when edited. Daily, weekly, and monthly times follow daylight-saving
+  changes, with a fixed time firing once during the repeated fall-back hour. The API and both SDKs
+  accept a time zone. Invalid zones and impossible dates are rejected with an explanation.
+- **GPT-6 Astra.** The OpenAI provider recognizes `gpt-6-astra`, including its context and output
+  limits, reasoning levels, vision, PDF input, tool search, and mid-conversation instructions.
+  Responses history also preserves the distinction between commentary and final answers, and their
+  order around tool calls, independently of whether reasoning replay is enabled.
+- **Visible approval reminders.** A persistent status-bar chip counts pending approvals and reveals
+  the waiting card, including cards inside collapsed task agents. Coordinators also have a clickable
+  approval count for child workstreams.
+- **Preview downloads.** Download the original file from a preview, including the complete table
+  when the displayed data is sorted or capped. Downloads retain the source filename and stay tied to
+  the originating workstream and node after navigation or reload.
+
+### Changed
+
+- **Clearer pane controls.** Each tab has a dismiss button: `−` hides a regular split pane while
+  keeping its tab; `×` closes a closable tab or preview. A chevron opens the pane menu with mouse
+  or keyboard. The active tab and pane agree visually, hidden tabs remain closable, and controls
+  stay visible when the tab strip overflows.
+- **Reasoning progress with elapsed time.** Interactive and coordinator views share a Reasoning
+  indicator and live clock in both Default and Compact modes. The clock measures what the browser
+  observed; restored history does not invent a duration.
+- **More readable light-theme indicators (#1092, #1094).** Darker accent colors improve contrast for
+  launcher labels, badges, buttons, and approval reminders.
+
+### Fixed
+
+- **Schedule dispatch and completion (#1099).** A firing is recorded as successful only after a node
+  creates the workstream. Definite failures retry about once a minute for five minutes, keeping
+  that deadline across console restarts. Uncertain results and partial fan-out success are reported
+  without retrying jobs that may already be running. One-shot status reflects whether the run
+  happened, including after re-arming or conversion from cron.
+- **One-shot times and schedule validation (#1096, #1098).** One-shot schedules honor their UTC
+  offset, including schedules stored before upgrading. Explicit null fields are rejected with
+  the field named, preventing accidental disabling or names saved as `"None"`.
+- **Discord and Slack conversation recovery (#1067).** Restarts, idle eviction, and missing event
+  streams no longer discard a channel's saved conversation. The next authorized message restores its
+  history and subscription. Recovery uses the exact saved identity and preserves the route when a
+  node is temporarily unreachable; concurrent recovery cannot overwrite another replacement.
+- **Persistent node placement (#1106).** A workstream explicitly assigned to a node stays there
+  after restart, close, idle timeout, or eviction. Reopening and routing honor that requirement
+  instead of silently moving execution. Forks inherit it unless a new destination is chosen.
+- **Reopening without an extra turn.** Restoring a workstream no longer launches a redundant
+  memory search. A message sent during reopening starts its own turn.
+- **Empty model completions (#1070).** A response with no answer or tool call now retries within a
+  bounded budget when no server-side tools may have run. Otherwise it reports an actionable error
+  instead of silently completing. Provider refusals remain visible.
+- **MCP timeouts (#951).** A caller's wait deadline cancels its local waiter without marking the
+  server unhealthy or opening its circuit breaker. Server-reported timeouts still count as failures.
+- **MCP OAuth registration and refresh (#1081, #1082).** Servers keep their resolved issuer when
+  discovery metadata comes from cache, so token refresh uses the right issuer. Client registration
+  no longer sends an unrelated resource parameter that authorization servers may reject.
+- **Shared Docker authentication setup (#1062, #1064).** Both Docker stacks can mount one private
+  `config.toml` for the console and nodes, sharing the encryption key and callback configuration for
+  MCP OAuth. The installer can prepare it once and preserves it on reruns. The guides cover local
+  login, SSO, delegated access, and remote callback registration.
+- **Operator access to saved history.** Authorized project members can list and reopen interactive
+  history without coordinator administration permissions. Read-only users can inspect and export
+  history; reopening or deleting requires write access. Nodes also enforce project and coordinator
+  permissions when requests arrive directly or through the console.
+- **Sign-in recovery on page load.** Rejected or outdated credentials reliably return the browser to
+  sign-in, including when the initial identity check races other requests. An older response cannot
+  erase a newer authenticated session.
+
+### Security
+
+- **Session creation and renewal use current permissions.** Password and OIDC sessions require
+  active role permissions. Permission-store outages return a retryable error without extending stale
+  permissions or clearing the existing cookie. Only human password/OIDC sessions can renew through
+  the public refresh endpoint. API-token sessions retain their explicit scopes and fixed expiry;
+  login no longer exchanges JWTs for fresh sessions. `turnstone-admin create-user` assigns viewer
+  access explicitly.
+- **Discord thread ownership survives recovery.** Only the original linked invoker can continue or
+  close the conversation. Another linked user cannot claim a bot-owned thread.
+
+## [1.8.2]
+
+Turnstone 1.8.2 moves model endpoints entirely into model definitions and
+retires the server's bootstrap endpoint flags, fixes MCP OAuth discovery for
+servers and issuers whose identity carries a path, teaches `web_fetch` to read
+PDFs, and gives every tool result one honest size limit. It includes no
+database schema migrations. Operators who start `turnstone-server` with
+`--base-url`, `--api-key`, `--provider` or `--model`, or who still carry an
+`[api]` section in `config.toml`, should read the **Removed** section before
+upgrading.
+
+### Added
+
+- **Claude Fable 5.1 (#1076).** The Anthropic lane knows `claude-fable-5-1`:
+  1M context, 128K output, adaptive thinking, the full effort ladder, web
+  search, tool search, vision, PDF and mid-conversation system messages. New
+  Anthropic organizations reject replayed thinking that predates an edit to
+  the conversation prefix; Turnstone opts into the documented degrade mode,
+  so such blocks are dropped server-side and unbilled and the request
+  proceeds instead of failing.
+- **PDF support in `web_fetch` (#1055).** A fetched response that is a PDF
+  is read the same way an attached PDF is: natively when the active model
+  accepts documents, as page images for a vision model, through configured
+  perception, and otherwise by local text extraction in an isolated worker
+  bounded by memory, CPU, wall time and output size. When none of those can
+  read the document the tool returns an explicit error instead of answering
+  from an empty page. Fetched PDFs are request-local and never enter
+  conversation history or attachment storage. Hardened containers need a
+  writable `/tmp` and a seccomp policy that permits the worker's
+  process-and-limit syscalls; see `docs/tools.md`.
+- **MCP OAuth discovery for servers on a private network.** The new
+  `mcp.oauth_allow_private_network` setting (console Settings → MCP,
+  default off) lets an MCP server at an internal address complete OAuth
+  discovery. It applies only to what the operator typed on the row — the
+  server URL and the authorization-server override — so an authorization
+  server named by a fetched document is still refused when it is private,
+  and a remote server cannot reach into the deployment's own network. Cloud
+  metadata, link-local, multicast and reserved addresses stay refused, and
+  per-user bearers still require `https://`. A refusal names the setting
+  that would allow it.
+
+### Changed
+
+- **One size limit for tool results (#1075).** Every place a tool result,
+  web page, search snippet, skill clip or reasoning display was cut now
+  uses the same rule: the limit includes its marker, and the marker
+  reports how much the producer actually returned rather than blaming the
+  limit. In automatic mode each result receives 20% of the batch's
+  remaining input budget, capped at 20% of the context window, and the
+  `tools.truncation` help text says so. Long `bash` and `diff_file`
+  output keeps its head and tail edges rather than buffering the whole
+  capture. A `bash_output` read returns whole lines up to the cap and reports
+  how many remain unread for the next call. A stored setting outside a
+  range the registry has since tightened is clamped on load with a
+  warning, and shown clamped in the admin listing, instead of silently
+  reverting to the default.
+- **A model definition that leaves `api_key` empty on a local server**
+  (`openai-compatible` / `anthropic-compatible`) resolves its bearer the way
+  the server's old `--api-key` default did: the SDK's environment variable
+  when set, otherwise a placeholder, so vLLM and llama.cpp definitions keep
+  working without an exported `OPENAI_API_KEY`. Commercial providers keep
+  the SDK environment-variable rule unchanged.
+- **`turnstone-doctor` resolves its own model the way a node does**, from
+  the database definitions and `[models.*]`, instead of seeding one from
+  `[api]`, which a node no longer reads.
+- **A `[models.*]` entry that names neither `base_url` nor `provider`** is
+  skipped with a startup warning. It used to inherit the server's bootstrap
+  endpoint; without one, the default provider would have sent its prompts
+  to the commercial OpenAI API.
+
+### Removed
+
+- **`turnstone-server` no longer takes `--base-url`, `--api-key`,
+  `--provider` or `--model`, and no longer reads `[api]` from
+  `config.toml` (#1052).** Model endpoints live in the console Models tab
+  and in `[models.*]` entries, each with its own `base_url` and `api_key`.
+  A server started with nothing configured boots with an empty registry
+  and picks models up live from the console. `compose.yaml` drops the
+  `LLM_BASE_URL` and `MODEL` variables, the Helm chart drops
+  `llm.baseUrl` / `llm.provider` (nothing read their environment
+  variables), and the Terraform module drops `llm_base_url`. A
+  `config.toml` that still carries `[api]` gets a startup warning naming
+  the replacement. The `turnstone` CLI keeps its flags for now (#1085).
+
+### Fixed
+
+- **Context window auto-detection (#1052).** A model definition whose
+  `context_window` is `0` used to inherit whatever window the server had
+  detected on its bootstrap endpoint at boot: 32768 whenever `--model` was
+  passed or that endpoint was unreachable, and the wrong endpoint's number
+  otherwise. It is now resolved per definition, at startup and on every
+  hot-reload: from the provider capability table for Anthropic, OpenAI and
+  xAI, and by asking the definition's own endpoint for local servers and
+  gateways (vLLM, llama.cpp, OpenRouter, Together, Fireworks, Groq and
+  Mistral all report it). Identical definitions share one probe, probes run
+  concurrently under a five-second budget, and when a reload's probe fails
+  the window the running registry already detected is kept, so a backend
+  mid-restart never shrinks live sessions. A definition that cannot be
+  resolved falls back to 32768 with a startup warning naming the alias and
+  the reason. The server, the console and the doctor resolve identically.
+  The console Detect button no longer offers a commercial model's window
+  for a local server, and when the endpoint reports none it fills in the
+  32768 the node would use and says so. A definition created through the
+  admin API without a `context_window` is stored as auto-detect rather than
+  a literal 32768, a local-server definition without a `base_url` is
+  refused at save time, and node hot-reloads are serialised and keep the
+  running registry when a load fails.
+- **MCP OAuth discovery for servers and issuers with paths (#1061, #1063).**
+  A server or authorization server whose identity carries a path never
+  resolved, because metadata URLs kept only the origin. Protected-resource
+  metadata is now tried at the RFC 9728 path-specific location first and
+  the origin-level location second, following one `WWW-Authenticate`
+  challenge per location, and each document must declare the identifier
+  its own URL was derived from. Authorization-server metadata is tried at
+  the locations MCP lists, and a candidate wins only after its whole
+  document validates, so a catch-all response cannot shadow the document
+  that describes the issuer. A document whose `issuer` does not match the
+  requested one is skipped; the templated issuer that multi-tenant
+  providers publish is accepted and logged. Discovery runs under one
+  wall-clock budget. User-scoped server rows store the canonical URL, so a
+  spelling-only change no longer purges user tokens, and every MCP OAuth
+  request asks for JSON so a content-negotiating token endpoint returns it
+  on every grant leg.
+- **Changing a server's authorization server now purges its grants.**
+  Pointing a user-scoped MCP row at a different Authorization Server URL
+  left every per-user grant and pending consent in place, so the next
+  refresh presented tokens issued by the previous server to the new one.
+  The change now purges those rows, so users re-consent against the server
+  now configured, and clears a dynamically registered client id the
+  previous server issued. A pre-registered client id is left alone.
+- **CLI startup failed with a retired-workstream error (#1058).** The
+  interactive `turnstone` CLI reserved a workstream id and then built its
+  session under a different one, so a fresh session could die during
+  construction with `workstream ... was retired`. The reserved id is now
+  carried through, and a subprocess test starts the CLI against a fresh
+  database on every run.
+
+## [1.8.1]
+
+Turnstone 1.8.1 strengthens long-running agent context and stable dependency
+compatibility, adds a quieter transcript view, and makes operator waits
+explicit. It includes no database schema migrations.
+
+### Added
+
+- **Task-agent compaction (#1044).** Long-running agents now receive the same
+  soft warning, hard compaction, recursive overflow recovery, and visible
+  progress as the foreground while retaining bounded execution evidence for
+  cancellation disposition and task recall. The generalized `compaction`
+  lifecycle targets either the workstream or a parent task card; task
+  compaction is transient and never persists the agent's private summary.
+  Python and TypeScript SDKs expose the target fields.
+- **Compact transcript presentation (#1048).** A browser-local Default/Compact
+  control now spans interactive and coordinator views. Compact mode hides
+  completed reasoning and folds fully settled routine tool batches while
+  keeping active, exceptional, and task-agent work visible; live events and
+  restored history use the same presentation rules.
+
+### Changed
+
+- **Configurable tool-approval waits (#1038, #1039).** The new
+  `tools.approval_timeout_seconds` setting defaults to `0` for an indefinite
+  operator wait and accepts positive finite deadlines. Each approval batch
+  snapshots the live value, platform wait limits are respected, and hard
+  deletion still releases outstanding waits.
+
+### Fixed
+
+- **Memory admission during MCP catalog priming (#1046).** First-turn immutable
+  memory-index capture now tolerates several asynchronous resource or prompt
+  catalog invalidations with a bounded, cancellation-aware backoff outside the
+  storage transaction and model-capacity lease.
+- **Anthropic SDK major-version guard (#1049, #1050).** Stable installations now
+  require `anthropic>=0.117,<1`, preventing fresh resolution of the HTTPX2-based
+  v1 SDK before Turnstone's client, sampling, and transport boundaries are
+  deliberately migrated.
+
+## [1.8.0]
+
+Turnstone 1.8 focuses on dependable long-running workstreams: one model-call
+pipeline, lossless reconnect and history recovery, visible compaction, stronger
+memory boundaries, and expanded enterprise identity and deployment paths. This
+entry describes the change from 1.7.4; features already shipped on
+the 1.7 line are not repeated here.
+
+> **Before upgrading:** 1.8 advances the database schema from migration 066 to
+> 072. The migrations add encrypted OIDC credential storage, per-model
+> authentication and concurrency fields, idempotent conversation commit keys,
+> and immutable memory-index snapshots. Migration 072 also removes the obsolete
+> `memory.fetch_limit` setting and resets structured-memory access counters
+> because access now means an explicit full-body fetch. Migrations run
+> automatically, but back up the database before upgrading as usual.
+
+### Added
+
+- **Immutable memory-index snapshots (#902).** At the first real model call, a
+  workstream captures the complete memory metadata visible to its acting user
+  and project. That index stays cache-stable for the life of the workstream;
+  later turns receive compact relevance pointers while memory bodies remain
+  behind an explicit `memory_get`. The console and SDKs expose snapshot health,
+  and project, persona, approval, and principal boundaries are enforced
+  throughout. Indexes over 65,536 characters raise an operator warning rather
+  than being truncated; task agents remain memory-disabled in this release.
+- **Single-sign-on passthrough for MCP servers (#551).** The new
+  `auth_type="oauth_obo"` can reuse an opt-in credential captured at Turnstone
+  OIDC login to mint short-lived, audience-scoped tokens for any configured MCP
+  server. It supports Entra and RFC 8693 exchange profiles, encrypted
+  credential storage, rotation, revocation, cache flushing, admin UI, and
+  operator documentation without changing existing `oauth_user` flows.
+- **Per-model gateway identity (#898, #950, #955).** A model alias can retain its
+  static key or explicitly use caller-delegated Entra OBO, RFC 8693 token
+  exchange, or shared app identity. Dynamic authentication is default-deny at
+  the admin boundary, uses audience and scope allow-lists, follows registry
+  reloads safely, and fails closed where no valid caller or fallback exists.
+  Existing aliases remain `static`.
+- **Visible, durable compaction.** Manual and automatic compaction now emit a
+  typed `compaction` lifecycle event and render a progress/result card in both
+  web viewers. The final token delta and summary survive reload through
+  history. Slash commands render as command chips, run on the workstream worker
+  slot, and defer concurrent sends in order instead of truncating or losing
+  them; Stop cancels an in-flight summary request.
+- **Coordinator MCP and unfinished-work recovery (#725, #913).** Coordinator
+  workstreams can use MCP tools, resources, and prompts under the same persona
+  and user gates as interactive sessions. Coordinators that go idle with
+  running children or open tasks receive bounded, factual nudges; tasks gain a
+  `needs_user` state and note, and task/child handles survive compaction.
+- **Optional project-required creation policy.** Enabling the default-off
+  `server.require_project` setting requires human-created interactive and
+  coordinator workstreams to be filed under a project. Forks inherit their
+  source project, while service automation and coordinator-spawned sessions
+  stay exempt. The console and direct API enforce the same tenancy-safe rule.
+- **Per-alias model concurrency limits (#917).** Operators can set
+  `max_concurrency` on a model alias. Admission is FIFO, covers the whole
+  stream, participates in request deadlines, and defaults to unlimited for
+  existing aliases.
+- **Large text pastes become attachments (#930).** Pasting more than 2,000
+  characters stages `pasted-text.txt` across every attachment-capable
+  composer. Clipboard files retain priority, text above the 512 KiB attachment
+  ceiling stays inline, duplicates collapse, and refused or queued sends keep
+  their staged content for retry.
+- **Copy actions across every chat surface.** Assistant messages copy their raw
+  Markdown, while code, Mermaid, and table blocks can be copied by pointer or
+  keyboard. The fallback works on plain-HTTP LAN deployments and preserves
+  focus and selection.
+- **Task-agent context meters (#982).** Running task-agent cards show normalized
+  used/total context after model turns that report usage, warn at 80%, recover
+  on reconnect, and clear on every terminal path. Python and TypeScript SDKs
+  gain the typed `agent_context` event.
+- **Claude Opus 5 support.** The Anthropic capability table includes its 1M
+  context window, 128K output, adaptive thinking, and full effort ladder.
+  Provider refusals now surface as content-filter stops instead of successful
+  empty answers.
+- **`server_parses_reasoning` model capability.** Models whose server already
+  separates reasoning can disable Turnstone's inline tag scanner on every lane,
+  preventing quoted `<think>` text from being mistaken for hidden reasoning.
+  Commercial provider defaults declare this capability automatically.
+
+### Changed
+
+- **All model calls use one turn and transport pipeline (#827, #831, #832,
+  #979).** Interactive turns, judges, titles, compaction, perception, web
+  extraction, evals, optimizers, and task agents now share `model_turn`,
+  provider-native replay, one lowering/re-ingest path, and the streaming
+  provider entry point. Utility calls are complete-or-error, cancellation closes
+  the underlying read, and transient stream failures retry at the shared
+  boundary.
+  - This is a compatibility boundary: every configured endpoint must support
+    streaming, and OpenAI-compatible endpoints must accept the current
+    `stream_options`. A gateway that cleanly ends a stream without a terminal
+    marker needs
+    `{"finish_reason_optional": true}` in that model's capabilities.
+  - The non-streaming `create_completion` adapter method and the unused
+    `supports_streaming` capability are gone.
+- **Sampling settings inherit instead of manufacturing defaults.** Temperature
+  and reasoning effort now resolve as alias override, then stored global
+  setting, then model-declared effort default, then omission. New workstreams
+  therefore inherit each backend's own defaults instead of silently sending
+  `temperature=0.5` and `reasoning_effort="medium"`. Use `none` to disable
+  reasoning explicitly; an empty effort now means inherit. Existing saved
+  workstreams retain their stamped values until their model or sampling
+  settings change.
+- **Compaction feedback is a typed event.** SSE and SDK consumers must handle
+  the `compaction` lifecycle event; 1.8 no longer dual-emits those updates as
+  generic `info` lines, which would double-render them in current clients.
+- **OpenAI SDK v3 and HTTPX2 are the supported provider stack (#1009).** Chat
+  Completions and Responses normalize HTTPX2 and legacy injected-HTTPX failures
+  through the same retry boundary. OpenAI's default client now uses the
+  operating-system trust store; installations that modified only `certifi`
+  must install their CA system-wide or set `SSL_CERT_FILE` /
+  `SSL_CERT_DIR`.
+- **lacme 1.2 and HTTPX2 back core mTLS (#1011).** Consoles can advertise a
+  routable `TURNSTONE_ACME_EXTERNAL_URL` for cross-host enrollment. Enrollment
+  uses purpose-confined rotating JWTs, managed identities are validated before
+  reuse, failed renewals keep the last usable certificate, and typed IPv4/IPv6
+  identifiers are issued as IP SANs. A complete multi-process cross-host
+  Compose smoke remains a manual deployment check.
+- **Retrieval and evaluation share bounded runtimes.** Reranking reuses a
+  lifecycle-owned HTTP client, the selected alias's admission limit, and a
+  circuit breaker that preserves native retrieval order during outages
+  (#1027). Intent-judge batch evaluations run in parallel rather than serially
+  (#946).
+- **File tools tell models where they operate (#857).** The `bash` and file
+  tool descriptions include the process working directory and, when present,
+  the user workspace directory. Stock Docker installs identify `/workspace`
+  without changing path permissions or the process cwd.
+- **Streaming log rename.** `drain_stream.post_finish_blip` is now
+  `stream.post_finish_blip`; the `usage_captured` field is unchanged.
+- **Frontend and SDK dependencies were refreshed.** The Anthropic SDK floor is
+  0.117, the bundled renderer now carries KaTeX 0.18.4, Highlight.js 11.12.0,
+  Mermaid 11.16.1, and HLS.js 1.7.0, and the TypeScript SDK moves to TypeScript
+  7.
+
+### Removed
+
+- **Retired OpenAI capability rows.** Built-in rows for the o1/o3/o4 families
+  and GPT-5 through GPT-5.3 have been removed; the built-in floor is GPT-5.4.
+  Unlisted gateway models still use generic commercial defaults and can declare
+  an explicit capabilities JSON.
+
+### Fixed
+
+- **Lossless SSE and history recovery.** Truncated replay now disconnects,
+  rebuilds history, adopts the returned cursor, and reconnects without dropping
+  an in-flight turn. Tool-output chunks are coalesced, restart-era global
+  cursors carry a boot epoch, concurrent `/history` reconstructions coalesce,
+  and both interactive and coordinator panes preserve their transcript across
+  failed refreshes, stale rewind windows, hidden-tab reconnects, and teardown.
+- **Durable history handoff and deletion safety (#981).** Conversation writes
+  carry idempotency keys, retry ambiguous acknowledgements without duplicates,
+  and refuse to cross a deleted-workstream boundary. History fails closed with
+  503 rather than painting an empty transcript when persistence is unresolved;
+  queued interjections remain partitioned by owner, and operator persistence
+  state no longer reports a tombstoned session as healthy.
+- **Provider failures are classified before they corrupt a turn.** Mid-body
+  transport deaths retry without double-rendering; HTTP-200 JSON error payloads
+  from OpenAI-compatible endpoints surface their real rate-limit/server
+  classification with bounded, cancellable, redacted reads (#995); Responses
+  truncations and refusals preserve usage and content; and a call cancelled
+  before dispatch no longer mints credentials or sends a request.
+- **Reasoning stays in the reasoning lane (#940, #965).** Inline
+  `<think>`/`<reasoning>` blocks are split once at the shared seam, split tags
+  reassemble across deltas, the active fallback model controls scanning, and
+  unmarked chain-of-thought is suppressed for titles, summaries, and web
+  extraction. Multi-block notification text is separated instead of fused.
+- **MCP catalogs remain live and honest.** Static `list_changed` notifications
+  no longer deadlock their own receive loop; pooled catalogs survive session
+  eviction; refreshes are serialized, bounded, retried, and reported accurately;
+  and either half of resource discovery may be unsupported without discarding
+  the other (#839, #993). Tool search now reports unavailable servers and the
+  full pre-limit match count rather than pretending a discovery failure was a
+  genuine no-match (#938).
+- **Workstream state cannot wedge behind lifecycle edges.** A failed worker
+  thread start releases its slot, first-message failures remain in the error
+  state, zero-budget truncation keeps tool results valid, force-cancel runs
+  abandonment before publishing idle, operator skill changes are recorded, and
+  soft close wakes pending web and background-CLI approvals before waiting for
+  cleanup (#1013).
+- **Frontend assets stay fresh across same-version deployments (#1014).**
+  First-party assets use content-derived ETags and revalidation, versioned
+  vendor files remain immutable, coordinator and proxied node responses preserve
+  cache policy, and encoded traversal paths are rejected. Composer project,
+  persona, model, and skill selectors paint immediately from their warm caches;
+  proxied node views also restore their back-to-console link.
+- **Memory authorization and storage parity.** Project-scoped memory operations
+  bind to the immutable acting principal, omitted-scope get/delete follows the
+  workstream's attached project, writes are atomic, and new memories require a
+  useful description. Fresh databases now create the same structured-memory
+  indexes as migrated databases (#1028).
+- **Helm and Docker deployment paths work as documented.** The chart can install
+  with bundled or external PostgreSQL, renders each credential independently,
+  gives every server replica a routable per-pod address, and exposes scheduling
+  controls. Docker Compose health checks work under WSL.
+
+### Security
+
+- **Outbound URL guards classify the destination actually reached
+  (GHSA-wm4f-79pw-pfr9).** One shared policy now handles NAT64, 6to4, Teredo,
+  mapped IPv4, CGNAT, metadata endpoints, DNS failures, and every redirect hop.
+  Private-network opt-ins still permit home-lab addresses but never metadata,
+  link-local, multicast, unspecified, or reserved destinations.
+- **Untrusted channel fields cannot create mentions.** Discord mention
+  resolution is disabled for model-authored messages, and Slack fields are
+  escaped at their trust boundary.
+- **Dynamic model authentication is permission-gated and fail-closed.** Enabling
+  or changing an identity-bearing alias requires the dedicated admin authority,
+  validates its audience/scope posture, and never silently falls back between
+  delegated and app identities.
+
+### Documentation and verification
+
+- The API reference, SDK guides, architecture diagrams, MCP OBO guide, memory
+  guide, deployment docs, and TLS runbook were updated for the 1.8 contracts.
+- New opt-in harnesses exercise OBO minting, frontend asset revalidation, and
+  end-to-end SSE recovery. `scripts/recovery_e2e.py` covers interactive,
+  coordinator, restart, truncation, and teardown scenarios in a real browser.
+- Release development and GitHub's default pull-request base now use `dev`,
+  while `main` remains the current stable install source and prior `stable/X.Y`
+  fixes merge forward. CI, Renovate, the installer, the release helper, and
+  publication aliases enforce that topology.
+- The README now leads its harness explanation with an architecture diagram,
+  and the contributor roster includes the latest external contributors.
+
+## [1.7.4]
+
+A feature-bearing patch for the 1.7 line, rolling up work that had stabilised
+on `main`. No schema migrations (head stays 066) and no new configuration knobs.
+
+### Added
+
+- **Background shells for the `bash` tool** — `run_in_background=true` starts a
+  command as a detached shell and returns a `bash_N` handle; new `bash_output`
+  (delta output since last read, optional regex filter, status/exit code) and
+  `kill_shell` (terminates the shell's process group) tools manage it. Output is
+  buffered with a drop-oldest cap, a system notice lands when a shell exits, and
+  shells die with their workstream — never outliving a `task_agent` that started
+  them.
+- **`task_agent` carries the model's native reasoning across its own tool loop** —
+  a task agent's replayed turns now preserve the provider-native reasoning lane
+  (Anthropic thinking blocks with signatures, OpenAI reasoning items, Gemini
+  `thought_signature`, vLLM/llama.cpp reasoning text) instead of rebuilding each
+  turn from text alone, restoring reasoning continuity for thinking models.
+- **Model-shelf response controls** — the console model shelf exposes verbosity
+  and reasoning-mode controls per identity.
+
+### Changed
+
+- **GPT-5.6 aligned with the GA API surface** — the Responses provider matches
+  GPT-5.6's GA shape (typed `reasoning.mode`, `prompt_cache_options`,
+  cache-write accounting); the `openai` floor moves to `>=2.45`.
+
+### Fixed
+
+- **`bash` never hangs on a backgrounded child** — a command that left a
+  long-lived process running no longer wedges the workstream; the tool waits on
+  the tracked process (bounded by the timeout) and reaps its whole process group.
+- **`task_agent` sub-tool ids are session-unique** — ids are minted
+  `{parent}::r{run}s{step}::{id}` so a local model reissuing sequential ids
+  (`call_0` each turn) no longer aliases two steps onto one live-card row while
+  `/history` keeps them apart.
+- **Judge completions honour model-definition capabilities** — a judge's
+  completion now threads its model's declared capabilities instead of assuming a
+  default surface.
+- **`create-admin` CLI** — adds an explicit admin-creation command; `run.sh` no
+  longer onboards into a role-less user.
+- **Install script Docker handling** — installs Docker on distros
+  `get.docker.com` rejects, and gates that path by `$ID` instead of trapping all
+  failures.
+
+## [1.7.3]
+
+A small feature and maintenance patch for the 1.7 line. No schema migrations
+and no new configuration knobs.
+
+### Added
+
+- **OpenAI GPT-5.6 (Sol/Terra/Luna) support** — the Responses provider
+  understands the GPT-5.6 family: the `reasoning.mode` control, the new
+  `max` effort tier, and `text.verbosity`, with golden wire payloads pinning
+  the request shapes. The `openai` dependency floor moves to `>=2.44`.
+
+### Changed
+
+- **Engineer base prompt hardened with process discipline** — the default
+  base prompt for non-coordinator sessions now works in phases scaled to the
+  size of the change, defaults to red-green for testable work, scopes to the
+  smallest sufficient diff, stops to report after repeated failed attempts
+  instead of thrashing, reports only observed results, and delegates
+  exploration to `task_agent`. Persona prompts freeze into the workstream
+  stamp at creation, so this reaches new workstreams only.
+
+### Fixed
+
+- **Unknown reasoning-mode warnings name the allowed modes** — a model
+  definition with an unrecognized reasoning mode now logs the valid options
+  instead of leaving the operator to guess.
+
+### Documentation
+
+- **HYPOTHESIS.md / PRIMER.md** — the control normal form is tightened and
+  the factored Q_E reading is carried into the glossary; the plain-language
+  PRIMER stays in sync.
+
+## [1.7.2]
+
+A feature-bearing patch for the 1.7 line. Rather than hold this work for the
+larger 1.8 churn, the fixes and the smaller features that had already
+stabilised on `main` are rolled into the stable line now: a rich preview
+pane, persona/project settings on scheduled tasks, and a batch of streaming,
+rendering, and nudge-delivery hardening.
+
+> **⚠️ Before upgrading:** 1.7.2 adds Alembic migration `066`, applied
+> automatically on first start. It adds two `Text NOT NULL DEFAULT ''`
+> columns (`persona`, `project_id`) to the `scheduled_tasks` table; existing
+> rows migrate to the empty default, which is byte-identical to pre-066
+> dispatch behaviour. The change is additive and reversible, but — as always
+> — back up your storage before upgrading (`pg_dump` for PostgreSQL; copy the
+> database file for SQLite).
+
+### Added
+
+- **Rich preview pane + `open_preview` tool** — a workstream can now open a
+  rendered preview (HTML, Markdown, and other kinds) in a pane beside the
+  conversation via the new `open_preview` tool. Guarded fetches stream under
+  a byte budget whose ceiling tracks the widest per-kind cap, preview blob
+  ids are salted, and a preflight probe handles legacy charsets and a
+  remote-assets opt-in. See `docs/tools.md`.
+- **`allow_private_network` opt-in for `web_fetch` / `open_preview`** —
+  private-address fetch and preview targets stay blocked by default; an
+  operator can opt a workstream in through the settings registry when a
+  private endpoint is genuinely intended. (Distinct from the 1.7.1 `[oidc]`
+  flag of the same name, which governs identity-provider discovery.)
+- **Persona + project settings on scheduled tasks** (migration `066`) — a
+  scheduled task can now pin the **persona** and **project** of the
+  workstream it dispatches, matching the levers a manually-created workstream
+  already carries. Both default to empty (kind-default persona / no project),
+  so existing schedules dispatch exactly as before.
+
+### Fixed
+
+- **Streaming fast-path overflow recovery** — fast-stream tokens are now
+  batched and overflowed SSE listeners recover instead of stalling (and
+  `connectSSE` no longer opens into a hidden background tab). The same
+  overflow-recovery companions were carried to the coordinator pane, so a
+  coordinator watching many children recovers dropped listeners the same way
+  the live-session view does.
+- **Renderer containment** — markdown sentinel-forgery and recursive-frame
+  content loss are contained, and an indented fence close no longer drags its
+  indent into the enclosed code content.
+- **Idle nudge / wake delivery** — nudge and wake delivery is hardened across
+  session eviction, cancellation, and identity rebinds; the wake gate now
+  requires a real nudge queue, refused wakes are logged, and
+  `initial_message_status` is typed as a closed enum on the wire.
+- **`web_fetch` extraction inherits model settings** — the completion that
+  extracts content from a fetched page now inherits the workstream's model
+  settings instead of falling back to defaults.
+- **UI panes** — ephemeral panes close on split-dismiss instead of orphaning
+  a tab, and an unsplit skips the redundant refresh after an ephemeral pane
+  closes.
+- **Shared code-highlight CSS** — renderer-output CSS is shared so the console
+  and coordinator panes highlight code identically.
+
+### Security
+
+- **`Content-Disposition` filenames made wire-safe** — download filenames
+  derived from user-controlled text are sanitised (latin-1- and
+  control-char-safe, quoting-safe) before they reach the `Content-Disposition`
+  response header, including the fallback path.
+
+### Documentation
+
+- **HYPOTHESIS.md: daemons + the outer loop, plus a plain-language PRIMER** —
+  the harness north-star document gains its daemon / outer-loop treatment and
+  a new top-level `PRIMER.md`.
+
+## [1.7.1]
+
+A maintenance and hardening patch for the 1.7 line. No schema migrations;
+the credential-redaction work below is additive and needs no configuration
+change. The one new operator-facing knob is the opt-in `[oidc]
+allow_private_network` flag (default off).
+
+### Security
+
+- **Credential redaction hardened across the tool-call surface** — the
+  redactor that scrubs secrets from tool arguments and log previews was
+  reworked on both the backend and the browser to close several leak paths
+  and to fix false-positive and performance issues. Malformed tool-call
+  arguments are now legalised before they reach the wire; the tool-args log
+  preview scrubs credentials and control characters; and the coordinator's
+  tool-call cards gain a matching client-side redaction pass so the JS and
+  backend redactors stay at parity. Pattern coverage now includes
+  `secret_access_key` / `aws_secret_access_key` multi-segment keys, bare
+  `token=` / `key=` forms (guarded by a negative lookbehind to avoid
+  false positives), and SQLAlchemy `+driver`-qualified connection-string
+  schemes matched case-insensitively.
+- **OIDC SSRF guard: `[oidc] allow_private_network` opt-in** — self-hosted
+  identity providers on private networks can now be reached by setting
+  `allow_private_network = true` under `[oidc]` (default off; the MCP OAuth
+  path stays strict). Rejections of discovered endpoints carry the opt-in
+  hint so the misconfiguration is self-explanatory. See `docs/oidc.md`.
+
+### Added
+
+- **Persona discoverability + forgiving name resolution** — personas are
+  now discoverable by agents, and persona-name resolution tolerates
+  case/whitespace variation; a not-found resolution reports the offending
+  input verbatim instead of a bare error.
+
+### Fixed
+
+- **MCP transport lifecycles routed through per-entry owner tasks**
+  (#787/#788) — static and pooled MCP transport lifecycles are now driven
+  by per-server / per-entry owner tasks, with a hardened disarm-sweep loop
+  guard and targeted exception handling in place of a broad `BaseException`
+  arm, so a dying transport can no longer spin the CPU or strand delivery.
+- **Client-construction failures surface as misconfiguration, not raw
+  500s** — a model whose client cannot be constructed now reports a factory
+  misconfiguration, and the raw exception text is kept out of the resulting
+  503 response.
+- **Postgres history search survives oversized rows** — a conversation row
+  exceeding Postgres' full-text limits no longer aborts history search.
+- **Agent-tool render is idempotent** — tool rendering no longer deep-copies
+  a tool definition until a description actually changes, so no-persona
+  sessions share the tool constant (correctness plus a hot-path allocation
+  win).
+- **Private-project workstream visibility scoped to members** — workstreams
+  in a private project are visible to project members only, not to every
+  admin; coordinator tenancy checks now use request-scoped storage.
+- **Pane hotkeys work off macOS and match across surfaces** — the pane
+  keyboard shortcuts no longer collide with browser accelerators on
+  non-macOS platforms and behave consistently across surfaces.
+
+## [1.7.0]
+
+The headline of the 1.7 line is **Personas** — operator-authored control
+over how each workstream composes its system message and capability
+envelope. The rest of the release hardens the pieces a persona leans on:
+concurrent approvals, cross-provider reasoning-effort control, cooperative
+compaction, multi-user session safety, and MCP resilience for unattended
+work.
+
+> **⚠️ Before upgrading:** 1.7.0 adds Alembic migrations `062`–`065`,
+> applied automatically on first start (projects, personas, and two
+> smaller schema tidy-ups). Migration `063` creates the `personas` table
+> with its six seed personas and converts existing `creative_mode`
+> workstreams to the `writer` persona in place. The changes are additive
+> to your conversation data, but — as always — back up your storage before
+> upgrading (`pg_dump` for PostgreSQL; copy the database file for SQLite).
+
+**Breaking changes at a glance** (details in the sections below): the
+`/creative` REPL toggle removed (replaced by the `writer` persona), the
+`turnstone-bootstrap` entry point renamed to `turnstone-doctor`, and the
+approval-status API/SDK field `pending_approval_details` changed from a
+single object to a list (one entry per concurrent approval cycle).
+
+### Added
+
+- **Personas** (#683) — a named, reusable bundle attached to a workstream
+  at creation, controlling system-message composition and the capability
+  envelope via exactly four levers: base-prompt override, tool visibility
+  set, MCP on/off, and memory on/off. The persona is resolved once and
+  snapshotted into `workstream_config`; editing or archiving a persona
+  never changes an existing workstream. Six seed personas ship with
+  migration `063` (`engineer` and `orchestrator` are the per-kind
+  defaults with no overrides, so zero-touch behavior is unchanged;
+  `scribe`, `researcher`, `writer`, and `executive` are curated
+  envelopes). Selectable on every creation surface (web pickers, the
+  create API/SDKs, coordinator `spawn_workstream` / `spawn_batch`, and
+  `turnstone --persona <name>`); authored in the console's new
+  Governance → Personas tab (`persona.{create,read,write}` perms,
+  archive-only lifecycle). See `docs/personas.md`.
+- **Projects — governed resource containers** (#724) — group workstreams
+  and their resources under a project (migration `062`), with
+  project-scoped memory, a per-project resources view, a project column on
+  the saved list, and server-enforced private-project workstream
+  visibility.
+- **Task-agent sub-harness** (#732) — a spawned task agent now runs on its
+  own Turn-IR sub-harness with parent-tagged step events: its sub-tool
+  steps nest inside an expandable card in the parent trajectory, its
+  sub-trajectory is recallable, and each agent gets read isolation from
+  its siblings.
+- **MCP static-server autonomous reconnect** (#768) — statically
+  configured MCP servers are now kept live by a health loop
+  (capped-jittered backoff, ping-based liveness) instead of silently
+  staying dead after the first transport drop.
+- **Attachments — capability-gated client-side fallback** — when the
+  active model can't natively handle an attachment, the client degrades
+  gracefully (PDF → extracted text, audio → transcript) instead of
+  failing the turn.
+- **Eval measurement / optimizer split** (#763, #765) — `turnstone-eval`
+  is now a measure-only substrate with the prompt optimizer factored out,
+  plus a new skill-adherence measurement mode.
+- **Deployment examples** — a vLLM + LiteLLM unified-memory inference
+  example showing a 3-model co-resident stack with an HF loader (#686,
+  #688), and an Altair + `vl-convert-python` visualization stack (#685).
+- **Concurrent approvals and a long-session frontend overhaul** (#754,
+  #755, #773, #775) — the live-session frontend was reworked for long
+  runs (the pipeline is wedge-proofed and its hot paths de-O(N)'d), and on
+  top of it a workstream can now hold more than one tool call awaiting
+  approval at a time. Each parallel batch gets its own approval cycle,
+  with one card per pending call in the interactive and coordinator UIs,
+  cycle-keyed tracking in Slack and Discord, and cycle-routed resolution
+  across the server/console/SDK APIs; sub-agent tool gates run the
+  intent-judge pipeline as their own generation. The send button no longer
+  sticks disabled after a batch resolves — orphaned approval cycles are
+  pruned and the app is the sole owner of the button state.
+  *(BREAKING: the `pending_approval_details` field is now a list, oldest
+  first.)*
+- **Reasoning-effort control on every provider lane** (#771, #774) — the
+  session effort knob now reaches local backends too: it drives
+  `chat_template_kwargs` on the anthropic-compatible and openai-compatible
+  lanes and threads through to Gemini and xAI, alongside the commercial
+  providers that handle effort natively. The console surfaces each model's
+  effective effort ladder in plain words and adds an always-on
+  thinking-mode option to the model form. Effort snapping is ordinal —
+  it rounds up and caps at the model's ceiling rather than silently
+  dropping.
+
+### Changed
+
+- **Skills are capability-context, not identity** (#762) — a task agent's
+  identity now comes from its persona; an applied skill's body is demoted
+  to capability context and moved out of the identity system message.
+  Skill-body substitution is unified across every invocation context so
+  the same skill renders identically whether loaded interactively, by the
+  model, or inside a sub-agent.
+- **`turnstone-doctor` replaces `turnstone-bootstrap`** (#718)
+  *(BREAKING)* — the setup/diagnostics entry point is renamed; update any
+  scripts or service units that invoke `turnstone-bootstrap`.
+- **Honest cancellation dispositions** — cancelled or timed-out
+  side-effecting tools now report an `UNKNOWN` disposition rather than a
+  flat failure, tool dispositions are typed (not just prose), and a
+  coordinator cancel propagates down the sub-tree.
+- **Multi-user shared-workstream context** (#750) — in a shared
+  workstream, send is gated to the acting participant while a turn is in
+  flight (both the interactive and coordinator surfaces), cross-user
+  mid-turn interjections are blocked, and shared-workstream state plus
+  fork sender attribution are now durable.
+- **Cooperative compaction** (#730) — the context budget is anchored to
+  the provider's true capacity, the summary call is chunked so it can't
+  overflow, and the active plan and the outstanding ask are carried across
+  compaction verbatim. The `recall` tool is scoped to the compacted-away
+  past.
+- **Intent judge sees the full tool arguments** (#760) — the judge's
+  argument projection is no longer narrowed, so it stops issuing confident
+  false denials on a partial view. The output-guard judge sources its real
+  context window, and `context_window = 0` in `config.toml` now means
+  auto-detect.
+
+### Fixed
+
+- **Compaction resume hardening** (#731) — checkpoint markers are
+  persisted so resume rehydration is bounded, context-overflow on resume
+  is recovered across providers, and a recognized rate-limit is no longer
+  misclassified as context overflow.
+- **MCP unattended-work resilience** (#706, #742, #767) — dead-transport
+  handling is completed, consented OAuth (OBO) tokens are refreshed
+  proactively so autonomous runs don't strand on an expired grant, the
+  Entra ID on-behalf-of impersonation flow blockers are closed (migration
+  `065` adds the OIDC `oid`), and OAuth refresh failures are classified so
+  a transient blip never revokes consent nor a dead grant strands the
+  user.
+- **Memory writes** (#735) — save/update is a single atomic upsert, and
+  writing a memory no longer recomposes the system prefix mid-session.
+
+### Removed
+
+- **`/creative` removed** *(BREAKING)* — subsumed by the Personas feature
+  above: the REPL toggle (and its tab completion) is gone, and the
+  `writer` seed persona replaces it — start a session with
+  `turnstone --persona writer` or pick *Writer* in the web
+  pickers. Unlike the old fork, the writer persona composes the full
+  system message, so session context and mandatory prompt policies now
+  apply to prose-only sessions too. The `creative_mode` key in
+  `workstream_config` is no longer read or written. Migration `063`
+  converts existing creative-mode workstreams to the `writer` persona
+  automatically, so they resume as writing sessions rather than as
+  legacy defaults.
+
+### Security
+
+- **High-risk skill activation is gated** (#762) — a model-initiated load
+  of a `high`- or `critical`-risk skill is gated and fails closed when the
+  backing storage is unavailable, so an untrusted turn can't silently
+  pull in a dangerous capability.
+- **Dependency security floors** — `cryptography` and `starlette` are
+  pinned to security-fixed minimums.
+- **CI publish hardening** — the vendored-JS dispatch path refuses fork
+  PRs, and `workflow_run` publishing is gated to same-repo tag pushes, so
+  a fork can't trigger a release build.
+
+## [1.6.0]
+
+The first stable release of the 1.6 line — and the first under Apache 2.0.
+
+> **⚠️ Before upgrading from 1.5.x:** 1.6.0 changes the internal
+> conversation storage schema (Alembic migration `060`, applied
+> automatically on first start). The migration converts existing
+> workstreams and attachments in place — **back up your storage before
+> upgrading** (`pg_dump` for PostgreSQL; copy the database file for
+> SQLite). Background: discussion
+> [#631](https://github.com/turnstonelabs/turnstone/discussions/631).
+
+**Breaking changes at a glance** (details in the sections below):
+`web_search` backend overhaul (Tavily/DuckDuckGo removed, `topic` →
+`category`), the `man` / `math` / `plan_agent` built-in tools and the
+plan-review protocol removed, and the body-keyed `/v1/api/command`
+endpoint replaced by path-keyed workstream verbs.
+
+### License
+
+- **Relicensed to Apache 2.0** — from BUSL-1.1, effective with this
+  release (#546, contributor assent record in #548). Versions 1.5.x and
+  earlier remain under BUSL-1.1 as shipped, and the `stable/1.5` branch
+  keeps its original LICENSE. New `NOTICE` and
+  `CONTRIBUTORS.md` files; `THIRD-PARTY-NOTICES` refreshed to match the
+  bundled library versions.
+
+### Added
+
+- **Mid-conversation system messages** — advisories, watch results,
+  skill hints, and operator interjections are now first-class
+  `role=system` turns in the trajectory instead of ad-hoc reminder
+  envelopes. Models with native mid-conversation system support receive
+  them verbatim; for everything else they fold into a nonce-fenced
+  wrapper. The one-shot `_reminders` side-channel is gone.
+- **Self-hosted SearxNG web search** — the `web_search` backend for
+  local/vLLM models is now a bundled [SearxNG](https://searxng.org)
+  service (in both compose stacks; internal network only). Configure via
+  `tools.searxng_url` / `tools.searxng_engines`. Commercial providers
+  keep their native server-side search; the model can target a corpus by
+  passing `category` (`general`, `news`, `it`, `science`). Operators
+  exposing the bundled SearxNG publicly: see the AGPL-3.0 §13 note in
+  [docs/docker.md](docs/docker.md).
+- **Endpoint-backed reranking** — a reranker is now a per-model
+  definition (Cohere/Jina-compatible wire: vLLM, TEI, llama.cpp, or a
+  commercial endpoint), disabled by default. When configured it scores
+  `web_search` results and the BM25 retrieval surfaces (deferred tools,
+  skills, memory) behind a `tools.rerank_bm25` toggle with a relevance
+  floor; a calibration CLI (and calibrate-on-detect) tunes the floor
+  per model.
+- **Proactive memory relevance** — injected memories are selected by
+  BM25 + reranker against the recent user messages instead of recency
+  alone, and first composition defers to the first user turn so fresh
+  sessions select against a real query.
+- **Smart Approvals** — opt-in (default off): high-confidence `approve`
+  verdicts from the intent judge auto-approve the tool call instead of
+  waiting for a human, with a confidence threshold and verdict
+  bookkeeping designed so a denied or reset judge never auto-fires.
+- **Early-painted tool calls** — committed tool calls render immediately
+  as pending cards (both UIs upgrade the card in place by `call_id`)
+  instead of waiting for the judge verdict, so big parallel batches no
+  longer sit invisible during judging.
+- **Voice I/O v1** — speech-to-text and text-to-speech as model roles
+  speaking the OpenAI audio wire protocol (#618); the interactive
+  composer grows a mic button.
+- **Rewind / retry / edit-first-message** — full UX in both the
+  interactive UI and the coordinator pane, backed by shared path-keyed
+  verb handlers (#549).
+- **Workstream export** — download a conversation as OpenAI-format
+  messages JSON.
+- **Skills platform round** — `SKILL.md` ingestion learns
+  `when_to_use` / `model` / `effort` / `paths`; prompt substitution
+  supports `$ARGUMENTS`, `$N`, `$<name>`, and `${CLAUDE_*}` (#572);
+  per-skill `disable-model-invocation` and `user-invocable` flags
+  (#571); `skill` + `list_skills` unify into one dual-kind tool; new
+  `model.skills.write` permission.
+- **Coordinator hardening for small models** — workstream references in
+  coordinator tool calls are validated with did-you-mean recovery, and
+  `wait_for_workstream` fails fast with uniform `not_found` entries
+  instead of hanging on a hallucinated `ws_id`.
+- **Provider support** — Claude Fable 5 and Claude Opus 4.8; xAI/Grok
+  via the OpenAI Responses lane; vLLM reasoning-field replay completes
+  the reasoning-persistence work (#537).
+- **Cluster-by-default deployment** — the compose stack fronts
+  everything with Caddy and supports bare-metal node join; a one-line
+  `curl | bash` installer bootstraps a node; nodes with no configured
+  models boot into a degraded state instead of crash-looping; channel
+  gateways stand by when no adapter token is set.
+- **MCP OAuth tokens encrypted at rest**.
+- **`turnstone-admin` reads `config.toml`** — same `[database]` section
+  and precedence as the server (`CLI / config.toml > TURNSTONE_DB_* env
+  > defaults`), including `pool_size` and the `ssl*` knobs it previously
+  dropped; new `--config PATH` flag.
+
+### Changed
+
+- **Conversation storage and the provider wire are rebuilt around a
+  canonical trajectory** (migration `060` — see the upgrade note).
+  Internally a conversation is now a provider-neutral `Turn` sequence
+  lowered to each provider's wire format at send time; provider-specific
+  tool-call metadata rides an opaque producer-tagged lane (replayed
+  verbatim to the producing provider, rebuilt for others); attachments
+  become content-addressed, reference-counted rows resolved at the
+  provider boundary; orphan tool-call repair happens once, at send time.
+  Wire-visible behavior is unchanged for OpenAI-compatible providers;
+  histories are preserved across the migration.
+- **The console and web UI share one L-shell** — a left glyph rail, a
+  tab bar, and a pane host now frame interactive chats, coordinator
+  sessions, dashboards, and the admin panel as tabs in a single window;
+  the standalone web UI adopts the same shell and the old split-pane
+  layout is retired. Coordinator and interactive conversations render
+  through shared `.conv-*` card builders, the rail collapses to a glyph
+  strip (remembered per browser), mobile gets an off-canvas drawer, and
+  the frontend is now ES modules end to end.
+- **Admin panel modals → the Service Hatch shelf** — all ~35 admin
+  modals are replaced by pane-scoped shelves plus a small dialog tier
+  for confirmations. Schedules gain a cron builder with a next-3-runs
+  preview endpoint, model capabilities render as an LED tile matrix, and
+  the legacy modal machinery is deleted.
+- **SSE delivery is resumable end to end** — per-workstream ring buffer
+  with `Last-Event-ID` replay (cap raised 2,000 → 50,000), fresh-connect
+  and reconnect unified on one event-id cursor (in-flight tool batches
+  included), persisted `last_error` replays on connect, the console
+  proxy forwards `Last-Event-ID`, and panes close their connections on
+  `beforeunload` to stop multi-pane refresh from exhausting the
+  browser's per-host connection cap (#539).
+- **Workstream verbs are path-keyed** *(BREAKING)* — `rewind` / `retry`
+  / `edit-first-message` live at
+  `/v1/api/workstreams/{ws_id}/<verb>` alongside the other session
+  verbs; the body-keyed `/v1/api/command` endpoint is removed (#549).
+- **`/history` is projected server-side** — both UIs consume the same
+  REST-first wire shape instead of re-deriving it client-side.
+- **Saved workstreams & coordinators: card grid → sortable table** with
+  model/skill/context columns, pagination, and a unified selector across
+  both dashboards.
+- **`tools.web_search_backend` accepted values** *(BREAKING)* — now `""`
+  (auto), `"searxng"`, or `"mcp:server:tool"`. The old `"tavily"` and
+  `"ddg"` values are gone; a config still set to either disables web
+  search and logs a warning. Auto-detect resolves to SearxNG when
+  `searxng_url` is set.
+- **`web_search` tool: `topic` → `category`** *(BREAKING)* — renamed
+  LLM-facing parameter; values map to SearxNG categories. The Tavily-era
+  `finance` topic is gone.
+- **Core install includes what most deployments use** — `anthropic`,
+  `postgres`, `console`, and `tls` are core dependencies rather than
+  extras.
+- **NODES table → bottom-bar node picker** in the console.
+
+### Fixed
+
+- **Cluster mTLS actually survives operations** — certificate identity
+  keys on the advertised host rather than the container ID, renewals are
+  scoped per node, reloaded certs hot-swap into the live SSL context,
+  and healthchecks/boot retries are mTLS-aware.
+- **Intent-verdict lifecycle** — history replay ships risk-none verdict
+  rows (live/replay parity), late verdicts persist as `superseded` for
+  the audit trail instead of vanishing, bulk verdict insert tolerates
+  per-row conflicts, and cancel-on-approval honors its run-to-completion
+  contract.
+- **Usage accounting** — dashboard totals were under-counting; auxiliary
+  LLM spend (judge, rerank, memory) is now recorded.
+- **Concurrent first-boot migrations** no longer deadlock on the
+  advisory lock.
+- **Output renderer** — single-`$` inline math no longer false-positives
+  in prose; `strip_html` preserves block structure and drops a ReDoS
+  risk.
+- **Model registry** orders versions numerically (no more `1.10 < 1.9`
+  selection).
+
+### Removed
+
+- **Tavily and DuckDuckGo `web_search` backends** *(BREAKING)* —
+  replaced by the bundled SearxNG service. Removed:
+  `tools.tavily_api_key`, `$TAVILY_API_KEY`, `[api].tavily_key`, and the
+  `ddg` install extra. Point `TURNSTONE_SEARXNG_URL` at an existing
+  instance or use the bundled one; no database migration required.
+- **`man`, `math`, and `plan_agent` built-in tools** *(BREAKING)* —
+  `man`/`math` duplicated `bash`; planning is better expressed as a
+  `task_agent` running a planning skill. Also removed: the `math`
+  sandbox executor, the read-only `AGENT_TOOLS` sub-agent set, the
+  plan-review protocol (`/v1/api/plan`, `plan_review`/`plan_resolved`
+  SSE events, `on_plan_review` hooks), and the `model.plan_*` settings.
+  Interactive built-in tool count: 19 → 16.
+- **`stable/1.4` track retired** — the maintenance policy is now the
+  current stable plus one prior (`stable/1.6` + `stable/1.5` as of this
+  release). 1.4's final release was `v1.4.0`; its tags and released
+  artifacts remain available, under BUSL-1.1 as shipped.
+
+### Security
+
+- **Zero direct-HTML frontend** — every `innerHTML` sink across the
+  console and web UI is replaced with DOM construction or `setSafeHtml`,
+  inline handlers became delegated bindings, and CI lints pin the
+  invariant (plus `var`-free and const-reassign checks) across all
+  swept bundles.
+- **Output guard grows an LLM stage** — merged with the heuristics as
+  escalate-only (an LLM verdict can raise but never lower a heuristic
+  positive), with annotated findings, a capability gate, and hardening
+  against domain-camouflaged injection (#560, #573).
+- **One trust-fence primitive** — operator and judge envelopes share a
+  nonce-fenced wrapper (64-bit nonces, host-escaping); the output guard
+  flags nonce forgery, and skill hints no longer echo model-controlled
+  filter values into trusted text.
+- **RBAC** — built-in role overrides get an editor, and several
+  under-enforced permission gates are tightened (#585).
+- **Permissive `config.toml` warns** — a single startup warning when the
+  resolved config file is group- or world-readable; operators usually
+  want `0600`.
+- **Dependency floors** — `starlette>=1.0.1` (PYSEC-2026-161 host-header
+  path injection) and `aiohttp>=3.14.0` (security release).
+
+## [1.5.17]
+
+Backports a clutch of coordinator-tool clarity fixes plus a watch-delivery
+correctness fix from `main` to the `stable/1.5` track, plus a previously-
+latent intent-verdicts persistence bug exposed by the new heuristic-verdict
+INSERT paths.  No schema changes.
+
+### Fixed
+
+- **`intent_verdicts` PK collisions on every llm_fallback delivery** —
+  async LLM-tier "llm_fallback" verdicts (`turnstone/core/judge.py` —
+  `_deliver_fallbacks` and the in-loop fallback path) deliberately
+  reuse the heuristic verdict's `verdict_id` so the row gets
+  "upgraded in place" from `tier="heuristic"` → `tier="llm_fallback"`
+  when the LLM judge times out, is cancelled, or returns no content.
+  The consumer `_persist_intent_verdict` was doing a plain INSERT,
+  hitting the `intent_verdicts_pkey` constraint on every fallback
+  delivery; Postgres logged the duplicate-key error, the application
+  try/except swallowed it at `log.debug`, and the row never actually
+  got upgraded — the LLM judge's annotation
+  (`"(LLM judge did not return a verdict)"`) was lost.  The collision
+  rate exploded on this release because the new heuristic-INSERT
+  paths in the auto-approve early-return branches of `approve_tools`
+  (introduced below) leave no gap for the fallback to land cleanly
+  into.  Fix: new `upsert_intent_verdict` storage method using
+  `ON CONFLICT (verdict_id) DO UPDATE` that updates only `tier`,
+  `reasoning`, `judge_model` — the three fields that genuinely
+  change between heuristic and llm_fallback.  Every other column
+  (identity, carried-verbatim, and `user_decision`) is excluded;
+  `user_decision` in particular would otherwise be clobbered back
+  to `"pending"` when a fallback arrives after the operator has
+  already resolved the approval.  The bulk-INSERT path stays as
+  plain INSERT — fresh UUIDs in `judge.evaluate` make in-turn dups
+  impossible; the inverse race (fallback wins before bulk lands) is
+  reachable but unchanged in observable behavior by this fix,
+  documented at the bulk site for a future hardening pass.
+- **Coordinator LLM re-spawn loops on large fan-outs** — the spawn-tool
+  return JSON used `ws_id` as its key, which primed the model's recency
+  bias to feed the spawn result straight back into another
+  `spawn_workstream(ws_id=...)` call instead of progressing to
+  `wait_for_workstream(ws_ids=[...])`.  On 10+ child fan-outs this cascaded
+  into self-inflicted re-spawn loops.  The LLM-facing tool result now emits
+  `child_ws_id` (the storage column / HTTP API contract is unchanged); the
+  field name is already an existing project term so the rename aligns
+  rather than introduces new vocabulary.  Also handles the silent
+  upstream-omits-ws_id success-shape edge that previously emitted
+  `{"child_ws_id": null}` to the LLM — now surfaces a tool error so the
+  model retries rather than chasing a null id.
+- **`inspect_workstream` blowing the coordinator context budget** — a
+  coord doing a fan-out wave against tool-heavy children could land
+  >100 KB of raw output per inspect call, and the previous safety net
+  (`_truncate_output`'s head+tail strategy) silently dropped *middle*
+  messages — exactly the wrong shape for understanding a child's
+  trajectory (the FIRST sets the brief, the LAST shows the conclusion,
+  the middle is the connective tissue).  Output now goes through a
+  three-tier degradation ladder mirroring the search tool's
+  `_format_search_results`: `_tier="full"` (every message verbatim) →
+  `_tier="compact"` (per-message head/tail-snipped content + snipped
+  `tool_calls.arguments`, falling through a `(20,30)` / `(10,20)` /
+  `(5,10)` message-list trim ladder) → `_tier="skeleton"` (counts, role
+  distribution, last-assistant preview).  Budget 32 KiB matches the
+  search tool's; the chosen tier is annotated on the response so the
+  model can recall with a tighter `message_limit` if signal was lost.
+- **Auto-approved verdicts indistinguishable from pending review** —
+  `intent_verdict` rows for auto-approved tool calls landed with
+  `user_decision=""`, which read identically to "still waiting for the
+  operator" in the audit trail and led to a real misdiagnosis incident.
+  The column now carries an explicit vocabulary at insert: `pending` /
+  `approved` / `denied` / `timeout` / `policy` / `blanket` / `skill` /
+  `always` / `auto_approve_tools`.  The auto-approve early-return
+  branches in `approve_tools` now persist heuristic verdicts stamped
+  with their reason (previously dropped on the floor), and late LLM-tier
+  verdicts that arrive for an already-auto-approved call_id are stamped
+  via a TTL-pruned lookup map — so the audit row carries the
+  auto-approve reason even when the LLM judge daemon completes after
+  the synchronous approval cycle finished.  `resolve_approval` gains a
+  `timeout` kwarg writing `"timeout"` (the previous shape collapsed
+  passive timeouts and active denials into the same column).
+- **`list_skills` empty `allowed_tools` misread as "no tool access"** —
+  the response previously emitted `"allowed_tools": []` for every skill
+  that hadn't declared an auto-approve allowlist, which a coordinator
+  model read as "this skill can't use any tools" (real misdiagnosis: a
+  code-review child appeared to have been spawned with zero tool
+  access).  The field is now omitted entirely when empty — absence
+  carries the unambiguous meaning "no tool is pre-approved for this
+  skill", presence (non-empty list) keeps the standard Claude Code
+  skill-spec shape.  The tool description rewrite makes the
+  auto-approve-allowlist semantics explicit so a future reader doesn't
+  re-derive the gating misread.
+- **Watch terminal-fires silently dropped on backpressure** —
+  delivery now routes terminal events through the same path as
+  normal fires instead of being filtered out when the consumer was
+  saturated.
+
+### Documentation
+
+- **Storage `LIKE_ESCAPE` contract** — clarify that callers passing
+  `.like(escape=...)` must use the same escape character that the
+  storage helper assumes; previous wording let a reader pass a
+  different escape and silently produce no matches.
+
+## [1.5.15]
+
+### Fixed
+
+- **Admin console blank-page on MCP server rows with consented users** — a
+  Phase 9 (1.5.14) regression in `admin.js` used double-quote string
+  delimiters on the bulk-revoke button HTML literal, but the literal embeds
+  a `"` mid-attribute. JS closed the string early, turned `bulk-revoke (`
+  into bare tokens, and the resulting `SyntaxError` wiped out every global
+  in `admin.js` — `showAdmin` and all other admin entry points became
+  undefined, so the console UI was non-functional whenever the rendered MCP
+  server list contained at least one row with `consented_users_count > 0`.
+  Switch the literal to single-quote delimiters to match the surrounding
+  block.
+
+## [1.5.14]
+
+Backports OAuth-MCP Phase 9 from `main` to the `stable/1.5` track.
+
+### Added
+
+- **OAuth-MCP Phase 9 — admin status, deferred-consent persistence, operator
+  docs** — completes the per-(user, server) OAuth-MCP build-out. The sync pool
+  dispatchers now upsert into a new `mcp_pending_consent` table on
+  `mcp_consent_required` / `mcp_insufficient_scope`, so a non-interactive run
+  (scheduled / channel) that hits an unconsented server surfaces the deferred
+  prompt to the user on their next dashboard load via the gear-icon badge —
+  rows are cleared automatically by the OAuth callback handler on consent
+  completion, or via new DELETE endpoints for manual dismiss. The MCP Servers
+  admin row gains a `consented_users_count` pill and a two-step-confirm
+  bulk-revoke button for `auth_type=oauth_user` servers (upstream RFC 7009
+  revoke is intentionally not attempted in bulk to avoid N synchronous
+  round-trips against the provider). Operator-facing docs land at
+  `docs/mcp-oauth.md` and `docs/operations/mcp-oauth-headless.md`.
+
+  Introduces forward-only migrations `054_mcp_pending_consent` and
+  `055_mcp_user_tokens_server_index`.
+
+## [1.5.13]
+
+This release introduces one forward-only schema migration:
+`053_services_notify_trigger` — installs the `services_notify` PostgreSQL
+trigger that backs the new LISTEN/NOTIFY dispatcher (no-op on SQLite, where
+the dispatcher uses in-process fan-out).
+
+### Added
+
+- **Reactive node discovery via PG LISTEN/NOTIFY** — the console gains a
+  `NotifyDispatcher` that holds a dedicated session-mode PostgreSQL `LISTEN`
+  connection (bypasses pgbouncer transaction pooling) and fans wake-ups out to
+  per-channel handlers on a separate dispatch thread. The cluster collector
+  subscribes to a new `services` channel and reacts to node register /
+  deregister within ~500 ms instead of waiting up to 60 s for the next discovery
+  loop; the 60 s loop is retained as the backstop for crash-shaped loss
+  (NOTIFY only fires on real writes). The storage layer also gains a uniform
+  `notify` / `listen` API with an SQLite synthetic-sweep fallback so consumer
+  code is identical across backends. `TURNSTONE_DB_LISTEN_URL` (or
+  `[database] listen_url` in `config.toml`) points the dispatcher at a
+  direct-to-Postgres URL; defaults to the main DB URL when unset.
+- **Event-driven `wait_for_workstream`** — coord's block-wait tool no longer
+  polls storage every 500 ms. A new in-process `ChildEventBus` notifies waiters
+  whenever a child state change is dispatched to the UI, and the wait loop
+  blocks on `threading.Event.wait` with a 2 s heartbeat cap (matching the
+  existing `wait_progress` SSE cadence). A 600 s wait that previously hit
+  storage ~2400 times now wakes only on real state transitions, with ~4× lower
+  SSE traffic in the quiescent case.
+- **Memory tool audit trail** — the memory tool now emits `memory.save`,
+  `memory.update`, and `memory.delete` audit events (the admin-console DELETE
+  route previously emitted only `memory.delete`, so tool-initiated mutations
+  had no audit footprint). All emissions are best-effort and never break the
+  tool call itself.
+- **`task_agent` per-call personas via `skill=`** — `task_agent` now accepts
+  an optional `skill=<name>` argument that loads the named skill's content as
+  the sub-agent's persona in place of the hardcoded identity statement. The
+  fixed operating-guidance block (one-shot, tool-use over narration,
+  no follow-up questions) is still layered on top of every persona. High- and
+  critical-risk skills surface their risk tier in the approval header and
+  emit a `task_agent.high_risk_skill` warning, matching the existing
+  session-load gate.
+
+### Fixed
+
+- **Per-role plan / task model overrides could be bypassed by the LLM** — the
+  back-compat `default` alias auto-synthesised by `load_model_registry`
+  remained visible to the model even when an operator had configured
+  `model.task_alias` / `model.plan_alias`, so `task_agent(model="default")`
+  routed to whichever backend the synthesised alias was attached to at boot
+  instead of the configured per-role default. The synthesised alias is now
+  only added when neither the DB nor `[models.*]` populates the registry,
+  filtered out of the LLM-visible alias list, and explicitly rejected at the
+  validator chokepoint as defense-in-depth.
+- **Mermaid streaming parse errors + progressive `hljs`** — live-streamed
+  mermaid blocks with bare `(`, `[`, `{` inside unquoted edge or rectangle
+  node labels were re-entering the shape parser and producing
+  `Parse error, got 'PS'` messages. The renderer now autoquotes the two
+  affected label forms (`|content|` and `ID[content]`) before the SVG cache
+  lookup; shapes whose syntax already nests delimiters (cylinders, subroutines,
+  trapezoids, etc.) are intentionally left alone. The companion `hljs` change
+  highlights code blocks progressively as they stream rather than only after
+  completion.
+- **Re-auth from inside the proxy-prefixed UI** — on a proxied node page
+  (`/node/{id}/...`), an expiring JWT triggered an in-page login modal whose
+  POST went to `/v1/api/auth/login` and was rewritten to
+  `/node/{id}/v1/api/auth/login`. Two latent bugs both blocked re-auth: the
+  console's `AuthMiddleware` didn't recognise the `/node/{id}/` prefix over a
+  public path, and `proxy_api` would have forwarded the login request to the
+  upstream node (which mints `JWT_AUD_SERVER` tokens the console then rejects).
+  Both fixed: proxied public paths stay public, and `proxy_api` now dispatches
+  every entry in `_PROXY_AUTH_LOCAL_HANDLERS` (login, logout, setup, refresh,
+  status, whoami, oidc/authorize, oidc/callback) to the console's own auth
+  handlers. The dispatch table is a single `(method, path) → handler` mapping
+  so the test parametrize list can't drift from the implementation.
+- **Appbar visibility + gear-icon dropdown on the dashboard** — the dashboard
+  overlay was covering the entire appbar, hiding the proxy-injected node
+  picker. The overlay now starts at `top: 48px` and the dashboard's role
+  downgrades from `dialog+aria-modal` to `region` so the appbar above it
+  remains reachable. The gear icon converts from a direct settings-panel
+  click into a dropdown with "MCP connections" and "Logout" (the latter with
+  `.destructive` styling). The settings-menu keydown handler is now attached
+  synchronously so `Escape` can't fall through the brief window between the
+  menu opening and its listeners being installed.
+- **PostgreSQL test backend on the notify dispatcher suite** — migration 053's
+  `services_notify` trigger lives only in the alembic chain, but the test
+  fixture creates tables via `metadata.create_all`. The trigger function +
+  trigger are now declared in `_schema.py` and attached via
+  `sa.event.listen(services, "after_create", ...)` DDL events gated on the
+  PostgreSQL dialect, with the same SQL constants imported by migration 053
+  so there's a single source of truth.
+
+## [1.5.12]
+
+### Added
+
+- **Enriched backend error messages** — provider name and attempted URL are now
+  included in session error responses, so operators can triage connectivity
+  failures without enabling debug logging.
+
+### Fixed
+
+- **`/rewind` always emits a `history` SSE event** — pre-fix, if the session
+  had no messages remaining after a rewind the history event was skipped,
+  leaving connected UIs with stale content and blocking edit-and-resend flows.
+
+## [1.5.11]
+
+This release introduces one forward-only schema migration:
+`052_model_reasoning_persistence` — `surface_persisted_reasoning` and
+`replay_reasoning_to_model` flag columns on `model_definitions`.
+
+### Added
+
+- **SSE refresh-resume** — clients that reload mid-stream (browser refresh, tab
+  restore) now receive an `in_progress_snapshot` event carrying the buffered
+  partial response, so the UI can resume rendering the in-flight turn without
+  losing content. The snapshot is keyed by a monotonic `_ws_inflight_seq`
+  counter so a reconnecting client can skip events it already saw.
+- **Reasoning persistence** (Phases 1–4) — model reasoning text can now be
+  persisted to conversation history and optionally replayed to the model on
+  subsequent turns. Phase 1 persists reasoning text on the history payload.
+  Phase 2 wires a build-time shape filter and a per-model
+  `replay_reasoning_to_model` flag. Phases 3+4 add full OpenAI Responses API
+  (`include=["reasoning.encrypted_content"]`) and Chat Completions support;
+  an `ANTHROPIC_VALID_BLOCK_TYPES` shape filter guards the Anthropic path. Two
+  new per-model capability flags (`surface_persisted_reasoning`,
+  `replay_reasoning_to_model`) both default `False` on unknown and
+  local-server models.
+- **Console home composer: placeholders + toggle** — the console landing-page
+  composer now shows context-aware placeholder text and a toggle component for
+  advanced options; an admin polish pass tightened spacing and focus behaviour
+  across the form.
+
+### Changed
+
+- **`judge.model` now requires a named alias** — raw provider model IDs on
+  `judge.model` in config are no longer accepted; the judge must reference an
+  alias registered in the model registry. The session-provider raw-model
+  fallback is removed. Existing configs using an unregistered model ID need a
+  corresponding alias entry.
+
+### Fixed
+
+- **`replay_reasoning_to_model` AND-gated with model capability** — setting the
+  flag for a model that does not declare reasoning-replay support now silently
+  no-ops instead of forwarding reasoning blocks and triggering a provider error.
+- **Coordinator alias resolution unified across placeholder + factory** — a
+  placeholder coordinator and the real coordinator factory could previously
+  resolve to different model aliases, producing a visible mismatch in the model
+  display. Both paths now share the same resolution logic.
+- **Console `cs=None` fallback in `/v1/api/models` placeholder** — an
+  under-initialised coordinator state no longer 500s when the models endpoint
+  is hit before the coordinator subsystem is fully bootstrapped.
+- **SSE `_ws_inflight_seq` always advances** — sequence numbers were previously
+  skipped when an emit was past the buffer cap, leaving gaps in the monotonic
+  counter that broke `state_change` / `in_progress_snapshot` ordering on
+  reconnect.
+- **Reasoning persistence shape + replay fixes** — per-block
+  `ANTHROPIC_VALID_BLOCK_TYPES` filter applied; `reasoning_text` is now
+  synthesised alongside non-reasoning `provider_blocks` so both appear
+  together in the history payload.
+
+## [1.5.10]
+
+This release introduces one forward-only schema migration:
+`051_skill_notify_on_complete_array_default` — backfills
+`prompt_templates.notify_on_complete` from `'{}'` to `'[]'`.
+
+### Added
+
+- **Skills unlock action** — operators can unlock an installed skill to allow
+  local customisation. Once unlocked, the skill's resource content, system
+  prompt additions, and notify configuration are editable through the admin UI.
+  Skills shipped as part of a bundle remain locked (read-only) until explicitly
+  unlocked; the unlock is logged to the audit trail. A lock icon in the
+  top-right of the Skills detail pane doubles as the unlock trigger.
+
+### Fixed
+
+- **`skills.sh` install endpoint** — the install script was targeting an
+  endpoint removed in an earlier refactor; switched to `/api/download`.
+- **Skills `notify_on_complete` default** — the field defaulted to `{}`
+  (object) instead of `[]` (array), causing notify configurations to be
+  rejected at schema validation.
+- **Skills admin UI modal errors** — `.is-visible` class used consistently
+  instead of inline `style.display`; stale error text is cleared on submit;
+  designer-review lock-icon UX applied.
+
+## [1.5.9]
+
+### Fixed
+
+- **`repair=False` on all display-read `load_messages` call sites** —
+  passing `repair=True` on display paths was silently mutating the stored
+  message list, causing divergence between what the UI showed and what the
+  model received on the next turn.
+
+## [1.5.8]
+
+This release introduces two forward-only schema migrations:
+`049_mcp_oauth_schema` — OAuth token + consent tables for MCP servers;
+`050_conversations_source_and_reminders` — `_source` and `_reminders` columns
+on `conversations`.
+
+### Added
+
+- **MCP OAuth 2.1 + PKCE** — MCP servers that require OAuth can now be
+  configured with a client ID and secret through the admin UI. The full token
+  lifecycle (acquire → refresh → rotate) is managed automatically; tokens are
+  stored encrypted at rest using a key derived from the JWT secret. The consent
+  flow runs in-browser via a provider redirect. Rolled out in phases:
+
+  - Minimum admin form and OAuth schema (`21663d15`).
+  - Token-at-rest AES-GCM encryption layer (`a4c335d7`).
+  - Per-(user, server) OAuth 2.1 + PKCE flow (`b0f7029f`).
+  - Per-(user, server) `ClientSession` pool with OAuth dispatch (`1a1043c4`).
+  - SDK 401/403 introspection via httpx response hook (`bde09134`).
+  - Phase 7 — per-user tool catalog scoping: each user sees only the tools
+    their OAuth token is permitted to call (`cfc8a6c8`).
+  - Phase 7b — per-user resource + prompt pool dispatch (`b368bdee`).
+  - Phase 8 — per-user MCP consent UX: users see a consent dialog on first
+    use of an OAuth-gated server and can revoke consent from their profile;
+    admins see per-server consent counts in the MCP Servers tab (`61051339`).
+
+- **Metacognition NudgeQueue** — all advisory channels (repeat-tool nudges,
+  watch reminders, wake triggers) are unified into a pull-model `NudgeQueue`
+  that delivers at most one nudge per turn, preventing multi-channel pile-ups
+  that inflate context. Observable changes:
+
+  - Watch results carry metadata (watch ID, `valid_until`, trigger type)
+    through to the system message so the model can reason about recency.
+  - Coordinator idle-children observer: a coordinator with no in-flight
+    children for longer than the configured idle threshold receives a nudge.
+  - Wake trigger (`IdleNudgeWatcher`): sessions waiting on an external event
+    can be unblocked via `ChatSession.deliver_wake_nudge_from_queue`.
+  - Watch switchover: watch results are now enqueued on the `NudgeQueue`
+    rather than the previous `_watch_pending` list, giving them the same
+    delivery guarantees and priority handling as other advisories.
+
+- **Structured watch-result card** — the UI renders watch results as a styled
+  card with a system-nudge marker, distinct from the assistant message body.
+  On history replay, system-nudge turns are visually distinguished from normal
+  assistant turns.
+- **Side-channel persistence** — `_source` and `_reminders` side-channel
+  fields are persisted to the `conversations` storage table and restored on
+  session resume, so metacognitive context survives process restarts. A
+  `REMINDER_TEXT_STORAGE_CAP` byte clamp prevents unbounded growth.
+
+### Fixed
+
+- **Replay consistency** — queued user messages captured mid-loop are now
+  persisted and replayed in the correct order on a subsequent `events`
+  subscription. Coordinator history replay fixed: blank assistant cards and
+  out-of-order tool results on the coordinator tree no longer occur when the
+  coordinator has mixed queued + delivered messages.
+- **Session reminder preservation on fork + resume** — `_source` and
+  `_reminders` are carried through workstream fork and restored from storage
+  on resume.
+- **NUL-byte sanitization in storage** — PostgreSQL rejects `\x00` in text
+  columns; `_source` and `_reminders` now strip NUL bytes on write.
+- **Console coordinator subsystem bootstrap** — the coordinator subsystem is
+  now committed atomically on first model add; startup teardown is offloaded
+  to avoid blocking the event loop.
+- **MCP `asyncio.timeout` over `asyncio.wait_for`** — Python 3.11's
+  `wait_for` wraps the coroutine in a fresh task, breaking anyio's `aclose`
+  scope exit. Replaced with `async with asyncio.timeout(N)` for safe cleanup.
+- **MCP pool-reuse 401 recovery** — a reused `ClientSession` returning 401
+  now replaces the pool entry with a fresh session; the carrier token is
+  owned by the pool entry to prevent a race between the 401 handler and a
+  concurrent request.
+- **OIDC hardening** — multiple security and correctness fixes:
+  SSRF + plaintext credential exfil via discovery document (sec-1, sec-3);
+  `TURNSTONE_OIDC_REDIRECT_BASE` now required, Host-header fallback removed
+  (sec-2); atomic user + identity provisioning prevents orphan rows (bug-1);
+  callback robustness — typed exceptions, shape checks, log sanitization, JS
+  race (bug-4–6, sec-4); role-mapping concurrency serialized (bug-2, perf-1);
+  stranded-user self-heal on role-mapping failure (cumulative bug-1).
+
+## [1.5.7]
+
+### Added
+
+- **Inline node picker** — a compact node-switcher dropdown in the console
+  header replaces the "← Back to console" banner, so operators can switch
+  between nodes without a full navigation.
+
+### Fixed
+
+- **Queued user messages injected mid-loop** — messages queued while a
+  generation was in progress were not being delivered at the correct seam and
+  could be dropped or reordered when the worker consumed the queue.
+- **Search tool output bounded** — pathological inputs (very long lines with
+  no whitespace) could produce search results exceeding the context budget.
+  Output is now clamped before reaching the message.
+
+## [1.5.6]
+
+### Added
+
+- **`api_surface` toggle** — model definitions gain an `api_surface` field
+  (`"chat"` | `"responses"`) that selects which OpenAI-compatible API surface
+  the provider client uses. Enables Mistral Medium reasoning via the Responses
+  surface; Chat Completions remains the default for all other models.
+- **Healthy model aliases per node** — `GET /v1/api/cluster/nodes` now
+  includes a `healthy_aliases` list per node, so the coordinator and operators
+  can see which model aliases are currently reachable without a separate
+  per-model health probe.
+- **Plan/task agent settings in Models → Roles** — the Models admin tab's
+  Roles sub-tab gains `plan_agent` and `task_agent` rows so operators can
+  configure per-kind reasoning effort and alias overrides from the UI rather
+  than editing `config.toml`. Live-refresh dropdowns update in place when
+  model definitions change.
+
+### Fixed
+
+- **Memory candidate selection** — recall now uses OR-of-terms BM25 with
+  query-aware candidate-set selection, dramatically improving recall for
+  queries whose terms span multiple stored entries.
+- **Workstream model + config preserved on rehydrate** — reopening a closed
+  workstream no longer overwrites the model alias and per-workstream config
+  with session defaults.
+- **Console home composer: attachments + user-message pills** — multipart
+  attachments in the home composer were not forwarded correctly; user-message
+  pills in the coordinator chat pane were missing.
+
+## [1.5.5]
+
+### Fixed
+
+- **Saved-workstream tool result rendering** — tool results in closed
+  workstreams were not rendering on history replay. Audit-trail decoration for
+  tool calls is now applied on the replay path.
+
+## [1.5.4]
+
+### Added
+
+- **Stage 3 SessionManager Children primitive lift** — child workstreams are
+  first-class citizens in the cluster event bus. `child_ws_state` events are
+  pushed through the cluster SSE stream so the console tree view updates in
+  real time without polling. `list_children` and `get_child` primitives on
+  `SessionManager` provide a consistent cross-node view of the coordinator's
+  spawn tree.
+- **Multi-select delete for Saved Coordinators** — the Saved Coordinators grid
+  in the console admin panel now supports checkbox multi-select with a
+  bulk-delete action.
+
+## [1.5.3]
+
+This release introduces one forward-only schema migration:
+`048_workstream_reaper_index` — partial composite index on `workstreams` for
+the orphan-reaper query.
+
+### Fixed
+
+- **Coordinator orphan reaping scoped by heartbeat** — the session manager's
+  `close_idle` pass now scopes the DB-orphan reaper by
+  `services.last_heartbeat` so workstreams belonging to a live node are not
+  incorrectly reaped. `bulk_close_stale_orphans` and `touch_workstream`
+  storage primitives added; a partial composite index keeps the reaper scan
+  cheap.
+- **Coordinator pool idle cleanup** — a periodic task on the console now
+  closes coordinator pool entries whose session has gone idle past the
+  configurable threshold, preventing pool exhaustion on long-running consoles.
+
+## [1.5.2]
+
+### Added
+
+- **Metacognition themed reminder bubble** — repeat-tool and user-reminder
+  nudges are rendered as a distinct styled bubble rather than being injected
+  inline into the assistant message, making it easier to distinguish model
+  output from metacognitive annotations. The CLI REPL gains matching
+  `on_user_reminder` / `on_tool_reminder` callbacks.
+
+### Fixed
+
+- **Metacog streak detector** — the N≥3 sequential-same-call streak detector
+  now fires correctly on the third repetition; a write-success-clear that
+  reset the counter after a successful tool call (preventing streaks across
+  mixed-outcome sequences) was removed.
+- **Metacog reminders isolated to side-channel** — reminder text no longer
+  appears in the user content turn; it flows through a dedicated side-channel
+  the session injects into the system context, preventing the model from
+  attributing it to the user.
+
+## [1.5.1]
+
+### Added
+
+- **`pending_approval_detail` on child `ws_state` SSE events** — coordinators
+  now receive the child's pending approval detail in `child_ws_state` events,
+  enabling the coordinator to surface approval prompts without a separate poll.
+
+### Fixed
+
+- **Coordinator registry auto-refresh** — the console coordinator registry now
+  refreshes when model definitions change, so a newly added alias is visible
+  to coordinators without restarting.
+- **Coordinator fan-out default** — coordinators now fan out to independent
+  child workstreams by default instead of serialising them, matching the
+  documented contract for parallel-work patterns.
+- **`wait_for_workstream` message cap raised to 10 KiB** — large plan
+  summaries and tool results from child workstreams were silently truncated at
+  the previous 4 KiB cap.
+- **Coordinator SSE isolated on dedicated thread pool** — coordinator SSE
+  polling now runs on a dedicated 200-thread executor, matching interactive's
+  `sse_executor`, so coordinator long-poll blocking no longer contends with
+  storage and routing workers on the default pool.
+
+## [1.5.0]
+
+User-visible additions: a unified workstream HTTP surface (interactive and
+coordinator under one URL family), inline child approvals, coordinator
+composer parity, progressive rendering, OIDC authentication, MCP OAuth
+foundations, and a redesigned UI built on the Design System v1 token layer.
+
+This release removes the pre-1.5 body-keyed and query-keyed URL family.
+See **Removed (BREAKING)** below before upgrading from a 1.x stable line.
+
+This release introduces the following forward-only schema migrations that the
+server applies automatically on first startup. All are additive; no data loss.
+
+- `039_workstream_kind` — `kind` + `parent_ws_id` columns on `workstreams`.
+- `040_coord_cluster_admin_perms` — grants `admin.coordinator` +
+  `admin.cluster.inspect` to the builtin-admin role.
+- `041_workstream_index_tuning` — refined indexes for the workstream query mix
+  introduced by 039.
+- `042_coord_trust_send_perm` — adds `coordinator.trust.send` permission to
+  builtin-admin.
+- `043_skill_description_required` — backfills empty `description` rows in
+  `prompt_templates`.
+- `044_skill_kind` — adds `kind` classifier column to `prompt_templates`
+  (`interactive` / `coordinator` / `any`).
+- `045_skill_risk_level_rename` — renames `prompt_templates.scan_status` →
+  `risk_level`.
+- `046_drop_hash_ring_tables` — drops the hash-ring bucket tables superseded
+  by rendezvous routing in 1.4.
+- `047_drop_coord_spawn_quota_settings` — removes the spawn-quota settings
+  rows removed from the coordinator in 1.5.0a4.
+
+### Added
+
+- **Inline child approvals** — pending tool approvals on coordinator child
+  workstreams surface directly in the coordinator tree view. A risk pill shows
+  the judge verdict (or "pending" while the judge evaluates); Approve/Deny
+  buttons appear inline so operators do not need to navigate to the child's
+  workstream. `pending_approval_detail` is exposed on
+  `GET /v1/api/dashboard` and passed through the cluster live-bulk SSE payload
+  so all connected clients render approval prompts simultaneously. LLM judge
+  verdicts are cached client-side and replayed on SSE reconnect.
+- **Coordinator composer parity** — the coordinator composer now supports
+  Stop, Send-to-queue, and Attach (file upload), matching the interactive
+  workstream composer feature set.
+- **Per-call model and judge override on coordinator composer** — operators
+  can override the model alias and judge model for a single coordinator send
+  from the composer, without changing the node-wide or role-wide defaults. Bad
+  aliases return a corrective error listing available choices.
+- **Coordinator status bar + richer history replay** — each coordinator
+  workstream gains a per-coordinator status bar showing active children, token
+  spend, and generation state. History replay in the coordinator panel is
+  extended to include tool results and thinking blocks.
+- **Coordinator child error surfacing + memory tool** — child workstream
+  errors are surfaced as distinct error rows in the coordinator tree view
+  rather than disappearing silently. The coordinator gains access to a
+  `memory` tool (same interface as interactive) for retrieving stored facts.
+- **Coordinator inline tool-batch construct** — the coordinator tool approval
+  UI replaces the separate approval dock with an inline batch construct that
+  groups all pending tool calls for a given turn into a single review card.
+- **Node capability auto-detection** — nodes report kernel-level capabilities
+  (available memory, CPU count, accelerator presence) via
+  `/v1/api/node/capabilities` at startup, enabling the console to filter model
+  aliases offered to coordinators routing to that node.
+- **Skills: paste `SKILL.md` to auto-fill the Create Skill modal** — pasting
+  a `SKILL.md` file's content into the modal auto-populates the name,
+  description, and configuration fields.
+- **Progressive mermaid rendering** — Mermaid diagrams begin rendering as
+  soon as a complete diagram block is detected in the stream rather than
+  waiting for the full response; the diagram re-renders in place as the model
+  extends it.
+- **LaTeX and MathML delimiter support** — `\(…\)` inline and `\[…\]` block
+  math delimiters are now recognised alongside the existing `$$` fences.
+
+### Removed (BREAKING — 1.5.0)
+
+- **Legacy body-keyed and query-keyed URL family for the workstream
+  interaction verbs.** Pre-1.5 interactive shipped both a path-keyed
+  and a body-keyed surface for the same five verbs; this release drops
+  the body-keyed and query-keyed mounts (and the
+  ``make_legacy_body_keyed_adapter`` /
+  ``make_legacy_query_keyed_adapter`` shims that backed them). External
+  SDK consumers on stable 1.0/1.3/1.4 must move to the path-keyed
+  shape:
+
+  | Removed (1.0/1.3/1.4)                          | Use instead                                            |
+  | ---------------------------------------------- | ------------------------------------------------------ |
+  | ``GET  /v1/api/events?ws_id=X``                | ``GET  /v1/api/workstreams/{ws_id}/events``            |
+  | ``POST /v1/api/send``     (body ``ws_id``)     | ``POST /v1/api/workstreams/{ws_id}/send``              |
+  | ``DELETE /v1/api/send``   (body ``ws_id``)     | ``DELETE /v1/api/workstreams/{ws_id}/send``            |
+  | ``POST /v1/api/approve``  (body ``ws_id``)     | ``POST /v1/api/workstreams/{ws_id}/approve``           |
+  | ``POST /v1/api/cancel``   (body ``ws_id``)     | ``POST /v1/api/workstreams/{ws_id}/cancel``            |
+  | ``POST /v1/api/workstreams/close`` (body)      | ``POST /v1/api/workstreams/{ws_id}/close``             |
+
+  Calls to the old URLs return **404** on 1.5.0+. Bodies on the new
+  URLs no longer carry ``ws_id`` (the path provides it); the
+  ``SendRequest`` / ``ApproveRequest`` / ``CancelRequest`` Pydantic
+  schemas drop the field, and ``CloseWorkstreamRequest`` slims to a
+  single optional ``reason`` field (the body is still required to be
+  valid JSON — send ``{}`` when omitting all fields).
+
+  ``/v1/api/plan`` and ``/v1/api/command`` are unaffected and remain
+  body-keyed in this release. The bundled web UI, channel adapters,
+  Python SDK, TypeScript SDK, and console routing-proxy SDK ship the
+  new URLs automatically; pinning to ≥ 1.5.0 is enough.
+
+  The console routing proxy's ``/v1/api/route/...`` family is updated
+  alongside: ``/v1/api/route/workstreams/{ws_id}/<verb>`` replaces the
+  pre-1.5 ``/v1/api/route/{send,approve,cancel,workstreams/close}``
+  mounts. ``DELETE`` is now passed through (``client.request(method,
+  ...)`` instead of ``client.post(...)``) so the new dequeue route
+  works through the proxy. Audit attribution for ``DELETE`` on
+  ``/send`` is logged as ``route.workstream.dequeue`` rather than
+  ``route.workstream.send``.
+
+  Auth scope wiring (``WRITE_PATHS`` / ``APPROVE_PATHS`` literals plus
+  the path-keyed verb match in ``required_scope``) updated to grant
+  ``write`` for path-keyed ``send/cancel/close``, ``approve`` for
+  path-keyed ``approve``, and ``write`` for ``DELETE`` on
+  path-keyed ``/send``. The ``/node/*`` proxy branch mirrors all four.
+
+### Changed
+
+- **Dashboard row shape: ``id`` → ``ws_id``.** The
+  ``GET /v1/api/dashboard`` row dict now keys the workstream
+  identifier as ``ws_id`` (matching the rest of the v1 workstream
+  surface — active list, saved list, history, detail). The Stage 2
+  list-verb lift converged ``/v1/api/workstreams`` and
+  ``/v1/api/workstreams/saved`` on ``ws_id`` but left dashboard
+  alone to keep that PR's diff focused; this lands the same rename
+  on the remaining endpoint so the v1 row shape is consistent
+  across the family. Pydantic ``DashboardWorkstream`` and the
+  TypeScript SDK ``DashboardWorkstream`` interface both rename the
+  field accordingly. The bundled web UI is the only consumer that
+  reads ``dashboard.workstreams[].id`` and is updated atomically;
+  no external SDK on a stable line reads the field, so the swap is
+  bounded by normal static-asset reload. Console
+  ``_fetch_live_block`` (cluster-inspect's projection over a
+  remote node's dashboard payload) is updated to match.
+
+- **Coordinator gains rich `ws_state` payload + live activity broadcast**
+  ([§ Post-P3 reckoning item #2 follow-up]). Pre-lift coord's
+  cluster broadcast was state-only — the dashboard's coord rows
+  showed the state column flipping but the ``tokens``,
+  ``context_ratio``, ``activity``, and per-turn ``content`` fields
+  were all hardcoded to zero / empty. The lift turns
+  ``on_status`` / ``on_content_token`` / ``on_thinking_start`` /
+  ``on_thinking_stop`` / ``on_stream_end`` / ``on_tool_result``
+  into shared bodies on :class:`SessionUIBase` so coord populates
+  the same per-ws metric fields interactive does (the fields were
+  already declared on the base; only the writes were
+  WebUI-specific). ``coord_adapter.emit_state`` now reads the UI's
+  snapshot under ``_ws_lock`` via the new
+  :meth:`SessionUIBase.snapshot_and_consume_state_payload` helper
+  and passes the rich kwargs through to
+  ``collector.emit_console_ws_state``; the cluster dashboard's
+  coord rows now render with the same tokens / activity / content /
+  context_ratio fields interactive rows do.
+
+  Three observable behaviour changes (all CHANGELOG-callout-worthy):
+
+  - **Coord persists ``usage_event`` storage rows.** Pre-lift only
+    WebUI did. The lifted ``on_status`` body unifies usage tracking
+    so governance dashboards / token-spend queries see coordinator
+    consumption alongside interactive. Operators querying
+    ``usage_event`` by ``ws_id`` will see coord rows for the first
+    time.
+  - **Coord broadcasts live activity transitions.** New
+    ``ClusterCollector.update_console_ws_activity(ws_id, *,
+    activity, activity_state)`` method (named ``update_*`` rather
+    than ``emit_*`` to flag the no-fan-out asymmetry vs. the rest
+    of the ``emit_console_ws_*`` family — it updates the in-memory
+    pseudo-node row but intentionally does NOT fan out a separate
+    SSE event). The cluster dashboard's per-ws polling reads the
+    in-memory pseudo-node row, so activity ticks land on the next
+    snapshot fetch (matches WebUI's behaviour where activity
+    events are observational; not fanned out through the cluster
+    SSE stream).
+  - **Cluster ``cluster_state`` events for coord rows now carry
+    non-zero ``tokens`` / ``content`` fields.** Frontend rendering
+    that conditionally hid these on coord rows can drop the
+    branch.
+
+  Architecture changes:
+
+  - ``_MAX_TURN_CONTENT_CHARS`` moved from ``turnstone.server`` to
+    ``turnstone.core.session_ui_base`` so coord enforces the same
+    per-turn content cap interactive does.
+  - WebUI keeps ``on_status`` / ``on_tool_result`` / ``on_error``
+    overrides that layer Prometheus ``_metrics.record_*`` calls
+    (node-only) on top of the shared body via ``super()`` — the
+    Prometheus surface stays node-scoped (the console isn't a
+    node and has no /metrics endpoint).
+  - ``ConsoleCoordinatorUI`` adds a ``_broadcast_activity``
+    override that fans out via the cluster collector instead of
+    the global SSE queue (which is node-only on interactive).
+  - ``coord_endpoint_config`` wires a new ``_coord_spawn_metrics``
+    hook (mirrors interactive's) so the per-spawn ``_ws_messages``
+    increment + ``_ws_turn_tool_calls`` reset happen on coord too.
+
+  Test additions: 23 new tests in ``tests/test_coord_rich_ws_state_payload.py``
+  pin the per-ws metric writes (status, content accumulation,
+  activity tracking, tool-result counters, stream-end activity
+  clear), the snapshot helper's IDLE/ERROR drain semantics +
+  single-lock-acquisition guarantee, the adapter's rich-payload
+  pass-through + defensive None-UI handling, the activity
+  broadcast (collector wire + failure swallow + no-op-when-
+  collector-unset + dedup against last-emitted state), the
+  spawn_metrics hook, and a concurrent-writes-during-snapshot
+  stress case (cycles through running / idle / error so the
+  drain branches actually run against a concurrent writer).
+  Plus WebUI-override regression tests confirming
+  ``_metrics.record_*`` still fires on top of the lifted bodies.
+  Existing ``tests/test_webui_content.py`` updated to import
+  ``_MAX_TURN_CONTENT_CHARS`` from its new home in
+  ``turnstone.core.session_ui_base``;
+  ``tests/test_coordinator_adapter.py`` updated to expect the
+  rich-payload kwargs (``tokens=0`` defaults) on
+  ``emit_console_ws_state``.
+
+  Two deferred follow-ups (out-of-scope for this lift,
+  flagged for tracking):
+
+  - **Synchronous ``record_usage_event`` INSERT on coord worker
+    thread.** The lifted ``on_status`` body persists usage rows on
+    every provider response — same shape WebUI uses, but coord
+    workers can fire multi-step plan/task agent loops where each
+    response blocks the worker for a write transaction. Parity
+    with WebUI is the explicit goal here; if coord throughput
+    becomes a concern, batch usage_event writes onto a background
+    flusher thread (one batch INSERT per N events / per K ms) on
+    both kinds.
+  - **Coord assistant turn content now flows on the cluster SSE
+    stream (``/v1/api/cluster/events``).** Pre-lift the broadcast
+    was ``content=""``; post-lift it carries the joined assistant
+    output. The cluster SSE stream has no per-user filter today —
+    extends an existing cross-tenant exposure (interactive
+    ``cluster_state`` events already carry content) to a
+    previously-empty channel (coord rows). Proper fix needs the
+    SSE endpoint gated on ``admin.cluster.inspect`` (matching
+    ``/v1/api/cluster/ws/{ws_id}/detail``) or per-listener
+    user_id filtering. Tracked as a separate security-tightening
+    project; not gating this lift since it inherits an existing
+    exposure rather than introducing a new mechanism.
+
+- **`history` / `detail` verb bodies lifted across both kinds**
+  ([Stage 2 Verb Lift — `history` / `detail`]). The coord
+  ``GET /v1/api/workstreams/{ws_id}/history`` and
+  ``GET /v1/api/workstreams/{ws_id}`` handlers now share two factory
+  bodies via ``make_history_handler(cfg)`` and
+  ``make_detail_handler(cfg)``. The lift adds both endpoints to the
+  interactive surface as a feature gain (pre-lift only coord exposed
+  them; interactive consumers had to subscribe to ``/events`` SSE
+  just to read history rows or display fields). No new
+  ``SessionEndpointConfig`` fields — the factories reuse
+  ``permission_gate``, ``manager_lookup``, ``not_found_label``,
+  ``audit_action_prefix``, and (for history's storage-fallback kind
+  check) ``list_kind`` — all already wired by both production
+  lifespans.
+
+  Three observable behaviour changes (all documented per kind):
+
+  - **Interactive gains ``GET /v1/api/workstreams/{ws_id}``.** Pre-lift
+    interactive had no detail endpoint — SDK consumers had to read
+    display fields from the SSE replay on ``/events`` or scrape the
+    active list. The lifted body lazy-rehydrates a closed/evicted
+    workstream via ``mgr.open()`` so the response shape is stable
+    across loaded / persisted-only states. Same
+    ``{ws_id, name, state, user_id, kind}`` shape coord exposed
+    pre-lift, now available on both surfaces.
+  - **Interactive gains ``GET /v1/api/workstreams/{ws_id}/history``.**
+    Same ``?limit=`` query param contract as coord (default 100, max
+    500, malformed values fall back to 100, out-of-range clamps to
+    [1, 500]). Persisted-but-not-loaded interactives serve history
+    without rehydrating — the lifted body falls back to a storage-row
+    + kind check (via ``cfg.list_kind``) when ``mgr.get`` returns
+    ``None``, mirroring coord's pre-lift
+    ``_resolve_coordinator_or_404`` ladder.
+  - **Storage / manager-lock work moved off the event loop on coord.**
+    The lifted ``history`` body always runs ``storage.get_workstream``
+    (storage-fallback path) and ``storage.load_messages`` through
+    ``asyncio.to_thread``; pre-lift coord ran them inline on the
+    event loop. Long-tail message reads on a saturated console no
+    longer stall every other async handler for the duration of the
+    SQL.
+
+  Pydantic schemas: ``CoordinatorDetailResponse`` and
+  ``CoordinatorHistoryResponse`` removed; both folded into
+  ``WorkstreamDetailResponse`` / ``WorkstreamHistoryResponse`` on
+  the shared ``server_schemas.py`` (mirrors the list lift's pattern
+  for ``WorkstreamInfo``). Both server and console OpenAPI specs
+  reference the unified schemas; ``server_spec.py`` gains
+  ``EndpointSpec`` entries for the new interactive endpoints. TS
+  SDK gains ``WorkstreamDetailResponse`` / ``WorkstreamHistoryResponse``
+  interfaces in ``sdk/typescript/src/types.ts``;
+  ``openapi-{server,console}.json`` regenerated.
+  ``GET /v1/api/workstreams/{ws_id}/history`` is the only verb
+  whose lifted body keeps a kind-aware storage fallback (via
+  ``cfg.list_kind``); ``detail`` defers cross-kind isolation to
+  ``mgr.open()`` itself.
+
+- **`list` / `saved` verb bodies lifted across both kinds** ([Stage 2
+  Verb Lift — `list` / `saved`]). The interactive
+  ``GET /v1/api/workstreams`` + ``GET /v1/api/workstreams/saved``
+  and coord ``GET /v1/api/workstreams`` + ``GET /v1/api/workstreams/saved``
+  handlers now share two factory bodies via
+  ``make_list_handler(cfg)`` and ``make_saved_handler(cfg)``. Four
+  new ``SessionEndpointConfig`` fields capture the per-kind
+  divergence:
+
+  - ``list_resolve_titles: ListResolveTitles | None`` — interactive
+    wires :func:`turnstone.core.memory.get_workstream_display_names`
+    (new bulk helper added on the storage layer + ``memory.py``)
+    so the active-list endpoint resolves every user-set alias in
+    ONE ``SELECT ... WHERE ws_id IN (...)`` instead of the pre-lift
+    per-row N+1. Coord wires ``None`` (no alias surface today).
+  - ``list_kind: WorkstreamKind | None`` — required storage-side
+    kind classifier passed to ``list_workstreams_with_history``.
+    Interactive wires ``WorkstreamKind.INTERACTIVE``; coord wires
+    ``WorkstreamKind.COORDINATOR``. Distinct from
+    ``audit_action_prefix`` (audit-action namespacing) so adding a
+    third kind doesn't have to overload the audit prefix as a
+    classifier; missing value surfaces as 500 with a clear log
+    line rather than silently filtering for the wrong kind.
+  - ``saved_state_filter: str | None`` — coord wires ``"closed"``
+    so only explicitly-closed coordinators surface in the
+    saved-card grid. Interactive wires ``None`` (the storage
+    layer already excludes ``state='deleted'`` tombstones).
+  - ``saved_loaded_lookup: SavedLoadedLookup | None`` — coord-only
+    defence-in-depth filter that excludes ws_ids currently in the
+    in-memory pool (a row can be ``state='closed'`` for a few
+    seconds while the close-emit sequence races the in-memory pop).
+    Interactive wires ``None``.
+
+  Five observable behaviour changes (all documented per kind):
+
+  - **Active-list top-level key converges on ``"workstreams"``.**
+    Pre-lift coord returned ``{"coordinators": [...]}``; the lifted
+    body returns ``{"workstreams": [...]}`` for response-shape
+    parity with interactive. Coord is a 1.5.0aN-only surface — never
+    shipped stable — so SDK / frontend consumers swap once and
+    there's no compat shim or fallback (the convergence MUST land
+    before v1.5.0 stable per
+    ``project_unification_before_stable.md``).
+  - **Saved-list top-level key converges on ``"workstreams"``.**
+    Same shape change as the active list, applied to
+    ``GET /v1/api/workstreams/saved`` on coord. Coord-only surface;
+    no compat shim.
+  - **Active-list row key renames ``"id"`` → ``"ws_id"``** on
+    interactive. Pre-lift interactive used the bare ``id`` field
+    while every other shared verb on this surface (cancel, open,
+    events, create, saved-list) uses ``ws_id``. Convergence
+    eliminates the internal inconsistency. Frontend consumers
+    reading ``ws.id`` from the active-list response swap to
+    ``ws.ws_id``. Interactive HAS shipped stable across 1.0 / 1.3 /
+    1.4, but the active-list endpoint is consumed by the bundled
+    JS only — there's no external SDK on those stable lines reading
+    the field. Browser-cache staleness is bounded by normal
+    static-asset reload on next page load.
+  - **Active-list row gains always-include fields.** ``user_id``
+    was coord-only; ``kind`` + ``parent_ws_id`` were
+    interactive-only. Both kinds now populate all three.
+    ``parent_ws_id`` defaults to ``None`` for coord (coordinators
+    have no parent).
+  - **Storage / manager-lock work moved off the event loop on
+    interactive.** The lifted ``saved`` body always uses
+    ``asyncio.to_thread`` for ``list_workstreams_with_history``;
+    pre-lift interactive ran it inline (correlated COUNT subquery
+    can stall every other async handler on a cluster with thousands
+    of saved rows). Coord already used ``to_thread`` (perf-2 from
+    the saved-coordinators review); convergence lifts interactive
+    up. The active-list body also moves ``mgr.list_all`` +
+    per-row title resolution off the event loop on both kinds.
+
+  Pydantic schemas: ``WorkstreamInfo.id`` renamed → ``ws_id``,
+  ``WorkstreamInfo.user_id`` field added. ``CoordinatorInfo`` and
+  ``CoordinatorListResponse`` removed (folded into the unified
+  ``WorkstreamInfo`` / ``ListWorkstreamsResponse``); ``console_spec``
+  active-list endpoint now points at ``ListWorkstreamsResponse``.
+  OpenAPI spec snapshots regenerated.
+
+  ``GET /v1/api/dashboard`` is **not** in the lift's scope and
+  still returns rows keyed on ``id``. A separate cleanup PR will
+  converge the dashboard row shape with the rest of the v1 surface.
+
+- **`SessionManager.create` gains a deferred-emit option; lifted
+  ``create`` HTTP handler eliminates the phantom create→close
+  pair on coord rollback.** ``SessionManager.create`` now accepts
+  ``defer_emit_created: bool = False`` (default preserves the
+  legacy "advertise immediately" contract for direct callers); two
+  new methods complete the deferred-create bracket:
+  - ``SessionManager.commit_create(ws)`` fires the deferred
+    ``emit_created`` event after the caller's post-create work
+    confirms the workstream should be advertised.
+  - ``SessionManager.discard(ws_id)`` releases the in-memory slot
+    + cleans up the UI WITHOUT firing ``emit_closed`` — the
+    workstream's existence was never advertised, so there's
+    nothing to advertise on rollback. Storage-row deletion stays
+    a separate concern (caller invokes ``delete_workstream`` for
+    a complete rollback), mirroring ``mgr.create``'s split between
+    slot reservation and ``register_workstream``. Logs a
+    ``warning`` (``session_mgr.discard.after_emit_created``) when
+    invoked on a workstream that's already been advertised
+    (non-deferred create or post-``commit_create``); the slot is
+    still released so capacity isn't stranded, but the warning
+    surfaces the caller-bug case where ``close`` would have been
+    the right call.
+
+  The lifted ``make_create_handler`` now uses this bracket: pass
+  ``defer_emit_created=True``, validate uploaded attachments, then
+  ``mgr.commit_create(ws)`` on success / ``mgr.discard(ws.id)`` on
+  failure. Pre-fix, coord's ``mgr.create`` fired ``emit_created``
+  synchronously — a rollback then called ``mgr.close`` which
+  fired ``emit_closed``, surfacing a quick create→close pair on
+  the cluster events stream that the collector's diff-reconcile
+  had to handle. Post-fix, a rejected upload produces zero
+  events. Interactive's ``emit_created`` is a documented no-op
+  stub so the deferral is observably a no-op there; the
+  ``ws_created`` broadcast on the global SSE queue continues to
+  fire from the kind's post_install callback after attachment
+  validation passes (unchanged).
+
+  Direct callers of ``mgr.create`` (test fixtures, the CLI REPL,
+  channel adapters) keep the default ``defer_emit_created=False``
+  and see no behaviour change.
+
+- **Coordinator HTTP surface unified under `/v1/api/workstreams/`**
+  ([Stage 2 Priority 0]). The experimental `/v1/api/coordinator/*`
+  URL tree from 1.5.0aN is removed; coord verbs now mount at the
+  same shape as interactive workstreams via a shared route
+  registrar (`turnstone.core.session_routes`). Path mapping:
+
+  | Was (1.5.0aN)                                    | Now                                              |
+  |--------------------------------------------------|--------------------------------------------------|
+  | `POST /v1/api/coordinator/new`                   | `POST /v1/api/workstreams/new`                   |
+  | `GET  /v1/api/coordinator`                       | `GET  /v1/api/workstreams`                       |
+  | `GET  /v1/api/coordinator/saved`                 | `GET  /v1/api/workstreams/saved`                 |
+  | `GET  /v1/api/coordinator/{ws_id}`               | `GET  /v1/api/workstreams/{ws_id}`               |
+  | `POST /v1/api/coordinator/{ws_id}/{verb}`        | `POST /v1/api/workstreams/{ws_id}/{verb}`        |
+
+  Permission scopes, request / response bodies, and SSE event shapes
+  are unchanged. Callers on the experimental 1.5.0aN coord SDK must
+  swap their URL prefix; the legacy paths are gone with no compat
+  shim. Stable releases (1.0 / 1.3 / 1.4) never exposed
+  `/v1/api/coordinator/`, so this change is a no-op for anyone
+  upgrading from a stable line.
+
+  Two handler bodies (`approve`, `close`) lifted into the shared
+  registrar with kind branching behind `SessionEndpointConfig` —
+  both kinds share one implementation per verb. Two related
+  behavior changes on the interactive close path:
+
+  - `mgr.close()` race-loss returns 404 (was 500 on coord;
+    "popped between .get() and .close()" is a not-found semantic,
+    not a server error).
+  - Audit-write failures (`record_audit` raising on the storage
+    write) are now caught and logged at `warning` level; the close
+    still returns 200. Previously the interactive path let the
+    exception propagate as HTTP 500. Coord previously already
+    swallowed; convergence is intentional — operators monitor the
+    `ws.close.audit_failed` log line in both kinds the same way.
+
+  Other shared verbs (`send`, `cancel`, `open`, `events`, `create`,
+  `list`, `saved`, `history`, `detail`) keep their per-kind
+  handlers — body convergence for those requires SessionManager-
+  side refactors (e.g. Priority 1's worker-dispatch unification
+  for `send`) or coordinated frontend changes (response-shape
+  unification for `list` / `saved`) that fall outside Priority 0
+  scope.
+
+- **TypeScript SDK bumped to 0.4.0** to flag the URL change for any
+  1.5.0aN-era consumer of the experimental coord client. The
+  `openapi-{server,console}.json` reference specs ship with the
+  unified path tree.
+
+- **Worker dispatch unified across interactive + coordinator**
+  ([Stage 2 Priority 1]). The atomic check-and-(spawn-or-queue)
+  decision for ``ChatSession.send`` now lives in
+  ``turnstone.core.session_worker.send`` and is shared by both
+  paths. Interactive ``/v1/api/send``, the coordinator adapter, the
+  watch-result dispatch, the rewind/retry path, and the
+  initial-message-on-create path all gate on
+  ``Workstream._worker_running`` (set/cleared atomically under
+  ``ws._lock``) instead of ``Thread.is_alive()`` — closes a race
+  where two senders could spawn parallel workers on the same
+  ChatSession.
+
+  The ``/send`` HTTP body itself stays per-kind in this PR.
+  Verb-shape convergence (one shared factory body with capability
+  flags for attachments / queue priorities / metric increments) is
+  tracked as P1.5 and MUST land before 1.5.0 stable — letting the
+  fork ship into the stable line bakes the duplication in for the
+  lifetime of the 1.5 track.
+
+- **`/send` body lift + coordinator attachments + queue surface
+  parity** ([Stage 2 Priority 1.5]). The ``/send`` HTTP handler is
+  now ONE factory body (``make_send_handler(cfg)``) wired with
+  capability flags on both kinds; the four attachment endpoints
+  (``upload`` / ``list`` / ``get_content`` / ``delete``) are also
+  unified via ``make_attachment_handlers(cfg)``. Coord workstreams
+  light up:
+
+  - ``POST/GET /v1/api/workstreams/{ws_id}/attachments``,
+    ``GET .../attachments/{aid}/content``,
+    ``DELETE .../attachments/{aid}`` — same shape, same caps, same
+    reservation flow as interactive.
+  - ``POST /v1/api/workstreams/{ws_id}/send`` accepts
+    ``attachment_ids`` (or auto-consumes pending) and returns
+    ``attached_ids`` / ``dropped_attachment_ids`` for surfacing
+    partial reservations. Live-worker reuse path also returns
+    ``priority`` / ``msg_id`` (parity with the interactive
+    ``status: queued`` shape).
+
+  Backend parity is end-to-end: storage layer was already
+  kind-agnostic; the route registrar's ``AttachmentHandlers`` slot
+  has been there since Stage 2 P0; the multi-node attachment
+  routing-proxy on the console (``route_attachment_proxy``) was
+  already shipping. P1.5 is the wiring + verb-shape lift that lets
+  these primitives surface on the coord side.
+
+  Coord dashboard rendering surfaces an attachment-count badge on
+  past messages with attachments; full chip rendering with
+  click-to-view is deferred (the coord dashboard is
+  diagnostic-leaning and chip parity isn't on the critical path
+  for the unification thesis). Python SDK adds
+  ``coordinator_send`` / ``coordinator_upload_attachment`` /
+  ``coordinator_list_attachments`` /
+  ``coordinator_get_attachment_content`` /
+  ``coordinator_delete_attachment`` on
+  ``AsyncTurnstoneConsole`` + ``TurnstoneConsole``. TS SDK
+  regenerated; bumped to 0.5.0.
+
+  Three lifted helpers (``sniff_image_mime``,
+  ``classify_text_attachment``, ``upload_lock``) moved from
+  ``turnstone/server.py`` to ``turnstone/core/attachments.py`` so
+  both processes use the canonical implementation. The interactive
+  surface keeps the same behaviour; the helpers are simply
+  imported from their new home.
+
+  ``coordinator_send`` no longer returns ``429`` on a full worker
+  queue — the unified body returns ``200 {"status": "queue_full"}``
+  for parity with interactive. Existing callers checking for ``429``
+  should switch to the status-code shape.
+
+  Coord ``GenerationCancelled`` now emits ``state=idle`` +
+  ``stream_end`` (parity with interactive); pre-P1.5 a cancel-killed
+  coord worker would have terminated silently with no state event.
+  Cluster fanout / alerting keyed on ``state=error`` for cancelled
+  coord workers should switch to monitoring ``stream_end`` /
+  ``state=idle`` together.
+
+- **`SessionKindAdapter` Protocol split into construction +
+  emission** ([Stage 2 Priority 3]). The adapter Protocol now covers
+  only what every kind must implement (``kind`` / ``build_ui`` /
+  ``build_session`` / ``cleanup_ui``); the four lifecycle emit
+  methods (``emit_created`` / ``emit_state`` / ``emit_rehydrated`` /
+  ``emit_closed``) move to a separate ``SessionEventEmitter``
+  Protocol wired through a new optional
+  ``event_emitter: SessionEventEmitter | None`` kwarg on
+  ``SessionManager``. Both production adapters (interactive on
+  ``server.py``, coordinator on ``console/server.py``) implement
+  both Protocols and are passed as both ``adapter`` and
+  ``event_emitter`` at lifespan-construction time, so production
+  behavior is unchanged. The interactive adapter's three
+  ``emit_created`` / ``emit_state`` / ``emit_rehydrated`` methods
+  remain documented no-op stubs (those events fire from out-of-band
+  paths — the create handler enqueues ``ws_created`` after
+  attachment validation, ``WebUI._broadcast_state`` emits
+  ``ws_state``); ``emit_closed`` stays load-bearing as the sole
+  transport path for ``ws_closed`` onto the global SSE queue.
+
+- **`cancel` verb body lifted across both kinds** ([Stage 2 Verb
+  Lift — `cancel`]). The interactive ``/v1/api/cancel`` and coord
+  ``/v1/api/workstreams/{ws_id}/cancel`` handlers now share one
+  body via ``make_cancel_handler(cfg, *, audit_emit=None)``;
+  per-kind divergence captured by a new
+  ``cancel_forensics: CancelForensics | None`` field on
+  ``SessionEndpointConfig`` (interactive wires
+  ``_capture_cancel_forensics``; coord wires ``None``).
+  Three observable behaviour changes for coord callers:
+
+  - **Coord cancel now accepts a ``force`` flag.** Same shape as
+    interactive: posting ``{"force": true}`` abandons the worker
+    thread and emits ``stream_end`` so a stuck coord generation
+    can be recovered without waiting for the daemon thread to
+    exit. Pre-lift coord ignored ``force``.
+  - **Coord cancel response always includes ``"dropped"``.**
+    Pre-lift coord returned bare ``{"status": "ok"}``; the lifted
+    body returns ``{"status": "ok", "dropped": {}}`` (always-include
+    parity with interactive). SDK consumers don't need to branch
+    on kind to read ``dropped``.
+  - **Coord cancel returns 400 when the workstream's session is
+    ``None``.** Pre-lift coord called ``coord_mgr.cancel`` which
+    silently no-op'd on a placeholder/build-failed workstream; the
+    lifted body 400s with ``{"error": "No session"}`` for parity
+    with interactive's pre-existing branch.
+
+  Two observable changes for interactive (asymmetric — coord
+  pre-lift already had this behaviour):
+
+  - ``resolve_plan`` now runs on every cancel (previously gated
+    on ``was_running``). ``resolve_plan`` has an internal
+    ``_pending_plan_review is None`` guard, so the call is no-op
+    when no plan review is pending. Lift gives interactive coord's
+    pre-lift recovery path: a stuck plan-pending state from a
+    crashed worker can be cleared via ``cancel`` instead of
+    requiring a workstream close + rehydrate.
+  - ``resolve_approval`` runs on every cancel **only when
+    ``ui._pending_approval is not None``** (the lifted body gates
+    the call). ``resolve_approval`` is not idempotent — it always
+    broadcasts ``approval_resolved`` and overwrites
+    ``_approval_result`` — so the gate prevents a stale resolution
+    event from leaking on idle cancels while preserving the recovery
+    path when an approval really is pending.
+
+  Coord ``coordinator.cancel`` audit detail now includes ``force``
+  so operator-driven recovery is distinguishable from a routine
+  cancel in the audit log.
+
+  Three /review fixes folded into the same commit:
+
+  - **No more stale ``approval_resolved`` SSE event on idle cancel.**
+    The lifted body's ``resolve_approval`` call is now gated on
+    ``ui._pending_approval is not None``. Pre-fix, the unconditional
+    call would broadcast a phantom ``approval_resolved`` to every
+    SSE listener even when no prompt was pending — listener UIs
+    that key on the event would dismiss prompts they didn't have.
+  - **Force-cancel now clears ``_worker_running`` alongside
+    ``worker_thread``.** Previously the force path left the half-
+    state ``(_worker_running=True, worker_thread=None)``, which
+    routed any follow-up ``send`` through the queue-enqueue path
+    onto the abandoned worker (where the cancel flag short-circuits
+    the queue-drain seam, leaving the message orphaned until the
+    next spawn). Restores the
+    ``(worker_thread, _worker_running)`` invariant
+    ``session_worker.send`` documents.
+  - **``coordinator_stop_cascade`` now treats child cancel
+    ``400 + "No session"`` as ``skipped``** (was previously
+    ``failed``). Lifted coord cancel returns 400 on placeholder /
+    build-failed children — matching the pre-lift outcome where
+    those children were silently no-op'd, so the cascade response's
+    ``failed`` bucket no longer fires spurious operator alerts.
+
+- **`open` verb body lifted across both kinds** ([Stage 2 Verb
+  Lift — `open`]). The interactive
+  ``POST /v1/api/workstreams/{ws_id}/open`` and coord
+  ``POST /v1/api/workstreams/{ws_id}/open`` handlers now share one
+  body via ``make_open_handler(cfg, *, audit_emit=None)``. Per-kind
+  divergence captured by two new ``SessionEndpointConfig`` fields:
+
+  - ``open_resolve_alias: AliasResolver | None`` — interactive
+    wires :func:`turnstone.core.memory.resolve_workstream` so
+    callers can pass user-friendly aliases ("my-debug-ws") in the
+    path param. Coord wires ``None`` (hex ids only).
+  - ``open_post_load: OpenPostLoad | None`` — interactive wires the
+    UI-replay (``clear_ui`` + history) + handler-side ``ws_created``
+    enqueue onto the global SSE queue. Coord wires ``None`` and
+    relies on the cluster collector fan-out from
+    ``CoordinatorAdapter.emit_rehydrated``.
+
+  **Load-bearing fix** (§ Post-P3 reckoning item #3): interactive
+  ``open_workstream`` previously called
+  ``mgr.create(ws_id=resolved_id)`` + ``ws.session.resume(...)`` to
+  rehydrate, bypassing ``mgr.open()`` entirely. After the lift both
+  kinds route through ``mgr.open()`` — which makes
+  ``InteractiveAdapter.emit_rehydrated`` reachable on interactive
+  (it had been dead-by-routing) and gives the manager a single
+  rehydrate code path to maintain. ``emit_rehydrated`` stays a
+  documented no-op stub on the interactive adapter (the
+  handler-side ``ws_created`` enqueue from ``open_post_load`` is
+  the load-bearing emission).
+
+  Two observable behaviour changes for interactive callers:
+
+  - **Cross-kind open returns 404** (was 400). Pre-lift had a
+    pre-mgr storage probe that returned ``400`` with
+    ``"Workstream is not an interactive kind"`` for coord rows;
+    the lift consolidates on ``mgr.open()``'s single ``None``-
+    return contract for missing / wrong-kind / tombstoned rows.
+    Security boundary unchanged.
+  - **Already-loaded response uses ``ws.name`` directly** (was
+    ``get_workstream_display_name(resolved_id) or resolved_id``).
+    A workstream renamed via ``set_workstream_alias`` after being
+    loaded into memory will surface the storage-row name in the
+    open response's ``name`` field instead of the latest alias.
+    The dashboard listing endpoint still resolves aliases on its
+    own pass, so the user-visible workstream name in the tab strip
+    isn't affected.
+
+  Coord behaviour unchanged.
+
+  Two /review fixes folded into the same commit:
+
+  - **Resume failures now return 5xx instead of broken-200.**
+    ``SessionManager.open()`` previously caught and ``log.debug``-
+    swallowed exceptions from ``ChatSession.resume`` (which assigns
+    ``self.messages`` *before* the config-restore block, so a
+    partial-failure resume — corrupted ``workstream_config`` row,
+    model-registry mismatch on a saved alias, malformed
+    ``temperature`` / ``max_tokens`` — would leave the session with
+    history but with default config). Pre-lift, the interactive
+    open handler called ``ws.session.resume(...)`` directly and let
+    exceptions propagate as 500. The lift accidentally inherited
+    the swallow because it routed through ``mgr.open()``. Restored
+    pre-lift behaviour: ``mgr.open()`` now re-raises resume
+    exceptions after rolling back the slot (``cleanup_ui`` +
+    ``_remove_locked``), so the lifted handler returns 500 with
+    a correlation id and the storage row stays available for a
+    retry instead of silently 200'ing with broken state.
+  - **``except Exception`` in the lifted body documents intent.**
+    The bare exception catch around ``mgr.open(ws_id)`` is
+    intentional — the kind's session factory has no documented
+    exception spec, and resume can propagate from
+    ``ChatSession.resume``. A one-line rationale comment in the
+    handler body keeps a future contributor from narrowing it
+    incorrectly.
+
+- **`events` verb body lifted across both kinds** ([Stage 2 Verb
+  Lift — `events`]). The interactive
+  ``GET /v1/api/events?ws_id=...`` and coord
+  ``GET /v1/api/workstreams/{ws_id}/events`` SSE handlers now
+  share one body via ``make_events_handler(cfg)``. Per-kind
+  divergence captured by a new
+  ``events_replay: EventsReplay | None`` cfg field — a Protocol-
+  typed callback yielding the kind-specific initial replay
+  payload that the lifted body iterates and sends as ``data:``
+  lines before starting the live event loop. Interactive's
+  ``_interactive_events_replay`` yields the pre-lift sequence
+  (``connected`` + ``status`` + ``history`` + ``pending_approval``
+  + cached intent verdicts + ``pending_plan_review``); coord's
+  ``_coord_events_replay`` yields just ``pending_approval`` +
+  ``pending_plan_review`` (matches pre-lift coord behaviour).
+
+  The legacy interactive query-keyed URL is preserved via a new
+  ``make_legacy_query_keyed_adapter`` helper (sister to
+  ``make_legacy_body_keyed_adapter`` from earlier lifts) — it
+  reads ``ws_id`` from the query string and splices into
+  ``request.path_params`` before delegating to the lifted body.
+  ``GET /v1/api/events?ws_id=...`` continues to work for any 1.x
+  SDK consumer.
+
+  Two convergence wins:
+
+  - **Coord gains SSE connect/disconnect metrics.** Pre-lift
+    coord didn't record per-stream metrics; the lifted body
+    always calls ``metrics.record_sse_connect()`` /
+    ``...disconnect()``, giving the cluster dashboard the same
+    per-stream observability interactive's had since 1.0.
+  - **Both kinds now check ``request.is_disconnected()`` AND
+    the ``ws_closed`` event** to terminate. Pre-lift interactive
+    relied solely on ``ws_closed`` (which never fires if the
+    client just goes away without closing the workstream);
+    pre-lift coord relied solely on ``is_disconnected``. The
+    lifted body uses both — whichever fires first wins.
+
+  One observable shape change for coord callers: the lifted body
+  returns 409 ``"session has no UI"`` when ``ws.ui`` is missing
+  (placeholder / build-failed UI), matching pre-lift coord.
+  Pre-lift interactive returned 404 in this case; the lift
+  converges on 409 across kinds because the workstream EXISTS
+  (404 would imply it doesn't).
+
+  **Item #2 from § Post-P3 reckoning split out** of this lift
+  during scoping (rich ``ws_state`` payload parity for coord —
+  lifting coord's ``ConsoleCoordinatorUI`` to broadcast
+  ``tokens + context_ratio + activity + content`` like
+  ``WebUI._broadcast_state`` does). The body lift touches
+  ``session_routes.py`` + ``server.py`` + ``console/server.py``;
+  the rich-payload work touches ``coordinator_ui.py`` +
+  ``collector.py`` + ``session_ui_base.py`` (different files,
+  different reviewer concern). Tracked as standalone follow-up
+  ``feat/coord-rich-ws-state-payload``.
+
+  Two /review fixes folded into the same commit:
+
+  - **Restored interactive's dedicated SSE thread pool.** The
+    initial draft of ``make_events_handler`` used
+    ``asyncio.to_thread`` (default executor, capped at
+    ``min(32, cpu_count + 4)``) for the per-connection
+    ``client_queue.get`` blocking wait. Pre-lift interactive used
+    a dedicated 200-thread ``sse_executor`` (created in the
+    lifespan with ``thread_name_prefix="sse"``) precisely to
+    avoid this — under high concurrent SSE counts the default
+    pool starves and SSE polling contends with every other
+    ``asyncio.to_thread`` caller in the process (storage, router,
+    audit). Restored isolation via a new
+    ``sse_executor_lookup: SseExecutorLookup | None`` cfg field;
+    interactive returns ``request.app.state.sse_executor``, coord
+    wires ``None`` and falls through to the default executor.
+  - **Restored 5s queue.get poll** (was shortened to 1s in the
+    initial draft). The 5x wakeup-rate bump compounded the thread-
+    pool starvation; the ``request.is_disconnected()`` probe
+    between polls already covers cancel-detection latency the
+    timeout would otherwise gate.
+  - **Replay phase streams events directly from the generator
+    instead of pre-building into a list.** The initial draft
+    materialised the entire kind-specific replay payload
+    (``connected`` + ``status`` + ``history`` + pending prompts)
+    into a list before constructing the ``EventSourceResponse``,
+    delaying time-to-first-byte until the heaviest replay event
+    (``_build_history`` for long-running interactive workstreams)
+    finished serialising AND letting the per-UI listener queue
+    accumulate over its 500-slot cap on a chatty mid-generation
+    workstream. The lifted body now iterates ``cfg.events_replay``
+    inside the async generator so each event ships as soon as the
+    callback yields it; the existing observational-failure swallow
+    semantics are preserved by wrapping the iteration in the same
+    try/except.
+
+- **`create` verb body lifted across both kinds** ([Stage 2 Verb
+  Lift — `create`]). The interactive
+  ``POST /v1/api/workstreams/new`` and coord
+  ``POST /v1/api/workstreams/new`` handlers now share one body via
+  ``make_create_handler(cfg, *, audit_emit=None)``. Per-kind
+  divergence captured by five new ``SessionEndpointConfig`` fields:
+
+  - ``create_supports_attachments: bool`` — multipart body parsing
+    + attachment validation+save+rollback. Both kinds wire ``True``.
+  - ``create_supports_user_id_override: bool`` — trusted-source
+    body ``user_id`` override (interactive ``True`` for console-
+    proxied creates; coord ``False``).
+  - ``create_validate_request: CreateRequestValidator | None`` —
+    per-kind pre-create gates (interactive: ws_id format, kind,
+    parent ownership, attachments+resume_ws combo; coord: 401-on-
+    empty-uid).
+  - ``create_build_kwargs: CreateKwargsBuilder | None`` — per-kind
+    kwargs dict for ``mgr.create``.
+  - ``create_post_install: CreatePostInstall | None`` — per-kind
+    tail end (interactive: WebUI auto_approve + watch_runner +
+    ``ws_created`` global broadcast + atomic resume + skill session
+    config + notify_targets + routing override + initial-message
+    worker thread; coord: ``coord_adapter.send`` for the optional
+    initial_message).
+
+  The pure helper ``_validate_and_save_uploaded_files`` lifted from
+  ``turnstone.server`` to ``turnstone.core.attachments`` as
+  ``validate_and_save_uploaded_files`` so both processes can call
+  the same kind-agnostic implementation.
+
+  **§ Post-P3 reckoning item #1 done — coord gains create-time
+  attachments.** Pre-lift ``coordinator_create`` accepted JSON only
+  and ignored uploads; the lifted body parses ``multipart/form-data``
+  on coord and saves attachments through the kind-agnostic storage
+  layer. ``CoordinatorAdapter.send`` gained optional
+  ``attachments`` + ``send_id`` kwargs so when a create request
+  carries both ``initial_message`` and uploads, the attachments
+  are reserved onto the dispatched first turn — the worker's
+  ``ChatSession.send(..., send_id=...)`` consumes them on dequeue
+  exactly the way interactive's create-with-attachments worker
+  thread does. The ``send_id`` reservation token soft-locks the
+  rows, and the adapter's failure path unreserves so a worker
+  crash returns them to pending. The pure helper
+  ``_reserve_and_resolve_attachments`` lifted from ``server.py``
+  to ``turnstone.core.attachments`` as
+  ``reserve_and_resolve_attachments`` so both kinds call one
+  kind-agnostic implementation.
+
+  Note on broadcast timing: coord's ``mgr.create`` fires
+  ``emit_created`` (cluster collector fan-out) BEFORE the lifted
+  body runs attachment validation. If validation fails on coord and
+  the rollback (``mgr.close`` → ``emit_closed``) fires, the cluster
+  events stream sees a phantom create→close pair. Cluster consumers
+  handle this gracefully (same shape as any quick-create-close);
+  decoupling ``emit_created`` from ``mgr.create`` would be a bigger
+  refactor that doesn't belong in the verb lift. Interactive's
+  broadcast (``gq.put_nowait("ws_created")``) is held until after
+  attachment validation by the post-install callback, so interactive
+  never sees the phantom pair.
+
+  Five observable behaviour changes on the create response:
+
+  - **Both kinds converge on 200 OK.** Pre-lift interactive
+    returned 200 (default JSONResponse status); pre-lift coord
+    returned 201. Picked 200 over 201 for response-shape parity
+    with every other shared verb at the cost of REST-strict
+    correctness — a one-time release note rather than ongoing
+    client churn (the rest of the v1 SDK already uses
+    ``response.ok`` per ``feedback_test_frontend_locally.md``).
+    SDK consumers that branched on ``status == 201`` for coord
+    must switch to ``response.ok``.
+  - **Always-include response shape.** Pre-lift interactive
+    returned ``{ws_id, name, resumed, message_count, attachment_ids}``
+    (5 fields); pre-lift coord returned ``{ws_id, name}`` (2). The
+    lifted body always returns the full shape, with ``resumed=False``
+    / ``message_count=0`` / ``attachment_ids=[]`` on kinds whose
+    post-install doesn't populate them. Coord callers will see the
+    parity fields appear with default values.
+  - **Both kinds converge on the manager-at-capacity 429
+    semantic.** Pre-lift interactive translated ``mgr.create``'s
+    ``RuntimeError`` to 400; coord already translated to 429. The
+    documented contract on ``SessionManager.create`` is "raises
+    RuntimeError when the manager is at capacity" — 429 (rate-
+    limit / try-later) is the correct shape.
+  - **Both kinds converge on the factory-misconfig 503 semantic.**
+    Pre-lift interactive let ``ValueError`` propagate as 500 with
+    a stack trace; coord already translated to 503 with the
+    factory's remediation text. Operators get the actionable
+    message instead of the trace.
+  - **Both kinds get a correlation_id'd 500 on unexpected
+    ``mgr.create`` failure.** Pre-lift interactive let unexpected
+    exceptions propagate as 500 with a stack trace (potential
+    information leak via frame names / file paths); coord already
+    returned a correlation_id'd 500 with the message redacted. The
+    lifted body adopts coord's safer pattern on both kinds.
+
+  Two coord-specific parity gains:
+
+  - **Coord rejects disabled skills.** Pre-lift
+    ``coordinator_create`` silently allowed disabled skills to
+    flow through to ``mgr.create`` — the row would create with a
+    skill the operator had marked inert, surprising both the
+    operator and the next user. The lifted body returns 400
+    "Skill not found or disabled" matching interactive's
+    behaviour.
+  - **Coord audit-emit failures no longer 500.** Pre-lift
+    ``coordinator_create`` already swallowed; pre-lift interactive
+    let the failure propagate as 500. The lifted body wraps
+    ``audit_emit`` in try/except + ``warning`` log, returning the
+    successful 200 to the caller. Mirrors the close / cancel /
+    open / events lift contracts.
+
+  No legacy adapter is needed for create — both kinds already
+  mounted ``POST {prefix}/new`` pre-lift; the lifted handler slots
+  in at the same path on each kind.
+
+  Three /review fixes folded into the same commit:
+
+  - **Pre-lift's 400 on malformed ``notify_targets`` preserved.** The
+    initial draft surfaced ``notify_targets`` validation errors from
+    inside the interactive ``post_install`` callback, which the
+    factory had no return-the-400 channel for — the only signal was
+    to ``raise``, which the factory's generic exception handler
+    turned into a redacted 500. Worse, by the time ``post_install``
+    ran the workstream was fully built (audit row written,
+    ``ws_created`` broadcast emitted), so a malformed-input request
+    surfaced as "create failed" with the workstream actually live.
+    Fixed by moving the ``notify_targets`` validation into
+    :func:`_interactive_create_validate_request` (the pre-create
+    gate), which returns the 400 before ``mgr.create`` runs and
+    keeps storage clean. New regression test:
+    ``test_create_lift_400s_on_malformed_notify_targets``.
+  - **Skill-lookup storage failure now correlation_id'd.** The
+    initial draft swallowed ``get_skill_by_name`` exceptions into
+    ``skill_data = None`` and returned a 400 "Skill not found or
+    disabled" — masking storage outages as user-input misses and
+    making operator triage of skill-related reports impossible. The
+    lifted body now lets the storage exception propagate to the
+    same correlation_id'd 500 path that ``mgr.create`` failures
+    use; the skill-lookup + version count + ``mgr.create`` all live
+    inside one ``try / except`` so storage outages anywhere in the
+    create-prelude get the redacted-message-with-correlation-id
+    treatment instead of a stack-traced 500 leak.
+  - **Whitespace-only ``skill`` field treated as empty.** The
+    initial draft took ``body.get("skill") or ""`` literally — a
+    payload with ``"skill": "  "`` would have hit
+    ``get_skill_by_name(" ")`` and 400'd as "Skill not found".
+    Pre-lift coord stripped via ``(body.get("skill") or "").strip()
+    or None``; the lifted body now strips for both kinds (interactive
+    never received whitespace-only skills from the web UI but the
+    convergence is the safer default).
+  - **Canonical skill name persisted to ``mgr.create``.** The initial
+    draft's ``_interactive_create_build_kwargs`` /
+    ``_coord_create_build_kwargs`` passed the raw ``body["skill"]``
+    through, so a whitespace-padded request would have persisted
+    ``"  my-skill "`` even though the lookup was done on the
+    stripped name. The build_kwargs callbacks now thread
+    ``skill_data["name"]`` (the resolved row's canonical name) so
+    the persisted ``Workstream.skill`` matches the row that was
+    actually applied — keeps later session-side ``skill`` lookups
+    working regardless of how dirty the inbound payload was.
+
+- **Coordinator scratchpad tool renamed: ``task_list`` → ``tasks``.**
+  The tool name on the LLM-facing schema, the audit event name
+  (``task_list.update`` → ``tasks.update``), the SSE
+  ``tool_result`` event name (the coord-tree UI keys
+  ``ev.name === "tasks"`` for /tasks-refetch debounce), and the
+  log tag (``task_list.corrupt_envelope`` → ``tasks.corrupt_envelope``)
+  all switch together. Operators with audit dashboards / SIEM filters
+  / log greps that pinned the old prefix should update; the rename
+  is observable on the wire, not just internal. Internal Python
+  surface follows: ``CoordinatorClient.task_list_*`` → ``tasks_*``,
+  ``ChatSession._prepare_task_list`` / ``_exec_task_list`` →
+  ``_prepare_tasks`` / ``_exec_tasks``, ``_TASK_LIST_MAX`` →
+  ``_TASKS_MAX``. The previous name compounded the bare word
+  ``task`` (which collides with chat-template channels on local
+  models — the same reason ``task_agent`` carries the suffix); the
+  plural form sidesteps the collision and is more accurate, since
+  the tool acts on the whole list rather than a single task.
+
+### Security
+
+- **Coord attachment endpoints are now kind-strict**
+  ([Stage 2 P1.5]). The coord ``attachment_owner_resolver``
+  resolves through the in-memory ``coord_mgr`` only — it does NOT
+  fall back to storage. Without this, an
+  ``admin.coordinator``-scoped caller could pass an *interactive*
+  workstream ws_id to the new coord attachment endpoints; the
+  generic ``get_workstream_owner`` storage call (kind-agnostic)
+  would resolve cleanly and grant cross-kind read / write access
+  to interactive attachments. The kind-strict resolver returns
+  404 for any ws_id not currently held by the coord manager,
+  closing the cross-kind path. Persisted-but-not-loaded
+  coordinators must be ``open``ed before their attachment endpoints
+  respond. Caught by /review pre-merge; no exploit observed.
+
+- **Workstream state writes are now buffered through ``StateWriter``.**
+  ``SessionManager.set_state`` no longer holds ``ws._lock`` across a
+  synchronous Postgres ``UPDATE`` for non-terminal transitions;
+  instead a ``StateWriter`` (constructed at app startup, started /
+  shutdown by the lifespan) coalesces transient transitions per
+  ws_id and flushes every ~1s. **Observable behavior change**:
+  transient state (``thinking`` / ``running`` / ``idle`` /
+  ``attention``) shows up in storage up to ~1s late; SSE consumers
+  see it immediately via the adapter's ``emit_state``. Terminal
+  ``ERROR`` transitions and ``close()`` write synchronously and
+  remain durable on return. The bug-3 invariant — a closed row
+  can't be resurrected by a buffered transient — is preserved by
+  ``close()`` calling ``state_writer.discard(ws_id)`` (drops
+  pending + waits for any in-flight flush) before its sync
+  ``state='closed'`` write.
+
+## [1.4.0]
+
+User-visible additions: a full attachment system (images + text documents,
+including pre-creation uploads), a unified dashboard composer, a Slack
+channel adapter, per-call plan/task model selection with an admin UI, and
+provider capability passthrough.
+
+This release introduces two forward-only schema migrations
+(`037_workstream_attachments`, `038_workstream_attachments_reserved_at`)
+that the server applies automatically on first startup against an
+existing 1.3.x database.  Both are additive; no data loss.  See
+**Database migrations** below for details.
+
+### Added
+
+- **Workstream attachments** — images (png/jpeg/gif/webp, 4 MiB cap) and
+  text documents (any `text/*` MIME, allowlisted application MIMEs, or
+  known text extensions; 512 KiB cap; UTF-8 enforced).  Magic-byte image
+  sniffing on upload; per-(ws, user) pending cap of 10.  Three-state
+  lifecycle (`pending → reserved → consumed`) with reservation tokens
+  threaded through `/v1/api/send` so queued multimodal turns can't lose
+  files to overlapping sends.  Provider-side translation: Anthropic
+  emits native document blocks; OpenAI Chat Completions inlines them as
+  escaped `<document>` text blocks; Responses API emits `input_text`
+  with the same wrapper. (#356)
+- **Attachments at workstream-creation time** —
+  `POST /v1/api/workstreams/new` accepts `multipart/form-data` (one
+  `meta` JSON field plus 0..N `file` parts).  Files are validated and
+  reserved onto the first turn before the dispatch worker fires; failure
+  rolls back the fresh workstream so no orphan rows leak.  Web UI
+  (new-workstream modal + dashboard composer), Python SDK, and
+  TypeScript SDK all gained attachment support.  Cluster routing
+  (`/v1/api/route/workstreams/{ws_id}/attachments`) extended to forward
+  multipart bodies + preserve upstream headers (CSP, Content-Disposition).
+  SDKs auto-generate `ws_id` client-side so cluster-routed callers can
+  bind the body to the owning node before it lands. (#362)
+- **Slack channel adapter** (Socket Mode) — mirrors the Discord adapter:
+  per-user channel sessions via configurable slash command, DM routing
+  without slash command, SSE event consumption, tool approval buttons
+  with per-user owner enforcement, plan-review approve / request-changes
+  modal, notification reply routing back into the workstream, and
+  session recovery after restart via persisted recoverable route keys
+  (the bot re-subscribes to existing Slack-routed workstreams when it
+  comes back).  Install with `pip install 'turnstone[slack]'`. (#355)
+- **Console admin UX support for Slack** — channel-link modal offers
+  Slack alongside Discord; skill notify-on-complete forms expose a
+  per-row channel-type dropdown (and no longer hardcode `discord`);
+  per-platform `.scope-discord` / `.scope-slack` badge classes with
+  theme-aware tokens (`--discord` / `--slack`) so light theme passes
+  WCAG AA. (#365)
+- **Per-call plan/task model selection** — `plan_model` and `task_model`
+  are now distinct from the conversation model and from each other,
+  with configurable reasoning effort per agent.  Three layers:
+  - **Backend split** (`#54dd557`) — `ModelRegistry` gains `plan_model`,
+    `task_model`, `plan_effort`, `task_effort`; per-kind overrides win
+    over the legacy `agent_model`, which still works as the single-knob
+    fallback.  `resolve_agent_alias(kind)` and `resolve_agent_effort(kind)`
+    centralise resolution.  Loader validates effort against
+    `{none, minimal, low, medium, high, xhigh, max}` with warn+drop on
+    typos.
+  - **Runtime configurability** (`#360`) — `ConfigStore` admin tab in
+    the console UI lets operators switch alias and reasoning effort per
+    agent **without restarting**.  `INHERIT_EMPTY_LABEL_KEYS` shows
+    `(inherit)` for empty effort selections — distinct from the literal
+    `none` choice which actually disables reasoning.  Routing overrides
+    apply on `/v1/api/_internal/config-reload` (admin saves), and
+    `model-reload` short-circuits when nothing changed so no in-flight
+    clients churn.
+  - **Per-call override** (`#361`) — the calling LLM can pass
+    `model="<alias>"` to `plan_agent` or `task_agent` to override the
+    operator-configured per-kind model for that one invocation.  Tool
+    descriptions list the live registered aliases (refreshed when the
+    operator hits "sync to nodes"), so the LLM always sees current
+    options.  Bad aliases return a corrective error dict listing the
+    available choices.  No whitelist — cost control is intentionally
+    ceded to the model.  Plan-retry path reuses the alias so coaching
+    reflects real model behaviour. (#360, #361)
+- **Provider capability passthrough** — resolved per-model capabilities
+  (vision, reasoning, native web search, thinking_mode, token_param,
+  etc.) flow through to provider clients via a new `capabilities`
+  parameter on `create_streaming` / `create_completion`, so feature
+  gating no longer relies on string matching and admin-UI / config.toml
+  overrides actually reach the provider.  Defensive shallow-copy in
+  `_finalize_extra_body` so callers reusing the same dict across models
+  are safe; deep-merge of `chat_template_kwargs` so operators can
+  extend instead of silently overwriting. (#352)
+- **Server compatibility layer for local model servers** — vLLM and
+  llama.cpp profiles suggest the right thinking mode and per-server
+  workarounds (`skip_special_tokens` for vLLM, `reasoning_format` for
+  llama.cpp) during model detection.  Admin UI gains structured fields
+  for server type, thinking mode, and extra body params, hidden for
+  non-local providers (openai/anthropic/google).  New `thinking_param`
+  text field surfaces the alias name (default `enable_thinking`;
+  Granite/DeepSeek use `thinking`).  Verified end-to-end against real
+  vLLM (Gemma 4 31B) and llama.cpp (Gemma 4 E4B) servers. (#352)
+- **Claude Opus 4.7 support** — `claude-opus-4-7` capability entry
+  (1M ctx, 128K output, adaptive thinking, `supports_temperature=False`,
+  `thinking_display=summarized`).  New `ModelCapabilities.thinking_display`
+  field — Opus 4.7 omits thinking by default but always sends summarized
+  blocks back through the provider boundary.  Adds `xhigh` effort level
+  to the global mapping and to Opus 4.7's `effort_levels`; admin-console
+  skill-template dropdowns gained `xhigh` and `max` options.  Reasoning
+  effort label capitalization aligned across all console dropdowns.
+  (#357 — also in 1.3.1)
+- **Dashboard composer refactor** — unified single-flow create from the
+  per-node dashboard.  Multi-line textarea + collapsible Options panel
+  (model / judge / skill) + paperclip + drag-drop / paste-image + chip
+  strip.  Submit-button label dynamically toggles between `Create`
+  (empty) and `Send` (text or attachments staged); Enter and click both
+  go through the same `dashboardSubmit()`.  Replaces the inconsistent
+  prior split where Enter created+sent raw and the button opened a
+  separate modal.  Options panel state persists in `localStorage`;
+  active non-default selections render as an inline summary chip beside
+  the Options button; drag-over shows an explicit "Drop to attach"
+  overlay.  The tab-bar `+` new-workstream modal also gained a paperclip
+  + chip strip + first-message field so the same flow is reachable from
+  both entry points. (#362, #366)
+- **Workstream attachments — orphan reservation sweep** — periodic
+  background sweep clears `reserved_for_msg_id` on rows whose
+  `reserved_at` exceeds a 1-hour threshold, self-healing reservations
+  leaked by process crashes between reserve and consume.  Backed by a
+  partial index on `(reserved_at) WHERE reserved_at IS NOT NULL` so the
+  scan stays cheap as the consumed-history grows.  Threshold tracks
+  reservation age, not upload age, so a long-pending fresh send can't
+  be racially unreserved. (#363)
+- **`SendResponse` extended** — `attached_ids`,
+  `dropped_attachment_ids`, `priority`, `msg_id` fields exposed in
+  Pydantic + TypeScript SDKs so attachment-aware clients can detect
+  partial reservations and dequeue queued messages. (#365)
+
+### Changed
+
+- **`plan_model` and `task_model` now split** from the conversation
+  model and from each other — operators who rely on a single model for
+  all three should set both `plan_model` and `task_model` explicitly in
+  their config; otherwise both default to the conversation model so
+  behaviour is unchanged. (#54dd557)
+- **Channel notify-on-complete `channel_type` is no longer hardcoded
+  in the admin UI** — operators creating notify targets through the
+  skill admin form previously got `channel_type: "discord"` regardless
+  of what they wanted.  Existing skill JSON values are unaffected; only
+  newly created targets through the form differ. (#365)
+- **Slack adapter approval previews** — capped at 600 chars per item
+  with a 2700-char total budget so multi-tool approval batches never
+  exceed Slack's 3000-char `section.text` limit.  Truncated batches
+  show a `…and N more (preview truncated)` suffix. (#365)
+- **PostgreSQL deployment image** swapped from `bitnami/pgbouncer` to
+  `edoburu/pgbouncer` to track upstream releases and reduce image size.
+  Environment variables remapped to the edoburu naming, ports updated
+  to match documented expectations, and the Kubernetes Helm Chart link
+  in the deployment docs now points at the same container.  Review
+  your helm values if you depend on `bitnami`-specific environment
+  variable conventions. (#353)
+
+### Fixed
+
+- **`plan_resolved` SSE broadcast** — when one client resolved a plan
+  approval, other clients viewing the same workstream now have the
+  approval card dismissed in sync. (#87a9af1)
+- **Slack notification reply routing** — one notification reply
+  previously pinned every later assistant response for that workstream
+  to the notification thread until the bot restarted.  Reply-route
+  override now clears on `StreamEndEvent`. (#365)
+- **Slack plan-review mrkdwn fence** — plan content containing triple
+  backticks (very common — plans often quote code) no longer breaks the
+  surrounding fence and lets later content render as live markup.  The
+  shared `_sanitize_slack_preview` helper splices a zero-width space
+  inside any ``` ``` `` sequence while keeping single backticks
+  readable. (#365)
+- **Slack-routed workstreams now load the chat-specific system prompt**
+  via `client_type="chat"`, matching Discord. (#365)
+- **`/v1/api/workstreams/new` no longer emits a phantom
+  `ws_created`/`ws_closed` SSE pair** when attachment validation
+  rejects a multipart create.  Validation runs before the broadcast so
+  failed creates are silent on dashboards. (#362)
+- **Multipart Content-Type boundary preservation** in console routing
+  proxy — `boundary=` parameter is case-sensitive and was being
+  lowercased before forwarding to the upstream node, breaking parsing
+  for clients that used mixed-case boundaries (most browsers). (#362)
+- **Local-theme contrast for new badge colors** — `.scope-discord` and
+  `.scope-slack` first shipped with raw hex that failed WCAG AA on
+  light theme (1.8:1 / 2.4:1).  Theme-aware `--discord` / `--slack`
+  tokens with proper light variants now pass. (#365)
+- **Cross-user attachment fetch hardening** — `get_attachment_content`
+  now scopes the row by `user_id` in addition to `ws_id`, so an
+  unowned workstream can't be a vector for cross-user blob fetches via
+  attachment-id guessing. (#356)
+- **Attachment-list DoS guard** — `/v1/api/send` rejects
+  `attachment_ids` lists longer than the per-(ws, user) pending cap
+  with a 400, preventing hostile clients from blowing up the storage
+  `IN (...)` clause. (#356)
+- **Bounded LRU for upload locks** — the per-(ws, user) attachment
+  upload-lock map now evicts the oldest unlocked entries past a soft
+  cap, so the in-process map can't grow unbounded on long-running
+  nodes. (#356)
+- **3.12 CI deadlock on attachment uploads** — the upload-lock was
+  initially an `asyncio.Lock`, but Starlette's `TestClient` runs each
+  request on a fresh anyio task / event loop, so the cached lock's
+  `_waiters` bound to the first loop and a later request would block
+  on a Future from a closed loop (silent deadlock).  Switched to
+  `threading.Lock` — loop-agnostic, and the critical section is one
+  COUNT + one INSERT.  Same root cause is reproducible against any
+  Starlette TestClient harness on Python ≥ 3.10; 3.12 surfaces it
+  more often.  Production users on a single event loop weren't
+  affected, but the test environment was. (#356)
+
+### Security
+
+- **Slack approval per-user authentication** — only the session owner
+  can click Approve/Deny on a Slack tool-approval card.  Without this,
+  any channel member with view access could approve dangerous tool
+  calls initiated by someone else. (#355)
+- **Attachment ownership masking** — cross-user/cross-workstream
+  attachment ID lookups return 404 (not 403) so non-owners can't
+  enumerate workstream existence by response code. (#356)
+- Bumped Debian base image; remaining unfixable `jq` CVEs are
+  documented and exception-listed. (#aaea4d3)
+
+### Database migrations
+
+- **`037_workstream_attachments`** — new `workstream_attachments` table
+  with the lifecycle columns described above.  Indexes for ws_id,
+  pending lookups, message linkage, and reservation scoping.
+- **`038_workstream_attachments_reserved_at`** — adds `reserved_at`
+  column for the orphan-sweep staleness signal, plus a partial index
+  on `reserved_at IS NOT NULL` so the periodic scan is cheap.
+
+Both migrations are additive and idempotent, and the server applies
+them automatically on first startup against an existing 1.3.x database.
+No manual `alembic upgrade` step is required — though running it
+manually beforehand (e.g. as part of a phased deploy) remains safe.
+
+### SDK
+
+Python + TypeScript clients gained:
+
+- `AttachmentUpload` type
+- `upload_attachment(ws_id, filename, data, mime_type=None)`
+- `list_attachments(ws_id)`
+- `get_attachment_content(ws_id, attachment_id) → bytes / Blob`
+- `delete_attachment(ws_id, attachment_id)`
+- `send(message, ws_id, attachment_ids=...)` (extended)
+- `create_workstream(..., attachments=[...])` — multipart variant with
+  client-side `ws_id` generation for cluster-routed callers
+- Console SDK: `route_create_workstream(attachments=...)`,
+  `route_upload_attachment`, `route_list_attachments`,
+  `route_get_attachment_content`, `route_delete_attachment`
+- Refusal of `attachments + target_node` combination at the SDK
+  boundary (the multipart routing layer doesn't honor `target_node`,
+  so silently picking the wrong node is now an explicit error)
+- `PlanResolvedEvent` SSE event with type guard, dispatched when one
+  client (e.g. mobile) resolves a plan so other connected clients can
+  dismiss their plan-approval modal in sync.  Available in both the
+  Python and TypeScript SDKs. (#87a9af1)
+
+### Operational
+
+- **CI vendor-asset auto-download covers `hls.js`** — the
+  `vendor-js.yml` workflow previously only iterated katex/hljs/mermaid,
+  so Renovate bumps for `hls.js` failed the wheel-completeness check
+  and required manual file downloads.  Detection loop now includes
+  `hls`, so future Renovate bumps are merge-ready without intervention.
+  (#354)
+
+### Contributors
+
+Thanks to the people who made this release happen — especially the
+external contributors who picked up substantial pieces of work:
+
+- **[@daoxley](https://github.com/daoxley)** — designed and shipped
+  the Slack channel adapter (Socket Mode bot, per-user sessions,
+  approvals, plan-review, notification routing).  Major new feature
+  surface in #355.
+- **[@pizzaandcheese](https://github.com/pizzaandcheese)** — replaced
+  the deprecated bitnami pgbouncer image with the edoburu image,
+  remapped environment variables, ports, and helm chart references.
+  Operationally important for anyone running our reference Postgres
+  deployment (#353).
+- Renovate kept dependencies and the JS vendor tree current via
+  several automated bumps.
+
+If you're interested in contributing, channel-attachment ingest from
+Discord + Slack is the headline 1.4.1 feature and a solid place to
+start — see the open issues on GitHub or open one to scope a piece.
+
+## [1.3.1]
+
+### Added
+
+- Backport: Claude Opus 4.7 support (provider capabilities, tokenizer,
+  adaptive thinking). (#357)

@@ -1,0 +1,229 @@
+"""Tests for ``turnstone-admin rerank-calibrate`` (Phase 3 per-model calibration).
+
+Drives the real ``_cmd_rerank_calibrate`` through a real sqlite storage. The CLI
+is now per-model: it requires ``--model <alias>``, resolves that reranker model
+definition, calibrates its endpoint, and (with ``--apply``) writes the three
+calibration fields onto the model's capabilities — NOT the global
+``tools.rerank_bm25_threshold``. ``calibrate_model`` is stubbed (it needs a live
+endpoint). Mirrors the storage setup in test_admin_export.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from typing import TYPE_CHECKING
+
+import pytest
+
+from turnstone.admin import _cmd_rerank_calibrate
+from turnstone.core.rerank_calibrate import CalibrationResult
+from turnstone.core.storage import init_storage, reset_storage
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+_ALIAS = "my-reranker"
+
+
+@pytest.fixture(autouse=True)
+def _reset_storage_singleton() -> Iterator[None]:
+    reset_storage()
+    yield
+    reset_storage()
+
+
+def _args(db_path: str, *, apply: bool, model: str = _ALIAS) -> argparse.Namespace:
+    return argparse.Namespace(
+        model=model,
+        apply=apply,
+        db_backend="sqlite",
+        db_url="",
+        db_path=db_path,
+        db_pool_size=None,
+        db_sslmode="",
+        db_sslrootcert="",
+        db_sslcert="",
+        db_sslkey="",
+    )
+
+
+def _result(*, separated: bool, threshold: float | None) -> CalibrationResult:
+    return CalibrationResult(
+        model="m",
+        raw_scale="probability (0-1)",
+        separated=separated,
+        suggested_threshold=threshold,
+        relevant_min=0.8,
+        relevant_max=0.9,
+        irrelevant_min=0.1,
+        irrelevant_max=0.2,
+        n_relevant=7,
+        n_irrelevant=42,
+    )
+
+
+def _seed_reranker(
+    db_path: str, *, base_url: str = "http://localhost:9999/rerank", api_key: str = ""
+) -> str:
+    """Create a reranker model definition; return its db_path-backed alias."""
+    reset_storage()
+    storage = init_storage("sqlite", path=db_path)
+    try:
+        storage.create_model_definition(
+            definition_id="def-reranker",
+            alias=_ALIAS,
+            model="bge-reranker",
+            provider="openai-compatible",
+            base_url=base_url,
+            api_key=api_key,
+            context_window=0,
+            capabilities=json.dumps({"supports_rerank": True}),
+        )
+        return _ALIAS
+    finally:
+        reset_storage()
+
+
+def _stub_calibrate(monkeypatch, result: CalibrationResult) -> None:
+    monkeypatch.setattr(
+        "turnstone.core.rerank_calibrate.calibrate_model",
+        lambda base_url, model, api_key, *, instruction="", timeout=60.0: result,
+    )
+
+
+def _read_caps(db_path: str) -> dict:
+    reset_storage()
+    storage = init_storage("sqlite", path=db_path)
+    try:
+        row = storage.get_model_definition_by_alias(_ALIAS)
+        assert row is not None
+        return json.loads(row["capabilities"] or "{}")
+    finally:
+        reset_storage()
+
+
+def test_apply_writes_model_caps(tmp_path, monkeypatch, capsys):
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db)
+    _stub_calibrate(monkeypatch, _result(separated=True, threshold=0.37))
+    _cmd_rerank_calibrate(_args(db, apply=True))
+    caps = _read_caps(db)
+    assert caps["rerank_threshold"] == 0.37
+    assert caps["rerank_scale"] == "probability (0-1)"
+    assert caps["rerank_separated"] is True
+    # The original capability is preserved (merge, not replace).
+    assert caps["supports_rerank"] is True
+    assert "Applied" in capsys.readouterr().out
+
+
+def test_no_apply_recommends_only(tmp_path, monkeypatch, capsys):
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db)
+    _stub_calibrate(monkeypatch, _result(separated=True, threshold=0.37))
+    _cmd_rerank_calibrate(_args(db, apply=False))
+    assert "rerank_threshold" not in _read_caps(db)  # not written
+    out = capsys.readouterr().out
+    assert "0.37" in out and "--apply" in out
+
+
+def test_no_separation_persists_marker_on_apply(tmp_path, monkeypatch, capsys):
+    """A no-separation result is a valid recorded outcome: with --apply it still
+    persists the marker (rerank_scale + separated=False, threshold 0.0) — aligned
+    with the calibrate endpoint — and exits 0 (no floor)."""
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db)
+    _stub_calibrate(monkeypatch, _result(separated=False, threshold=None))
+    _cmd_rerank_calibrate(_args(db, apply=True))  # no SystemExit
+    caps = _read_caps(db)
+    assert caps["rerank_scale"] == "probability (0-1)"
+    assert caps["rerank_separated"] is False
+    assert caps["rerank_threshold"] == 0.0
+    assert caps["supports_rerank"] is True  # merge, not replace
+    assert "No clean separation" in capsys.readouterr().out
+
+
+def test_unknown_model_errors(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.db")
+    init_storage("sqlite", path=db)  # schema only, no model definition
+    reset_storage()
+    with pytest.raises(SystemExit) as ei:
+        _cmd_rerank_calibrate(_args(db, apply=False, model="nope"))
+    assert ei.value.code == 1
+
+
+def test_model_without_base_url_errors(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db, base_url="")
+    with pytest.raises(SystemExit) as ei:
+        _cmd_rerank_calibrate(_args(db, apply=False))
+    assert ei.value.code == 1
+
+
+def test_settings_that_cannot_load_stop_it_before_calibrating(tmp_path, monkeypatch, capsys):
+    """The stored query instruction is a setting: calibrating on the default one
+    would record a threshold measured under an instruction nobody chose (#1406)."""
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "turnstone.core.rerank_calibrate.calibrate_model",
+        lambda base_url, model, api_key, **kw: calls.append(model),
+    )
+
+    def unreadable(self, node_id=""):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(SQLiteBackend, "get_system_settings_bulk", unreadable)
+    with pytest.raises(SystemExit) as ei:
+        _cmd_rerank_calibrate(_args(db, apply=True))
+    assert ei.value.code == 1
+    assert "database went away" in capsys.readouterr().err
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("stored", "sent"),
+    [
+        ("secret://fake/reranker", "rk-from-store"),
+        ("${TS_CONSOLE_ONLY_VALUE}", "${TS_CONSOLE_ONLY_VALUE}"),
+    ],
+)
+def test_only_a_stored_reference_is_resolved(tmp_path, monkeypatch, stored, sent):
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db, api_key=stored)
+    install_fake_resolver(monkeypatch, {"/reranker": "rk-from-store"})
+    monkeypatch.setenv("TS_CONSOLE_ONLY_VALUE", "console-env-value")
+    seen: dict[str, str] = {}
+
+    def fake(base_url, model, api_key, *, instruction="", timeout=60.0):
+        seen["api_key"] = api_key
+        return _result(separated=True, threshold=0.37)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", fake)
+    _cmd_rerank_calibrate(_args(db, apply=False))
+    assert seen["api_key"] == sent
+
+
+def test_a_stored_key_a_header_cannot_carry_is_refused_unquoted(tmp_path, monkeypatch, capsys):
+    """Refused before the probe, as the console's Re-calibrate refuses it, so no client error can
+    quote it."""
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db, api_key="rk" + chr(1) + "keymarker")
+    called: list[str] = []
+
+    def fake(base_url, model, api_key, *, instruction="", timeout=60.0):
+        called.append(api_key)
+        return _result(separated=True, threshold=0.37)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", fake)
+    with pytest.raises(SystemExit) as ei:
+        _cmd_rerank_calibrate(_args(db, apply=False))
+    assert ei.value.code == 1
+    err = capsys.readouterr().err
+    assert "api_key is a value an HTTP header cannot carry" in err and "keymarker" not in err
+    assert called == []

@@ -1,0 +1,362 @@
+# =============================================================================
+# Turnstone — local cluster stack (docker compose)
+#
+# Clone the repo and run:
+#
+#     docker compose up
+#
+# That builds one image and brings up a complete, console-visible cluster:
+# PostgreSQL + console + Caddy + channel gateway + 10 server nodes (node-1…10).
+#
+#   Dashboard: https://localhost:8443   (Caddy's local CA — trust it once)
+#
+# Access is via Caddy only — the console's plain-HTTP port is intentionally not
+# published (HTTP/2 from Caddy avoids the browser's 6-connection cap on the
+# dashboard's SSE streams). Trust Caddy's root once:
+#     docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
+#
+# It works out of the box with INSECURE dev defaults (see the secret/password
+# values below) so there's nothing to configure first. A .env file still
+# overrides any value. For a real deployment use the bundled production stack
+# at turnstone/deploy/compose.yaml — it pulls released images from ghcr.io and
+# requires you to set real secrets.
+#
+# Bring your own LLM: nodes boot without one and show up in the console
+# immediately. Add model backends (OpenAI / Anthropic / local vLLM) from the
+# console UI's Models tab; OPENAI_API_KEY (below) backs definitions that leave
+# api_key empty (local servers need none).
+#
+# Fewer nodes (lighter machines):
+#     docker compose up postgres console caddy channel node-1 node-2 node-3
+#
+# Join a bare-metal host: a turnstone-server running OUTSIDE compose (e.g. to use
+# a local GPU) can join this cluster. Postgres, the console's ACME endpoint, and
+# SearxNG are published on 127.0.0.1 so a node on THIS machine reaches them via
+# localhost. Keep secrets in ~/.config/turnstone/config.toml (chmod 0600 — the
+# loader warns otherwise):
+#     [auth]
+#     jwt_secret = "dev-only-insecure-jwt-secret-change-me-for-real-deployments"
+#     [database]
+#     backend = "postgresql"
+#     url = "postgresql+psycopg://turnstone:turnstone@localhost:5432/turnstone"
+#     [api]
+#     base_url = "http://localhost:8000/v1"
+#     api_key = "dummy"
+#     [tls]              # only if the cluster runs mTLS
+#     enabled = true
+# then run (node identity isn't a secret, so it stays on the command line):
+#     TURNSTONE_NODE_ID=host-1 \
+#       TURNSTONE_ADVERTISE_URL=http://host.docker.internal:8080 \
+#       TURNSTONE_CONSOLE_URL=http://localhost:8090 \
+#       TURNSTONE_SEARXNG_URL=http://localhost:8081 \
+#       turnstone-server --host 0.0.0.0 --port 8080
+# The node registers in Postgres, auto-enrolls its mTLS cert from the console's
+# ACME endpoint (when the cluster runs mTLS), and the console collector reaches
+# it back via host.docker.internal. To join from ANOTHER machine, set
+# TURNSTONE_HOST_IP to this host's LAN IP and set TURNSTONE_ACME_EXTERNAL_URL to
+# http://<this-host-ip>:8090/acme. Use the same host IP in the node's URLs above
+# (and the NODE host's IP in TURNSTONE_ADVERTISE_URL) — see docs/docker.md.
+# =============================================================================
+
+name: turnstone
+
+networks:
+  turnstone-net:
+    driver: bridge
+
+volumes:
+  turnstone-data:
+  workspace:
+  postgres-data:
+  caddy-data:
+  caddy-config:
+  searxng-cache:
+
+# -- Shared values (scalar anchors) -------------------------------------------
+# Defined once here, referenced (*alias) by every service so the dev defaults
+# can't drift. All `${VAR:-default}` values are still overridable via .env.
+x-shared:
+  # INSECURE dev default. Every service MUST share ONE secret — the console
+  # mints its own service token (signed with this) to reach the nodes. Override
+  # TURNSTONE_JWT_SECRET in .env for anything that isn't a local sandbox.
+  jwt-secret: &jwt-secret "${TURNSTONE_JWT_SECRET:-dev-only-insecure-jwt-secret-change-me-for-real-deployments}"
+  db-backend: &db-backend "${TURNSTONE_DB_BACKEND:-postgresql}"
+  # All services point at the same Postgres. Node discovery REQUIRES a shared
+  # DB: each server registers + heartbeats into a `services` table that the
+  # console polls. (SQLite-per-container can't see other containers.)
+  db-url: &db-url "${TURNSTONE_DB_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}"
+
+services:
+  # -------------------------------------------------------------------
+  # PostgreSQL — the shared database that ties the cluster together.
+  # -------------------------------------------------------------------
+  postgres:
+    image: pgautoupgrade/pgautoupgrade:18-alpine
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-300}
+      - -c
+      - shared_buffers=128MB
+    environment:
+      POSTGRES_DB: turnstone
+      POSTGRES_USER: ${POSTGRES_USER:-turnstone}
+      # INSECURE dev default — override POSTGRES_PASSWORD in .env for real use.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-turnstone}
+      PGDATA: /var/lib/postgresql/data
+    # Published so a bare-metal turnstone-server can join the cluster (see "Join
+    # a bare-metal host" in the header). Bound to 127.0.0.1 by default (same-host
+    # nodes only); set TURNSTONE_HOST_IP to this host's LAN IP to let another
+    # machine connect — but set a real POSTGRES_PASSWORD first, or you'll expose a
+    # database with the insecure default password to your network. (The legacy
+    # POSTGRES_BIND is still honored as a fallback when TURNSTONE_HOST_IP is unset.)
+    ports:
+      - "${TURNSTONE_HOST_IP:-${POSTGRES_BIND:-127.0.0.1}}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - turnstone-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-turnstone}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # turnstone-console — cluster dashboard. Reach it ONLY through Caddy at
+  # https://localhost:8443 (see the caddy service below).
+  #
+  # Browsers must reach the dashboard through Caddy (https://localhost:8443): a
+  # plain HTTP/1.1 origin caps the browser at 6 connections, which starves the
+  # dashboard's per-pane SSE streams, whereas Caddy serves HTTP/2 (multiplexed)
+  # and proxies to console:8090 internally. The console's :8090 is published
+  # below ONLY so bare-metal nodes can reach the plain-HTTP ACME enrollment
+  # endpoint — don't point a browser at it.
+  #
+  # The single `build:` here produces the turnstone:local image every other
+  # service reuses. extra_hosts lets the console reach a bare-metal server
+  # advertising http://host.docker.internal:8080 (see "Join a host" below).
+  # -------------------------------------------------------------------
+  console:
+    image: turnstone:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - turnstone-console
+      - --host=0.0.0.0
+      - --port=8090
+    # Publishes the console's plain-HTTP listener so a bare-metal node can reach
+    # the ACME endpoint, fetch the CA, and enroll its cert (the console serves
+    # HTTP here even under mTLS). Bound to 127.0.0.1 by default; setting
+    # TURNSTONE_HOST_IP exposes the WHOLE console HTTP API on that interface.
+    # ACME signing routes require a dedicated short-lived service JWT, but the
+    # listener and bearer token are still plain HTTP: bind only a trusted LAN
+    # or VPN interface and restrict it to enrolling nodes. Browsers use Caddy
+    # :8443, never this port.
+    ports:
+      - "${TURNSTONE_HOST_IP:-127.0.0.1}:8090:8090"
+    environment:
+      TURNSTONE_JWT_SECRET: *jwt-secret
+      TURNSTONE_DB_BACKEND: *db-backend
+      TURNSTONE_DB_URL: *db-url
+      TURNSTONE_CONSOLE_URL: http://console:8090
+      # Separate from TURNSTONE_CONSOLE_URL: this is the canonical responder
+      # base embedded in ACME directory/order URLs for cross-host enrollment.
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - turnstone-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # caddy — browser TLS for the console dashboard.
+  # Terminates HTTPS (Caddy's own local CA, see turnstone/deploy/Caddyfile) → console:8090.
+  # Dashboard over TLS: https://localhost:${CONSOLE_HTTPS_PORT:-8443}
+  # -------------------------------------------------------------------
+  caddy:
+    image: caddy:2.11
+    depends_on:
+      - console
+    ports:
+      - "${CONSOLE_HTTPS_PORT:-8443}:443"
+      # SearxNG web UI — localhost-only (it has no auth). Browse https://localhost:8444.
+      - "127.0.0.1:${SEARXNG_HTTPS_PORT:-8444}:8444"
+    volumes:
+      - ./turnstone/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # persist Caddy's local CA and certs across restarts
+      - caddy-config:/config
+    networks:
+      - turnstone-net
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # turnstone-channel — channel gateway (Discord and/or Slack).
+  # Runs HTTP-only with no adapters until you set a token, so it's safe
+  # to leave running. See docs/channels.md.
+  # -------------------------------------------------------------------
+  channel:
+    image: turnstone:local
+    command:
+      - sh
+      - -c
+      - >-
+        turnstone-channel
+        --http-host=0.0.0.0
+        $${TURNSTONE_DISCORD_GUILD:+--discord-guild $$TURNSTONE_DISCORD_GUILD}
+    environment:
+      TURNSTONE_JWT_SECRET: *jwt-secret
+      TURNSTONE_DB_BACKEND: *db-backend
+      TURNSTONE_DB_URL: *db-url
+      TURNSTONE_DISCORD_TOKEN: ${TURNSTONE_DISCORD_TOKEN:-}
+      TURNSTONE_DISCORD_GUILD: ${TURNSTONE_DISCORD_GUILD:-0}
+      TURNSTONE_SLACK_TOKEN: ${TURNSTONE_SLACK_TOKEN:-}
+      TURNSTONE_SLACK_APP_TOKEN: ${TURNSTONE_SLACK_APP_TOKEN:-}
+      TURNSTONE_CHANNEL_ADVERTISE_URL: http://channel:8091
+    networks:
+      - turnstone-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # searxng — self-hosted metasearch backing the web_search tool.
+  # Internal-network only (no published port): nodes reach it at
+  # http://searxng:8080. Config (JSON output on, limiter off) lives in
+  # turnstone/deploy/searxng/settings.yml, mounted read-only. Commercial
+  # models use native provider search and never hit this; it serves
+  # local/vLLM models. Override the tag with SEARXNG_IMAGE_TAG in .env.
+  # -------------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}
+    # Published so a bare-metal node's web_search can reach it. SearxNG has NO
+    # auth, so it is bound to 127.0.0.1 by default; setting TURNSTONE_HOST_IP
+    # exposes it on that interface — an open search proxy on your LAN, which also
+    # triggers the SearxNG AGPL-3.0 §13 source-offer obligation (see docs/docker.md).
+    # In-compose nodes always use the internal http://searxng:8080 and ignore this.
+    ports:
+      - "${TURNSTONE_HOST_IP:-127.0.0.1}:${SEARXNG_API_PORT:-8081}:8080"
+    volumes:
+      - ./turnstone/deploy/searxng:/etc/searxng:ro
+      - searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)
+    networks:
+      - turnstone-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # ===================================================================
+  # Server fleet — node-1 … node-10
+  #
+  # Each node registers itself in Postgres on boot (unique
+  # TURNSTONE_NODE_ID + TURNSTONE_ADVERTISE_URL) and the console
+  # discovers it automatically — no static node list anywhere.
+  #
+  # node-1 carries the shared definition (&node / &node-env); node-2…10
+  # inherit it and override only their identity.
+  # ===================================================================
+  node-1: &node
+    image: turnstone:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - sh
+      - -c
+      - >-
+        turnstone-server
+        --host 0.0.0.0
+        --port 8080
+        $${SKIP_PERMISSIONS:+--skip-permissions}
+        $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
+    volumes:
+      - turnstone-data:/data
+      - ${WORKSPACE_MOUNT:-workspace}:/workspace
+    environment: &node-env
+      TURNSTONE_JWT_SECRET: *jwt-secret
+      TURNSTONE_DB_BACKEND: *db-backend
+      TURNSTONE_DB_URL: *db-url
+      # Model backends are configured in the console Models tab. A definition
+      # that leaves api_key empty falls back to this variable (local servers
+      # need none); a definition saved in the console does not expand ${...}
+      # placeholders.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
+      # web_search backend. Defaults to the bundled searxng service; point at an
+      # external SearxNG by setting TURNSTONE_SEARXNG_URL in .env (empty disables).
+      TURNSTONE_SEARXNG_URL: ${TURNSTONE_SEARXNG_URL:-http://searxng:8080}
+      MCP_CONFIG: ${MCP_CONFIG:-}
+      SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
+      TURNSTONE_NODE_ID: node-1
+      TURNSTONE_ADVERTISE_URL: http://node-1:8080
+      # Lets the authenticated ACME client follow the console's canonical LAN
+      # URLs without trusting destinations learned from the public directory.
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - turnstone-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    restart: unless-stopped
+
+  node-2:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-2, TURNSTONE_ADVERTISE_URL: "http://node-2:8080" }
+  node-3:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-3, TURNSTONE_ADVERTISE_URL: "http://node-3:8080" }
+  node-4:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-4, TURNSTONE_ADVERTISE_URL: "http://node-4:8080" }
+  node-5:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-5, TURNSTONE_ADVERTISE_URL: "http://node-5:8080" }
+  node-6:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-6, TURNSTONE_ADVERTISE_URL: "http://node-6:8080" }
+  node-7:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-7, TURNSTONE_ADVERTISE_URL: "http://node-7:8080" }
+  node-8:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-8, TURNSTONE_ADVERTISE_URL: "http://node-8:8080" }
+  node-9:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-9, TURNSTONE_ADVERTISE_URL: "http://node-9:8080" }
+  node-10:
+    <<: *node
+    environment: { <<: *node-env, TURNSTONE_NODE_ID: node-10, TURNSTONE_ADVERTISE_URL: "http://node-10:8080" }

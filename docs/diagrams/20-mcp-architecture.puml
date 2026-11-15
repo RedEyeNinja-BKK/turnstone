@@ -1,0 +1,261 @@
+@startuml
+!theme plain
+title Turnstone — MCP Architecture (Resources, Prompts, Tools)
+
+skinparam participant {
+    BackgroundColor<<mcp>> #E1BEE7
+    BackgroundColor<<session>> #C8E6C9
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<ui>> #E8EAF6
+    BackgroundColor<<registry>> #F8BBD0
+}
+
+participant "MCP Server\n(external)" as MCPSrv <<mcp>>
+participant "MCPClientManager\n(mcp_client.py)" as MCPMgr <<mcp>>
+participant "ChatSession\n(session.py)" as Session <<session>>
+participant "StorageBackend\n(governance)" as Storage <<storage>>
+participant "Server / Console\n(health + UI)" as UI <<server>>
+
+participant "Console Admin UI\n(admin panel)" as Admin <<ui>>
+participant "Database\n(mcp_servers table)" as DB <<storage>>
+
+participant "MCPRegistryClient\n(mcp_registry.py)" as RegClient <<mcp>>
+participant "MCP Registry\n(registry.modelcontextprotocol.io)" as Registry <<registry>>
+
+== Admin-Driven Configuration ==
+
+Admin -> DB : CRUD MCP server definitions\n(POST/PUT/DELETE /v1/api/admin/mcp-servers)
+
+Admin -> UI : POST /v1/api/admin/mcp-servers/reload
+UI -> MCPMgr : POST /_internal/mcp-reload\n(forwarded to each node)
+MCPMgr -> MCPMgr : reconcile_sync()
+note right
+  Diffs running servers against DB:
+  - New entries → connect
+  - Removed entries → disconnect
+  - Changed entries → reconnect
+end note
+
+== Registry Discovery & Install ==
+
+Admin -> UI : GET /v1/api/admin/mcp-registry/search?search=...
+UI -> RegClient : search(q, limit, cursor)
+RegClient -> Registry : GET /v0.1/servers?search=...&latest=true
+Registry --> RegClient : Server entries\n(remotes, packages, meta)
+RegClient --> UI : RegistrySearchResult\n(annotated with installed status)
+UI --> Admin : Search results\n(Install / Installed badges)
+
+Admin -> UI : POST /v1/api/admin/mcp-registry/install
+UI -> DB : create_mcp_server()\n(registry_name, version, meta)
+UI -> MCPMgr : POST /_internal/mcp-reload\n(fan-out to nodes)
+MCPMgr -> MCPMgr : reconcile_sync()
+MCPMgr -> MCPSrv : connect to new server
+
+note over RegClient, Registry
+  MCPRegistryClient is an async httpx2 client
+  targeting registry.modelcontextprotocol.io/v0.1.
+  resolve_install_config() translates registry
+  remotes/packages into mcp_servers rows.
+end note
+
+== Startup: Connection & Discovery ==
+
+MCPMgr -> DB : load_mcp_config(storage=)\n(merge config file + DB)
+
+MCPMgr -> MCPSrv : server/discover (stdio or HTTP)
+alt 2026-07-28 server
+  MCPSrv --> MCPMgr : DiscoverResult\n(versions, capabilities)
+else earlier server refuses the probe
+  MCPSrv --> MCPMgr : error
+  MCPMgr -> MCPSrv : initialize (2025-11-25 handshake)
+  MCPSrv --> MCPMgr : capabilities\n(tools, resources, prompts)
+end
+
+MCPMgr -> MCPSrv : tools/list
+MCPSrv --> MCPMgr : Tool[]
+
+opt resources capability
+  MCPMgr -> MCPSrv : resources/list
+  MCPSrv --> MCPMgr : Resource[]
+  MCPMgr -> MCPSrv : resources/templates/list
+  MCPSrv --> MCPMgr : ResourceTemplate[]
+end
+
+opt prompts capability
+  MCPMgr -> MCPSrv : prompts/list
+  MCPSrv --> MCPMgr : Prompt[]
+end
+
+opt 2026-07-28 server with a list_changed capability
+  MCPMgr -> MCPSrv : subscriptions/listen
+  note right
+    Held open by the connection's owner task;
+    reopened when the server ends it, with a
+    full catalog refresh after the reopen.
+  end note
+end
+
+note over MCPMgr
+  Per-server storage:
+  _per_server_tools, _per_server_resources, _per_server_prompts
+  Copy-on-write rebuild into _tools, _resources, _prompts
+  Prefix: mcp__{server}__{name}
+end note
+
+MCPMgr -> Session : notify tool listeners
+MCPMgr -> Session : notify resource listeners
+
+== Governance Sync (on connect & refresh) ==
+
+MCPMgr -> Storage : sync_prompts_to_storage()
+note right
+  For each MCP prompt:
+  - Manual template exists? → skip
+  - MCP template exists? → update
+  - New? → create (origin="mcp",
+    readonly=True)
+  Removed prompts → delete unless disabled
+  Protected by _sync_lock
+end note
+
+== set_storage() from entry point ==
+
+UI -> MCPMgr : set_storage(backend)
+note right
+  If servers already connected,
+  triggers immediate sync
+end note
+
+== Runtime: Tool Execution ==
+
+Session -> Session : _prepare_mcp_tool(func_name, args)
+note right
+  approval_label = func_name
+  (e.g. mcp__github__search)
+  needs_approval = True
+end note
+Session -> MCPMgr : call_tool_sync(name, args)
+MCPMgr -> MCPSrv : tools/call
+MCPSrv --> MCPMgr : ToolResult
+MCPMgr --> Session : output (text)
+
+== Runtime: Resource Read ==
+
+Session -> Session : _prepare_read_resource(uri)
+note right
+  approval_label = mcp_resource__{normalized_uri}
+  URI normalized (.. resolved)
+  needs_approval = True
+end note
+Session -> MCPMgr : read_resource_sync(uri)
+alt 2026-07-28, and a fresh cached read
+  MCPMgr --> Session : cached content
+  note right
+    Kept for the server's ttlMs (at most 24 h).
+    Per-user servers share a read the server
+    marks public among their users (#1388).
+  end note
+else
+  MCPMgr -> MCPSrv : resources/read
+  MCPSrv --> MCPMgr : ReadResourceResult
+  MCPMgr --> Session : content (text/blob)
+end
+
+== Runtime: Prompt Invocation ==
+
+Session -> Session : _prepare_use_prompt(name, arguments)
+note right
+  approval_label = mcp__srv__prompt
+  Validated via is_mcp_prompt()
+  needs_approval = True
+end note
+Session -> MCPMgr : get_prompt_sync(name, args)
+MCPMgr -> MCPSrv : prompts/get
+MCPSrv --> MCPMgr : GetPromptResult
+MCPMgr --> Session : messages [{role, content}]
+
+== Resilience: Circuit Breaker & Stream Safety ==
+
+note over MCPMgr
+  **Per-server circuit breaker**
+  CLOSED --(3 failures)--> OPEN
+  OPEN --(cooldown expires)--> half-open probe
+  Probe success --> CLOSED (trip_count decays by 1)
+  Probe failure --> OPEN (cooldown doubles, max 5 min)
+
+  MCPError (protocol) and a refused result
+  (an input request) do NOT trip breaker.
+  HTTP 5xx and a held session's 404, read off
+  the wire, count as transport failures.
+  BrokenPipeError / EOFError evicts dead session.
+  All sync methods cancel orphaned futures on timeout.
+  Transport streams pre-closed before stack teardown
+  to avoid anyio cancel-scope CPU busy-loop (SDK #2147).
+end note
+
+Session -> MCPMgr : call_tool_sync()
+MCPMgr -> MCPMgr : _cb_gate(server)\n[reject if circuit open]
+MCPMgr -> MCPMgr : _cb_auto_reconnect()\n[if session gone + cooldown expired]
+MCPMgr -> MCPSrv : tools/call
+MCPSrv --> MCPMgr : result or error
+MCPMgr -> MCPMgr : _cb_record_success()\nor _cb_record_failure()
+
+== Three-Tier Refresh ==
+
+group Push Notifications (debounced 5s per server)
+  note over MCPSrv, MCPMgr : 2026-07-28: delivered on the subscriptions/listen stream
+  MCPSrv -> MCPMgr : ToolListChangedNotification
+  MCPMgr -> MCPMgr : debounce check\n(skip if < 5s since last)
+  MCPMgr -> MCPMgr : _refresh_server_tools()
+
+  MCPSrv -> MCPMgr : ResourceListChangedNotification
+  MCPMgr -> MCPMgr : _refresh_server_resources()
+
+  MCPSrv -> MCPMgr : PromptListChangedNotification
+  MCPMgr -> MCPMgr : _refresh_server_prompts()
+  MCPMgr -> Storage : sync_prompts_to_storage()
+end
+
+group Manual Refresh
+  Session -> MCPMgr : refresh_sync()
+  note right
+    /mcp refresh [server] —
+    re-fetches catalog and
+    attempts reconnect for
+    disconnected servers.
+  end note
+end
+
+group Manual Reconnect
+  Session -> MCPMgr : reconnect_sync(name)
+  note right
+    Operator-driven via the
+    console admin panel —
+    tears down session, clears
+    circuit breaker, runs a
+    fresh handshake.
+  end note
+end
+
+== Policy Evaluation ==
+
+note over Session
+  Tool policies use fnmatch on approval_label:
+  - mcp__github__* → allow (all GitHub tools/prompts)
+  - mcp_resource__file:///docs/* → allow
+  - mcp_resource__* → deny (block all resource reads)
+  - mcp__untrusted__* → ask
+end note
+
+== UI Visibility ==
+
+UI -> MCPMgr : server_count, get_resources(), get_prompts()
+note over UI
+  /health → mcp.servers, mcp.resources, mcp.prompts
+  Server UI: magenta status badge
+  Console: cluster status bar + node detail
+  System message: <mcp-resources> + <mcp-prompts> catalogs
+end note
+
+@enduml

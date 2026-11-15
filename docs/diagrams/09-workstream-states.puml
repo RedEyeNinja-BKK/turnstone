@@ -1,0 +1,159 @@
+@startuml
+!theme plain
+title Turnstone — Workstream State Machine
+
+skinparam state {
+    BackgroundColor<<lifecycle>> #ECEFF1
+    BackgroundColor<<idle>> #E8F5E9
+    BackgroundColor<<thinking>> #E3F2FD
+    BackgroundColor<<running>> #FFF3E0
+    BackgroundColor<<attention>> #FCE4EC
+    BackgroundColor<<evaluation>> #E0F7FA
+    BackgroundColor<<error>> #FFCDD2
+}
+
+state "CREATING (persisted only)" as creating <<lifecycle>> : Hidden durable reservation.\nNot returned by ordinary list/open/history.
+state "IDLE" as idle <<idle>> : Waiting for user input.\nNo active LLM call or tool execution.
+state "THINKING" as thinking <<thinking>> : LLM streaming response.\nTokens flowing (reasoning + content).
+state "RUNNING" as running <<running>> : Tools executing.\nThreadPoolExecutor active.
+state "ATTENTION" as attention <<attention>> : Blocked on user action.\nTool approval needed.
+state "EVALUATION" as evaluation <<evaluation>> : Smart Approvals wait.\nThe intent judge may still\napprove the batch.
+state "ERROR" as error <<error>> : Exception occurred.\nRecoverable on next send().
+state "CLOSED (persisted only)" as closed <<lifecycle>> : Unloaded, explicitly reopenable row.\nNot a live WorkstreamState member.
+
+[*] --> creating : reserve live id\nstate="creating"
+creating --> idle : finalize + publish create\nemit ws_created
+creating --> [*] : immediate exact-token rollback\n(no lifecycle birth emitted)
+creating --> [*] : stale >2h recovery\natomic hard delete; no close event
+
+idle --> thinking : send() called\n_emit_state("thinking")
+
+thinking --> running : Tool calls detected\nin LLM response\n_emit_state("running")
+
+thinking --> idle : No tool calls\n(final answer)\n_emit_state("idle")
+
+thinking --> error : Exception during\nstreaming
+
+running --> evaluation : Smart Approvals wait\n(shared gate)\n_emit_state("evaluation")
+
+evaluation --> running : Judge approves\n(tools execute)\n_emit_state("running")
+
+evaluation --> attention : A person is needed\n_emit_state("attention")
+
+running --> attention : A person must decide\n_emit_state("attention")
+
+attention --> running : User approves\n(tools execute)\n_emit_state("running")
+
+attention --> running : User denies\n(denial recorded)\n_emit_state("running")
+
+running --> thinking : Tool results appended,\nnext LLM call\n_emit_state("thinking")
+
+running --> error : Exception during\ntool execution
+
+error --> thinking : New send() call\n_emit_state("thinking")
+
+idle --> closed : close / eviction\n[journal reconciled]
+error --> closed : close\n[journal reconciled]
+thinking --> closed : close\n[journal reconciled]
+running --> closed : close\n[journal reconciled]
+attention --> closed : close\n[journal reconciled]
+evaluation --> closed : close\n[journal reconciled]
+closed --> [*] : hard delete
+closed --> idle : open / rehydrate
+
+note right of creating
+  The workstreams primary key reserves the ID while this row exists.
+  Rollback, stale-create reap, and hard deletion release it for reuse
+  after owned state is removed in the same transaction.
+end note
+
+note right of closed
+  Before every soft-close / eviction transition,
+  the total accepted conversation-row journal must
+  be durably reconciled. An unresolved row makes an
+  explicit close return HTTP 409 (eviction refuses),
+  and the workstream remains loaded in its live state.
+end note
+
+thinking --> idle : cancel() called\nstream aborted\n_emit_state("idle")
+
+running --> idle : cancel() called\n_emit_state("idle")
+
+attention --> idle : cancel() unblocks\napproval wait\n_emit_state("idle")
+
+evaluation --> idle : cancel() ends\nthe judge wait\n_emit_state("idle")
+
+note left of idle
+  **Generation-scoped Stop:**
+  • Sets the active generation event.
+  • Closes its SDK stream; aborts child model
+    scopes and judges; kills subprocess groups.
+  • Sweeps every approval cycle owned by the
+    cancelled workstream operation.
+  • Every later send/model live or durable commit
+    re-checks generation ownership.
+
+  **force=true:** also abandons the stuck worker
+  slot and emits stream_end + IDLE immediately.
+  An orphaned send/model generation may unwind
+  but cannot publish into a successor generation.
+  Quick slash-command workers are a best-effort
+  escape hatch: without generation checkpoints,
+  one may finish an in-place mutation concurrently.
+
+  **Capacity eviction:** an IDLE candidate is only
+  a hint. Per-ID + object lifecycle lanes and the
+  workstream lock revalidate it as worker- and
+  send-barrier-free,
+  then install a terminal claim before slot swap.
+end note
+
+note right of thinking
+  **Emitted via:**
+  session._emit_state(state)
+    → ui.on_state_change(state)
+    → SessionManager state tail
+
+  **Propagation:**
+  • WebUI → global SSE queue (ws_state)
+  • Console → cluster event / HTTP state
+  • CLI → SessionManager.set_state()
+
+  Non-terminal persistence may use StateWriter;
+  a per-id tail orders storage + subscribers and
+  prevents a late state from overwriting CLOSED.
+end note
+
+note left of attention
+  **Blocking mechanisms:**
+  • TerminalUI: input() prompt
+  • WebUI: one Event per ApprovalCycle
+  • ChannelBot: SSE event + Discord button
+  • NullUI: auto-approve (never reaches)
+end note
+
+note right of creating
+  CREATING and CLOSED are storage lifecycle
+  values, not members of WorkstreamState. The
+  live enum remains IDLE / THINKING / RUNNING /
+  ATTENTION / EVALUATION / ERROR.
+
+  **Crash-abandoned CREATING recovery:**
+  • Boot pass, then every 5 min even when idle
+    eviction is disabled.
+  • Only rows >2h old; manager loaded/pending
+    IDs and rows with a live owner lease are
+    protected.
+  • A crashed creator's lease expires, so its rows
+    are reclaimed whatever node ID restarts.
+  • A storage failure deletes nothing. Deletion
+    is atomic across dependents and attachment refs.
+  • Tokenless legacy/corrupt rows are locked,
+    reaped, and logged with a warning.
+
+  A loaded hard delete closes publication, drains
+  admitted session durability + state tails, then
+  conditionally removes the exact durable token.
+end note
+
+@enduml

@@ -1,0 +1,600 @@
+"""Attachment data types + upload-classification helpers for user-uploaded files
+bound to a workstream turn.
+
+The image-sniff / text-classify helpers live here (rather than in
+``turnstone/server.py``) so the console process can wire them into the lifted
+attachment endpoints for the coordinator surface without depending on the
+node-side server module.  The classification policy is intentionally
+kind-agnostic — the same type allowlist applies on both processes.
+
+In the content-addressed model an upload is *staged* in the per-node in-memory
+``attachment_buffer`` (keyed by content hash) until the send that references
+it commits, at which point the bytes are written content-addressed +
+reference-counted into ``workstream_attachments``.  Staging is thread-safe and
+idempotent on the content hash, so the old per-(ws,user) upload lock + pending
+cap (which only existed to serialize a DB count-check) are gone — the buffer's
+own size/TTL ceilings bound a flood instead.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from turnstone.core import fence
+
+if TYPE_CHECKING:
+    from starlette.responses import JSONResponse
+
+# Byte caps — enforced by the server layer at upload time.  The
+# constants live here so the session / tests share the same definitions.
+IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
+TEXT_DOC_SIZE_CAP: int = 512 * 1024
+PDF_SIZE_CAP: int = 32 * 1024 * 1024
+AUDIO_SIZE_CAP: int = 25 * 1024 * 1024
+
+# A create's multipart parse holds each file to the largest kind cap (its own kind's cap applies
+# when it is classified) and all of the create's files together to the total.
+LARGEST_KIND_SIZE_CAP: int = max(IMAGE_SIZE_CAP, TEXT_DOC_SIZE_CAP, PDF_SIZE_CAP, AUDIO_SIZE_CAP)
+CREATE_ATTACHMENTS_TOTAL_CAP: int = 64 * 1024 * 1024
+
+ALLOWED_IMAGE_MIMES: frozenset[str] = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
+
+# The image types sent to a model: the ones the vision providers have in
+# common.  A provider rejects the whole request over an image type it does not
+# take, and a stored image goes out with every later request too.  GIF stays
+# out because provider support for it differs; it remains in
+# ALLOWED_IMAGE_MIMES for previews and for displaying GIFs already stored.
+MODEL_IMAGE_MIMES: frozenset[str] = frozenset({"image/png", "image/jpeg", "image/webp"})
+
+# Audio MIMEs accepted as chat attachments (sniffed by magic bytes; the
+# client-claimed Content-Type is never trusted alone).  ``AUDIO_MIME_TO_FORMAT``
+# maps each to the OpenAI ``input_audio.format`` token the wire builder emits.
+ALLOWED_AUDIO_MIMES: frozenset[str] = frozenset(
+    {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/ogg",
+        "audio/flac",
+        "audio/mp4",
+        "audio/aac",
+        "audio/webm",
+    }
+)
+
+AUDIO_MIME_TO_FORMAT: dict[str, str] = {
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/ogg": "ogg",
+    "audio/flac": "flac",
+    "audio/mp4": "m4a",
+    "audio/aac": "aac",
+    "audio/webm": "webm",
+}
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """An attachment resolved from storage, ready for injection into a turn.
+
+    ``kind`` is ``"image"``, ``"text"``, ``"pdf"``, or ``"audio"``.  ``content``
+    is raw bytes — text attachments are UTF-8 decoded at content-part
+    construction; image/pdf/audio are base64-encoded at the wire boundary.
+    """
+
+    attachment_id: str
+    filename: str
+    mime_type: str
+    kind: str
+    content: bytes
+
+    @property
+    def is_image(self) -> bool:
+        return self.kind == "image"
+
+    @property
+    def is_text(self) -> bool:
+        return self.kind == "text"
+
+    @property
+    def is_pdf(self) -> bool:
+        return self.kind == "pdf"
+
+    @property
+    def is_audio(self) -> bool:
+        return self.kind == "audio"
+
+
+# ---------------------------------------------------------------------------
+# Upload classification
+# ---------------------------------------------------------------------------
+_TEXT_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".c",
+        ".conf",
+        ".cpp",
+        ".css",
+        ".go",
+        ".h",
+        ".hpp",
+        ".html",
+        ".ini",
+        ".java",
+        ".js",
+        ".json",
+        ".jsx",
+        ".md",
+        ".py",
+        ".rs",
+        ".sh",
+        ".sql",
+        ".toml",
+        ".ts",
+        ".tsx",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
+
+
+def sniff_image_mime(data: bytes) -> str | None:
+    """Return a canonical image MIME type by inspecting magic bytes.
+
+    Returns ``None`` if the bytes don't match any supported image
+    format. Do not trust the client-provided ``Content-Type`` alone.
+    The result can be GIF, which models are not sent: check it against
+    :data:`MODEL_IMAGE_MIMES` before sending it as a provider media type.
+    """
+    if len(data) < 12:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def sniff_pdf_mime(data: bytes) -> str | None:
+    """Return ``"application/pdf"`` if ``data`` starts with the PDF magic, else None."""
+    return "application/pdf" if data[:5] == b"%PDF-" else None
+
+
+def sniff_audio_mime(data: bytes) -> str | None:
+    """Return a canonical audio MIME type by inspecting magic bytes.
+
+    Covers WAV, MP3 (ID3 tag or MPEG frame sync), AAC (ADTS), OGG, FLAC,
+    ISO-BMFF audio (m4a / m4b — video brands like mp4 / mov are rejected), and
+    WebM/Matroska.  Returns ``None`` on no match — the client-provided
+    ``Content-Type`` is never trusted alone.
+    """
+    if len(data) < 12:
+        return None
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    # ADTS AAC frame sync (0xFFF...): 0xF1 = MPEG-4, 0xF9 = MPEG-2 (no CRC).
+    # Distinct from the MP3 syncs above (FB/F3/F2).  audio/aac is allowed +
+    # format-mapped but was never sniffed, so a raw .aac upload always failed.
+    if data[:2] in (b"\xff\xf1", b"\xff\xf9"):
+        return "audio/aac"
+    if data[:4] == b"OggS":
+        return "audio/ogg"
+    if data[:4] == b"fLaC":
+        return "audio/flac"
+    # ISO-BMFF: the ``ftyp`` box is shared by MP4/MOV *video* and M4A/M4B
+    # *audio*.  Accept only when an audio brand is the major brand or appears
+    # anywhere in the compatible-brands list — scan the whole ftyp box (its
+    # length is the big-endian uint32 at data[0:4]) so a real .m4a with the
+    # audio brand listed late still passes; a pure-video file carries none.  A
+    # generic-MP4 (isom/mp42) audio stream with no audio brand is
+    # indistinguishable from video by magic bytes alone, so it falls through
+    # (rejected) rather than risk passing a video off as audio.
+    if data[4:8] == b"ftyp":
+        box_end = int.from_bytes(data[0:4], "big")
+        if not 16 <= box_end <= len(data):
+            box_end = len(data)
+        brands = data[8:box_end]  # major brand (8:12) + compatible brands (16:end)
+        if any(b in brands for b in (b"M4A ", b"M4B ", b"F4A ", b"F4B ")):
+            return "audio/mp4"
+    if data[:4] == b"\x1aE\xdf\xa3":
+        return "audio/webm"
+    return None
+
+
+def classify_text_attachment(
+    filename: str, claimed_mime: str, data: bytes
+) -> tuple[str | None, str | None]:
+    """Return ``(canonical_mime, error)`` for a candidate text upload.
+
+    Accepts MIMEs starting with ``text/`` or in an application allowlist,
+    OR a filename with a known text-file extension. The payload must
+    decode as UTF-8. Returns ``(None, error_message)`` on rejection.
+    """
+    allowed_app_mimes = {
+        "application/json",
+        "application/xml",
+        "application/x-yaml",
+        "application/yaml",
+        "application/toml",
+    }
+    mime_ok = claimed_mime.startswith("text/") or claimed_mime in allowed_app_mimes
+    ext_ok = os.path.splitext(filename)[1].lower() in _TEXT_ATTACHMENT_EXTENSIONS
+    if not (mime_ok or ext_ok):
+        return None, (
+            f"Unsupported file type: {claimed_mime or 'unknown'} (filename: {filename!r})"
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "Text attachment is not valid UTF-8"
+    # Normalize MIME — prefer the claimed one if sensible, else text/plain.
+    if mime_ok and claimed_mime:
+        return claimed_mime, None
+    return "text/plain", None
+
+
+@dataclass(frozen=True)
+class UploadRejection:
+    """A rejected upload: client-facing message, machine code, HTTP status.
+
+    The single rejection shape both upload paths (the single-file endpoint and
+    the create-with-attachments batch) render into a JSON error response.
+    """
+
+    message: str
+    code: str
+    status: int
+
+
+def _too_large(label: str, size: int, cap: int) -> UploadRejection:
+    return UploadRejection(
+        f"{label} too large ({size:,} bytes); cap is {cap:,} bytes.", "too_large", 413
+    )
+
+
+def classify_upload(
+    filename: str, claimed_mime: str, data: bytes
+) -> tuple[str | None, str | None, UploadRejection | None]:
+    """Classify one non-empty upload into ``(kind, canonical_mime, rejection)``.
+
+    The single attachment-policy point, shared by the upload endpoint and the
+    create-with-attachments batch.  Sniff order is image → pdf → audio (magic
+    bytes; the client-claimed ``Content-Type`` is never trusted), then UTF-8
+    text by MIME/extension allowlist.  Each kind enforces its own byte cap.
+    Returns ``(kind, mime, None)`` on success, or ``(None, None, rejection)`` on
+    the first failure.  Callers pre-check for empty data.
+    """
+    sniffed_image = sniff_image_mime(data)
+    if sniffed_image is not None:
+        if sniffed_image not in MODEL_IMAGE_MIMES:
+            label = sniffed_image.split("/", 1)[1].upper()
+            return (
+                None,
+                None,
+                UploadRejection(
+                    f"{label} images are not supported. Use PNG, JPEG or WebP.",
+                    "unsupported",
+                    400,
+                ),
+            )
+        if len(data) > IMAGE_SIZE_CAP:
+            return None, None, _too_large("Image", len(data), IMAGE_SIZE_CAP)
+        from turnstone.core.images import MAX_JPEG_SCANS, too_many_jpeg_scans
+
+        if too_many_jpeg_scans(data):
+            return (
+                None,
+                None,
+                UploadRejection(
+                    f"This JPEG is saved in more than {MAX_JPEG_SCANS} passes, which takes too "
+                    "long to read. Save it again as an ordinary JPEG or as a PNG.",
+                    "unsupported",
+                    400,
+                ),
+            )
+        return "image", sniffed_image, None
+    if sniff_pdf_mime(data) is not None:
+        if len(data) > PDF_SIZE_CAP:
+            return None, None, _too_large("PDF", len(data), PDF_SIZE_CAP)
+        return "pdf", "application/pdf", None
+    sniffed_audio = sniff_audio_mime(data)
+    if sniffed_audio is not None:
+        if len(data) > AUDIO_SIZE_CAP:
+            return None, None, _too_large("Audio", len(data), AUDIO_SIZE_CAP)
+        return "audio", sniffed_audio, None
+    if len(data) > TEXT_DOC_SIZE_CAP:
+        return None, None, _too_large("Text document", len(data), TEXT_DOC_SIZE_CAP)
+    mime, err = classify_text_attachment(filename, claimed_mime, data)
+    if mime is None:
+        return None, None, UploadRejection(err or "Unsupported file type", "unsupported", 400)
+    return "text", mime, None
+
+
+def classify_uploaded_files(
+    files: list[tuple[str, str, bytes]],
+) -> tuple[list[tuple[str, str, str, bytes]], JSONResponse | None]:
+    """Classify a create's ``(filename, claimed_mime, data)`` files, stopping at a refusal.
+
+    Returns ``([(filename, kind, mime, data), ...], None)``, or the files
+    classified so far and a ``JSONResponse`` (400/413) whose error starts with
+    the refused file's name.  The node's create and the console's launcher
+    proxy share it, so both refuse the same files in the same words.
+    """
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.web_helpers import with_filename
+
+    classified: list[tuple[str, str, str, bytes]] = []
+    for filename, claimed_mime, data in files:
+        if not data:
+            return classified, _JSONResponse(
+                {"error": with_filename(filename, "Empty file")}, status_code=400
+            )
+        kind, mime, rejection = classify_upload(filename, claimed_mime, data)
+        if rejection is not None:
+            return classified, _JSONResponse(
+                {"error": with_filename(filename, rejection.message), "code": rejection.code},
+                status_code=rejection.status,
+            )
+        assert kind is not None and mime is not None  # success ⟹ both set
+        classified.append((filename, kind, mime, data))
+    return classified, None
+
+
+def stored_upload_content(kind: str, data: bytes) -> bytes:
+    """The bytes an upload of ``kind`` is staged and stored as.
+
+    An image has its transparency flattened (:func:`turnstone.core.images.flatten_image`), so the
+    stored attachment is the image every model is sent; other kinds are stored as uploaded.  Both
+    upload paths stage what this returns.  It decodes a transparent image, so an async handler
+    calls :func:`gated_upload_content` instead.
+    """
+    if kind != "image":
+        return data
+    from turnstone.core.images import flatten_image
+
+    return flatten_image(data, max_bytes=IMAGE_SIZE_CAP)
+
+
+async def gated_upload_content(kind: str, data: bytes, gate: asyncio.Lock) -> bytes:
+    """:func:`stored_upload_content` for an async handler, one image at a time per ``gate``.
+
+    An image whose header declares transparency to flatten waits for ``gate`` on the event loop
+    and only then takes a worker thread to flatten.  Waiting in worker threads instead, behind
+    flatten_image's own one-at-a-time slot, a burst of uploads would fill the shared default
+    executor that every other request's storage and permission calls run on.  Anything else is
+    stored as uploaded without waiting for a turn.
+    """
+    from turnstone.core.images import needs_flattening
+
+    if kind != "image" or not await asyncio.to_thread(needs_flattening, data):
+        return data
+    async with gate:
+        return await asyncio.to_thread(stored_upload_content, kind, data)
+
+
+def any_upload_needs_flattening(files: list[tuple[str, str, bytes]]) -> bool:
+    """Whether storing a create's ``(filename, claimed_mime, data)`` files may flatten one.
+
+    Judged from each image's header (:func:`turnstone.core.images.needs_flattening`), so a create
+    whose files are documents, or images with no transparency to flatten, doesn't wait for a turn.
+    """
+    from turnstone.core.images import needs_flattening
+
+    return any(
+        sniff_image_mime(data) in MODEL_IMAGE_MIMES and needs_flattening(data)
+        for _, _, data in files
+    )
+
+
+def stage_classified_files(
+    classified: list[tuple[str, str, str, bytes]],
+    ws_id: str,
+    user_id: str,
+) -> list[str]:
+    """Stage files :func:`classify_uploaded_files` accepted, for ``(ws_id, user_id)``.
+
+    Each ``(filename, kind, mime, data)`` is staged in the per-node
+    :class:`~turnstone.core.attachment_buffer.AttachmentBuffer` as
+    :func:`stored_upload_content` returns it, so an image is stored flattened.  The returned ids
+    are the content hashes the buffer computed: re-uploading identical bytes is idempotent (same
+    id).  The buffer's own size and TTL ceilings bound a flood.
+
+    Both kinds' create-with-attachments call this from the lifted ``make_create_handler``, after
+    ``mgr.create``, with the list the handler classified before it.
+    """
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    saved_ids: list[str] = []
+    if not classified:
+        return saved_ids
+
+    buffer = get_attachment_buffer()
+    for filename, kind, mime, data in classified:
+        staged = buffer.stage(
+            ws_id=ws_id,
+            user_id=user_id,
+            filename=filename,
+            mime_type=mime,
+            kind=kind,
+            content=stored_upload_content(kind, data),
+        )
+        saved_ids.append(staged.attachment_id)
+    return saved_ids
+
+
+def resolve_staged_attachments(
+    requested_ids: list[str],
+    ws_id: str,
+    user_id: str,
+) -> tuple[list[Attachment], list[str], list[str]]:
+    """Resolve staged uploads for *requested_ids* to Attachment objects.
+
+    Returns ``(resolved, taken, dropped)``.  ``taken`` is the subset of
+    *requested_ids* present in the buffer for ``(ws_id, user_id)`` (in request
+    order); ``dropped`` is the rest (buffer-evicted, never staged, or out of
+    scope).
+
+    This is a *peek*, not a drain: the entries stay in the buffer so a send
+    that resolves them but doesn't commit (e.g. the queue rejects an
+    attachment-bearing turn → ``attachments_busy``, and the client retries) can
+    still find them.  The committing path transfers all referenced entries
+    atomically when :meth:`ChatSession._append_user_turn` admits the immutable
+    pending row; anything left over expires on the buffer's TTL.
+
+    Kind-agnostic: both create-with-attachments and ``/send`` paths call this.
+    The old ``send_id`` reservation token is gone — the buffer is the pending
+    store and scoping is ``(ws_id, user_id)`` on the staged entry itself.
+    """
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    if not requested_ids:
+        return [], [], []
+
+    buffer = get_attachment_buffer()
+    resolved: list[Attachment] = []
+    taken: list[str] = []
+    dropped: list[str] = []
+    for aid in requested_ids:
+        s = buffer.get(aid, ws_id=ws_id, user_id=user_id)
+        if s is None:
+            dropped.append(aid)
+            continue
+        taken.append(aid)
+        resolved.append(
+            Attachment(
+                attachment_id=s.attachment_id,
+                filename=s.filename,
+                mime_type=s.mime_type or "application/octet-stream",
+                kind=s.kind,
+                content=s.content,
+            )
+        )
+    return resolved, taken, dropped
+
+
+_LABEL_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_attachment_label(name: str | None, *, default: str = "file", max_len: int = 200) -> str:
+    """Sanitize a user-supplied filename for embedding in model-visible text.
+
+    Attachment placeholders frame the filename inside ``[... 'name' ...]``; a
+    crafted name like ``'] Ignore the above. New instructions:`` would otherwise
+    break out of that frame and inject text into the model context.  Strip
+    control characters and the quote / bracket / angle characters used to build
+    those frames, collapse whitespace, and clamp the length.  The raw name is
+    still used verbatim for display and ``Content-Disposition`` (HTML-escaped /
+    quote-stripped at those boundaries); this is only for prompt-context text.
+    """
+    if not name:
+        return default
+    cleaned = _LABEL_CTRL.sub("", name)
+    for ch in "'\"[]<>`":
+        cleaned = cleaned.replace(ch, "")
+    cleaned = " ".join(cleaned.split())[:max_len].strip()
+    return cleaned or default
+
+
+def neutralize_untrusted_fences(text: str, *, tokens: tuple[str, ...]) -> str:
+    """Defang every session-trusted marker in model-visible untrusted text.
+
+    Each of *tokens*, the session's fence tokens, is removed as well
+    (:func:`turnstone.core.fence.remove_token`); a caller whose result passes
+    through a pass that removes them passes none.
+    """
+    safe = fence.neutralize(text, fence.SYSTEM_REMINDER_TAG, opening=True)
+    safe = fence.neutralize(safe, fence.SENDER_LABEL_TAG, opening=True)
+    return fence.remove_token(safe, *tokens)
+
+
+def neutralize_attachment_part(part: Any, *, tokens: tuple[str, ...]) -> Any:
+    """Return an attachment part with textual trust-marker forgeries defanged.
+
+    The fold reaches only a message's text parts, so the strings of document
+    parts (text files, a PDF's extracted text) are cleaned here: markers are
+    defanged and each of *tokens* removed.  Only model-visible text and
+    document strings are inspected; binary image/audio data and base64 PDF
+    payloads retain their exact bytes.
+    """
+    if isinstance(part, list):
+        safe_parts: list[Any] | None = None
+        for idx, item in enumerate(part):
+            safe = neutralize_attachment_part(item, tokens=tokens)
+            if safe is not item:
+                if safe_parts is None:
+                    safe_parts = list(part)
+                safe_parts[idx] = safe
+        return part if safe_parts is None else safe_parts
+    if not isinstance(part, dict):
+        return part
+    if part.get("type") == "text" and isinstance(part.get("text"), str):
+        text = part["text"]
+        safe = neutralize_untrusted_fences(text, tokens=tokens)
+        return part if safe == text else {**part, "text": safe}
+    if part.get("type") != "document" or not isinstance(part.get("document"), dict):
+        return part
+    document = part["document"]
+    safe_document: dict[str, Any] | None = None
+    for field in ("name", "data"):
+        value = document.get(field)
+        if not isinstance(value, str):
+            continue
+        # PDF data is base64 and therefore contains no bracketed marker. Skip
+        # the potentially large payload rather than scanning it pointlessly.
+        if field == "data" and document.get("media_type") == "application/pdf":
+            continue
+        safe = neutralize_untrusted_fences(value, tokens=tokens)
+        if safe != value:
+            if safe_document is None:
+                safe_document = dict(document)
+            safe_document[field] = safe
+    return part if safe_document is None else {**part, "document": safe_document}
+
+
+def unreadable_placeholder(filename: str) -> dict[str, Any]:
+    """Return a content-part placeholder used when an attachment can't be
+    decoded for a given turn.
+
+    Shared between live injection (session.send) and history replay
+    (storage._utils) so the wording stays canonical.
+    """
+    return {
+        "type": "text",
+        "text": f"[unreadable attachment: {safe_attachment_label(filename, default='attachment')}]",
+    }
+
+
+def attached_file_label(filename: str) -> dict[str, Any]:
+    """Return the text part that introduces an attached text file on the wire.
+
+    The document part carries the bytes, but nothing in it tells a model that
+    this is the file the user means by its name or by "the attached document",
+    nor that the file exists nowhere else.  Small models then look for the
+    name with ``read_file`` / ``search`` and, finding nothing, offer to create
+    it.  This label states both facts once per attachment, ahead of the part.
+    """
+    name = safe_attachment_label(filename, default="attachment")
+    return {
+        "type": "text",
+        "text": (
+            f"[Attached file '{name}' — its full contents follow; "
+            "attachments are not saved to disk]"
+        ),
+    }

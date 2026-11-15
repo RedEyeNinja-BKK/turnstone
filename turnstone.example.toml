@@ -1,0 +1,219 @@
+# turnstone.toml — shared bootstrap configuration
+#
+# This file is read once at startup. Values here are overridden by
+# environment variables, which are in turn overridden by CLI flags.
+#
+# All sections are optional. Missing sections use binary defaults.
+# Config file location precedence:
+#   1. --config flag
+#   2. $TURNSTONE_CONFIG env var
+#   3. ~/.config/turnstone/config.toml
+
+# --- LLM API (turnstone CLI, eval) ---
+# The server (node) does not read this section: its models come from the
+# console Models tab and the [models.*] entries below, each with its own
+# base_url and api_key.
+
+[api]
+# base_url = ""                # API endpoint; empty = binary default
+# api_key = ""                 # env: OPENAI_API_KEY or ANTHROPIC_API_KEY
+
+# --- Model routing and sampling (turnstone, node, eval) ---
+
+[model]
+# temperature = 0.0            # 0 = provider default
+# reasoning_effort = ""        # "none", "minimal", "low", "medium", "high", "xhigh", "max"
+# max_tokens = 0               # 0 = provider default
+#
+# Sub-agent routing (task_agent tool).  Falls back to agent_model when
+# unset, then to the session model.
+# agent_model = ""             # legacy single-knob alias used as fallback
+# task_model = ""              # task_agent override (e.g. "local" for cheap subtasks)
+# task_effort = ""             # reasoning effort for task_agent (default: inherit session)
+#
+# At call time, the calling LLM may also pass `model="<alias>"` to
+# task_agent to override these per-invocation.  Tool descriptions list
+# available aliases dynamically; bad aliases return an error so the
+# model retries with a valid choice.
+
+# --- Named Models (turnstone, node, eval) ---
+# Define model aliases with per-model overrides. Useful for local model
+# servers or mixing providers. Route with [model].default above, or per
+# call through task_agent's model= argument.
+#
+# [models.local]
+# model = "llama-3-70b"
+# provider = "openai"
+# base_url = "http://localhost:8000/v1"
+# context_window = 0           # 0 = node asks the server at startup (vLLM,
+#                              # llama.cpp); set it when the server does not
+#                              # report one. The CLI applies its own window.
+# max_concurrency = 1          # Per-process generation cap for this alias; 0 = unlimited.
+#                              # For llama.cpp, start with its usable -np slot count.
+#
+# [models.local.capabilities]
+# supports_vision = false
+# supports_web_search = false
+#
+# [models.claude]
+# model = "claude-opus-4-8"
+# provider = "anthropic"       # context_window omitted = provider capability table
+#                              # (Anthropic, OpenAI, xAI; Google needs a value)
+# [models.claude.capabilities.server_compat]
+# anthropic_workspace_id = "wrkspc_..."  # organization-level keys only: sent as the
+#                                        # anthropic-workspace-id header on every request
+
+# --- Database (turnstone, node, console) ---
+
+[database]
+# url = ""                     # postgres://user:pass@host/db or /path/to.db
+                               # env: TURNSTONE_DB_URL
+# listen_url = ""              # direct-to-postgres URL for the console's
+                               # dedicated LISTEN connection.  Set this when
+                               # `url` points at pgbouncer in transaction
+                               # pooling mode (LISTEN holds session state and
+                               # is incompatible with transaction pooling —
+                               # see docs/pgbouncer.md).  Defaults to `url`
+                               # when unset.  env: TURNSTONE_DB_LISTEN_URL
+# SSL params (passed through to SQLAlchemy connection):
+# sslmode = "prefer"           # disable, allow, prefer, require, verify-ca, verify-full
+# sslrootcert = ""             # path to CA cert for verify-ca/verify-full
+# sslcert = ""                 # path to client cert (mTLS)
+# sslkey = ""                  # path to client key (mTLS)
+
+# --- Auth (node, console) ---
+
+[auth]
+# Auth is always enabled. JWT secret is required.
+# jwt_secret = ""              # HS256 signing secret (min 32 bytes recommended)
+                               # env: TURNSTONE_JWT_SECRET
+
+# --- Logging (turnstone, node, console) ---
+
+[log]
+# level = ""                   # "debug", "info", "warn", "error"
+                               # empty = binary default (warn for CLI, info for servers)
+                               # env: TURNSTONE_LOG_LEVEL
+# json = false                 # JSON output; auto-enabled when stderr is not a TTY
+
+# --- Session (turnstone, node) ---
+
+[session]
+# instructions = ""            # Default system message
+# compact_max_tokens = 32768   # Max tokens for context compaction summary
+# auto_compact_pct = 0.8       # Trigger compaction at this % of context window
+
+# --- Tools (turnstone, node) ---
+
+[tools]
+# timeout = 120                # Tool execution timeout in seconds
+# skip_permissions = false     # Auto-approve all tool calls
+#
+# web_search backend (local/vLLM models only — commercial providers use their
+# own native server-side search). The docker-compose stack bundles a SearxNG
+# service and points at it by default.
+# web_search_backend = ""      # "" (auto), "searxng", or "mcp:server:tool"
+# searxng_url = "http://searxng:8080"  # SearxNG base URL; env: TURNSTONE_SEARXNG_URL
+                               # (the admin Settings value, if set, wins; clear it
+                               # there to disable web search)
+# searxng_engines = ""         # comma-separated engines (e.g. "duckduckgo,wikipedia");
+                               # empty = the instance's default mix
+                               # env: TURNSTONE_SEARXNG_ENGINES
+#
+# workspace_dir = "/workspace" # model workspace hint and Files pane workspace root
+                               # (informational only — does not chdir or confine
+                               # tools; skipped if the directory doesn't exist).
+                               # The Docker image presets this to /workspace.
+                               # env: TURNSTONE_WORKSPACE
+#
+# Reranking (optional, disabled by default). Turnstone runs no reranker itself —
+# it POSTs to an external Cohere/Jina-compatible /rerank endpoint (self-hosted
+# vLLM/TEI/llama.cpp, or hosted Cohere/Jina/Voyage) to reorder results by query
+# relevance. The endpoint is a per-model definition: add a model in the admin
+# Models tab with capability {"supports_rerank": true} and base_url set to the
+# full /rerank endpoint, then pick it under Models -> Roles -> Reranker. The
+# settings below are global knobs — there is no rerank_url-style endpoint setting.
+# rerank_web_search = true     # rerank web_search results (when an endpoint is set)
+# rerank_bm25 = true           # rerank tool/skill search and live memory-pointer metadata
+# rerank_bm25_threshold = 0.0  # 0-1 relevance floor for memory pointers; 0 = off (reorder
+                               # only). Per-model: set via `turnstone-admin rerank-calibrate`.
+# rerank_instruction = ""      # for instruction-aware rerankers (Qwen3) when the endpoint
+                               # does NOT apply the model's chat template, e.g. "Given a web
+                               # search query, retrieve relevant passages that answer the
+                               # query". Prefer vLLM's --chat-template; don't use both.
+                               # NB: serving Qwen3-Reranker via vLLM REQUIRES --chat-template
+                               # (the model's chat_template.jinja) or scores are near-random.
+
+# --- Judge (turnstone CLI; server/console use Admin -> Judge) ---
+
+[judge]
+# enabled = true               # Enable intent validation
+# model = ""                   # Registered judge alias; empty = same as session
+# confidence_threshold = 0.95  # Judge verdict confidence threshold
+# timeout = 120.0              # Per-turn LLM judge timeout in seconds
+# parallel_evaluations = 1     # Concurrent LLM evaluations per tool-call batch (1-16)
+
+# --- MCP (turnstone, node) ---
+
+[mcp]
+# config_path = ""             # Path to MCP servers config file (JSON)
+
+# --- Shared authentication (console and every server node) ---
+# See docs/docker.md#shared-bootstrap-config for OAuth, SSO, and delegation.
+# Keep the same key on every process sharing the database. This key is
+# config-file-only: never put it in .env or the admin Settings table.
+
+[security]
+# Encrypts per-user MCP tokens, captured SSO credentials, and model auth tokens.
+# mcp_token_encryption_key = "" # Generate once; keep a private backup
+# python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+
+# --- Secret references (console and every server node) ---
+# A model api_key or MCP header may hold secret://<backend>/<path>[#<field>]
+# instead of the value; the value is fetched from the store when needed and
+# never stored. Keep this table identical on every process sharing the
+# database. See docs/security.md#secret-references.
+
+[secrets]
+# cache_ttl_seconds = 300      # How long a fetched value is reused; with a store
+#                              # configured, models also reload this often (60 s minimum)
+
+# [secrets.file]
+# root = "/run/secrets"        # secret://file/run/secrets/openai reads that file
+
+# [secrets.vault]              # Vault or OpenBao, KV v2
+# address = "https://vault.example.com:8200"
+# auth = "approle"             # "approle" (role_id + secret_id/secret_id_file)
+#                              # or "jwt" (role + jwt_path; Kubernetes: auth_mount = "kubernetes")
+# role_id = ""
+# secret_id_file = "/etc/turnstone/vault-secret-id"   # must lie outside [secrets.file] root
+# mount = "secret"             # secret://vault/turnstone/openai#api_key
+# namespace = ""               # Sent only when set
+# ca_cert = ""                 # CA bundle for a private certificate authority
+# timeout_seconds = 5
+
+[oidc]
+# Shared origin for SSO login and per-user MCP OAuth; setting it alone enables neither.
+# redirect_base = "https://turnstone.example.com" # Origin only, no path/query/fragment
+# MCP callback: https://turnstone.example.com/v1/api/mcp/oauth/callback
+# SSO callback: https://turnstone.example.com/v1/api/auth/oidc/callback
+
+# Optional SSO: configure all three fields after creating a local admin.
+# See docs/oidc.md for provider registration and role mapping.
+# issuer = "https://identity.example.com"
+# client_id = "your-client-id"
+# client_secret = "your-client-secret"
+# provider_name = "SSO"
+# password_enabled = true      # Keep local password login available
+
+# Optional SSO delegation to MCP/model backends. Requires the encryption key
+# above, provider permissions, and the grant profile supported by your IdP.
+# See docs/mcp-oauth.md and docs/oidc.md#model-gateway-credentials.
+# capture_user_credential = false # Set true to capture refresh tokens at login
+# obo_grant_profile = "entra"     # "entra" or "rfc8693"
+
+# --- Server (node, console) ---
+
+[server]
+# max_workstreams = 50         # Maximum concurrent workstreams per node
+                               # env: TURNSTONE_MAX_WORKSTREAMS

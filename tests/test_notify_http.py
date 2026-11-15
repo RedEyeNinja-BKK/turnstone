@@ -1,0 +1,418 @@
+"""Tests for the channel gateway HTTP notify endpoint."""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
+import pytest
+from starlette.testclient import TestClient
+
+from turnstone.channels._http import create_channel_app
+from turnstone.core.auth import JWT_AUD_CHANNEL, create_jwt
+
+_JWT_SECRET = "a" * 32
+
+
+def _make_jwt() -> str:
+    """Create a valid JWT for channel auth."""
+    return create_jwt(
+        user_id="system",
+        scopes=frozenset({"write"}),
+        source="service",
+        secret=_JWT_SECRET,
+        audience=JWT_AUD_CHANNEL,
+    )
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_make_jwt()}"}
+
+
+@pytest.fixture
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
+
+
+@pytest.fixture
+def mock_adapter():
+    adapter = AsyncMock()
+    adapter.channel_type = "discord"
+    adapter.send = AsyncMock(return_value="msg_001")
+    return adapter
+
+
+@pytest.fixture
+def no_auth_client(storage, mock_adapter):
+    """Client with no auth configured (for fail-closed tests)."""
+    app = create_channel_app({"discord": mock_adapter}, storage)
+    return TestClient(app)
+
+
+@pytest.fixture
+def client(storage, mock_adapter):
+    """Default client with JWT auth configured."""
+    app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
+    return TestClient(app)
+
+
+@pytest.fixture
+def authed_client(storage, mock_adapter):
+    """Alias -- same as client, for auth-specific test clarity."""
+    app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
+    return TestClient(app)
+
+
+@pytest.fixture
+def jwt_client(storage, mock_adapter):
+    """Client with JWT auth configured."""
+    app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
+    return TestClient(app)
+
+
+class TestNotifyEndpoint:
+    def test_health(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    def test_direct_discord_target(self, client, mock_adapter):
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123456"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert len(results) == 1
+        assert results[0]["status"] == "sent"
+        assert results[0]["message_id"] == "msg_001"
+        mock_adapter.send.assert_called_once_with("123456", "Hello!")
+
+    def test_with_title(self, client, mock_adapter):
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123456"},
+                "message": "Hello!",
+                "title": "Alert",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        mock_adapter.send.assert_called_once_with("123456", "**Alert**\nHello!")
+
+    @pytest.mark.parametrize(
+        ("body", "error"),
+        [
+            (b"[]", "Request body must be a JSON object"),
+            (b'{"target": "x", "message": "hi"}', "target must be an object"),
+            (b'{"target": ["x"], "message": "hi"}', "target must be an object"),
+            (
+                b'{"target": {"username": ["u"]}, "message": "hi"}',
+                "target's username, channel_type and channel_id must be strings",
+            ),
+            (
+                b'{"target": {"channel_type": ["x"], "channel_id": "c"}, "message": "hi"}',
+                "target's username, channel_type and channel_id must be strings",
+            ),
+            (
+                b'{"target": {"channel_type": "discord", "channel_id": 5}, "message": "hi"}',
+                "target's username, channel_type and channel_id must be strings",
+            ),
+        ],
+        ids=[
+            "body-list",
+            "target-string",
+            "target-list",
+            "username-list",
+            "channel-type-list",
+            "channel-id-number",
+        ],
+    )
+    def test_a_body_it_cannot_use_is_a_400(self, client, mock_adapter, body, error):
+        resp = client.post(
+            "/v1/api/notify",
+            content=body,
+            headers={**_auth_headers(), "Content-Type": "application/json"},
+        )
+        assert (resp.status_code, resp.json()) == (400, {"error": error})
+        mock_adapter.send.assert_not_called()
+
+    def test_username_resolution(self, client, storage, mock_adapter):
+        # Create a user and link a channel
+        storage.create_user("u1", "testuser", "Test User", "hash")
+        storage.create_channel_user("discord", "disc_123", "u1")
+
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"username": "testuser"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert len(results) == 1
+        assert results[0]["status"] == "sent"
+        mock_adapter.send.assert_called_once_with("disc_123", "Hello!")
+
+    def test_unknown_username(self, client):
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"username": "nobody"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 404
+        error = resp.json()["error"]
+        assert "nobody" not in error
+        assert "not found or has no linked channels" in error
+
+    def test_user_no_channels(self, authed_client, storage):
+        storage.create_user("u1", "testuser", "Test User", "hash")
+
+        resp = authed_client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"username": "testuser"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 404
+        # Generic message -- must not differentiate "not found" vs "no channels"
+        error = resp.json()["error"]
+        assert "testuser" not in error
+        assert "not found or has no linked channels" in error
+
+    def test_missing_fields(self, client):
+        resp = client.post(
+            "/v1/api/notify",
+            json={"target": {"username": "x"}},
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 400
+
+    def test_missing_target(self, client):
+        resp = client.post(
+            "/v1/api/notify",
+            json={"message": "Hello!"},
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 400
+
+    def test_invalid_target(self, client):
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"invalid": "field"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 400
+
+    def test_no_adapter(self, client, storage):
+        # App has discord adapter, try email target
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "email", "channel_id": "test@example.com"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert results[0]["status"] == "no_adapter"
+
+    def test_adapter_failure(self, client, mock_adapter):
+        mock_adapter.send.side_effect = RuntimeError("Discord API error")
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123456"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert results[0]["status"] == "failed"
+
+    def test_adapter_timeout(self, storage, mock_adapter, monkeypatch):
+        """Adapter calls that exceed the timeout return timeout status."""
+        import asyncio
+
+        async def _hang(*_args: object) -> str:
+            await asyncio.sleep(300)
+            return ""
+
+        mock_adapter.send = _hang
+
+        # Use a very short timeout to keep the test fast
+        from turnstone.channels import _http as _http_mod
+
+        monkeypatch.setattr(_http_mod, "_NOTIFY_ADAPTER_TIMEOUT", 0.1)
+        app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
+        tc = TestClient(app)
+        resp = tc.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123456"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert results[0]["status"] == "timeout"
+
+    def test_invalid_json(self, client):
+        resp = client.post(
+            "/v1/api/notify",
+            content=b"not json",
+            headers={
+                "content-type": "application/json",
+                "Authorization": f"Bearer {_make_jwt()}",
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_whitespace_only_message(self, client):
+        """Whitespace-only messages should be rejected."""
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "   ",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 400
+
+
+class TestNotifyAuth:
+    """Tests for authentication on the /v1/api/notify endpoint."""
+
+    @pytest.mark.parametrize(
+        ("header", "reason"),
+        [
+            ("", "missing_authorization"),
+            ("Basic private-credentials", "invalid_auth_scheme"),
+            ("Bearer private-token", "invalid_token_format"),
+            ("Bearer private-token.invalid.jwt", "invalid_jwt"),
+        ],
+    )
+    def test_auth_rejection_logs_reason_without_credentials(self, authed_client, header, reason):
+        from unittest.mock import patch
+
+        with patch("turnstone.channels._http.log") as logger:
+            response = authed_client.post(
+                "/v1/api/notify",
+                json={"message": "private-message"},
+                headers={"Authorization": header} if header else {},
+            )
+
+        assert response.status_code == 401
+        assert response.json() == {"error": "Unauthorized"}
+        logger.warning.assert_called_once_with(
+            "notify.auth_rejected", reason=reason, client_host="testclient"
+        )
+        assert "private-" not in repr(logger.mock_calls)
+
+    def test_reject_when_unconfigured(self, no_auth_client):
+        """Requests are rejected (fail closed) when no auth is configured."""
+        resp = no_auth_client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "Hello!",
+            },
+        )
+        assert resp.status_code == 401
+
+    def test_reject_without_token(self, authed_client):
+        """Requests without Authorization header are rejected when auth is configured."""
+        resp = authed_client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "Hello!",
+            },
+        )
+        assert resp.status_code == 401
+
+    def test_reject_wrong_token(self, authed_client):
+        """Requests with wrong token are rejected."""
+        resp = authed_client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "Hello!",
+            },
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
+    def test_accept_valid_jwt(self, jwt_client, mock_adapter):
+        """Requests with a valid JWT for the channel audience are accepted."""
+        token = _make_jwt()
+        resp = jwt_client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "Hello!",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+
+    def test_reject_jwt_wrong_audience(self, jwt_client):
+        """JWTs with wrong audience are rejected."""
+        token = create_jwt(
+            user_id="system",
+            scopes=frozenset({"write"}),
+            source="service",
+            secret=_JWT_SECRET,
+            audience="turnstone-server",  # wrong audience
+        )
+        resp = jwt_client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "Hello!",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 401
+
+    def test_reject_jwt_wrong_secret(self, jwt_client):
+        """JWTs signed with wrong secret are rejected."""
+        token = create_jwt(
+            user_id="system",
+            scopes=frozenset({"write"}),
+            source="service",
+            secret="b" * 32,  # wrong secret
+            audience=JWT_AUD_CHANNEL,
+        )
+        resp = jwt_client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "Hello!",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 401
+
+    def test_health_bypasses_auth(self, authed_client):
+        """Health endpoint is always accessible regardless of auth config."""
+        resp = authed_client.get("/health")
+        assert resp.status_code == 200

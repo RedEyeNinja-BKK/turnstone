@@ -1,0 +1,818 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
+
+import pytest
+
+
+def stop_loop_thread(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
+    """Fully tear down a ``loop.run_forever``-in-a-thread test loop.
+
+    Shuts the loop's default executor down ON the loop (joining its worker
+    threads — the ``asyncio_N`` threads that otherwise leak past the test),
+    then stops the loop, joins the thread, and closes the loop. Use in the
+    ``finally`` of a background-loop fixture so nothing outlives the test.
+    """
+    with contextlib.suppress(Exception):
+        asyncio.run_coroutine_threadsafe(loop.shutdown_default_executor(), loop).result(timeout=5)
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    with contextlib.suppress(Exception):
+        loop.close()
+
+
+def serve_until_exit(server: Any) -> None:
+    """Run a uvicorn ``Server`` on a fresh event loop until it exits.
+
+    The thread target for an in-thread test upstream: when ``server.serve()``
+    returns (the fixture set ``server.should_exit`` / ``force_exit``), the loop
+    is closed so it doesn't leak past the fixture.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(server.serve())
+    finally:
+        # Cancel + drain anything the app left pending (e.g. sse_starlette's
+        # shutdown watcher) so loop.close() doesn't warn "Task was destroyed
+        # but it is pending".
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+
+
+@contextlib.contextmanager
+def serve_asgi(app: Any, **config: Any) -> Iterator[int]:
+    """Serve *app* with uvicorn on a thread, at a free localhost port, for the ``with`` block.
+
+    Yields the port once it accepts TCP connections. *config* goes to ``uvicorn.Config`` (for
+    example ``ssl_certfile`` and ``ssl_keyfile``). On exit the server stops at once and its thread
+    is joined.
+    """
+    import uvicorn
+
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="critical",
+            access_log=False,
+            timeout_graceful_shutdown=0,
+            **config,
+        )
+    )
+    thread = threading.Thread(target=serve_until_exit, args=(server,), daemon=True)
+    thread.start()
+    try:
+        assert _wait_tcp_ready(port, 5), "test server did not start"
+        yield port
+    finally:
+        server.should_exit = True
+        server.force_exit = True
+        thread.join(timeout=5)
+
+
+class _PendingResolver:
+    """Race-free drop-in for ``threading.Timer(delay, ui.resolve_approval)``.
+
+    ``approve_tools`` runs ``_approval_event.clear()`` -> register
+    ``_pending_approval`` -> ``_approval_event.wait(_APPROVAL_WAIT_TIMEOUT)``
+    (3600s). A *fixed-delay* timer can fire ``resolve_approval``
+    (``_approval_event.set()``) BEFORE that ``.clear()`` on a slow/loaded
+    runner, so the set is wiped by the clear and ``approve_tools`` blocks the
+    full hour -- surfacing as a CI hang. This instead waits until the approval
+    is actually registered (which happens *after* the clear), then resolves, so
+    the wakeup can never be lost. ``start()`` / ``cancel()`` mirror
+    ``threading.Timer`` so it drops into existing scaffolding. ``cancel()``
+    signals the worker to stop and joins it, so a test that errors *before* the
+    approval registers can't leak the thread or resolve late into a finished
+    test. ``before`` runs just before resolving -- e.g. to snapshot
+    pending-state fields the test asserts on.
+    """
+
+    def __init__(
+        self,
+        ui: Any,
+        *args: Any,
+        before: Callable[[], None] | None = None,
+        deadline: float = 10.0,
+        **kwargs: Any,
+    ) -> None:
+        self._ui = ui
+        self._args = args
+        self._kwargs = kwargs
+        self._before = before
+        self._deadline = deadline
+        self._cancelled = threading.Event()
+        self._started = False
+        self._thread = threading.Thread(target=self._run, name="resolve-when-pending", daemon=True)
+
+    def _run(self) -> None:
+        end = time.monotonic() + self._deadline
+        while time.monotonic() < end:
+            if self._cancelled.is_set():
+                return
+            # getattr (not a bare read) so a UI without _pending_approval can't
+            # crash the worker into a silent death that leaves approve_tools
+            # blocked for the full _APPROVAL_WAIT_TIMEOUT.
+            if getattr(self._ui, "_pending_approval", None) is not None:
+                if self._before is not None:
+                    self._before()
+                self._ui.resolve_approval(*self._args, **self._kwargs)
+                return
+            time.sleep(0.001)
+        # Deadline without registration: approve_tools isn't parked on the
+        # approval event (returned early, or never reached it) -- don't resolve
+        # into an unknown state; let the test's own assertions speak.
+
+    def start(self) -> None:
+        self._started = True
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        if self._started:
+            self._thread.join(timeout=5)
+
+
+def resolve_when_pending(ui: Any, *args: Any, **kwargs: Any) -> _PendingResolver:
+    """Build a race-free approval resolver (see :class:`_PendingResolver`)."""
+    return _PendingResolver(ui, *args, **kwargs)
+
+
+@contextlib.contextmanager
+def stdin_from_pipe(data: bytes = b"") -> Iterator[None]:
+    """Make this process's stdin (fd 0) a pipe holding *data* for the block, so a
+    child that inherits fd 0 would read it."""
+    read_end, write_end = os.pipe()
+    os.write(write_end, data)
+    os.close(write_end)
+    saved_stdin = os.dup(0)
+    try:
+        os.dup2(read_end, 0)
+        yield
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        os.close(read_end)
+
+
+@contextlib.contextmanager
+def stdin_from_pty() -> Iterator[int]:
+    """Make this process's stdin (fd 0) a pseudo-terminal for the block, as the
+    CLI's is; yields its master, where a write is a line typed into it."""
+    try:
+        master, slave = os.openpty()
+    except OSError:
+        pytest.skip("this host cannot open a pseudo-terminal")
+    saved_stdin = os.dup(0)
+    try:
+        os.dup2(slave, 0)
+        yield master
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        os.close(slave)
+        os.close(master)
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+    from pathlib import Path
+
+    from turnstone.core.mcp_client import MCPClientManager, StaticServerState
+    from turnstone.core.oauth.oidc import OIDCConfig
+    from turnstone.core.storage._sqlite import SQLiteBackend
+    from turnstone.core.token_store.crypto import TokenCipher
+
+
+# A background daemon (e.g. title generation) can log into pytest's per-test
+# capture as it is torn down — a benign "I/O operation on closed file" handler
+# error. Don't let the logging module turn that race into noisy stderr
+# tracebacks. (Process-global, test-only — product runtime keeps the default.)
+logging.raiseExceptions = False
+
+
+# Threads a test leaves running after teardown bleed into LATER tests' captured
+# output (the "I/O operation on closed file" heisenbug) and, worse, can wedge
+# the whole run (a leaked event loop / server that never stops). This grace
+# lets a legitimately-finishing quick daemon settle before we judge a leak.
+_THREAD_LEAK_GRACE = 5.0
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_threads(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Fail a test that leaves a background thread running past teardown.
+
+    Snapshots the live threads at setup; at teardown, gives any NEW thread a
+    short grace to finish, then fails listing those still alive — so a leak is
+    caught here instead of as a heisenbug days later. Opt out with
+    ``@pytest.mark.allow_thread_leak`` (e.g. module-scoped servers in the live
+    suite).
+    """
+    if request.node.get_closest_marker("allow_thread_leak"):
+        yield
+        return
+    # Snapshot the Thread OBJECTS, not their idents: Thread.ident is recycled
+    # after a thread exits, so an ident-based snapshot could mistake a new
+    # leaked thread (reusing an exited thread's ident) for a pre-existing one.
+    before = set(threading.enumerate())
+    yield
+    main = threading.main_thread()
+    current = threading.current_thread()
+    # One deadline shared across all joined threads — a deliberate TOTAL
+    # teardown budget (not per-thread), so a pathological test can't stall
+    # teardown by N×grace. A genuine never-stopping leak exhausts it and fails.
+    deadline = time.monotonic() + _THREAD_LEAK_GRACE
+    leaked = []
+    for t in threading.enumerate():
+        if t in before or t is main or t is current or not t.is_alive():
+            continue
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+        if t.is_alive():
+            leaked.append(t.name)
+    if leaked:
+        pytest.fail(
+            f"test left background threads running after teardown: {leaked}. "
+            "Stop them in teardown (shut down servers / close event loops / join "
+            "threads), or mark @pytest.mark.allow_thread_leak if intentional."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _every_lease_handle_has_a_slot(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Fail a test whose SessionManager still renews a lease no slot holds.
+
+    Every way a slot leaves must release its owner lease. A forgotten release
+    goes on renewing until shutdown and nothing else notices (#988), so at
+    teardown each manager built during the test may track only the handles of
+    its loaded slots, its retained failed-delete tombstones and its pending
+    creates. Opt out with ``@pytest.mark.allow_lease_outside_slot``.
+    """
+    if request.node.get_closest_marker("allow_lease_outside_slot"):
+        yield
+        return
+    from turnstone.core.session_manager import SessionManager
+
+    managers: list[SessionManager] = []
+    init = SessionManager.__init__
+
+    def tracked_init(self: SessionManager, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        managers.append(self)
+
+    monkeypatch.setattr(SessionManager, "__init__", tracked_init)
+    yield
+    stray: list[str] = []
+    for mgr in managers:
+        with mgr._lock:
+            slots = [
+                *mgr._workstreams.values(),
+                *mgr._failed_delete_tombstones.values(),
+                *mgr._pending_creates.values(),
+            ]
+        held = {id(ws._lease) for ws in slots if ws._lease is not None}
+        stray.extend(
+            f"{lease.ws_id[:8]} ({lease.state})"
+            for lease in mgr._lease_keeper.tracked()
+            if id(lease) not in held
+        )
+    if stray:
+        pytest.fail(
+            f"a SessionManager still renews leases no slot holds: {stray}. Release the "
+            "slot's lease on every exit, or mark @pytest.mark.allow_lease_outside_slot "
+            "if the test holds a bare handle on purpose."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _default_sqlite_outside_the_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    pytestconfig: pytest.Config,
+) -> None:
+    """Keep an auto-initialized SQLite store out of the repo root.
+
+    ``get_storage()`` creates ``.turnstone.db`` in the current directory when
+    nothing initialized storage; while that is the repo root, the file is
+    shared by every run (and by a CLI started there), so point the default at
+    a temporary directory instead. A test that moved into its own directory
+    keeps the real default.
+    """
+    from turnstone.core.storage import _registry
+
+    init = _registry.init_storage
+    root = os.path.realpath(pytestconfig.rootpath)
+
+    def init_outside_the_repo(backend: str = "sqlite", **kwargs: Any) -> Any:
+        in_root = os.path.realpath(os.getcwd()) == root
+        if backend == "sqlite" and not kwargs.get("path") and in_root:
+            kwargs["path"] = str(tmp_path_factory.mktemp("default-storage") / ".turnstone.db")
+        return init(backend, **kwargs)
+
+    monkeypatch.setattr(_registry, "init_storage", init_outside_the_repo)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_proxies(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the runner's proxy variables, so that no test depends on them.
+
+    A client built while they are set sends through the runner's proxy, past any transport the
+    test swapped in, and holds proxy mounts the test does not expect. Tests that exercise proxies
+    set their own. Live tests keep them: they reach real providers, which may need the proxy.
+    """
+    if request.node.get_closest_marker("live"):
+        return
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _close_oauth_runtimes(
+    monkeypatch: pytest.MonkeyPatch, _no_leaked_threads: None
+) -> Iterator[None]:
+    """Own and join OAuth runtimes created by adapter fixtures or lazy startup."""
+    from tests._oauth_runtime_helpers import adapter_runner
+    from turnstone.core.oauth.runtime import OAuthRuntime
+
+    runtimes: list[OAuthRuntime] = []
+    start = OAuthRuntime.start
+
+    def tracked_start(runtime: OAuthRuntime, *, deadline: float | None = None) -> None:
+        if runtime not in runtimes:
+            runtimes.append(runtime)
+        start(runtime, deadline=deadline)
+
+    monkeypatch.setattr(OAuthRuntime, "start", tracked_start)
+    runner = asyncio.Runner()
+    token = adapter_runner.set(runner)
+    yield
+    for runtime in reversed(runtimes):
+        runtime.shutdown()
+    runner.close()
+    adapter_runner.reset(token)
+
+
+def make_mcp_token_cipher() -> TokenCipher:
+    """Build a single-key MCP token cipher for tests.
+
+    Used by test files that need to exercise ``MCPTokenStore`` round-
+    trips without the lifespan-side configuration loader; centralised
+    here so the key/material defaults stay aligned across files.
+    """
+    import base64
+
+    from cryptography.fernet import Fernet
+
+    from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
+
+    raw = base64.urlsafe_b64decode(Fernet.generate_key())
+    return TokenCipher(TokenCipherConfig(keys=(raw,)))
+
+
+def _seed_static_state(mgr: MCPClientManager, name: str, **overrides: Any) -> StaticServerState:
+    """Get-or-create a ``StaticServerState`` on ``mgr`` and apply ``overrides``.
+
+    Shared across MCP test files so the helper stays in one place. Imported
+    where needed; ``StaticServerState`` is constructed lazily so non-MCP
+    tests don't pay the import cost.
+    """
+    from turnstone.core.mcp_client import StaticServerState
+
+    state = mgr._static_servers.get(name)
+    if state is None:
+        state = StaticServerState(name=name)
+        mgr._static_servers[name] = state
+    for k, v in overrides.items():
+        setattr(state, k, v)
+    return state
+
+
+def make_client_session_double() -> MagicMock:
+    """A ``ClientSession`` double, specced against the SDK's class, for a server on the
+    2025-11-25 revision: it refuses the ``server/discover`` probe as such a server does, so
+    negotiation falls back to ``initialize`` and no ``subscriptions/listen`` stream opens.
+
+    Callers set the capabilities and catalogs their test needs; a name the SDK's class lacks fails,
+    whether read or written.
+    """
+    import mcp.types as mcp_types
+    from mcp import ClientSession, MCPError
+
+    session = MagicMock(spec_set=ClientSession)
+    session.send_discover.side_effect = MCPError(
+        code=mcp_types.METHOD_NOT_FOUND, message="Method not found"
+    )
+    session.protocol_version = "2025-11-25"
+    return session
+
+
+def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float = 10) -> Any:
+    """Submit *coro* to *loop*, wait for the result.
+
+    The ONE copy shared by the MCP test files — four hand-synced copies
+    had already drifted on the timeout (5s hardcoded vs a 10s default).
+    The timeout is an upper bound on waiting, not a behavior assertion,
+    so the most generous variant won the merge.
+    """
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result(timeout=timeout)
+
+
+def _drain_background(mgr: MCPClientManager, loop: asyncio.AbstractEventLoop) -> None:
+    """Deterministically await ``mgr``'s tracked background tasks.
+
+    Replaces fixed sleeps for synchronizing with scheduled dead-grant
+    drops / spawned refreshes: exact, and immune to slow-runner flake.
+    """
+
+    async def _drain() -> None:
+        tasks = [t for t in list(mgr._background_tasks) if not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run_on_loop(loop, _drain())
+
+
+def _poll_until(predicate: Callable[[], bool], timeout: float, interval: float = 0.05) -> bool:
+    """Poll *predicate* until true or *timeout* elapses — the ONE wait loop.
+
+    Shared by the live MCP smoke tests' condition helpers so the
+    deadline/poll pattern doesn't accrete per-file hand-synced copies.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _free_port() -> int:
+    """Grab an ephemeral localhost port for a live-server subprocess.
+
+    Shared by the live MCP smoke tests (flaky-server, push-refresh) so
+    the socket-probe helpers stay in one place instead of drifting per
+    file.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _tcp_accepts(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_tcp_ready(port: int, timeout: float) -> bool:
+    """Poll until something accepts TCP on 127.0.0.1:*port* (live tests)."""
+    return _poll_until(lambda: _tcp_accepts(port), timeout)
+
+
+def _wait_session_live(
+    mgr: MCPClientManager, name: str, timeout: float, *, previous_session: object | None = None
+) -> bool:
+    """Poll for an initialized session other than *previous_session*.
+
+    After a server restart the old session can remain installed until its
+    asynchronous teardown finishes; its presence is not proof of recovery.
+    """
+
+    def _live() -> bool:
+        state = mgr._static_servers.get(name)
+        session = state.session if state is not None else None
+        return session is not None and session is not previous_session
+
+    return _poll_until(_live, timeout)
+
+
+def _popen_mcp_server(script_path: Any, port: int) -> subprocess.Popen[bytes]:
+    """Start an MCPServer live-server subprocess, streams to DEVNULL.
+
+    The shared spawn primitive for the live MCP smoke tests
+    (flaky-server flap loop, push-refresh) — the readiness wait and the
+    skip-vs-raise-on-failure policy legitimately differ per test and
+    stay at the call sites. ``sys.executable`` runs the same interpreter,
+    so a server-side import gap surfaces as a failed TCP wait, not here.
+    """
+    return subprocess.Popen(
+        [sys.executable, str(script_path), str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def make_oidc_test_config(**overrides: Any) -> OIDCConfig:
+    """Build a test ``OIDCConfig`` with sensible defaults.
+
+    Shared between ``test_oidc.py`` and ``test_oidc_handlers.py`` so the
+    defaults (including the now-required ``redirect_base``) stay aligned.
+    """
+    from turnstone.core.oauth.oidc import OIDCConfig
+
+    defaults: dict[str, Any] = {
+        "enabled": True,
+        "issuer": "https://idp.example.com",
+        "client_id": "my-client",
+        "client_secret": "my-secret",
+        "scopes": "openid email profile",
+        "provider_name": "TestIDP",
+        "role_claim": "",
+        "role_map": {},
+        "password_enabled": True,
+        "redirect_base": "https://app.example.com",
+        "authorization_endpoint": "https://idp.example.com/authorize",
+        "token_endpoint": "https://idp.example.com/token",
+        "userinfo_endpoint": "https://idp.example.com/userinfo",
+        "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+    }
+    defaults.update(overrides)
+    return OIDCConfig(**defaults)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--storage-backend",
+        default="sqlite",
+        choices=["sqlite", "postgresql"],
+        help="Storage backend for integration tests (default: sqlite)",
+    )
+
+
+def _pg_base_url() -> str:
+    return os.environ.get(
+        "TURNSTONE_TEST_PG_URL",
+        "postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test",
+    )
+
+
+@pytest.fixture
+def fresh_pg_url(request: pytest.FixtureRequest) -> Iterator[Any]:
+    """Create a throwaway PostgreSQL database for migration-path tests.
+
+    Skips unless the suite is running against PostgreSQL. Tests that exercise
+    migrations from scratch cannot use the shared ``turnstone_test`` schema.
+    """
+    if request.config.getoption("--storage-backend") != "postgresql":
+        pytest.skip("PostgreSQL-only migration path")
+
+    import uuid
+
+    import sqlalchemy as sa
+
+    base = sa.make_url(_pg_base_url())
+    db_name = f"ts_migtest_{uuid.uuid4().hex[:12]}"
+    # CREATE/DROP DATABASE cannot run in a transaction.
+    admin = sa.create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            conn.execute(sa.text(f'CREATE DATABASE "{db_name}"'))
+        yield base.set(database=db_name)
+    finally:
+        with admin.connect() as conn:
+            # Terminate any lingering backends before dropping the database.
+            conn.execute(
+                sa.text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :d AND pid <> pg_backend_pid()"
+                ),
+                {"d": db_name},
+            )
+            conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
+        admin.dispose()
+
+
+@pytest.fixture(scope="session")
+def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Prepare an empty schema once; tests copy it into their own temporary paths."""
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    path = tmp_path_factory.mktemp("sqlite-schema") / "template.db"
+    # Closing the last connection checkpoints WAL before any file is copied.
+    with contextlib.closing(SQLiteBackend(str(path))):
+        pass
+    return path
+
+
+@pytest.fixture(scope="session")
+def sqlite_migrated_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Prepare migration seed data without changing the storage singleton."""
+    from turnstone.core.storage._migrate import run_migrations
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    path = tmp_path_factory.mktemp("sqlite-migrated") / "template.db"
+    with contextlib.closing(SQLiteBackend(str(path), create_tables=False)) as storage:
+        run_migrations(storage, "sqlite")
+    return path
+
+
+@pytest.fixture
+def sqlite_backend_factory(request: pytest.FixtureRequest) -> Callable[..., SQLiteBackend]:
+    """Create explicitly SQLite-backed stores and close each after the test.
+
+    Register cleanup before callers seed data or build dependent fixtures so
+    failures during their setup still dispose every pool they opened.
+    """
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    def create(path: str, *, create_tables: bool = True) -> SQLiteBackend:
+        backend = SQLiteBackend(path, create_tables=create_tables)
+        request.addfinalizer(backend.close)
+        return backend
+
+    return create
+
+
+@pytest.fixture
+def tmp_db(tmp_path, sqlite_schema_template):
+    """Provide a temporary SQLite storage backend (singleton registry)."""
+    from turnstone.core.storage import init_storage, reset_storage
+
+    db_path = str(tmp_path / "test.db")
+    reset_storage()
+    if not os.path.exists(db_path):
+        shutil.copyfile(sqlite_schema_template, db_path)
+    # Own the instance even when a test replaces the registry with a mock.
+    with contextlib.closing(init_storage("sqlite", path=db_path, run_migrations=False)):
+        yield db_path
+    reset_storage()
+
+
+@pytest.fixture
+def storage_backend(request, tmp_path):
+    """Shared storage backend fixture — respects --storage-backend flag.
+
+    Returns a StorageBackend instance (SQLite or PostgreSQL).
+    Tests that use this fixture run against whichever backend CI selects.
+    """
+    from turnstone.core.storage import init_storage, reset_storage
+
+    backend_type = request.config.getoption("--storage-backend")
+    reset_storage()
+
+    if backend_type == "postgresql":
+        pg_url = os.environ.get(
+            "TURNSTONE_TEST_PG_URL",
+            "postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test",
+        )
+        backend = init_storage("postgresql", url=pg_url, run_migrations=False)
+        yield backend
+        # Truncate all tables between tests — faster than DELETE and resets
+        # autoincrement sequences.  CASCADE handles any future FK constraints.
+        # NOTE: accesses backend._engine (SQLAlchemy internal) — both SQLite
+        # and PostgreSQL backends expose this.  If a non-SQLAlchemy backend is
+        # ever added, this cleanup will need a protocol-level hook.
+        try:
+            import sqlalchemy as sa
+
+            from turnstone.core.storage._schema import metadata as db_metadata
+
+            with backend._engine.connect() as conn:
+                table_names = ", ".join(t.name for t in reversed(db_metadata.sorted_tables))
+                conn.execute(sa.text(f"TRUNCATE {table_names} RESTART IDENTITY CASCADE"))
+                conn.commit()
+        except Exception:
+            pass  # best-effort cleanup; reset_storage disposes engine
+        finally:
+            backend.close()
+            reset_storage()
+    else:
+        db_path = str(tmp_path / "test.db")
+        if not os.path.exists(db_path):
+            shutil.copyfile(request.getfixturevalue("sqlite_schema_template"), db_path)
+        backend = init_storage("sqlite", path=db_path, run_migrations=False)
+        with contextlib.closing(backend):
+            yield backend
+        reset_storage()
+
+
+@pytest.fixture
+def backend(storage_backend):
+    """Alias for storage_backend — used by test_storage_sqlite.py etc."""
+    return storage_backend
+
+
+@pytest.fixture
+def db(storage_backend):
+    """Alias for storage_backend — used by domain-specific storage tests."""
+    return storage_backend
+
+
+@pytest.fixture
+def storage(storage_backend):
+    """Alias for storage_backend — used by services/skill resource tests."""
+    return storage_backend
+
+
+@pytest.fixture
+def mock_openai_client():
+    """Return a minimal mock OpenAI client."""
+    client = MagicMock()
+    client.models.list.return_value.data = [MagicMock(id="test-model")]
+    return client
+
+
+@pytest.fixture
+def make_config_store():
+    """Factory for a lightweight ConfigStore double.
+
+    ``make_config_store(**overrides)`` returns an object whose ``.get(key)``
+    yields the override when present, else the registered SettingDef default —
+    mirroring the real :meth:`ConfigStore.get` fail-open (a bool setting reads
+    as its ``False`` default on a miss, never ``None``). Shared by the
+    ``server.require_project`` gate / advisory tests.
+    """
+
+    _unset = object()
+
+    def _make(**overrides: Any) -> Any:
+        from turnstone.core.settings_registry import SETTINGS
+
+        class _ConfigStoreDouble:
+            def get(self, key: str, default: Any = _unset) -> Any:
+                # Mirror ConfigStore.get precedence exactly: cache (overrides)
+                # first, then a caller-supplied default, then the registry
+                # default, then None — so a reused caller passing an explicit
+                # default for an unset key gets the same value production would.
+                if key in overrides:
+                    return overrides[key]
+                if default is not _unset:
+                    return default
+                defn = SETTINGS.get(key)
+                return defn.default if defn else None
+
+        return _ConfigStoreDouble()
+
+    return _make
+
+
+@pytest.fixture(autouse=True)
+def _reset_secret_refs():
+    """Drop the process-wide secret:// resolver between tests.
+
+    It is built lazily from config.toml on the first reference and would
+    otherwise carry one test's patched ``[secrets]`` (or a developer's real
+    one) into the next. A no-op when nothing built it.
+    """
+    from turnstone.core.secret_refs import reset_for_tests
+
+    reset_for_tests()
+    yield
+    reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _clear_policy_cache():
+    """Drop the in-process tool-policy cache between tests.
+
+    The cache is keyed by org_id (default ``""``), so without this
+    autouse hook a policy created in test A would leak into test B's
+    ``evaluate_loaded_tool_policies`` call — distinct storage instances, same
+    cache slot. Production singleton storage doesn't see the leak
+    because there's only one storage instance for the process lifetime;
+    the test isolation requirement is what motivates the autouse.
+    """
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache()
+    yield
+    invalidate_policy_cache()
+
+
+@pytest.fixture(autouse=True)
+def _clear_skill_risk_tiers():
+    """Drop the memoized skill risk tiers between tests.
+
+    The memo is process-wide and keyed on the skill's text, so a test that
+    patches the scanner would otherwise get the tier an earlier test scanned
+    for the same text.
+    """
+    from turnstone.core.storage._utils import skill_risk_tier
+
+    skill_risk_tier.cache_clear()
+    yield
+    skill_risk_tier.cache_clear()

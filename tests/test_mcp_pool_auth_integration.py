@@ -1,0 +1,1053 @@
+"""Phase 6 integration tests — real-transport drives 401/403 through the SDK.
+
+These are the structural exit criterion for Phase 6. They MUST drive through the real
+``streamable_http_client``, the real httpx2 response-hook path, and a REAL upstream MCP server (an
+in-process ``MCPServer`` on a background thread, with a starlette middleware that programmatically
+returns 401/403 with crafted ``WWW-Authenticate`` headers).
+
+Direct ``httpx2.HTTPStatusError`` injection is FORBIDDEN here — Phase 5 bug-1 was masked precisely
+by that pattern (the production code path was structurally unreachable, but the unit-test injection
+bypassed the SDK, which never hands a request's HTTP status error to the caller). The integration
+tests gate that the production path actually receives the carrier signal end-to-end.
+
+The fixture upstream is built in-thread (uvicorn on its own asyncio
+loop in a background thread) — same pattern as
+``tests/spike_sdk_concurrency.py``. Per the orchestrator's startup-cost
+note, measured at ~0.05s per fixture spin-up locally; well under the
+2s threshold for default-collection inclusion.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import socket
+import threading
+import time
+import urllib.parse
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
+
+import httpx2
+import pytest
+import uvicorn
+from aiohttp import web
+from mcp.server.mcpserver import MCPServer
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from tests._oauth_runtime_helpers import make_oauth_context
+from tests.conftest import make_mcp_token_cipher, serve_until_exit, stop_loop_thread
+from tests.test_mcp_oauth_handlers import _build_app
+from turnstone.core import mcp_oauth
+from turnstone.core.mcp_client import MCPClientManager, _decode_tool_result
+from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.mcp_oauth import TokenLookupResult
+from turnstone.core.oauth.context import TokenCoordination, oauth_context
+from turnstone.core.oauth.runtime import OAuthRuntime
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+# Quiet noisy logs during tests.
+logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("mcp").setLevel(logging.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# Fixture upstream — programmable BehaviorMiddleware
+# ---------------------------------------------------------------------------
+
+
+class BehaviorMiddleware(BaseHTTPMiddleware):
+    """Inspects per-request behaviour state and returns 401/403 on demand.
+
+    The behaviour is steered by a mutable ``behaviour`` dict on the
+    middleware instance; tests mutate it via the fixture handle.
+    Records every request's Authorization header for assertion.
+
+    Behaviour semantics:
+      * ``"once_401"``: return 401 once, then 200 thereafter.
+      * ``"always_401"``: always return 401.
+      * ``"once_403_insufficient"``: return 403 with insufficient_scope once.
+      * ``"once_403_generic"``: return 403 without error param once.
+      * ``"once_multi_www_auth_403"``: return 403 with TWO
+        ``WWW-Authenticate`` headers — first ``Bearer`` challenge
+        carries the SAFE scopes, second carries INJECTED scopes. The
+        dispatcher must report only the first.
+      * ``"never"`` (default): pass through to the real handler.
+
+    ``www_authenticate`` overrides the default header crafted per shape.
+    """
+
+    def __init__(self, app: Any, behaviour: dict[str, Any]) -> None:
+        super().__init__(app)
+        self._behaviour = behaviour
+
+    async def dispatch(self, request: Request, call_next: Callable[..., Any]) -> Response:
+        from starlette.responses import Response as StarletteResponse
+
+        # Record the Authorization header for assertion. POST is the
+        # tools/call request the dispatcher sends.
+        if request.method == "POST" and "/mcp" in str(request.url):
+            self._behaviour.setdefault("post_auth_headers", []).append(
+                request.headers.get("authorization")
+            )
+
+        mode = self._behaviour.get("mode", "never")
+        if mode == "once_401":
+            if not self._behaviour.get("_fired"):
+                self._behaviour["_fired"] = True
+                return StarletteResponse(
+                    "unauthorized",
+                    status_code=401,
+                    headers={
+                        "www-authenticate": self._behaviour.get(
+                            "www_authenticate", 'Bearer error="invalid_token"'
+                        )
+                    },
+                )
+        elif mode == "always_401":
+            return StarletteResponse(
+                "unauthorized",
+                status_code=401,
+                headers={
+                    "www-authenticate": self._behaviour.get(
+                        "www_authenticate", 'Bearer error="invalid_token"'
+                    )
+                },
+            )
+        elif mode == "once_403_insufficient":
+            if not self._behaviour.get("_fired"):
+                self._behaviour["_fired"] = True
+                return StarletteResponse(
+                    "forbidden",
+                    status_code=403,
+                    headers={
+                        "www-authenticate": self._behaviour.get(
+                            "www_authenticate",
+                            'Bearer error="insufficient_scope", scope="files:write mail:send"',
+                        )
+                    },
+                )
+        elif mode == "once_403_generic" and not self._behaviour.get("_fired"):
+            self._behaviour["_fired"] = True
+            return StarletteResponse(
+                "forbidden",
+                status_code=403,
+                headers={
+                    "www-authenticate": self._behaviour.get("www_authenticate", "Bearer realm=mcp")
+                },
+            )
+        elif mode == "once_multi_www_auth_403" and not self._behaviour.get("_fired"):
+            self._behaviour["_fired"] = True
+            # Two ``WWW-Authenticate: Bearer ...`` challenges. The
+            # first carries ``error=insufficient_scope`` but NO
+            # ``scope=`` parameter; the second carries the INJECTED
+            # scopes the dispatcher must NOT report. The first
+            # challenge intentionally lacks ``scope`` because
+            # ``parse_www_authenticate_bearer`` uses ``setdefault`` —
+            # if the first challenge HAD a scope, ``setdefault`` would
+            # already win on first-occurrence. The vector this test
+            # guards is the case where a defended absence becomes a
+            # silent presence: a hook regression to ``get(...)`` joins
+            # repeated headers with ``, `` and the parser then folds
+            # the second challenge's scope into the first challenge's
+            # params dict because there is no first-occurrence to
+            # protect.
+            response = StarletteResponse("forbidden", status_code=403)
+            response.headers.append(
+                "www-authenticate",
+                'Bearer realm="legit", error="insufficient_scope"',
+            )
+            response.headers.append(
+                "www-authenticate",
+                'Bearer error="insufficient_scope", scope="org:admin db:write"',
+            )
+            return response
+        return await call_next(request)
+
+
+def _find_free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _build_server(port: int, behaviour: dict[str, Any]) -> uvicorn.Server:
+    mcp = MCPServer(name="phase6-target")
+
+    @mcp.tool()
+    async def echo(payload: str = "default") -> str:
+        return f"echoed:{payload}"
+
+    app = mcp.streamable_http_app(streamable_http_path="/mcp")
+    app.add_middleware(BehaviorMiddleware, behaviour=behaviour)
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        access_log=False,
+        timeout_graceful_shutdown=0,  # don't block teardown on a held-open stream
+    )
+    return uvicorn.Server(config)
+
+
+def _wait_ready(port: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise TimeoutError(f"upstream at 127.0.0.1:{port} not ready after {timeout}s")
+
+
+@pytest.fixture
+def upstream():
+    """Boot an MCPServer fixture upstream in a background thread.
+
+    Yields ``(url, behaviour)`` where ``behaviour`` is a mutable dict
+    the test mutates to steer the middleware (set ``mode`` to one of
+    the BehaviorMiddleware shapes).
+    """
+    port = _find_free_port()
+    behaviour: dict[str, Any] = {}
+    server = _build_server(port, behaviour)
+
+    def _run() -> None:
+        serve_until_exit(server)
+
+    t = threading.Thread(target=_run, daemon=True, name="phase6-upstream")
+    t.start()
+    try:
+        _wait_ready(port)
+        yield f"http://127.0.0.1:{port}/mcp", behaviour
+    finally:
+        # should_exit alone triggers a GRACEFUL shutdown that can wait forever
+        # on a held-open streamable-http stream; force_exit skips that wait so
+        # serve() returns and the upstream thread doesn't leak past the test.
+        server.should_exit = True
+        server.force_exit = True
+        t.join(timeout=5)
+
+
+@pytest.fixture
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
+
+
+def _seed_oauth_server(
+    storage: SQLiteBackend,
+    *,
+    name: str = "pool-srv",
+    server_id: str = "srv-pool",
+    url: str = "https://mcp.example.com/sse",
+) -> None:
+    storage.create_mcp_server(
+        server_id=server_id,
+        name=name,
+        transport="streamable-http",
+        url=url,
+        auth_type="oauth_user",
+        oauth_client_id="client-abc",
+        oauth_scopes="openid",
+        oauth_audience=url,
+    )
+
+
+def _seed_user_token(
+    storage: SQLiteBackend,
+    cipher: Any,
+    *,
+    user_id: str = "user-1",
+    server_name: str = "pool-srv",
+    expires_in_seconds: int = 3600,
+    access_token: str = "access-aaa",
+    refresh_token: str | None = "refresh-rrr",
+) -> None:
+    expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in_seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    store = MCPTokenStore(storage, cipher, node_id="test")
+    store.create_user_token(
+        user_id,
+        server_name,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=expires_at,
+        scopes="openid",
+        as_issuer="https://as.example.com",
+        audience="https://mcp.example.com",
+    )
+
+
+def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        auth_storage=storage,
+        mcp_oauth_coordination=TokenCoordination(),
+        mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, cipher, node_id="test"),
+            http_client=MagicMock(spec=httpx2.AsyncClient),
+        ),
+    )
+
+
+def test_browser_consent_then_dispatch_refreshes_on_oauth_runtime(
+    upstream: Any, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real browser routes, HTTP connections and MCP dispatch share one consent."""
+    url, behaviour = upstream
+    storage.create_user("user-1", "user1", "User One", "hash")
+    _seed_oauth_server(storage, url=url)
+    store = MCPTokenStore(storage, make_mcp_token_cipher())
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+
+    async def run() -> None:
+        requests: list[tuple[str, httpx2.AsyncClient, asyncio.AbstractEventLoop]] = []
+        grants: list[str] = []
+
+        def client() -> httpx2.AsyncClient:
+            instance = httpx2.AsyncClient()
+            owner = asyncio.get_running_loop()
+
+            async def observe(request: httpx2.Request) -> None:
+                # Deterministic even if a slow runner expires a keepalive socket.
+                assert asyncio.get_running_loop() is owner
+                requests.append((request.url.path, instance, owner))
+
+            instance.event_hooks["request"].append(observe)
+            return instance
+
+        async def handle(request: web.Request) -> web.Response:
+            if request.path == "/.well-known/oauth-authorization-server":
+                return web.json_response(
+                    {
+                        "issuer": origin,
+                        "authorization_endpoint": f"{origin}/authorize",
+                        "token_endpoint": f"{origin}/token",
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": ["none"],
+                    }
+                )
+            if request.path == "/token":
+                body = await request.post()
+                grant = str(body["grant_type"])
+                grants.append(grant)
+                if grant == "authorization_code":
+                    assert body["code"] == "browser-code" and body["code_verifier"]
+                    token, refresh = "consented-token", "consented-refresh"
+                else:
+                    assert grant == "refresh_token"
+                    assert body["refresh_token"] == "consented-refresh"
+                    token, refresh = "dispatch-token", "rotated-refresh"
+                return web.json_response(
+                    {"access_token": token, "refresh_token": refresh, "expires_in": 3600}
+                )
+            assert request.path == "/warm"
+            return web.json_response({})
+
+        provider = web.Application()
+        provider.router.add_route("*", "/{path:.*}", handle)
+        runner = web.AppRunner(provider)
+        await runner.setup()
+        runtime = None
+        try:
+            await web.TCPSite(runner, "127.0.0.1", 0).start()
+            origin = f"http://127.0.0.1:{runner.addresses[0][1]}"
+            storage.update_mcp_server("srv-pool", oauth_authorization_server_url=origin)
+            async with client() as browser_client:
+                app = _build_app(storage=storage, http_client=browser_client, token_store=store)
+                # Exercise the host initializer so this test catches cache splits.
+                with monkeypatch.context() as patch:
+                    patch.setattr(mcp_oauth.oauth_http, "json_http_client", lambda: browser_client)
+                    await mcp_oauth.initialize_mcp_oauth_state(app.state)
+                context = oauth_context(app.state)
+                runtime = OAuthRuntime(context, client_factory=client)
+                context.runtime = runtime
+                runtime.start()
+                manager.set_storage(storage)
+                manager.set_app_state(app.state)
+                await asyncio.to_thread(manager.start)
+                try:
+                    async with httpx2.AsyncClient(
+                        transport=httpx2.ASGITransport(app), base_url="https://testserver"
+                    ) as browser:
+                        start = await browser.get(
+                            "/v1/api/mcp/oauth/start", params={"server": "pool-srv"}
+                        )
+                        assert start.status_code == 302, start.text
+                        state = urllib.parse.parse_qs(
+                            urllib.parse.urlsplit(start.headers["location"]).query
+                        )["state"][0]
+                        callback = await browser.get(
+                            "/v1/api/mcp/oauth/callback",
+                            params={"state": state, "code": "browser-code"},
+                        )
+                        assert callback.status_code == 302, callback.text
+                    assert store.get_user_token("user-1", "pool-srv")["access_token"] == (
+                        "consented-token"
+                    )
+                    from sqlalchemy import text
+
+                    with storage._engine.begin() as connection:
+                        connection.execute(
+                            text("UPDATE oauth_tokens SET expires_at = :expired"),
+                            {"expired": "2000-01-01T00:00:00"},
+                        )
+                    await browser_client.get(f"{origin}/warm")
+                    runtime_client = context.http_client
+                    assert runtime_client is not None
+                    await runtime.call(lambda: runtime_client.get(f"{origin}/warm"))
+                    assert origin in context.metadata_cache
+                    requests.clear()
+                    result = await asyncio.to_thread(
+                        manager.call_tool_sync,
+                        "mcp__pool-srv__echo",
+                        {"payload": "consented"},
+                        user_id="user-1",
+                        timeout=15,
+                    )
+                    assert "echoed:consented" in _decode_tool_result(result)
+                    assert grants == ["authorization_code", "refresh_token"]
+                    assert [path for path, _, _ in requests] == ["/token"]
+                    assert all(
+                        used is runtime_client and loop is runtime._loop
+                        for _, used, loop in requests
+                    )
+                    assert runtime._loop is not manager._loop
+                    assert set(behaviour["post_auth_headers"]) == {"Bearer dispatch-token"}
+                    assert store.get_user_token("user-1", "pool-srv")["refresh_token"] == (
+                        "rotated-refresh"
+                    )
+                finally:
+                    await asyncio.to_thread(manager.shutdown)
+                    await asyncio.to_thread(runtime.shutdown)
+        finally:
+            if runtime is not None:
+                await asyncio.to_thread(runtime.shutdown)
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def running_loop_mgr():
+    cfg: dict[str, Any] = {}
+    mgr = MCPClientManager(cfg)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="mcp-pool-test-loop")
+    thread.start()
+    mgr._loop = loop
+    try:
+        yield mgr, loop, thread
+    finally:
+
+        async def _drain(m: MCPClientManager) -> None:
+            task = m._user_pool_eviction_task
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+                m._user_pool_eviction_task = None
+
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)
+        stop_loop_thread(loop, thread)
+
+
+# ---------------------------------------------------------------------------
+# Test 21: 401 → refresh-and-retry → success
+# ---------------------------------------------------------------------------
+
+
+def test_integration_401_refresh_and_retry_succeeds(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Real upstream returns 401 once with ``WWW-Authenticate: Bearer
+    error="invalid_token"``, then 200. Dispatcher carrier captures the
+    401, ``force_refresh=True`` mints a new bearer (stubbed), retry
+    succeeds. Hard invariant 3: breaker counter remains 0.
+
+    Drives through the REAL ``streamable_http_client`` and a REAL upstream server on a background
+    thread (no ``httpx2.HTTPStatusError`` injection). This is the structural exit gate for Phase 6 —
+    the equivalent unit tests CANNOT prove the production wiring works because the SDK never hands
+    the caller the HTTP status.
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "once_401"
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    # Override URL to point at the local upstream (loopback http:// is
+    # exempt from the URL-validator).
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**kwargs: Any) -> TokenLookupResult:
+        if kwargs.get("force_refresh"):
+            return TokenLookupResult(kind="token", token="refreshed-bearer")
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with patch(
+        "turnstone.core.mcp_client.get_user_access_token_classified",
+        side_effect=_fake_classified,
+    ):
+        result = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__echo", {"payload": "hi"}, user_id="user-1", timeout=15
+            )
+        )
+
+    assert "echoed:hi" in result
+    assert mgr._consecutive_failures.get("pool-srv", 0) == 0
+    # Server saw at least 2 POSTs to /mcp (initial + retry).
+    post_headers = behaviour.get("post_auth_headers", [])
+    assert len(post_headers) >= 2, f"expected >=2 POSTs; got {len(post_headers)}"
+    # Retry carries a different bearer than the initial.
+    initial = post_headers[0]
+    retry = post_headers[1]
+    assert initial != retry, (
+        "retry attached the same bearer as the initial; the dispatcher "
+        "did not pick up the refreshed token."
+    )
+    # Pool entry has a session after the successful retry.
+    entry = mgr._user_pool_entries[("user-1", "pool-srv")]
+    assert entry.session is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 22: 401 + refresh failure → mcp_consent_required
+# ---------------------------------------------------------------------------
+
+
+def test_integration_401_with_refresh_failure_emits_consent_required(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    url, behaviour = upstream
+    behaviour["mode"] = "once_401"
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**kwargs: Any) -> TokenLookupResult:
+        if kwargs.get("force_refresh"):
+            return TokenLookupResult(kind="refresh_failed")
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
+
+    # Structured-error envelopes flow back via ``RuntimeError(json_str)``
+    # so the session-layer ``except Exception`` handler routes the
+    # consent card uniformly across tool / resource / prompt dispatchers.
+    payload = json.loads(str(exc_info.value))
+    assert payload["error"]["code"] == "mcp_consent_required"
+    assert payload["error"]["server"] == "pool-srv"
+    # Phase 8 — consent_url surfaces a /start URL the dashboard can open
+    # in a popup. URL-encoded server name; no scopes baked in (the AS
+    # picks up the configured scopes server-side at /start).
+    assert payload["error"]["consent_url"] == "/v1/api/mcp/oauth/start?server=pool-srv"
+    assert mgr._consecutive_failures.get("pool-srv", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 23: 403 + insufficient_scope → mcp_insufficient_scope with parsed scopes
+# ---------------------------------------------------------------------------
+
+
+def test_integration_403_insufficient_scope_emits_structured_error(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    url, behaviour = upstream
+    behaviour["mode"] = "once_403_insufficient"
+    behaviour["www_authenticate"] = (
+        'Bearer error="insufficient_scope", scope="files:write mail:send"'
+    )
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
+
+    payload = json.loads(str(exc_info.value))
+    assert payload["error"]["code"] == "mcp_insufficient_scope"
+    assert payload["error"]["scopes_required"] == ["files:write", "mail:send"]
+    # Phase 8 — consent_url carries the step-up scopes URL-encoded so the
+    # dashboard can union them with the configured set at /start.
+    assert payload["error"]["consent_url"] == (
+        "/v1/api/mcp/oauth/start?server=pool-srv&scopes=files%3Awrite%20mail%3Asend"
+    )
+    # No retry — exactly ONE POST attempted before the structured error.
+    post_headers = behaviour.get("post_auth_headers", [])
+    assert len(post_headers) == 1, (
+        f"403 must NOT trigger a retry; observed {len(post_headers)} POSTs"
+    )
+    assert mgr._consecutive_failures.get("pool-srv", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 24: 403 without insufficient_scope → generic forbidden
+# ---------------------------------------------------------------------------
+
+
+def test_integration_403_no_insufficient_scope_emits_generic_forbidden(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    url, behaviour = upstream
+    behaviour["mode"] = "once_403_generic"
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
+
+    payload = json.loads(str(exc_info.value))
+    assert payload["error"]["code"] == "mcp_tool_call_forbidden"
+    assert "scopes_required" not in payload["error"]
+    post_headers = behaviour.get("post_auth_headers", [])
+    assert len(post_headers) == 1, (
+        f"403 must NOT trigger a retry; observed {len(post_headers)} POSTs"
+    )
+
+
+# ---------------------------------------------------------------------------
+# sec-1: multi-WWW-Authenticate header injection — only the FIRST
+# Bearer challenge feeds the structured-error / audit emission.
+# ---------------------------------------------------------------------------
+
+
+def test_integration_403_multi_www_authenticate_drops_injected_scopes(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Upstream returns a 403 with TWO ``WWW-Authenticate: Bearer ...``
+    challenges. The first carries ``error=insufficient_scope`` but NO
+    ``scope=`` parameter; the second carries INJECTED scopes
+    (``["org:admin", "db:write"]``). The dispatcher must report
+    ``scopes_required == []`` — derived from the first challenge alone
+    — never the second challenge's injected scopes.
+
+    Two layers of defence cooperate (either alone neutralises the
+    vector; both run together so a regression in one cannot silently
+    re-open it):
+
+    1. ``_make_capturing_http_client``'s ``_hook`` reads
+       ``response.headers.get_list("www-authenticate")[0]`` rather than
+       ``response.headers.get(...)`` — the latter joins repeated headers with ``", "`` which the
+       RFC 7235 tokenizer would otherwise consume as a continuation of the first challenge.
+    2. ``parse_www_authenticate_bearer`` stops at the first ``Bearer``
+       challenge boundary even if the input was already joined, so a
+       hook regression to ``get(...)`` would NOT re-open the vector.
+
+    The first challenge intentionally lacks ``scope=`` — the parser
+    uses ``setdefault`` so a first-occurrence ``scope`` would already
+    win and mask a single-layer regression. The undefended-absence
+    case is what proves both layers actually do their job.
+
+    Negative-test (CRITICAL — Phase 5 lesson): verified by reverting the hook to
+    ``response.headers.get("www-authenticate")`` AND removing the
+    ``_looks_like_bearer_challenge_start`` guard in ``parse_www_authenticate_bearer``. The test then
+    fails because ``scopes_required`` becomes ``["org:admin", "db:write"]`` — the injected scopes
+    from the second challenge silently fold into the first challenge's params dict via httpx2's
+    comma-joined header value (the absence of a first-occurrence scope means nothing blocks the
+    fold).
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "once_multi_www_auth_403"
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
+
+    payload = json.loads(str(exc_info.value))
+    assert payload["error"]["code"] == "mcp_insufficient_scope", (
+        f"expected mcp_insufficient_scope; got {payload!r}"
+    )
+    # ``scopes_required`` derives from the FIRST challenge alone, which
+    # carries no ``scope=`` parameter. The injected second challenge
+    # MUST NOT appear here.
+    assert payload["error"]["scopes_required"] == [], (
+        "Multi-header injection slipped through: dispatcher reported "
+        "scopes from the SECOND Bearer challenge. Got "
+        f"{payload['error']['scopes_required']!r}; expected []."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 25: 401 retry ceiling — never recurse
+# ---------------------------------------------------------------------------
+
+
+def test_integration_401_retry_ceiling(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Upstream always returns 401; refresh stub keeps minting tokens.
+    After exactly ONE retry, dispatcher emits ``mcp_consent_required``.
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "always_401"
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    refresh_count = 0
+
+    async def _fake_classified(**kwargs: Any) -> TokenLookupResult:
+        nonlocal refresh_count
+        if kwargs.get("force_refresh"):
+            refresh_count += 1
+            return TokenLookupResult(kind="token", token=f"refreshed-{refresh_count}")
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with (
+        patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mgr.call_tool_sync("mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15)
+
+    payload = json.loads(str(exc_info.value))
+    assert payload["error"]["code"] == "mcp_consent_required"
+    # Exactly ONE refresh round-trip.
+    assert refresh_count == 1, f"expected exactly 1 refresh round-trip; got {refresh_count}"
+    # Server saw EXACTLY 2 POSTs (initial + 1 retry).
+    post_headers = behaviour.get("post_auth_headers", [])
+    assert len(post_headers) == 2, (
+        f"expected exactly 2 POSTs (initial + 1 retry); got {len(post_headers)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 26: breaker unaffected by repeated auth failures (slow — 50 cycles)
+# ---------------------------------------------------------------------------
+
+
+def test_integration_breaker_unaffected_by_auth_failures(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """50 sequential dispatches all hit 401 with refresh-failed → 50
+    cycles of ``mcp_consent_required``. ``_consecutive_failures`` MUST
+    stay at 0 throughout (hard invariant 3 verified end-to-end).
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "always_401"
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**kwargs: Any) -> TokenLookupResult:
+        if kwargs.get("force_refresh"):
+            return TokenLookupResult(kind="refresh_failed")
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with patch(
+        "turnstone.core.mcp_client.get_user_access_token_classified",
+        side_effect=_fake_classified,
+    ):
+        for _ in range(50):
+            with pytest.raises(RuntimeError) as exc_info:
+                mgr.call_tool_sync(
+                    "mcp__pool-srv__echo", {"payload": "x"}, user_id="user-1", timeout=15
+                )
+            payload = json.loads(str(exc_info.value))
+            assert payload["error"]["code"] == "mcp_consent_required"
+            assert mgr._consecutive_failures.get("pool-srv", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 27: static path unaffected by Phase 6 changes
+# ---------------------------------------------------------------------------
+
+
+def test_integration_static_path_unaffected(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Static-path connect against an unauthed upstream succeeds, and a reconnect keeps its
+    ``StaticServerState`` and replaces its session. This is the integration-level mirror of
+    ``test_reconnect_preserves_static_state_identity``.
+
+    Drives the static path against the same fixture upstream (with
+    ``behaviour={}`` so middleware passes through) — confirms the
+    static path's session lifecycle is byte-identical even when the
+    pool path's auth introspection is wired up.
+    """
+    url, _behaviour = upstream
+    # No mode → middleware passes through to MCPServer.
+
+    mgr, loop, _ = running_loop_mgr
+
+    # Manually configure mgr with a static-path server pointing at the
+    # fixture upstream. Use _connect_one (not the pool path).
+    cfg = {"type": "streamable-http", "url": url}
+    mgr._server_configs["static-srv"] = cfg
+
+    async def _connect_static() -> None:
+        await mgr._connect_one("static-srv")
+
+    fut = asyncio.run_coroutine_threadsafe(_connect_static(), loop)
+    fut.result(timeout=15)
+
+    state_before = mgr._static_servers.get("static-srv")
+    assert state_before is not None
+    assert state_before.session is not None
+    # Snapshot identity.
+    state_id_before = id(state_before)
+    session_before = state_before.session
+
+    # Reconnect — the canonical regression check is that the
+    # StaticServerState object identity is preserved.
+    reconnected = mgr.reconnect_sync("static-srv", timeout=15)
+    assert reconnected["connected"], reconnected
+
+    state_after = mgr._static_servers.get("static-srv")
+    assert state_after is not None
+    assert id(state_after) == state_id_before, (
+        "Static path StaticServerState identity changed across reconnect; "
+        "hard invariant 1 violated."
+    )
+    assert state_after.session is not None
+    assert state_after.session is not session_before, (
+        "Reconnect did not actually replace the session"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 27b: static dispatch unaffected by Phase 8 consent_url kwarg
+# ---------------------------------------------------------------------------
+
+
+def test_static_dispatch_unaffected_by_consent_url_kwarg(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Static-auth tool dispatch must be byte-identical post-Phase 8.
+
+    The Phase 8 changes only ADD a ``consent_url`` kwarg to
+    ``_structured_error`` invocations on the pool path. Static dispatch
+    must not pick up the field — there's no consent flow for
+    ``auth_type='none'`` / ``'static'`` servers, and exposing one would
+    confuse the dashboard renderer. Asserts a successful tool result is
+    a plain string with no JSON envelope and no ``consent_url`` substring.
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "never"  # passthrough — succeeds
+
+    mgr, loop, _ = running_loop_mgr
+    cfg = {"type": "streamable-http", "url": url}
+    mgr._server_configs["static-srv"] = cfg
+
+    async def _connect_static() -> None:
+        await mgr._connect_one("static-srv")
+
+    fut = asyncio.run_coroutine_threadsafe(_connect_static(), loop)
+    fut.result(timeout=15)
+
+    # Drive call_tool_sync without a user_id — the static path is taken.
+    result = _decode_tool_result(
+        mgr.call_tool_sync("mcp__static-srv__echo", {"payload": "static-x"}, timeout=15)
+    )
+
+    # Static path returns the MCPServer fixture's echo string.
+    assert "echoed:static-x" in result
+    # No JSON envelope leaked through; specifically no consent_url field.
+    assert "consent_url" not in result, (
+        f"Static-auth tool dispatch surfaced a consent_url; result: {result!r}"
+    )
+    # Defensive: result is not a JSON-encoded structured error.
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        assert "error" not in parsed, (
+            f"Static-auth dispatch returned a structured-error envelope; got {parsed!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 28: pool reuse — 401 on a SECOND dispatch (carrier owned by entry)
+# ---------------------------------------------------------------------------
+
+
+def test_integration_pool_reuse_401_refresh_and_retry_succeeds(
+    upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
+) -> None:
+    """Reused pool sessions still capture 401 correctly.
+
+    Dispatch 1 hits a passthrough upstream (200) and populates ``entry.session``. Dispatch 2
+    reuses that session — no fresh connect, so a per-dispatch ``_AuthCapture`` would never reach
+    the httpx2 response hook (the hook closes over the carrier passed at first connect, which
+    lives on the entry). A correctly-wired entry-owned carrier is the only shape that lets
+    dispatch 2's 401 surface to the dispatcher.
+
+    Verified on mcp 2.3.0 by reverting ``PoolEntryState.auth_capture`` to a per-dispatch
+    ``_AuthCapture()`` for both the call and the classification: dispatch 2's 401 reaches the
+    dispatcher only as the SDK's generic ``MCPError(-32603, "Server returned an error response")``,
+    nothing refreshes or retries, and the test fails. The race against the carrier's fired event in
+    ``_await_session_call`` does not gate this test, because SDK 2.3.0 answers the 401 at once with
+    a JSON-RPC error (tests/test_mcp_user_catalog.py::test_pool_connect_list_tools_401_propagates
+    fails if it does not); tests/test_mcp_http_failures.py pins the race.
+
+    This test is the structural gate against the per-dispatch carrier pattern: it looks right in
+    code review and passes single-dispatch integration tests, but breaks silently on session
+    reuse.
+    """
+    url, behaviour = upstream
+    behaviour["mode"] = "never"  # passthrough — dispatch 1 succeeds
+
+    mgr, _loop, _ = running_loop_mgr
+    cipher = make_mcp_token_cipher()
+    _seed_oauth_server(storage, name="pool-srv", url=url)
+    _seed_user_token(storage, cipher)
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+
+    async def _fake_classified(**kwargs: Any) -> TokenLookupResult:
+        if kwargs.get("force_refresh"):
+            return TokenLookupResult(kind="token", token="refreshed-bearer")
+        return TokenLookupResult(kind="token", token="access-aaa")
+
+    with patch(
+        "turnstone.core.mcp_client.get_user_access_token_classified",
+        side_effect=_fake_classified,
+    ):
+        # Dispatch 1: passthrough success. Establishes the pooled session.
+        result1 = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__echo", {"payload": "first"}, user_id="user-1", timeout=15
+            )
+        )
+        assert "echoed:first" in result1
+
+        entry = mgr._user_pool_entries[("user-1", "pool-srv")]
+        session_after_first = entry.session
+        assert session_after_first is not None, (
+            "test setup: dispatch 1 did not populate entry.session; "
+            "subsequent dispatch will not exercise the reuse path"
+        )
+
+        # Reconfigure upstream to 401 once on the next call. Reset the
+        # auth-headers log so we can count dispatch-2's POSTs cleanly.
+        behaviour["post_auth_headers"] = []
+        behaviour["mode"] = "once_401"
+        behaviour["_fired"] = False
+
+        # Dispatch 2: same (user, server). The hook from dispatch 1's
+        # connect is still bound to entry.auth_capture. The 401 fires;
+        # the dispatcher's auth_401 path triggers refresh-and-retry.
+        result2 = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__echo", {"payload": "second"}, user_id="user-1", timeout=15
+            )
+        )
+
+    assert "echoed:second" in result2, (
+        f"reused-session 401 retry did not succeed. result: {result2!r}. "
+        "If this is JSON with mcp_consent_required, the dispatcher "
+        "fell through to consent_required emission; if a generic "
+        "tool error, the carrier was empty (auth branch unreachable)."
+    )
+    assert mgr._consecutive_failures.get("pool-srv", 0) == 0, (
+        "auth failures must not trip the per-server breaker"
+    )
+
+    # Dispatch 2 produces multiple POSTs: the original 401 with the
+    # rejected bearer, then the retry's full connect handshake
+    # (initialize + notifications/initialized + tools/list) followed by
+    # the actual tools/call — all under the refreshed bearer. The retry
+    # reconnects because the auth_401 handler evicted the broken session.
+    post_headers = behaviour.get("post_auth_headers", [])
+    assert len(post_headers) >= 2, (
+        f"expected >=2 POSTs after dispatch 2 (401 + retry); "
+        f"got {len(post_headers)}: {post_headers}"
+    )
+    # First POST is the original bearer that got 401'd.
+    assert post_headers[0] == "Bearer access-aaa", (
+        f"first POST was {post_headers[0]!r}; expected the original bearer"
+    )
+    # Every subsequent POST carries the refreshed bearer (the retry
+    # ran with force_refresh=True and reconnected with the new token).
+    refreshed = post_headers[1:]
+    assert all(h == "Bearer refreshed-bearer" for h in refreshed), (
+        f"retry POSTs carried unexpected bearer(s); observed: {post_headers}"
+    )

@@ -1,0 +1,3884 @@
+"""Tests for the coordinator HTTP endpoints.
+
+Builds a minimal Starlette app wiring only the coordinator routes and
+an auth-injector middleware.  Verifies the permission gate, 503
+remediation when coord_mgr / model alias is missing, ownership
+enforcement, and lazy rehydration on GET /{ws_id}. Also exercises
+the lifted ``approve`` and ``close`` handlers from
+``turnstone.core.session_routes`` wired through the coord
+``SessionEndpointConfig`` — same code path the live console uses.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import MagicMock
+
+import httpx2
+import pytest
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
+# ---------------------------------------------------------------------------
+# Auth injection middleware
+# ---------------------------------------------------------------------------
+from tests._coord_test_helpers import (
+    _AuthMiddleware,
+    _build_mgr,
+    _build_mgr_with_factory,
+    _fake_registry,
+    _FakeConfigStore,
+    _rehydrate_with_children_down,
+    _seed_children,
+)
+from tests._helpers import opaque_png
+from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from turnstone.console.server import (
+    _COORDINATOR_COMMANDS,
+    COORDINATOR_MODEL_WORDING,
+    _audit_cancel_coordinator,
+    _audit_close_coordinator,
+    _audit_coordinator_create,
+    _coord_create_build_kwargs,
+    _coord_create_post_install,
+    _coord_create_validate_request,
+    _coordinator_tenant_check,
+    _require_admin_coordinator,
+    _require_coord_mgr,
+    cluster_ws_detail,
+    coordinator_children,
+    coordinator_tasks,
+)
+from turnstone.core.attachments import (
+    classify_upload as _coord_test_classify_upload,
+)
+from turnstone.core.auth import AuthResult
+from turnstone.core.model_registry import UnknownModelAliasError
+from turnstone.core.session_routes import (
+    AttachmentUploadHelpers,
+    SessionEndpointConfig,
+    make_approve_handler,
+    make_attachment_handlers,
+    make_cancel_handler,
+    make_close_handler,
+    make_command_handler,
+    make_create_handler,
+    make_dequeue_handler,
+    make_detail_handler,
+    make_export_handler,
+    make_history_handler,
+    make_list_handler,
+    make_open_handler,
+    make_refresh_title_handler,
+    make_saved_handler,
+    make_send_handler,
+    make_set_title_handler,
+)
+from turnstone.core.workstream import WorkstreamKind
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _coord_attach_owner(request, ws_id, mgr):
+    """Coord attachment owner resolver mirroring production wiring.
+
+    Kind-strict — coord attachments can only be accessed for
+    workstreams currently held by ``coord_mgr``; no storage fallback
+    so cross-kind ws_ids 404 instead of leaking through storage. Also
+    project-tenancy-strict: mirrors ``_coord_attachment_owner`` so a
+    private-project coordinator's attachments 404-mask non-members.
+    """
+    from starlette.responses import JSONResponse
+
+    from turnstone.core.auth import WorkstreamProjectVisibility
+    from turnstone.core.web_helpers import auth_user_id
+
+    ws = mgr.get(ws_id)
+    if ws is None:
+        return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
+    if not visibility.ws_visible(getattr(ws, "project_id", "") or "", ws_owner=ws.user_id or ""):
+        return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+    return ws.user_id or auth_user_id(request), None
+
+
+# Per-kind config the lifted handler factories capture by closure.
+# Mirrors the production console wiring so tests exercise the same
+# code path as the live server.
+_coord_endpoint_config = SessionEndpointConfig(
+    permission_gate=_require_admin_coordinator,
+    manager_lookup=_require_coord_mgr,
+    tenant_check=_coordinator_tenant_check,
+    not_found_label="coordinator not found",
+    audit_action_prefix="coordinator",
+    supports_attachments=True,
+    attachment_owner_resolver=_coord_attach_owner,
+    attachment_helpers=AttachmentUploadHelpers(
+        classify_upload=_coord_test_classify_upload,
+    ),
+    spawn_metrics=None,
+    emit_message_queued=True,
+    create_supports_attachments=True,
+    create_supports_user_id_override=False,
+    create_validate_request=_coord_create_validate_request,
+    create_build_kwargs=_coord_create_build_kwargs,
+    create_post_install=_coord_create_post_install,
+    list_resolve_titles=None,
+    list_kind=WorkstreamKind.COORDINATOR,
+    # As the console wires it (#1359).
+    model_wording=COORDINATOR_MODEL_WORDING,
+)
+
+
+@pytest.fixture
+def storage(tmp_path):
+    # The attachment handlers resolve storage via ``memory.get_storage()`` (the
+    # registry singleton), not the instance passed to ``_make_client``/``_build_mgr``.
+    # Register the test backend so ``get_attachment`` & co. hit this fresh db rather
+    # than a stale default — otherwise schema drift (e.g. a new column) surfaces here.
+    from turnstone.core.storage import init_storage, reset_storage
+
+    reset_storage()
+    backend = init_storage("sqlite", path=str(tmp_path / "coord.db"), run_migrations=False)
+    # The per-node upload buffer is a process-global singleton; clear it so a
+    # prior test's staged uploads can't leak into this one (pending uploads
+    # live here now, not in storage).
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    get_attachment_buffer().clear()
+    yield backend
+    get_attachment_buffer().clear()
+    reset_storage()
+
+
+def _make_client(
+    storage,
+    *,
+    coord_mgr=None,
+    alias="my-model",
+    registry=None,
+    raise_server_exceptions: bool = True,
+) -> TestClient:
+    """Build a TestClient exposing just the coordinator routes."""
+    coord_attachments = make_attachment_handlers(_coord_endpoint_config)
+    coord_create_handler = make_create_handler(
+        _coord_endpoint_config, audit_emit=_audit_coordinator_create
+    )
+    app = Starlette(
+        routes=[
+            Route(
+                "/v1/api/workstreams/new",
+                coord_create_handler,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams",
+                make_list_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            # Literal path before the /{ws_id} routes below so Starlette
+            # matches "saved" as the literal, not as a ws_id.
+            Route(
+                "/v1/api/workstreams/saved",
+                make_saved_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/send",
+                make_send_handler(_coord_endpoint_config),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/send",
+                make_dequeue_handler(_coord_endpoint_config),
+                methods=["DELETE"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/approve",
+                make_approve_handler(_coord_endpoint_config),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/cancel",
+                make_cancel_handler(
+                    _coord_endpoint_config,
+                    audit_emit=_audit_cancel_coordinator,
+                ),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/close",
+                make_close_handler(
+                    _coord_endpoint_config,
+                    audit_emit=_audit_close_coordinator,
+                    supports_close_reason=False,
+                ),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/refresh-title",
+                make_refresh_title_handler(_coord_endpoint_config),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/command",
+                make_command_handler(
+                    _coord_endpoint_config,
+                    allowed_commands=_COORDINATOR_COMMANDS,
+                ),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/title",
+                make_set_title_handler(_coord_endpoint_config),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/history",
+                make_history_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/export",
+                make_export_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/open",
+                make_open_handler(_coord_endpoint_config),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/children",
+                coordinator_children,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/tasks",
+                coordinator_tasks,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments",
+                coord_attachments.upload,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments",
+                coord_attachments.list,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+                coord_attachments.get_content,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}",
+                coord_attachments.delete,
+                methods=["DELETE"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}",
+                make_detail_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/cluster/ws/{ws_id}/detail",
+                cluster_ws_detail,
+                methods=["GET"],
+            ),
+        ],
+        middleware=[Middleware(_AuthMiddleware)],
+    )
+    app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
+    app.state.config_store = _FakeConfigStore({"coordinator.model_alias": alias})
+    app.state.coord_registry = registry
+    app.state.coord_registry_error = "" if coord_mgr else "registry missing"
+    app.state.auth_storage = storage
+    app.state.jwt_secret = "x" * 64
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
+
+
+# ---------------------------------------------------------------------------
+# Permission gate
+# ---------------------------------------------------------------------------
+
+
+def test_missing_permission_returns_403(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "c1"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
+    )
+    assert resp.status_code == 403
+
+
+def test_no_auth_returns_401(storage):
+    """No AuthResult in request.state → 401 (require_permission semantics)."""
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/workstreams/new", json={"name": "c1"})
+    assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# 503 remediation when coordinator subsystem isn't configured
+# ---------------------------------------------------------------------------
+
+
+def test_missing_coord_mgr_returns_503(storage):
+    client = _make_client(storage, coord_mgr=None)
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "c1"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 503
+    body = resp.json()
+    assert "not initialized" in body["error"]
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        # Every stored definition was skipped: the loader's text names the reference.
+        "No model definitions could be loaded. Skipped: main: secret://vault/kv/team#key: not found",
+        # A fresh console with no definitions at all.
+        "No model definitions found. Provide --model, configure [models.*] in config.toml, "
+        "or add model definitions in the admin panel.",
+        # The definitions loaded, but the builder failed.
+        "Coordinator subsystem failed to initialise (RuntimeError). See console logs and retry.",
+        "",
+    ],
+)
+def test_the_503_is_the_same_neutral_text_whatever_the_cause(storage, recorded):
+    # The recorded cause can name secret reference paths, and any
+    # admin.coordinator holder reads this 503, so it never carries it; and it
+    # asserts no cause that may be false (#1359).
+    client = _make_client(storage, coord_mgr=None)
+    client.app.state.coord_registry_error = recorded  # type: ignore[attr-defined]
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "c1"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["error"] == (
+        "Coordinator subsystem not initialized. Add a model definition in the admin "
+        "Models tab; if one exists, an admin can see why by pressing Sync to Nodes "
+        "there, or in the console log."
+    )
+
+
+def test_missing_model_alias_falls_back_to_registry_default(storage):
+    """``coordinator.model_alias`` unset → resolve through the
+    registry's default alias rather than 503-ing.  Operators get a
+    working coordinator out of the box once any model is configured."""
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, alias="", registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
+    )
+    # The fake registry resolves any alias (including None → default)
+    # so the create call succeeds past the gate.  We only assert that
+    # the 503 remediation stack is NOT fired — any success or further
+    # downstream failure is unrelated to this regression.
+    assert resp.status_code != 503, resp.json()
+
+
+def test_unloaded_coordinator_model_fails_only_the_create(storage):
+    """#1359: the gate no longer resolves the coordinator's model, so one that
+    isn't loaded fails the create with ``model_not_loaded`` and leaves the
+    other coordinator verbs working; no other model is used."""
+
+    def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        raise UnknownModelAliasError("ghost")
+
+    mgr = _build_mgr_with_factory(storage, _sf)
+    broken_registry = MagicMock()
+    broken_registry.resolve.side_effect = UnknownModelAliasError("ghost")
+    client = _make_client(storage, coord_mgr=mgr, alias="ghost", registry=broken_registry)
+    headers = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
+    resp = client.post("/v1/api/workstreams/new", json={}, headers=headers)
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["code"] == "model_not_loaded"
+    assert body["alias"] == "ghost"
+    assert body["error"] == (
+        "The coordinator model 'ghost' isn't loaded on the console. Ask an admin to "
+        "check its definition, or to set coordinator.model_alias."
+    )
+    broken_registry.resolve.assert_not_called()
+    assert client.get("/v1/api/workstreams", headers=headers).status_code == 200
+
+
+def test_create_naming_an_unloaded_model_says_so(storage):
+    def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        raise UnknownModelAliasError(model_alias or "")
+
+    mgr = _build_mgr_with_factory(storage, _sf)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"model": "picked"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["code"] == "model_not_loaded"
+    assert body["error"].startswith("The model 'picked' isn't loaded")
+
+
+# ---------------------------------------------------------------------------
+# Happy path — create + list + send + close
+# ---------------------------------------------------------------------------
+
+
+_COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
+
+
+# ---------------------------------------------------------------------------
+# Title verbs — refresh-title (LLM regenerate) + set title (manual alias),
+# ported to coordinators via the lifted make_refresh_title_handler /
+# make_set_title_handler factories so both kinds share one body.
+# ---------------------------------------------------------------------------
+
+
+def test_coord_refresh_title_triggers_regeneration(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/refresh-title", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    # The lifted handler resolves the current display name and asks the
+    # live session to regenerate a (different) title in the background.
+    ws.session.request_title_refresh.assert_called_once_with(
+        "c1",
+        principal_id="user-1",
+    )
+
+
+def test_coord_refresh_title_requires_operator_permission(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/refresh-title",
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
+    )
+    assert resp.status_code == 403
+    ws.session.request_title_refresh.assert_not_called()
+
+
+def test_coord_refresh_title_unknown_ws_404(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/" + ("0" * 32) + "/refresh-title", headers=_COORD_HEADERS
+    )
+    assert resp.status_code == 404
+
+
+def test_coord_set_title_stores_alias_and_broadcasts(storage):
+    from turnstone.core.memory import get_workstream_display_name
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/title",
+        json={"title": "Nightly migration sweep"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "Nightly migration sweep"
+    # Stored as the alias (outranks the auto-title) ...
+    assert get_workstream_display_name(ws.id) == "Nightly migration sweep"
+    # ... and broadcast live to the dashboard via the session UI.
+    ws.session.ui.on_rename.assert_called_once_with("Nightly migration sweep")
+
+
+def test_coord_set_title_empty_400(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/title", json={"title": "   "}, headers=_COORD_HEADERS
+    )
+    assert resp.status_code == 400
+
+
+def test_coord_set_title_alias_conflict_409(storage):
+    mgr = _build_mgr(storage)
+    first = mgr.create(user_id="user-1", name="c1")
+    second = mgr.create(user_id="user-1", name="c2")
+    storage.set_workstream_alias(first.id, "taken", lease=mgr.lease_fence(first.id))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{second.id}/title", json={"title": "taken"}, headers=_COORD_HEADERS
+    )
+    assert resp.status_code == 409
+
+
+def test_coord_set_title_rejects_unowned_ws_404(storage):
+    """An admin.coordinator operator can't rename a workstream the coord
+    manager doesn't own (here a cross-kind interactive row) via the coord
+    /title route: set_workstream_alias is a global kind-unscoped UPDATE, so
+    the handler 404s on the in-memory coord lookup BEFORE writing — no
+    silent 200, no cross-kind alias write."""
+    from turnstone.core.memory import get_workstream_display_name
+
+    mgr = _build_mgr(storage)
+    # An interactive-kind row in storage, NOT held by coord_mgr.
+    storage.register_workstream(
+        "i" * 32,
+        node_id="node-1",
+        user_id="user-1",
+        name="interactive-ws",
+        kind=WorkstreamKind.INTERACTIVE,
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{'i' * 32}/title",
+        json={"title": "hijacked"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 404
+    # The interactive ws's display name is untouched — the alias write never fired.
+    assert get_workstream_display_name("i" * 32) == "interactive-ws"
+
+
+# ---------------------------------------------------------------------------
+# Slash commands (POST /{ws_id}/command) — the node /command body behind the
+# coordinator's one command, /model.
+# ---------------------------------------------------------------------------
+
+
+def _post_command(client, ws_id, command, headers=_COORD_HEADERS):
+    return client.post(
+        f"/v1/api/workstreams/{ws_id}/command", json={"command": command}, headers=headers
+    )
+
+
+def _quiet_coord(storage):
+    """A coordinator whose stub session reports that the command did not end it."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    session = cast("MagicMock", ws.session)
+    session.handle_command.return_value = False
+    return mgr, ws, session
+
+
+@pytest.mark.parametrize("command", ["/model fast", "/model", "/MODEL fast"])
+def test_command_runs_model_on_the_worker(storage, command):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, ws.id, command)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "ok"}
+    session.handle_command.assert_called_once_with(command, principal_id="user-1")
+    assert ws.worker_kind == "command"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/name triage",
+        "/clear",
+        "/compact",
+        "/instructions be terse",
+        "/help",
+        "/rewind 1",
+        "/retry",
+        "/exit",
+        "/new",
+        "/models",
+    ],
+)
+def test_command_other_than_model_is_refused(storage, command):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, ws.id, command)
+    assert resp.status_code == 400
+    word = command.split()[0]
+    assert resp.json()["error"] == f"{word} is not available here. Available: /model."
+    session.handle_command.assert_not_called()
+    session.compact_now.assert_not_called()
+
+
+@pytest.mark.parametrize("body", [{}, {"command": "   "}, {"command": 7}])
+def test_command_without_a_command_is_400(storage, body):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/command", json=body, headers=_COORD_HEADERS)
+    assert resp.status_code == 400
+    session.handle_command.assert_not_called()
+
+
+def test_command_requires_admin_coordinator(storage):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(
+        client, ws.id, "/model fast", headers={"X-Test-User": "user-1", "X-Test-Perms": "read"}
+    )
+    assert resp.status_code == 403
+    session.handle_command.assert_not_called()
+
+
+def test_command_unknown_coordinator_404(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, "0" * 32, "/model fast")
+    assert resp.status_code == 404
+
+
+def test_command_private_project_hidden_from_non_member(storage):
+    # The coordinator must be live in the manager: a storage-only row 404s at
+    # mgr.get whether or not the tenant check runs.
+    storage.create_project("proj-secret", "Secret", "alice")
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="alice", project_id="proj-secret")
+    session = cast("MagicMock", ws.session)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(
+        client,
+        ws.id,
+        "/model fast",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+    session.handle_command.assert_not_called()
+
+
+def test_command_on_a_busy_coordinator_is_409(storage):
+    mgr, ws, session = _quiet_coord(storage)
+    ws._worker_running = True
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, ws.id, "/model fast")
+    assert resp.status_code == 409
+    assert resp.json()["status"] == "busy"
+    session.handle_command.assert_not_called()
+
+
+def test_active_list_row_shape_includes_unified_fields(storage):
+    """Stage 2 list-verb-lift parity regression — coord active-list row
+    carries the always-include fields (ws_id, name, state, kind,
+    parent_ws_id, user_id) that the lifted ``make_list_handler``
+    produces on every kind. SDK consumers don't have to branch on
+    kind to read any of these. Pre-lift coord returned a smaller
+    row ({ws_id, name, state, user_id}) under a different top-level
+    key (``coordinators`` vs ``workstreams``)."""
+    mgr = _build_mgr(storage)
+    mgr.create(user_id="u1", name="lifted-coord")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    # Top-level key converged on `workstreams`.
+    assert "workstreams" in body
+    assert "coordinators" not in body
+    rows = body["workstreams"]
+    assert len(rows) == 1
+    row = rows[0]
+    # Always-include row shape — coord populates kind=COORDINATOR
+    # and parent_ws_id=None (coordinators have no parent today).
+    assert set(row.keys()) == {
+        "ws_id",
+        "name",
+        "state",
+        "kind",
+        "parent_ws_id",
+        "user_id",
+        "project_id",
+        "persona",
+        "persistence_state",
+    }
+    assert row["name"] == "lifted-coord"
+    assert row["kind"] == "coordinator"
+    assert row["parent_ws_id"] is None
+    assert row["user_id"] == "u1"
+    # mgr.create without a persona kwarg stamps nothing at this layer
+    # (default resolution lives in the HTTP create handler), so the
+    # row carries the null slug — not a fabricated default.
+    assert row["persona"] is None
+
+
+def test_create_returns_ws_id_and_records_audit(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "my-coord"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"]
+    assert "my-coord" in body["name"]
+    # Always-include parity fields land on coord post-`create` lift —
+    # SDK consumers don't have to branch on kind to read them.
+    assert body["resumed"] is False
+    assert body["message_count"] == 0
+    assert body["attachment_ids"] == []
+    # Audit row recorded on storage.
+    events = storage.list_audit_events(user_id="user-1", limit=10)
+    actions = [e["action"] for e in events]
+    assert "coordinator.create" in actions
+
+
+def test_create_unreadable_project_refuses_without_partial_create(storage):
+    storage.create_project(
+        "public-without-read",
+        "Public Without Read",
+        "project-owner",
+        visibility="public",
+    )
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "must-not-exist", "project_id": "public-without-read"},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 403
+    assert resp.json() == {"error": "project is not available for workstream attachment"}
+    assert mgr.list_all() == []
+    assert storage.list_workstreams() == []
+    assert storage.list_audit_events(action="coordinator.create") == []
+
+
+def _capture_factory_pair():
+    """Return ``(factory, captured)`` — factory records model_alias +
+    judge_model into the captured dict on every call so tests can assert
+    the per-call override threading."""
+    captured: dict = {}
+
+    def _factory(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        captured["model_alias"] = model_alias
+        captured["judge_model"] = kw.get("judge_model")
+        return MagicMock()
+
+    return _factory, captured
+
+
+def test_create_forwards_model_and_judge_model_overrides(storage):
+    """Per-call ``model`` + ``judge_model`` body fields land on the
+    coord session factory (mirrors interactive's create surface)."""
+    factory, captured = _capture_factory_pair()
+    mgr = _build_mgr_with_factory(storage, factory)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={
+            "name": "tuned-coord",
+            "model": "gpt-5",
+            "judge_model": "gpt-5-mini",
+        },
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == {"model_alias": "gpt-5", "judge_model": "gpt-5-mini"}
+
+
+def test_create_empty_model_fields_collapse_to_none(storage):
+    """Empty-string ``model`` / ``judge_model`` body fields don't override
+    the ConfigStore default — they collapse to ``None`` so the factory
+    falls back to ``coordinator.model_alias`` / ``judge.model``."""
+    factory, captured = _capture_factory_pair()
+    mgr = _build_mgr_with_factory(storage, factory)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "default-coord", "model": "  ", "judge_model": ""},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == {"model_alias": None, "judge_model": None}
+
+
+def test_create_503_factory_misconfig_message_is_sanitised(storage):
+    """503 response from a factory ``ValueError`` strips ASCII control
+    chars and caps the echoed alias text — defence-in-depth for the
+    user-controlled ``body["model"]`` reflection surface. Operators
+    keep the actionable message in the log; clients see a clean
+    bounded string."""
+
+    def _factory_raises(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        # Simulate the registry's actual exception shape, plus a
+        # control char + a long-tail attacker payload.
+        raise ValueError("Unknown model alias: \x00\x07attack\x1b[31m" + ("A" * 1000))
+
+    mgr = _build_mgr_with_factory(storage, _factory_raises)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "c"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 503
+    err = resp.json()["error"]
+    # Cap enforced (hard-capped at _FACTORY_MISCONFIG_MAX_LEN total —
+    # the truncation reserves one codepoint for the ellipsis).
+    assert len(err) <= 200
+    assert "\x00" not in err
+    assert "\x1b" not in err
+    assert "Unknown model alias" in err
+    assert err.endswith("…")
+
+
+def test_create_non_string_model_fields_collapse_to_none(storage):
+    """Non-string ``model`` / ``judge_model`` body fields (e.g. a hostile
+    dict / list / int) collapse to ``None`` rather than reaching
+    ``.strip()`` and crashing into the lifted handler's generic 500
+    path. Defense-in-depth — the auth gate already requires
+    ``admin.coordinator``."""
+    factory, captured = _capture_factory_pair()
+    mgr = _build_mgr_with_factory(storage, factory)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={
+            "name": "hostile-body",
+            "model": {"url": "http://evil"},
+            "judge_model": [1, 2, 3],
+        },
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == {"model_alias": None, "judge_model": None}
+
+
+_PNG_1X1 = opaque_png()
+
+
+def test_create_with_multipart_attachments_stages_to_buffer(storage):
+    """§ Post-P3 reckoning item #1 regression — coord gains create-time
+    attachments. In the content-addressed model a multipart create with a
+    magic-byte-valid PNG *stages* the upload in the per-node buffer (no DB
+    row); a subsequent ``/send`` resolves it and persists it content-addressed.
+
+    No ``initial_message`` here, so the staged upload remains in the buffer
+    for the workstream after create returns."""
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "with-image"}'},
+            files={"file": ("img.png", _PNG_1X1, "image/png")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        ws_id = body["ws_id"]
+        assert ws_id
+        assert len(body["attachment_ids"]) == 1
+        # Pending upload lives in the buffer, scoped to (ws, user).
+        staged = get_attachment_buffer().list_for(ws_id=ws_id, user_id="user-1")
+        assert len(staged) == 1
+        assert staged[0].kind == "image"
+        # The id is the content hash (content-addressed).
+        assert staged[0].attachment_id == hashlib.sha256(_PNG_1X1).hexdigest()
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_create_with_multipart_attachments_and_initial_message_resolves(storage):
+    """Coord initial-message + create-time-attachments coordination — when
+    ``initial_message`` is provided alongside multipart uploads, the staged
+    bytes are resolved onto the dispatched first turn (the committing
+    ``ChatSession.send`` then writes them content-addressed + drains the
+    buffer; that commit is async and covered synchronously by the session
+    tests).
+
+    Asserts the deterministic surface: the create response carries the
+    content-addressed id, and the post-install resolved (drained) the staged
+    upload from the buffer so it isn't left behind for the new workstream."""
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "with-init", "initial_message": "look at this image"}'},
+            files={"file": ("img.png", _PNG_1X1, "image/png")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ws_id"]
+        attachment_ids = body["attachment_ids"]
+        assert len(attachment_ids) == 1
+        assert attachment_ids[0] == hashlib.sha256(_PNG_1X1).hexdigest()
+        # The initial-message worker resolves (peeks) the staged upload and the
+        # committing send drains it + writes it content-addressed.  That commit
+        # runs on a background thread, so the create response (the
+        # content-addressed id) is the deterministic contract asserted here;
+        # the synchronous commit path is covered by test_session_attachments.
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_create_attachment_failure_no_phantom_create_close_pair(storage, monkeypatch):
+    """A coordinator create whose files fail to stage after ``mgr.create`` is rolled back unseen.
+
+    The create's lifecycle events wait until it commits (``defer_emit_created``), so the rollback
+    discards it without the cluster collector seeing a ``ws_created`` or an orphan ``ws_closed``,
+    and the manager keeps no slot for it.
+    """
+    from turnstone.core import attachments
+
+    def fail_staging(classified, ws_id, user_id):
+        raise RuntimeError("staging failed")
+
+    monkeypatch.setattr(attachments, "stage_classified_files", fail_staging)
+    mgr = _build_mgr(storage)
+    # Pull the collector MagicMock out of the adapter so we can
+    # introspect call counts after the failed create.
+    coord_collector = mgr._adapter._collector  # type: ignore[attr-defined]
+    client = _make_client(
+        storage, coord_mgr=mgr, registry=_fake_registry(), raise_server_exceptions=False
+    )
+
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "rollback-target"}'},
+            files={"file": ("notes.md", b"# notes\n", "text/markdown")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 500, resp.text
+        # The rollback discarded the slot.
+        assert mgr.count == 0
+        # ``MagicMock`` records every method call, so no calls to these is the check.
+        assert coord_collector.emit_console_ws_created.call_count == 0
+        assert coord_collector.emit_console_ws_closed.call_count == 0
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_create_refuses_an_empty_file_before_creating(storage, monkeypatch):
+    """A refused file stops a coordinator create before ``mgr.create``: no slot, no events."""
+    mgr = _build_mgr(storage)
+    coord_collector = mgr._adapter._collector  # type: ignore[attr-defined]
+    creates: list[str] = []
+    real_create = mgr.create
+
+    def counting_create(*args, **kwargs):
+        creates.append(kwargs.get("name", ""))
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(mgr, "create", counting_create)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "refused"}'},
+            files={"file": ("blank.bin", b"", "application/octet-stream")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"] == "blank.bin: Empty file"
+        assert creates == []
+        assert mgr.count == 0
+        assert coord_collector.emit_console_ws_created.call_count == 0
+        assert coord_collector.emit_console_ws_closed.call_count == 0
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_create_rejects_disabled_skill(storage):
+    """Coord parity gain — disabled skills now rejected at the lift,
+    matching interactive's pre-lift behaviour. Pre-lift coord silently
+    let disabled skills through."""
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        # Save a disabled skill row so ``get_skill_by_name`` resolves
+        # but the lifted body's enabled check rejects it. Mirrors the
+        # ``_create_template`` helper in ``tests/test_skills.py``;
+        # inlined here so this regression test stays self-contained.
+        storage.create_prompt_template(
+            template_id="sk-disabled",
+            name="dormant-skill",
+            category="general",
+            content="dormant",
+            variables="[]",
+            org_id="",
+            created_by="test",
+            origin="manual",
+            mcp_server="",
+            readonly=False,
+            description="",
+            tags="[]",
+            source_url="",
+            version="1.0.0",
+            author="",
+            token_estimate=0,
+            auto_approve=False,
+            notify_on_complete="{}",
+            enabled=False,  # the gate under test
+            allowed_tools="[]",
+            priority=0,
+        )
+        mgr = _build_mgr(storage)
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "x", "skill": "dormant-skill"},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 400
+        assert "dormant-skill" in resp.json()["error"]
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_list_returns_cluster_wide(storage):
+    # Trusted-team visibility: any caller with admin.coordinator sees
+    # every active coordinator regardless of owner.  ``user_id`` stays
+    # on the response as metadata.
+    mgr = _build_mgr(storage)
+    mgr.create(user_id="user-1", name="mine")
+    mgr.create(user_id="user-2", name="theirs")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    names = {c["name"] for c in body["workstreams"]}
+    assert names == {"mine", "theirs"}
+
+
+def _seed_closed_coord_with_history(
+    mgr,
+    storage,
+    *,
+    user_id: str,
+    name: str,
+) -> str:
+    """Create + close a coordinator and seed one conversation row.
+
+    The saved list skips workstreams with no messages, so it won't surface a
+    freshly-closed coordinator unless we've stamped at least one
+    conversation row.
+    """
+    ws = mgr.create(user_id=user_id, name=name)
+    storage.save_message(ws.id, role="user", content="seed", lease=mgr.lease_fence(ws.id))
+    closed = mgr.close(ws.id)
+    assert closed
+    return ws.id
+
+
+@pytest.fixture
+def saved_storage(tmp_path):
+    """Storage fixture for saved-coordinator tests.
+
+    Initialises the singleton registry to a fresh SQLite db and yields the
+    same backend, so the manager, the saved-list query and the test's own
+    conversation seeding all share one store.
+    """
+    from turnstone.core.storage import init_storage, reset_storage
+
+    db_path = str(tmp_path / "saved.db")
+    reset_storage()
+    backend = init_storage("sqlite", path=db_path, run_migrations=False)
+    try:
+        yield backend
+    finally:
+        reset_storage()
+
+
+def test_saved_returns_cluster_wide(saved_storage):
+    # Trusted-team visibility: every ``admin.coordinator`` caller sees
+    # every closed coordinator.
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    a = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="a")
+    b = _seed_closed_coord_with_history(mgr, storage, user_id="user-2", name="b")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert {c["ws_id"] for c in resp.json()["workstreams"]} == {a, b}
+
+
+def test_saved_excludes_currently_loaded(saved_storage):
+    """A coordinator currently in coord_mgr must NOT appear in saved cards.
+
+    A loaded coordinator holds a live owner lease, so even a row that says
+    state='closed' on disk (e.g. mid-close) stays out of the saved list and the
+    same ws_id is never in both the active list and the saved cards.
+    """
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    closed_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="closed")
+    # Create another coord, leave it loaded — should never appear in saved.
+    loaded_ws = mgr.create(user_id="user-1", name="loaded")
+    loaded_fence = mgr.lease_fence(loaded_ws.id)
+    storage.save_message(loaded_ws.id, role="user", content="seed", lease=loaded_fence)
+    # Force it to state='closed' on disk without removing from memory.
+    storage.update_workstream_state(loaded_ws.id, "closed", lease=loaded_fence)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    saved_ids = {c["ws_id"] for c in resp.json()["workstreams"]}
+    assert closed_id in saved_ids
+    assert loaded_ws.id not in saved_ids
+
+
+def _unload_without_closing(mgr, ws) -> None:
+    """Drop *ws* from memory and release its lease, leaving its state as is."""
+    mgr._workstreams.pop(ws.id, None)
+    if ws.id in mgr._order:
+        mgr._order.remove(ws.id)
+    mgr._release_slot_lease(ws)
+
+
+def test_saved_lists_unloaded_coordinators_in_any_state(saved_storage):
+    """A coordinator no process holds is saved, whatever state it was left in.
+
+    A console that shuts down or crashes leaves its coordinators idle (or
+    mid-turn) on disk. Once their owner lease is released or has expired they
+    can be resumed, so the saved list shows them rather than waiting for the
+    idle reaper to mark them closed (#1268).
+    """
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    closed_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="closed")
+    released = mgr.create(user_id="user-1", name="released")
+    storage.save_message(
+        released.id, role="user", content="seed", lease=mgr.lease_fence(released.id)
+    )
+    # A clean shutdown releases the lease without closing the row.
+    _unload_without_closing(mgr, released)
+    crashed = mgr.create(user_id="user-1", name="crashed")
+    crashed_fence = mgr.lease_fence(crashed.id)
+    storage.save_message(crashed.id, role="user", content="seed", lease=crashed_fence)
+    _unload_without_closing(mgr, crashed)
+    # A crashed boot's lease that has since run out (zero TTL: already expired).
+    assert storage.acquire_workstream_lease(
+        crashed.id,
+        incarnation_token=crashed_fence.incarnation_token,
+        holder="crashed-boot",
+        node_id="console",
+        ttl_seconds=0,
+    )
+    assert storage.get_workstream(released.id)["state"] == "idle"
+    assert storage.get_workstream(crashed.id)["state"] == "idle"
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    saved_ids = {c["ws_id"] for c in resp.json()["workstreams"]}
+    assert saved_ids == {closed_id, released.id, crashed.id}
+
+
+def test_saved_excludes_rows_another_process_holds(saved_storage):
+    """A coordinator another console has loaded stays out of this console's list."""
+    storage = saved_storage
+    mgr = _build_mgr(storage)
+    held = mgr.create(user_id="user-1", name="held-elsewhere")
+    fence = mgr.lease_fence(held.id)
+    storage.save_message(held.id, role="user", content="seed", lease=fence)
+    _unload_without_closing(mgr, held)
+    assert storage.acquire_workstream_lease(
+        held.id,
+        incarnation_token=fence.incarnation_token,
+        holder="other-console",
+        node_id="console-b",
+        ttl_seconds=60,
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["workstreams"] == []
+    assert resp.json()["total"] == 0
+
+
+def test_send_any_admin_coordinator_caller_can_send(storage):
+    # Trusted-team model: send is gated on admin.coordinator scope,
+    # not on per-row ownership.  Any caller with the scope can post
+    # to any coordinator.
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner", name="theirs")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"message": "hi"},
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+
+
+def test_send_requires_message(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Dequeue (DELETE /send) — lifted handler wired onto the coord endpoint
+# config. Pins the URL/scope contract so a regression in the route table
+# (wrong endpoint_config, wrong method, missing gate) trips a test.
+# ---------------------------------------------------------------------------
+
+
+def test_dequeue_removes_queued_coord_message(storage):
+    """POST /send while busy → queued; DELETE /send with msg_id → removed."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # _build_mgr's session_factory returns a MagicMock posing as a
+    # ChatSession so the test can stub queue_message / dequeue_message.
+    session = cast("MagicMock", ws.session)
+
+    # Force the queue path by marking the worker as already running.
+    # The lifted send handler hands off to ``session_worker.send`` which
+    # picks ``enqueue`` over ``run`` when ``ws._worker_running`` is True.
+    ws._worker_running = True
+    session.queue_message.return_value = ("hi", "important", "msg-abc")
+    session.dequeue_message.return_value = True
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    send_resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"message": "hi"},
+        headers=_COORD_HEADERS,
+    )
+    assert send_resp.status_code == 200, send_resp.text
+    body = send_resp.json()
+    assert body["status"] == "queued"
+    assert body["msg_id"] == "msg-abc"
+
+    dequeue_resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"msg_id": "msg-abc"},
+        headers=_COORD_HEADERS,
+    )
+    assert dequeue_resp.status_code == 200, dequeue_resp.text
+    assert dequeue_resp.json() == {"status": "removed"}
+    session.dequeue_message.assert_called_with("msg-abc")
+
+
+def test_dequeue_unknown_msg_id_returns_not_found(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cast("MagicMock", ws.session).dequeue_message.return_value = False
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"msg_id": "missing"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "not_found"}
+
+
+def test_dequeue_requires_msg_id(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 400
+
+
+def test_dequeue_unknown_ws_returns_404(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        "/v1/api/workstreams/0000000000000000000000000000000000000000000000000000000000000000/send",
+        json={"msg_id": "anything"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 404
+    assert "coordinator not found" in resp.json()["error"]
+
+
+def test_dequeue_requires_admin_coordinator_scope(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.request(
+        "DELETE",
+        f"/v1/api/workstreams/{ws.id}/send",
+        json={"msg_id": "msg-abc"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
+    )
+    assert resp.status_code == 403
+
+
+def test_close_records_audit_and_removes_from_mgr(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert mgr.get(ws.id) is None
+    events = storage.list_audit_events(user_id="user-1", limit=10)
+    actions = [e["action"] for e in events]
+    assert "coordinator.close" in actions
+
+
+def test_close_returns_409_when_unresolved_persistence_refuses_unload(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.session.prepare_soft_close = MagicMock(return_value=False)
+    ws.session.has_unresolved_conversation_persistence = MagicMock(return_value=True)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
+
+    assert resp.status_code == 409
+    assert resp.json() == {"error": "workstream has unresolved persistence"}
+    assert mgr.get(ws.id) is ws
+
+
+def test_close_returns_503_when_structural_cleanup_refuses_unload(storage, caplog):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.session.prepare_soft_close = MagicMock(return_value=False)
+    ws.session.has_tool_structural_debt = MagicMock(return_value=True)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
+
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "workstream cleanup is still in progress; try again shortly"}
+    assert mgr.get(ws.id) is ws
+    assert any(
+        "session_mgr.close_refused" in record.message and "cleanup_pending" in record.message
+        for record in caplog.records
+    )
+
+
+def test_approve_resolves_ui_event(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    assert isinstance(ws.ui, ConsoleCoordinatorUI)
+    cycle = _seed_pending(ws, "c-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "always": True, "call_id": "c-1"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cycle_id"] == cycle.cycle_id
+    assert cycle.event.is_set()
+    assert cycle.result == (True, None)
+    assert ws.ui._always_approve_tools_by_principal["user-1"] == {"spawn_workstream"}
+
+
+def test_peer_approval_is_binary_only_and_keeps_execution_principal(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    peer_headers = {"X-Test-User": "user-2", "X-Test-Perms": "admin.coordinator"}
+
+    feedback_cycle = _seed_pending(ws, "c-feedback")
+    response = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": False, "feedback": "change this", "call_id": "c-feedback"},
+        headers=peer_headers,
+    )
+    assert response.status_code == 409
+    assert not feedback_cycle.resolved
+
+    always_cycle = _seed_pending(ws, "c-always")
+    response = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "always": True, "call_id": "c-always"},
+        headers=peer_headers,
+    )
+    assert response.status_code == 409
+    assert not always_cycle.resolved
+
+    response = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-feedback"},
+        headers=peer_headers,
+    )
+    assert response.status_code == 200
+    assert feedback_cycle.resolver_principal_id == "user-2"
+    assert feedback_cycle.execution_principal_id == "user-1"
+    assert feedback_cycle.result == (True, None)
+
+
+def _seed_pending(ws, *call_ids: str, func_name: str = "spawn_workstream"):
+    """Register a live ApprovalCycle on the coord UI the way its
+    ``approve_tools`` gate does, returning the cycle for direct
+    event/result assertions (the pre-cycle singleton
+    ``_approval_event`` / ``_approval_result`` slots are gone)."""
+    from turnstone.core.session_ui_base import ApprovalCycle
+
+    items = [
+        {
+            "call_id": cid,
+            "func_name": func_name,
+            "approval_label": func_name,
+            "needs_approval": True,
+            "_principal_id": ws.user_id,
+        }
+        for cid in call_ids
+    ]
+    card = {
+        "type": "approve_request",
+        "cycle_id": f"cyc-{'-'.join(call_ids)}",
+        "items": ws.ui._serialize_approval_items(items),
+        "judge_pending": False,
+    }
+    cycle = ApprovalCycle(items, card, None)
+    ws.ui._register_approval_cycle(cycle)
+    return cycle
+
+
+def test_approve_409_on_stale_call_id(storage):
+    """Body call_id doesn't match any pending item → 409 with the
+    current primary call_id + cycle_id so the UI can re-render
+    against the new round."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-current")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-stale"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"] == "stale call_id"
+    assert body["current_call_id"] == "c-current"
+    assert body["current_cycle_id"] == cycle.cycle_id
+    # The live cycle must NOT have been resolved.
+    assert not cycle.event.is_set()
+
+
+def test_approve_409_when_no_pending_and_call_id_sent(storage):
+    """Body sends a call_id but the UI has no live cycle — 409 with
+    current_call_id=None so the UI knows to clear the row."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # No cycle registered.
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-anything"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"] == "stale call_id"
+    assert body["current_call_id"] is None
+    assert body["current_cycle_id"] is None
+
+
+def test_approve_no_call_id_preserves_backward_compat(storage):
+    """Existing clients (CLI, channel adapters) that omit call_id
+    must still resolve approvals — a selector-less body lands on the
+    oldest live cycle."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True},  # no call_id
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cycle_id"] == cycle.cycle_id
+    assert cycle.event.is_set()
+
+
+def test_approve_no_call_id_no_pending_resolves_nothing(storage):
+    """Legacy clients (no call_id) calling approve with no live cycle:
+    200 with ``cycle_id: null`` — the handler resolves NOTHING rather
+    than racing a cycle that registers between its lookup and its
+    resolve (the client can't have been looking at one)."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # No cycle registered.
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True},  # no call_id
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cycle_id"] is None
+
+
+def test_approve_call_id_matches_any_item_in_multi_envelope(storage):
+    """N>1 envelope: any one of the items' call_ids in the body
+    is sufficient — server resolves the whole envelope per the
+    one-boolean semantics of resolve_approval."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-1", "c-2", "c-3")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-2"},  # middle item
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert cycle.event.is_set()
+
+
+def test_approve_invokes_modern_handler_once_with_pinned_identity(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-modern")
+    real_find = ws.ui.find_approval_cycle
+    real_resolve = ws.ui.resolve_approval
+    ws.ui.find_approval_cycle = MagicMock(wraps=real_find)
+    ws.ui.resolve_approval = MagicMock(wraps=real_resolve)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "feedback": "ship it", "call_id": "c-modern"},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 200
+    ws.ui.find_approval_cycle.assert_called_once_with(cycle_id=None, call_id="c-modern")
+    ws.ui.resolve_approval.assert_called_once_with(
+        True,
+        "ship it",
+        always=False,
+        cycle_id=cycle.cycle_id,
+        resolver_principal_id="user-1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        ({}, "approved"),
+        ({"approved": "false"}, "approved"),
+        ({"approved": True, "always": "false"}, "always"),
+        ({"approved": True, "feedback": ["no"]}, "feedback"),
+        ({"approved": True, "call_id": 123}, "call_id"),
+        ({"approved": True, "cycle_id": ["cycle"]}, "cycle_id"),
+    ],
+)
+def test_approve_rejects_malformed_fields_without_resolving(storage, body, field):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-malformed")
+    ws.ui.find_approval_cycle = MagicMock(wraps=ws.ui.find_approval_cycle)
+    ws.ui.resolve_approval = MagicMock(wraps=ws.ui.resolve_approval)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json=body,
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 400
+    assert field in resp.json()["error"]
+    ws.ui.find_approval_cycle.assert_not_called()
+    ws.ui.resolve_approval.assert_not_called()
+    assert not cycle.event.is_set()
+
+
+def test_approve_rejects_ui_without_cycle_routing(storage):
+    class _LegacyApprovalUI:
+        def resolve_approval(self, *_args, **_kwargs):
+            raise AssertionError("legacy resolver must not be called")
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.ui = _LegacyApprovalUI()
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json() == {"error": "session UI does not support principal-aware approval"}
+
+
+def test_approve_callback_type_error_is_not_retried(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-bug")
+    ws.ui.resolve_approval = MagicMock(side_effect=TypeError("callback implementation bug"))
+    client = _make_client(
+        storage,
+        coord_mgr=mgr,
+        registry=_fake_registry(),
+        raise_server_exceptions=False,
+    )
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": False, "call_id": "c-bug"},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 500
+    ws.ui.resolve_approval.assert_called_once_with(
+        False,
+        None,
+        always=False,
+        cycle_id=cycle.cycle_id,
+        resolver_principal_id="user-1",
+    )
+    assert not cycle.event.is_set()
+
+
+def test_selectorless_always_whitelists_only_the_resolved_oldest_cycle(storage):
+    """sweep-3 regression: with several live cycles, a selector-less
+    "Approve + Always" must whitelist the tools of the cycle it
+    actually resolved (the oldest) — not a sibling's."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    oldest = _seed_pending(ws, "a-1", func_name="spawn_workstream")
+    newer = _seed_pending(ws, "b-1", func_name="send_message")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "always": True},  # no selector
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cycle_id"] == oldest.cycle_id
+    assert oldest.event.is_set()
+    assert not newer.event.is_set()
+    grants = ws.ui._always_approve_tools_by_principal["user-1"]
+    assert "spawn_workstream" in grants
+    assert "send_message" not in grants
+
+
+def test_approve_always_skips_whitelist_when_pinned_cycle_lost_the_race(storage):
+    """sweep-3 regression: the handler collects always-names from the
+    cycle its lookup pinned; if that cycle is resolved by someone else
+    (gate timeout, peer tab) between lookup and resolve, the whitelist
+    must NOT grow — approving a card that already resolved must not
+    auto-approve anything."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    _seed_pending(ws, "a-1", func_name="spawn_workstream")
+    ui = ws.ui
+    real_find = ui.find_approval_cycle
+
+    def racing_find(**kwargs):
+        card = real_find(**kwargs)
+        if card is not None:
+            # A concurrent resolver wins the gap between the handler's
+            # lookup and its (pinned) resolve.
+            ui.resolve_approval(False, "raced", cycle_id=card["cycle_id"])
+        return card
+
+    ui.find_approval_cycle = racing_find
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "always": True},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cycle_id"] is None
+    assert "spawn_workstream" not in ws.ui._always_approve_tools_by_principal.get("user-1", set())
+
+
+# ---------------------------------------------------------------------------
+# Lazy rehydration
+# ---------------------------------------------------------------------------
+
+
+def test_detail_triggers_lazy_rehydration(storage):
+    """GET /v1/api/workstreams/{ws_id} finds the row and rehydrates it."""
+    mgr = _build_mgr(storage)
+    # Simulate a coordinator persisted by a previous console process.
+    storage.register_workstream(
+        "persisted-coord",
+        node_id="console",
+        user_id="user-1",
+        kind="coordinator",
+    )
+    assert mgr.get("persisted-coord") is None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/persisted-coord", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    # Now tracked in the manager.
+    assert mgr.get("persisted-coord") is not None
+
+
+def test_detail_any_admin_coordinator_caller_can_open(storage):
+    # Trusted-team model: any ``admin.coordinator`` caller can rehydrate
+    # any persisted coordinator regardless of owner.  ``user_id`` stays
+    # on the response as metadata.
+    mgr = _build_mgr(storage)
+    storage.register_workstream("coord-x", kind="coordinator", user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/workstreams/coord-x",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["user_id"] == "owner"
+
+
+def test_detail_404_when_kind_interactive(storage):
+    """Non-coordinator rows aren't reachable via the coordinator endpoint."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("ws-int", kind="interactive", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/ws-int", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+
+
+def test_detail_503_on_session_factory_misconfig(storage):
+    """``ValueError`` from ``mgr.open`` (e.g. a model alias that no longer
+    resolves) surfaces as 503 with the factory's remediation text — not
+    a correlation-id'd 500. Mirrors the open verb lift's contract so
+    operators can fix the misconfig without grepping logs."""
+    from unittest.mock import patch
+
+    mgr = _build_mgr(storage)
+    storage.register_workstream("misconfig-coord", kind="coordinator", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    with patch.object(mgr, "open_with_outcome", side_effect=ValueError("no such model alias")):
+        resp = client.get("/v1/api/workstreams/misconfig-coord", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert "no such model alias" in resp.json()["error"]
+
+
+def test_detail_correlation_id_on_unexpected_rehydrate_failure(storage):
+    """Bare ``Exception`` from ``mgr.open`` (build_session / resume failure
+    with no documented spec) surfaces as a correlation-id'd 500 with the
+    per-kind noun in the user-facing message — not the raw exception
+    text. Mirrors :func:`make_open_handler`'s leak-prevention contract."""
+    from unittest.mock import patch
+
+    mgr = _build_mgr(storage)
+    storage.register_workstream("broken-coord", kind="coordinator", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    with patch.object(
+        mgr, "open_with_outcome", side_effect=RuntimeError("internal stack frame leak")
+    ):
+        resp = client.get("/v1/api/workstreams/broken-coord", headers=_COORD_HEADERS)
+    assert resp.status_code == 500
+    body = resp.json()
+    assert "internal stack frame leak" not in body["error"]
+    assert "correlation_id=" in body["error"]
+    # Per-kind noun via cfg.audit_action_prefix — coord wires "coordinator".
+    assert "coordinator" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+
+
+class _HistoryHandoffSession:
+    """Minimal concrete session for token-bearing history endpoint tests."""
+
+    def __init__(self) -> None:
+        self._history_generation = 0
+
+    def capture_history_handoff(
+        self,
+        load_messages: Callable[[int], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        return load_messages(0), f"test-history.{self._history_generation}"
+
+    def rehydrate(self) -> bool:
+        return True
+
+
+def _build_history_mgr(storage: Any):
+    def session_factory(
+        _ui: Any,
+        _model_alias: str | None = None,
+        _ws_id: str | None = None,
+        **_kwargs: Any,
+    ) -> _HistoryHandoffSession:
+        return _HistoryHandoffSession()
+
+    return _build_mgr_with_factory(storage, session_factory)
+
+
+def test_history_returns_messages(storage):
+    mgr = _build_history_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # Seed a message in storage.
+    storage.save_message(ws.id, "user", "hello", lease=mgr.lease_fence(ws.id))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/history", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"] == ws.id
+    assert body["handoff_token"]
+    assert any(m.get("role") == "user" and m.get("content") == "hello" for m in body["messages"])
+
+
+def test_history_any_admin_coordinator_caller_can_read(storage):
+    # Trusted-team visibility: history is readable by any
+    # ``admin.coordinator`` caller.
+    mgr = _build_history_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    storage.save_message(ws.id, "user", "hello", lease=mgr.lease_fence(ws.id))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/history",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ws_id"] == ws.id
+
+
+def test_history_private_project_hidden_from_non_member(storage):
+    # admin.coordinator gates the surface, but a coordinator in a private
+    # project the caller isn't a member of is 404-masked — the conversation
+    # does not leak to a non-member operator.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    storage.save_message("c" * 32, "user", "secret plan")
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/history",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_history_private_project_visible_to_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.add_project_member("proj-secret", "member-bob")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    storage.save_message("c" * 32, "user", "secret plan")
+    mgr = _build_history_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/history",
+        headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    assert any(m.get("content") == "secret plan" for m in resp.json()["messages"])
+
+
+def test_export_private_project_hidden_from_non_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    storage.save_message("c" * 32, "user", "secret plan")
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/export",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_children_private_project_hidden_from_non_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/children",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_open_private_project_hidden_from_non_member(storage):
+    # `open` rehydrates + returns the auto-titled name, so an ungated open is a
+    # private-project existence/metadata oracle AND an unauthorized resurrection.
+    # The tenant_check must fire before the already-loaded shortcut and mgr.open.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{'c' * 32}/open",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_coord_attachments_private_project_hidden_from_non_member(storage):
+    # Attachment list/serve resolves the owner as the coord owner and only
+    # enforced cross-kind before — a non-member operator could enumerate and
+    # download the owner's staged blobs. Now 404-masked by project tenancy.
+    storage.create_project("proj-secret", "Secret", "alice")
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="alice", project_id="proj-secret")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/attachments",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_coord_attachments_private_project_visible_to_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.add_project_member("proj-secret", "member-bob")
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="alice", project_id="proj-secret")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/attachments",
+        headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+
+
+def test_history_serves_storage_only_workstream(storage):
+    """Closed coordinators are still readable via /history without rehydrating.
+
+    Deliberate pin update (back to the pre-handoff assertion, plus the token
+    contract): a cold row has no live writer and no splice to witness, so the
+    read is storage-only and tokenless — never constructing a session into
+    the bounded pool. The tokenless 200 seeds a render plus the tokenless
+    stream bootstrap.
+    """
+    mgr = _build_history_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    storage.save_message("storage-only-coord", "user", "from cold storage")
+    # Confirm precondition: row is in storage, NOT in the manager's pool.
+    assert mgr.get("storage-only-coord") is None
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/workstreams/storage-only-coord/history",
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert any(m.get("content") == "from cold storage" for m in body["messages"])
+    assert body["handoff_token"] is None
+    # The read verb leaves the pool untouched.
+    assert mgr.get("storage-only-coord") is None
+
+
+def test_history_404_when_kind_interactive(storage):
+    """Cross-kind isolation on the storage fallback path: an interactive
+    ws_id that exists in storage 404s on the coord history endpoint
+    (mirrors :func:`test_detail_404_when_kind_interactive`). The lifted
+    factory uses ``cfg.list_kind`` for the kind check; pre-lift coord
+    used :func:`_resolve_coordinator_or_404`'s explicit kind compare."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("ws-int", kind="interactive", user_id="user-1")
+    storage.save_message("ws-int", "user", "interactive content")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/ws-int/history", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+    assert "interactive content" not in resp.text
+
+
+def test_history_load_messages_exception_returns_non_authoritative_503(storage):
+    """A transient history-load failure must not masquerade as empty truth.
+
+    The browser retains its prior transcript and repair latch on a non-2xx.
+    The failure body therefore carries neither projected messages nor a
+    handoff token that could authorize an SSE connection from an incomplete
+    durable prefix.
+    """
+    from unittest.mock import patch
+
+    mgr = _build_history_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    with patch.object(storage, "load_messages", side_effect=RuntimeError("db gone")):
+        resp = client.get(f"/v1/api/workstreams/{ws.id}/history", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "History temporarily unavailable"}
+
+
+def test_history_lookup_failing_after_the_tenant_check_is_503(storage):
+    """A row read that starts failing between the tenant check and the
+    handler's own lookup answers the 503 a failed history load does, not
+    404: an outage is not a missing workstream."""
+    from unittest.mock import patch
+
+    mgr = _build_history_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    assert mgr.get("storage-only-coord") is None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    real_get = storage.get_workstream
+    calls: list[str] = []
+
+    def _fail_after_the_tenant_check(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        if len(calls) == 1:
+            return real_get(ws_id)
+        raise RuntimeError("db gone")
+
+    with patch.object(storage, "get_workstream", side_effect=_fail_after_the_tenant_check):
+        resp = client.get("/v1/api/workstreams/storage-only-coord/history", headers=_COORD_HEADERS)
+    assert len(calls) == 2  # the tenant check read, then the handler's lookup failed
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "History temporarily unavailable"}
+
+
+def test_export_lookup_failing_after_the_tenant_check_is_503(storage):
+    """Export answers the same race as history: a row read that starts
+    failing between the tenant check and the handler's own lookup is a
+    503, not a 404, since an outage is not a missing workstream."""
+    from unittest.mock import patch
+
+    mgr = _build_history_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    real_get = storage.get_workstream
+    calls: list[str] = []
+
+    def _fail_after_the_tenant_check(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        if len(calls) == 1:
+            return real_get(ws_id)
+        raise RuntimeError("db gone")
+
+    with patch.object(storage, "get_workstream", side_effect=_fail_after_the_tenant_check):
+        resp = client.get("/v1/api/workstreams/storage-only-coord/export", headers=_COORD_HEADERS)
+    assert len(calls) == 2  # the tenant check read, then the handler's lookup failed
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "Export temporarily unavailable"}
+
+
+def test_history_clamps_limit_query_param(storage):
+    """Pre-lift coord clamped ``?limit=`` to [1, 500]. The lifted factory
+    preserves the same bounds. Out-of-range / unparseable values
+    fall back to defaults instead of erroring — coord's page-load
+    handshake should never 4xx on a malformed limit param."""
+    mgr = _build_history_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # Seed enough messages to exercise the upper bound. SQLite's INSERT
+    # is fast enough that 6 inserts in a tight loop is fine.
+    for i in range(6):
+        storage.save_message(ws.id, "user", f"msg-{i}", lease=mgr.lease_fence(ws.id))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    base = f"/v1/api/workstreams/{ws.id}/history"
+
+    # No limit → default 100 (returns all 6).
+    resp = client.get(base, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 6
+
+    # limit=2 → only 2 messages returned (storage owns the row
+    # ordering contract; the factory just threads ``limit`` through).
+    resp = client.get(base, params={"limit": 2}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 2
+
+    # Negative / zero → clamp to 1 (factory: ``max(1, min(limit, 500))``).
+    resp = client.get(base, params={"limit": 0}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 1
+
+    # Garbage → falls back to default 100 (still 200, returns all 6).
+    resp = client.get(base, params={"limit": "garbage"}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["messages"]) == 6
+
+    # Above-cap → clamps to 500 (page-load handshake never 4xx's).
+    resp = client.get(base, params={"limit": 999}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    # We only have 6 messages but the response is still 200 — the cap
+    # is enforced on the SQL LIMIT, not on the row count.
+    assert len(resp.json()["messages"]) == 6
+
+
+# ---------------------------------------------------------------------------
+# Export (issue #613) — conversation-only, never a zip
+# ---------------------------------------------------------------------------
+
+
+def test_export_happy_path_returns_json_not_zip(storage):
+    """A seeded coordinator exports as a JSON conversation envelope —
+    never a zip. The HTTP surface is conversation-only; the children/zip
+    capability is admin-CLI-only."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    storage.save_message(ws.id, "user", "coordinate the work", lease=mgr.lease_fence(ws.id))
+    storage.save_message(ws.id, "assistant", "on it", lease=mgr.lease_fence(ws.id))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/export", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.headers["content-disposition"] == f'attachment; filename="{ws.id}.json"'
+    # NOT a zip — zip archives start with the "PK" local-file magic.
+    assert not resp.content.startswith(b"PK")
+    # Body parses to the OpenAI envelope with the seeded turns.
+    body = resp.json()
+    role_contents = [(m.get("role"), m.get("content")) for m in body["messages"]]
+    assert ("user", "coordinate the work") in role_contents
+
+
+def test_export_serves_storage_only_coordinator(storage):
+    """Closed / evicted coordinators export from storage without
+    rehydrating, same ladder history uses."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    storage.save_message("storage-only-coord", "user", "from cold storage")
+    assert mgr.get("storage-only-coord") is None
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/workstreams/storage-only-coord/export",
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    contents = [m.get("content") for m in resp.json()["messages"]]
+    assert "from cold storage" in contents
+    # Export does NOT rehydrate — pool stays cold.
+    assert mgr.get("storage-only-coord") is None
+
+
+def test_creating_storage_only_coordinator_is_not_addressable(storage):
+    """Both coordinator resolution ladders hide lifecycle reservations."""
+    ws_id = "c" * 32
+    storage.register_workstream(
+        ws_id,
+        kind="coordinator",
+        user_id="user-1",
+        state="creating",
+    )
+    storage.save_message(ws_id, "user", "unpublished coordinator transcript")
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    children = client.get(f"/v1/api/workstreams/{ws_id}/children", headers=_COORD_HEADERS)
+    exported = client.get(f"/v1/api/workstreams/{ws_id}/export", headers=_COORD_HEADERS)
+
+    assert children.status_code == 404
+    assert exported.status_code == 404
+    assert "unpublished coordinator transcript" not in exported.text
+
+
+def test_export_404_when_kind_interactive(storage):
+    """Cross-kind isolation: an interactive ws_id in shared storage 404s
+    on the coordinator export endpoint (the handler is built with
+    ``list_kind=COORDINATOR``). Proves the kind gate the same way
+    :func:`test_history_404_when_kind_interactive` does."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("ws-int", kind="interactive", user_id="user-1")
+    storage.save_message("ws-int", "user", "interactive content")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/ws-int/export", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+    assert "interactive content" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Cancel
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_resolves_pending_approval(storage):
+    """Cancel addresses the workstream, not one batch — EVERY live
+    cycle resolves (parallel task agents can hold several gates)."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    assert isinstance(ws.ui, ConsoleCoordinatorUI)
+    first = _seed_pending(ws, "c-1")
+    second = _seed_pending(ws, "c-2")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert first.event.is_set()
+    assert second.event.is_set()
+    assert first.result == (False, "Cancelled by user")
+    assert first.resolver_principal_id == "user-1"
+    assert second.resolver_principal_id == "user-1"
+
+
+def test_cancel_does_not_fallback_to_single_cycle_approval_api(storage):
+    """An incompatible UI cannot bypass the attributed all-cycle sweep."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    single_cycle_resolver = MagicMock()
+    ws.ui = SimpleNamespace(resolve_approval=single_cycle_resolver)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+
+    assert resp.status_code == 200
+    single_cycle_resolver.assert_not_called()
+
+
+def test_cancel_response_always_includes_dropped_key(storage):
+    """Always-include shape parity: post-P3 verb lift, coord cancel
+    returns ``{"status": "ok", "dropped": {}}`` regardless of whether
+    a forensics callable is wired (coord wires ``None``). SDK
+    consumers don't have to branch on kind to read ``dropped``."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["dropped"] == {}
+
+
+def test_cancel_force_flag_abandons_worker_thread_and_emits_stream_end(storage):
+    """Parity gain from the verb lift: coord now honours the ``force``
+    flag the same way interactive does (pre-lift coord ignored it).
+    Stuck-worker recovery: the abandoned thread is cleared, an
+    ``idle`` state-change is dispatched via the UI, and a
+    ``stream_end`` event lands on the listener queue so the dashboard
+    recovers without waiting for the daemon thread to exit."""
+    import threading
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    assert isinstance(ws.ui, ConsoleCoordinatorUI)
+    # Simulate an in-flight worker the UI is still waiting on.
+    ws._worker_running = True
+    ws.worker_thread = threading.Thread(target=lambda: None, daemon=True)
+    listener = ws.ui._register_listener()
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/cancel",
+        headers=_COORD_HEADERS,
+        json={"force": True},
+    )
+    assert resp.status_code == 200
+    # Worker thread reference cleared so a follow-up send doesn't
+    # think a generation is still in flight.
+    assert ws.worker_thread is None
+    # ``stream_end`` lands on the listener so SDK consumers bail out
+    # of the SSE loop instead of hanging on the daemon thread.
+    seen = []
+    while not listener.empty():
+        seen.append(listener.get_nowait().get("type"))
+    assert "stream_end" in seen
+
+
+def test_cancel_returns_400_when_session_missing(storage):
+    """Pre-lift coord called ``coord_mgr.cancel`` which silently
+    no-op'd on a placeholder workstream (session=None). The lifted
+    body 400s for parity with interactive's existing
+    ``"No session"`` branch — surfaces the build-failure state to
+    the operator instead of swallowing it."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # Force the placeholder/build-failed shape.
+    ws.session = None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 400
+
+
+def test_cancel_swallows_forensics_exception(storage):
+    """``cancel_forensics`` is observational — a bug in the snapshot
+    callable must NOT block the actual cancel. The lifted body wraps
+    the call in try/except + log.debug and falls through with an
+    empty ``dropped`` dict so the response shape stays consistent."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import (
+        SessionEndpointConfig,
+        make_cancel_handler,
+    )
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+
+    def _raises_forensics(session, ui, *, was_running):  # noqa: ARG001
+        raise RuntimeError("forensics blew up")
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+        cancel_forensics=_raises_forensics,
+    )
+    handler = make_cancel_handler(cfg)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["dropped"] == {}
+
+
+def test_cancel_swallows_audit_emit_exception(storage):
+    """``audit_emit`` failures are demoted to ``log.warning`` and the
+    cancel returns 200. Mirrors the same pattern in ``make_close_handler``
+    — telemetry bugs must not block recovery verbs."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import (
+        SessionEndpointConfig,
+        make_cancel_handler,
+    )
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+
+    def _raises_audit(request, ws_id, ws_obj, force):  # noqa: ARG001
+        raise RuntimeError("audit blew up")
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, audit_emit=_raises_audit)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_cancel_idle_workstream_does_not_broadcast_approval_resolved(storage):
+    """Bug-1 from /review: the unconditional resolve_approval lift
+    leaked a stale ``approval_resolved`` SSE event on every idle
+    cancel. The fix gates the call on ``_pending_approval is not None``
+    so listeners don't see a phantom resolution. Asserts the
+    ``approval_resolved`` event does NOT land on the listener queue
+    when no approval is pending."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    assert isinstance(ws.ui, ConsoleCoordinatorUI)
+    assert ws.ui._pending_approval is None  # idle baseline
+    listener = ws.ui._register_listener()
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+
+    seen_types = []
+    while not listener.empty():
+        seen_types.append(listener.get_nowait().get("type"))
+    assert "approval_resolved" not in seen_types
+
+
+def test_coord_cancel_cascades_to_children(storage):
+    """Cancelling a coordinator auto-propagates the cancel down its
+    spawned subtree (HYPOTHESIS.md cancellation appendix: cancel flows
+    down the subtree).  The ``post_cancel`` hook fans ``coord_client.cancel``
+    over the direct children after the coordinator's own session is
+    cancelled."""
+    import json
+    from unittest.mock import MagicMock
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.console.server import _cascade_cancel_to_children
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr = _build_mgr(storage)
+    coord = mgr.create(user_id="user-1", name="coord-a")
+    _seed_children(mgr._adapter, coord.id, ["child-1", "child-2"])
+
+    coord_client = MagicMock()
+    coord_client.cancel.return_value = {"status": "ok"}
+    coord.session = MagicMock()
+    coord.session._coord_client = coord_client
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.state.coord_adapter = mgr._adapter
+    app.state.auth_storage = storage  # for the cascade audit (sec-2)
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+
+    resp = client.post(f"/v1/api/workstreams/{coord.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    # The coordinator's own session was cancelled (owner first)...
+    coord.session.cancel.assert_called_once()
+    # ...and every direct child received a cancel (subtree propagation). The
+    # fan-out runs as the response BackgroundTask (perf-1: it does not block
+    # the cancel response); the TestClient drives it before returning.
+    cascaded = {c.args[0] for c in coord_client.cancel.call_args_list}
+    assert cascaded == {"child-1", "child-2"}
+    # sec-2: the cascade records a forensic audit row with the child lists.
+    events = [
+        e for e in storage.list_audit_events() if e["action"] == "coordinator.cancel_cascaded"
+    ]
+    assert len(events) == 1
+    assert set(json.loads(events[0]["detail"])["cancelled"]) == {"child-1", "child-2"}
+
+
+def test_coord_cancel_cascade_records_children_it_could_not_read(storage, monkeypatch):
+    """A coordinator rehydrated while its children query fails can't reach its
+    children: the owner's cancel still answers 200, and the cascade audit says
+    the children couldn't be read instead of recording an empty cascade."""
+    import json
+
+    from turnstone.console.server import _cascade_cancel_to_children
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr, ws, coord_id, _down = _rehydrate_with_children_down(
+        storage, monkeypatch, ["c" * 32, "d" * 32]
+    )
+    coord_client = MagicMock()
+    ws.session = MagicMock()
+    ws.session._coord_client = coord_client
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.state.coord_adapter = mgr._adapter
+    app.state.auth_storage = storage
+    app.add_middleware(_AuthMiddleware)
+
+    resp = TestClient(app).post(f"/v1/api/workstreams/{coord_id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    ws.session.cancel.assert_called_once()
+    coord_client.cancel.assert_not_called()
+    events = [
+        e for e in storage.list_audit_events() if e["action"] == "coordinator.cancel_cascaded"
+    ]
+    assert len(events) == 1
+    detail = json.loads(events[0]["detail"])
+    assert detail["error"] == "the coordinator's children could not be read"
+    assert detail["cancelled"] == []
+
+
+def test_coord_cancel_cascade_denied_for_service_token_without_grant(storage):
+    """sec-1 regression: the destructive subtree cascade is gated at
+    ``allow_service_bypass=False`` (the bar the removed stop_cascade held).
+    A service-scoped token without ``admin.coordinator`` can still cancel the
+    coordinator's own turn (the cancel route allows the service bypass) but
+    must NOT trigger the child cascade."""
+    from unittest.mock import MagicMock
+
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.console.server import _cascade_cancel_to_children
+    from turnstone.core.auth import AuthResult
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr = _build_mgr(storage)
+    coord = mgr.create(user_id="svc-user", name="coord-a")
+    _seed_children(mgr._adapter, coord.id, ["child-1", "child-2"])
+    coord_client = MagicMock()
+    coord_client.cancel.return_value = {"status": "ok"}
+    coord.session = MagicMock()
+    coord.session._coord_client = coord_client
+
+    class _ServiceAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            request.state.auth_result = AuthResult(
+                user_id="svc-user",
+                scopes=frozenset({"read", "write", "approve", "service"}),
+                token_source="test",
+                permissions=frozenset(),  # NO admin.coordinator grant
+            )
+            return await call_next(request)
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
+    app = Starlette(
+        routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])],
+        middleware=[Middleware(_ServiceAuth)],
+    )
+    app.state.coord_adapter = mgr._adapter
+    app.state.auth_storage = storage
+    client = TestClient(app)
+
+    resp = client.post(f"/v1/api/workstreams/{coord.id}/cancel", json={})
+    # Owner's own cancel still succeeds (cancel route allows the service bypass)…
+    assert resp.status_code == 200
+    coord.session.cancel.assert_called_once()
+    # …but the destructive cascade is withheld — no child was cancelled.
+    assert coord_client.cancel.call_count == 0
+
+
+def test_coord_cancel_cascade_failure_does_not_fail_owner_cancel(storage):
+    """A cascade error must not strand the owner half-cancelled: the
+    ``post_cancel`` exception is swallowed and the owner's cancel still
+    returns 200 (the owner's own session was already cancelled)."""
+    from unittest.mock import MagicMock
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr = _build_mgr(storage)
+    coord = mgr.create(user_id="user-1", name="coord-a")
+    coord.session = MagicMock()
+
+    async def _boom(request, ws_id, ws):  # noqa: ARG001
+        raise RuntimeError("cascade blew up")
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_boom)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+
+    resp = client.post(f"/v1/api/workstreams/{coord.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    coord.session.cancel.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Events (SSE replay shape)
+# ---------------------------------------------------------------------------
+
+
+from tests._replay_helpers import make_replay_mocks as _make_coord_replay_mocks  # noqa: E402
+
+
+def test_coord_shared_preamble_yields_connected_first():
+    """The shared preamble gives coordinator streams the same bootstrap."""
+    from turnstone.core.session_replay import session_replay_preamble
+
+    ws, ui, _request = _make_coord_replay_mocks()
+    out = list(session_replay_preamble(ws.session, ui))
+    assert out[0]["type"] == "connected"
+    assert out[0]["model"] == "gpt-5"
+    assert out[0]["model_alias"] == "default"
+    assert out[0]["skip_permissions"] is False
+
+
+def test_coord_shared_preamble_includes_status_only_when_last_usage_present():
+    """The ``status`` event populates the per-tab token-usage bar on
+    resume. Skipped when ``session._last_usage`` is None (a freshly-
+    created coordinator that hasn't completed a turn) — matches
+    interactive behaviour."""
+    from turnstone.core.session_replay import session_replay_preamble
+
+    ws, ui, _request = _make_coord_replay_mocks()
+    out = list(session_replay_preamble(ws.session, ui))
+    assert "status" not in {ev["type"] for ev in out}
+
+
+def test_coord_shared_preamble_status_payload_shape():
+    """When ``last_usage`` exists, the replayed ``status`` event carries
+    every field the dashboard's updateStatusBar() reads — same shape
+    SessionUI.on_status emits live."""
+    from turnstone.core.session_replay import session_replay_preamble
+
+    ws, ui, request = _make_coord_replay_mocks(
+        last_usage={
+            "prompt_tokens": 40000,
+            "completion_tokens": 6310,
+            "cache_creation_tokens": 100,
+            "cache_read_tokens": 50,
+        },
+        _ws_turn_tool_calls=3,
+        _ws_messages=7,
+    )
+    out = list(session_replay_preamble(ws.session, ui))
+    status = next(ev for ev in out if ev["type"] == "status")
+    assert status["prompt_tokens"] == 40000
+    assert status["completion_tokens"] == 6310
+    assert status["total_tokens"] == 46310
+    assert status["context_window"] == 100000
+    assert status["pct"] == round(46310 / 100000 * 100, 1)
+    assert status["effort"] == "medium"
+    assert status["tool_calls_this_turn"] == 3
+    assert status["turn_count"] == 7
+    assert status["cache_creation_tokens"] == 100
+    assert status["cache_read_tokens"] == 50
+
+
+def test_coord_events_replay_skips_session_block_when_no_session():
+    """Detached session (close-then-reopen race) — replay skips the
+    connected/status preamble and falls through to the pending-prompt
+    branches.  Mirrors interactive's defensive guard at
+    turnstone/server.py:665."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, _request = _make_coord_replay_mocks()
+    ws.session = None
+    out = list(_coord_events_replay(ws, ui, MagicMock()))
+    assert out == []
+
+
+def test_coord_events_replay_yields_pending_approval():
+    """The coord replay tail yields pending approval without mutation."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, request = _make_coord_replay_mocks(
+        _pending_approval={"type": "approve_request", "items": []},
+    )
+
+    out = list(_coord_events_replay(ws, ui, request))
+    types = [ev["type"] for ev in out]
+    assert types[0] == "connected"
+    assert "approve_request" in types
+
+
+def test_coord_events_replay_yields_cached_verdicts_after_pending_approval():
+    """When the SSE stream reconnects mid-approval, the verdict-cache
+    replay must follow the pending_approval re-injection. Without this,
+    a refreshing tab sees the approve_request prompt but no judge chip
+    until the operator re-invokes the action — intent_verdict is a
+    one-shot SSE event with no late-subscriber push. Mirrors the
+    interactive replay path."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, request = _make_coord_replay_mocks(
+        _pending_approval={
+            "type": "approve_request",
+            "items": [{"call_id": "c-1"}],
+        },
+        _llm_verdicts={
+            "c-1": {
+                "verdict_id": "v-1",
+                "call_id": "c-1",
+                "recommendation": "deny",
+                "risk_level": "high",
+            }
+        },
+    )
+
+    out = list(_coord_events_replay(ws, ui, request))
+    types = [ev["type"] for ev in out]
+    approve_idx = types.index("approve_request")
+    verdict_idx = types.index("intent_verdict")
+    assert approve_idx < verdict_idx
+    verdict = out[verdict_idx]
+    assert verdict["verdict_id"] == "v-1"
+    assert verdict["recommendation"] == "deny"
+
+
+def test_coord_events_replay_skips_verdict_replay_without_pending_approval():
+    """Verdict replay rides on top of pending_approval — no prompt,
+    no chip. Stale verdicts from a previously-resolved round must
+    not surface on a fresh connect."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, request = _make_coord_replay_mocks(
+        _llm_verdicts={"old": {"verdict_id": "stale"}},
+    )
+
+    out = list(_coord_events_replay(ws, ui, request))
+    types = [ev["type"] for ev in out]
+    assert "intent_verdict" not in types
+    assert "approve_request" not in types
+    assert "plan_review" not in types
+
+
+def test_coord_events_replay_yields_only_connected_when_no_pending():
+    """Without controls or usage, replay contains only the preamble."""
+    from turnstone.console.server import _coord_events_replay
+
+    ws, ui, request = _make_coord_replay_mocks()
+    out = list(_coord_events_replay(ws, ui, request))
+    assert [ev["type"] for ev in out] == ["connected"]
+
+
+def test_coord_events_returns_404_on_missing_ws(storage):
+    """Cross-kind / missing ws_id surfaces as 404 with
+    ``cfg.not_found_label`` ("coordinator not found") via the lifted
+    body's ``mgr.get`` None-return contract."""
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/nonexistent-id/events", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Open (explicit rehydration)
+# ---------------------------------------------------------------------------
+
+
+def test_open_returns_already_loaded_when_in_memory(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="live")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"] == ws.id
+    assert body.get("already_loaded") is True
+
+
+def test_open_any_admin_coordinator_caller_succeeds_in_memory(storage):
+    # Trusted-team model: open is gated by admin.coordinator scope
+    # only; any authenticated caller can open any in-memory coordinator.
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner", name="theirs")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/open",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    assert resp.json().get("already_loaded") is True
+
+
+def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
+    mgr = _build_mgr(storage)
+    # The tenancy gate resolves the row from storage before rehydrating, so a
+    # legitimately-openable coordinator must exist there (it always does in
+    # production — open rehydrates a persisted row).
+    storage.register_workstream("coord-rehy", kind="coordinator", user_id="user-1")
+    rehydrated = MagicMock()
+    rehydrated.id = "coord-rehy"
+    rehydrated.name = "rehydrated"
+    rehydrated.user_id = "user-1"
+    monkeypatch.setattr(mgr, "open_with_outcome", MagicMock(return_value=(rehydrated, True)))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/workstreams/coord-rehy/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"] == "coord-rehy"
+    assert body["name"] == "rehydrated"
+    assert "already_loaded" not in body
+    # The open takes a single positional arg now — no per-caller
+    # ownership / admin plumbing.
+    mgr.open_with_outcome.assert_called_once_with("coord-rehy")
+
+
+def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):
+    mgr = _build_mgr(storage)
+    monkeypatch.setattr(mgr, "open_with_outcome", MagicMock(return_value=(None, False)))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/workstreams/nonexistent/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+
+
+def test_open_503_on_coord_mgr_unavailable(storage):
+    client = _make_client(storage, coord_mgr=None)
+    resp = client.post("/v1/api/workstreams/any-ws/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+
+
+def test_open_correlation_id_on_factory_failure(storage, monkeypatch):
+    mgr = _build_mgr(storage)
+    storage.register_workstream("bad-ws", kind="coordinator", user_id="user-1")
+    monkeypatch.setattr(mgr, "open_with_outcome", MagicMock(side_effect=RuntimeError("boom")))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 500
+    assert "correlation_id=" in resp.json()["error"]
+
+
+def test_open_503_when_open_raises_value_error(storage, monkeypatch):
+    """ValueError from the factory surfaces as 503 with the remediation text."""
+    mgr = _build_mgr(storage)
+    storage.register_workstream("bad-ws", kind="coordinator", user_id="user-1")
+    monkeypatch.setattr(
+        mgr, "open_with_outcome", MagicMock(side_effect=ValueError("coord registry missing"))
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert "registry missing" in resp.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/api/workstreams/{ws_id}/children — phase 3 tree view backend
+# ---------------------------------------------------------------------------
+
+
+def _seed_child(storage, parent_ws_id: str, ws_id: str, *, state: str = "idle") -> None:
+    storage.register_workstream(
+        ws_id,
+        node_id="node-a",
+        user_id="user-1",
+        name=f"child-{ws_id[:4]}",
+        kind="interactive",
+        parent_ws_id=parent_ws_id,
+    )
+    if state != "idle":
+        storage.update_workstream_state(ws_id, state)
+
+
+def test_children_empty_for_new_coordinator(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/children", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"items": [], "truncated": False}
+
+
+def test_children_returns_interactive_children(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    _seed_child(storage, ws.id, "c" * 32)
+    _seed_child(storage, ws.id, "d" * 32, state="running")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/children", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["items"]) == 2
+    states = {r["state"] for r in body["items"]}
+    assert states == {"idle", "running"}
+    kinds = {r["kind"] for r in body["items"]}
+    assert kinds == {"interactive"}
+
+
+def test_children_any_admin_coordinator_caller_sees_subtree(storage):
+    # Trusted-team visibility: the children subtree is readable by any
+    # ``admin.coordinator`` caller.
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    _seed_child(storage, ws.id, "a" * 32)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/children",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["items"]) == 1
+
+
+def test_children_invalid_ws_id_400(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/workstreams/INVALID-WS-SHOUT/children", headers=_COORD_HEADERS)
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/api/workstreams/{ws_id}/tasks — phase 3 task pane backend
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_empty_envelope_for_new_coordinator(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json() == {"version": 1, "tasks": []}
+
+
+def test_tasks_round_trips_stored_envelope(storage):
+    import json
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    envelope = {
+        "version": 1,
+        "tasks": [
+            {
+                "id": "tsk_abc",
+                "title": "Spawn analyzer",
+                "status": "in_progress",
+                "child_ws_id": "",
+                "created": "2026-04-17T00:00:00+00:00",
+                "updated": "2026-04-17T00:01:00+00:00",
+            }
+        ],
+    }
+    storage.save_workstream_config(
+        ws.id, {"tasks": json.dumps(envelope)}, lease=mgr.lease_fence(ws.id)
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json() == envelope
+
+
+def test_tasks_corrupt_envelope_returns_empty(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    storage.save_workstream_config(ws.id, {"tasks": "NOT-JSON"}, lease=mgr.lease_fence(ws.id))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json() == {"version": 1, "tasks": []}
+
+
+def test_tasks_failed_read_is_503(storage, monkeypatch):
+    """A failed storage read answers 503, never an empty list (#1416), so
+    the pane keeps the list it last rendered."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_workstream_config", _broken)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "task list could not be read"}
+
+
+def test_unloaded_coordinator_whose_row_cannot_be_read_is_denied(storage, monkeypatch):
+    """When the coordinator isn't loaded and its row read fails, its own
+    routes and the shared ones behind the tenant check (history here) deny
+    it as they deny an unknown id, rather than answer a 500."""
+    mgr = _build_mgr(storage)
+    ws_id = "c" * 32
+    storage.register_workstream(ws_id, kind="coordinator", user_id="user-1")
+    assert mgr.get(ws_id) is None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    routes = ("tasks", "children", "history")
+    for route in routes:  # the unloaded row resolves while reads work
+        before = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=_COORD_HEADERS)
+        assert before.status_code == 200, route
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "get_workstream", _broken)
+    for route in routes:
+        resp = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=_COORD_HEADERS)
+        assert resp.status_code == 404, route
+        assert resp.json() == {"error": "coordinator not found"}
+
+
+@pytest.mark.parametrize(
+    "failing",
+    [
+        ("get_workstream",),
+        ("get_project", "is_project_member"),
+        ("get_workstream", "get_project", "is_project_member"),
+    ],
+    ids=["rows", "projects", "both"],
+)
+def test_an_outage_tells_a_non_member_nothing_about_coordinators(storage, monkeypatch, failing):
+    """Whichever reads fail, a caller outside a private project gets the same
+    404 for a loaded coordinator in that project, an unloaded one and an id
+    that names nothing, so an outage is no existence oracle."""
+    storage.create_project("proj-secret", "Secret", "alice")
+    mgr = _build_mgr(storage)
+    loaded = mgr.create(user_id="alice", project_id="proj-secret")
+    unloaded_id = "e" * 32
+    storage.register_workstream(
+        unloaded_id, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    stranger = {"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"}
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    for method in failing:
+        monkeypatch.setattr(storage, method, _broken)
+    for route in ("tasks", "history"):
+        for ws_id in (loaded.id, unloaded_id, "d" * 32):
+            resp = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=stranger)
+            assert resp.status_code == 404, (route, ws_id)
+            assert resp.json() == {"error": "coordinator not found"}
+
+
+def test_tasks_any_admin_coordinator_caller_can_read(storage):
+    # Trusted-team visibility: any ``admin.coordinator`` caller can
+    # read the tasks envelope.
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/tasks",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/api/cluster/ws/{ws_id}/detail — cluster-wide live inspect
+# ---------------------------------------------------------------------------
+
+
+_CLUSTER_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.cluster.inspect"}
+
+
+def test_cluster_inspect_requires_permission(storage):
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/cluster/ws/" + ("a" * 32) + "/detail",
+        headers={"X-Test-User": "u", "X-Test-Perms": "read"},
+    )
+    assert resp.status_code == 403
+
+
+def test_cluster_inspect_unknown_ws_id_404(storage):
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get("/v1/api/cluster/ws/" + ("a" * 32) + "/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 404
+
+
+def test_cluster_inspect_failed_message_read_is_503(storage, monkeypatch):
+    """A failed read of the message tail is not an empty one: the route
+    answers 503 rather than a detail with ``messages: []``."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    url = f"/v1/api/cluster/ws/{ws.id}/detail"
+    assert client.get(url, headers=_CLUSTER_HEADERS).status_code == 200
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_messages", _broken)
+    resp = client.get(url, headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "workstream messages could not be read"}
+    # A caller that asks for no messages reads none, so it still gets its detail.
+    assert client.get(url + "?limit=0", headers=_CLUSTER_HEADERS).status_code == 200
+
+
+def test_cluster_inspect_invalid_ws_id_400(storage):
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get("/v1/api/cluster/ws/NOT-HEX/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 400
+
+
+def test_cluster_inspect_any_inspect_caller_sees_detail(storage):
+    # A project-less workstream has no tenancy to enforce, so any
+    # admin.cluster.inspect caller sees it (trusted-team default).
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{ws.id}/detail",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"]["ws_id"] == ws.id
+
+
+def test_cluster_inspect_private_project_hidden_from_non_member(storage):
+    # admin.cluster.inspect gates the surface, but a workstream in a
+    # private project the caller isn't a member of is masked as 404 —
+    # no private-project oracle even for a cluster admin.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32,
+        node_id="console",
+        user_id="alice",
+        kind="coordinator",
+        project_id="proj-secret",
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{'c' * 32}/detail",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 404
+
+
+def test_cluster_inspect_private_project_visible_to_member(storage):
+    # A project member (even a non-owner) still sees the persisted row.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.add_project_member("proj-secret", "member-bob")
+    storage.register_workstream(
+        "c" * 32,
+        node_id="console",
+        user_id="alice",
+        kind="coordinator",
+        project_id="proj-secret",
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{'c' * 32}/detail",
+        headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"]["ws_id"] == "c" * 32
+
+
+def test_cluster_inspect_coordinator_self_path(storage):
+    """A coordinator row returns live from the in-process manager."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/cluster/ws/{ws.id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["persisted"]["ws_id"] == ws.id
+    assert body["persisted"]["kind"] == "coordinator"
+    # The console holds this coordinator's lease; the holder is a routing hint only.
+    assert "lease_node_id" not in body["persisted"]
+    # Live is populated from the manager snapshot (pending_approval key signals
+    # we went through the coordinator branch, not the node-fetch branch).
+    assert body["live"] is not None
+    assert "pending_approval" in body["live"]
+    # Freshly created coordinator has no pending approval — the previous
+    # implementation read `not _approval_event.is_set()` which fires True
+    # on any unset event, making this flag spuriously True on every new
+    # coordinator.  Regression guard.
+    assert body["live"]["pending_approval"] is False
+    assert body["live"]["activity_state"] == ""
+    assert isinstance(body["messages"], list)
+
+
+def test_cluster_inspect_scrubs_private_assistant_provenance(storage):
+    """Cluster inspection never exposes the durable audit principal."""
+    import json
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    storage.save_message(
+        ws.id,
+        "assistant",
+        "accepted",
+        meta=json.dumps(
+            {
+                "provenance": {
+                    "model_alias": "main",
+                    "backend_model_id": "kernel",
+                    "registry_generation": 8,
+                    "acting_principal_id": "private-user-id",
+                }
+            }
+        ),
+        commit_key="private-commit-key",
+        lease=mgr.lease_fence(ws.id),
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    response = client.get(f"/v1/api/cluster/ws/{ws.id}/detail", headers=_CLUSTER_HEADERS)
+
+    assert response.status_code == 200
+    [message] = response.json()["messages"]
+    assert message["role"] == "assistant"
+    assert message["content"] == "accepted"
+    assert "_provenance" not in message
+    assert "_commit_key" not in message
+    assert "private-user-id" not in response.text
+    assert "private-commit-key" not in response.text
+
+
+def test_cluster_inspect_unloaded_coordinator_live_null(storage):
+    """A persisted-but-not-loaded coordinator returns live: null, 200."""
+    mgr = _build_mgr(storage)
+    # Persist a coordinator row directly without loading into the manager.
+    storage.register_workstream(
+        "f" * 32,
+        node_id="console",
+        user_id="user-1",
+        name="offline-coord",
+        kind="coordinator",
+        parent_ws_id=None,
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/cluster/ws/{'f' * 32}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["live"] is None
+    assert body["persisted"]["kind"] == "coordinator"
+
+
+def _install_proxy_client(client: TestClient, transport: httpx2.MockTransport) -> None:
+    """Attach an httpx2.AsyncClient backed by a MockTransport to the app state.
+
+    cluster_ws_detail's node-backed branch reads
+    ``request.app.state.proxy_client`` + ``request.app.state.collector``
+    to fetch a node's dashboard.  Both are normally wired in the lifespan;
+    tests short-circuit by injecting a proxy client here and stubbing
+    the collector's node lookup with a MagicMock.
+    """
+    client.app.state.proxy_client = httpx2.AsyncClient(transport=transport)
+
+
+def _install_collector_with_node(client: TestClient, node_id: str, server_url: str) -> None:
+    """Stub app.state.collector so _get_server_url returns server_url."""
+    collector = MagicMock()
+    collector.get_node_detail.return_value = {
+        "node_id": node_id,
+        "server_url": server_url,
+    }
+    client.app.state.collector = collector
+
+
+def _seed_node_workstream(storage, *, ws_id: str, node_id: str, user_id: str = "user-1") -> None:
+    storage.register_workstream(
+        ws_id,
+        node_id=node_id,
+        user_id=user_id,
+        name=f"child-{ws_id[:4]}",
+        kind="interactive",
+        parent_ws_id=None,
+    )
+
+
+def test_cluster_inspect_node_backed_success(storage):
+    """Node returns a matching workstream entry in /dashboard — cluster_ws_detail
+    merges its live fields into the `live` block."""
+    mgr = _build_mgr(storage)
+    ws_id = "ab" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    payload = {
+        "workstreams": [
+            {
+                "ws_id": ws_id,
+                "state": "running",
+                "tokens": 512,
+                "context_ratio": 0.25,
+                "activity": "tool: bash",
+                "activity_state": "tool",
+                "tool_calls": 3,
+                "model": "gpt-5",
+                "model_alias": "default",
+                "title": "hello",
+                "name": "child",
+            }
+        ]
+    }
+
+    def _handler(req: httpx2.Request) -> httpx2.Response:
+        assert req.url.path == "/v1/api/dashboard"
+        return httpx2.Response(200, json=payload)
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx2.MockTransport(_handler))
+
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    live = body["live"]
+    assert live is not None
+    assert live["state"] == "running"
+    assert live["tokens"] == 512
+    assert live["tool_calls"] == 3
+    # pending_approval synthesized from activity_state != "approval"
+    assert live["pending_approval"] is False
+
+
+def test_cluster_inspect_node_backed_pending_approval_detail_passes_through(storage):
+    """Node /dashboard returns pending_approval_detail → live block carries
+    it through verbatim. Regression guard for the projection allowlist
+    `_CLUSTER_WS_LIVE_KEYS`: dropping the key from the tuple silently
+    breaks inline approve/deny buttons on remote-node child rows even
+    though coord rows still work via the in-process synthesis branch."""
+    mgr = _build_mgr(storage)
+    ws_id = "f0" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    detail = {
+        "cycle_id": "cyc-bash",
+        "call_id": "c-bash",
+        "judge_pending": False,
+        "items": [
+            {
+                "call_id": "c-bash",
+                "header": "bash",
+                "preview": "$ rm -rf /tmp/x",
+                "func_name": "bash",
+                "approval_label": "bash",
+                "needs_approval": True,
+                "error": None,
+                "heuristic_verdict": None,
+                "judge_verdict": {
+                    "recommendation": "deny",
+                    "risk_level": "crit",
+                    "tier": "llm",
+                },
+            }
+        ],
+    }
+    payload = {
+        "workstreams": [
+            {
+                "ws_id": ws_id,
+                "state": "attention",
+                "activity_state": "approval",
+                "activity": "awaiting approval",
+                "tokens": 100,
+                "pending_approval_details": [detail],
+            }
+        ]
+    }
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    live = resp.json()["live"]
+    assert live["pending_approval"] is True  # derived bool, existing behavior
+    assert live["pending_approval_details"] == [detail]  # full payload passthrough
+
+
+def test_cluster_inspect_node_backed_pending_approval_synthesized(storage):
+    """activity_state=='approval' from the node synthesizes pending_approval=True."""
+    mgr = _build_mgr(storage)
+    ws_id = "cd" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    payload = {
+        "workstreams": [
+            {
+                "ws_id": ws_id,
+                "state": "attention",
+                "activity_state": "approval",
+                "activity": "awaiting approval",
+                "tokens": 100,
+            }
+        ]
+    }
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"]["pending_approval"] is True
+
+
+def test_cluster_inspect_node_unreachable_live_null(storage):
+    """httpx2 connect/timeout error → live: null, status 200."""
+    mgr = _build_mgr(storage)
+    ws_id = "de" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+
+    def _handler(req: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("node down")
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx2.MockTransport(_handler))
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"] is None
+
+
+def test_cluster_inspect_node_5xx_live_null(storage):
+    """Non-2xx from the node → live: null, status 200."""
+    mgr = _build_mgr(storage)
+    ws_id = "ef" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx2.MockTransport(lambda r: httpx2.Response(503, text="down")))
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"] is None
+
+
+def test_cluster_inspect_node_missing_entry_live_null(storage):
+    """Node returned 200 but the target ws_id is not in its workstream list."""
+    mgr = _build_mgr(storage)
+    ws_id = "1a" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    payload = {
+        "workstreams": [
+            {"ws_id": "different-" + "x" * 24, "state": "idle"},
+        ]
+    }
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"] is None
+
+
+def test_cluster_inspect_message_limit_clamped(storage):
+    """Seed enough messages that the 200-row clamp must actually
+    execute, and assert the tail slice is correct — prior version
+    only checked `<= 200` on a fresh coordinator (0 messages), which
+    passed even if the clamp were stripped."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # 250 messages — last 200 must come back, in chronological order.
+    for i in range(250):
+        storage.save_message(
+            ws.id, role="user", content=f"msg-{i:04d}", lease=mgr.lease_fence(ws.id)
+        )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{ws.id}/detail?message_limit=9999",
+        headers=_CLUSTER_HEADERS,
+    )
+    assert resp.status_code == 200
+    messages = resp.json()["messages"]
+    # Clamp took effect: exactly 200 rows back.
+    assert len(messages) == 200
+    # Chronological order preserved: oldest of the tail-200 first,
+    # newest last.  The tail of 250 inserts is messages 50..249.
+    contents = [m.get("content") for m in messages]
+    assert contents[0] == "msg-0050"
+    assert contents[-1] == "msg-0249"
+
+
+def test_cluster_inspect_zero_message_limit_returns_empty(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    for i in range(10):
+        storage.save_message(ws.id, role="user", content=f"msg-{i}", lease=mgr.lease_fence(ws.id))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{ws.id}/detail?message_limit=0",
+        headers=_CLUSTER_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["messages"] == []
+
+
+# ---------------------------------------------------------------------------
+# _coordinator_rows tenant filter — regression for the cross-tenant leak
+# ultrareview flagged in the cluster dashboard path
+# ---------------------------------------------------------------------------
+
+
+def test_coordinator_rows_filters_by_caller_identity(storage):
+    """Non-admin callers get only their own coordinators.  `list_all` must
+    never be reached for them — mirrors list_for_user's docstring
+    invariant, which the phase-3 dashboard merge originally bypassed."""
+    from unittest.mock import MagicMock
+
+    from turnstone.console.server import _coordinator_rows
+
+    mgr = _build_mgr(storage)
+    mgr.create(user_id="alice", name="alice-coord")
+    mgr.create(user_id="bob", name="bob-coord")
+
+    def _request_for(user_id: str, perms: frozenset[str]) -> MagicMock:
+        request = MagicMock()
+        request.app.state.coord_mgr = mgr
+        request.state.auth_result = AuthResult(
+            user_id=user_id,
+            scopes=frozenset({"read"}),
+            token_source="test",
+            permissions=perms,
+        )
+        return request
+
+    # Trusted-team visibility: every caller sees every coordinator.
+    for caller in ("alice", "bob", "admin-1"):
+        rows = _coordinator_rows(_request_for(caller, frozenset({"read"})))
+        assert {r["name"] for r in rows} == {"alice-coord", "bob-coord"}
+
+
+def _persisted_rows_request(storage, mgr, user_id: str, perms: frozenset[str]):
+    """Build a _coordinator_rows-shaped request with auth_storage wired
+    up so the persisted-rows merge path fires."""
+    from unittest.mock import MagicMock
+
+    request = MagicMock()
+    request.app.state.coord_mgr = mgr
+    request.app.state.auth_storage = storage
+    request.state.auth_result = AuthResult(
+        user_id=user_id,
+        scopes=frozenset({"read"}),
+        token_source="test",
+        permissions=perms,
+    )
+    return request
+
+
+def test_coordinator_rows_surfaces_closed_coordinators_from_storage(storage):
+    """Closed coordinators get popped from ``self._workstreams`` but
+    their persisted row stays in storage with ``state='closed'``.  The
+    landing page polls _coordinator_rows via
+    /v1/api/cluster/workstreams?node=console — the persisted-rows
+    merge path surfaces closed rows so the operator can still see
+    them alongside active ones."""
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.workstream import WorkstreamKind
+
+    mgr = _build_mgr(storage)
+    # Seed a persisted-but-not-loaded closed coordinator directly —
+    # register + soft-close via storage primitives.
+    storage.register_workstream(
+        "a" * 32,
+        node_id="console",
+        user_id="alice",
+        name="historical-coord",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+    # Also seed a live coordinator via the manager to prove merge.
+    mgr.create(user_id="alice", name="live-coord")
+
+    request = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
+    rows = _coordinator_rows(request)
+    names = {r["name"] for r in rows}
+    assert names == {"live-coord", "historical-coord"}
+    # Closed coord carries its persisted state so the UI can render
+    # it with the correct state glyph.
+    closed = next(r for r in rows if r["name"] == "historical-coord")
+    assert closed["state"] == "closed"
+    assert closed["kind"] == "coordinator"
+
+
+def test_coordinator_rows_dedupes_by_ws_id_in_memory_wins(storage):
+    """When a coordinator is both in-memory (manager) AND in storage,
+    _coordinator_rows must prefer the in-memory row so live session
+    state (model / model_alias / current state) stays authoritative.
+    The storage row has stale fields after every restart / refresh,
+    so merging it twice is strictly worse."""
+    from turnstone.console.server import _coordinator_rows
+
+    mgr = _build_mgr(storage)
+    live = mgr.create(user_id="alice", name="alice-live")
+    # Persist an explicit storage-only shape for the SAME ws_id —
+    # mgr.create already did this, but we deliberately corrupt the
+    # stored row to prove the in-memory row wins.  Update the state
+    # to something the manager would never produce so the dedup check
+    # is unambiguous.
+    storage.update_workstream_state(live.id, "error", lease=mgr.lease_fence(live.id))
+
+    request = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
+    rows = _coordinator_rows(request)
+    assert len(rows) == 1
+    assert rows[0]["id"] == live.id
+    # In-memory WorkstreamState wins over the persisted "error" tweak
+    # — the manager reports "idle" for a freshly-created coordinator.
+    assert rows[0]["state"] == "idle"
+
+
+def test_coordinator_rows_persisted_cluster_wide(storage):
+    # Trusted-team visibility: every caller sees every persisted row,
+    # including rows from other identities and orphan (empty-user_id)
+    # rows.  ``user_id`` stays on the response as metadata.
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.workstream import WorkstreamKind
+
+    mgr = _build_mgr(storage)
+    storage.register_workstream(
+        "a" * 32,
+        node_id="console",
+        user_id="alice",
+        name="alice-closed",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+    storage.register_workstream(
+        "b" * 32,
+        node_id="console",
+        user_id="bob",
+        name="bob-closed",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+    storage.register_workstream(
+        "c" * 32,
+        node_id="console",
+        user_id="",  # orphan / system row
+        name="orphan-closed",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+
+    for caller, perms in (
+        ("alice", frozenset({"read"})),
+        ("bob", frozenset({"read"})),
+        ("admin-1", frozenset({"read", "admin.users"})),
+    ):
+        request = _persisted_rows_request(storage, mgr, caller, perms)
+        rows = _coordinator_rows(request)
+        assert {r["name"] for r in rows} == {"alice-closed", "bob-closed", "orphan-closed"}
+
+
+def test_coordinator_rows_surface_persisted_title(storage):
+    """Regression for the coordinator-title-persistence bug.
+
+    The LLM auto-title (``update_workstream_title``) and the user alias
+    (``set_workstream_alias``) live only in ``workstreams.title`` /
+    ``workstreams.alias``.  ``_coordinator_rows`` must resolve the
+    display name ``alias > title > name`` from the persisted row for BOTH
+    lanes — the in-memory ``ws.name`` is the synthetic ``ws-xxxx``
+    placeholder.  Before the fix the read path hardcoded ``title=""`` and
+    used ``ws.name`` / the ``name`` column, so a generated title was
+    written but never read back: it reverted to ``ws-xxxx`` on every
+    dashboard refresh."""
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.workstream import WorkstreamKind
+
+    mgr = _build_mgr(storage)
+
+    # In-memory lane: a LIVE coordinator titled after creation.  The
+    # manager assigned the placeholder ``ws.name``; the title is in the DB.
+    live = mgr.create(user_id="alice", name="ws-abcd")
+    storage.update_workstream_title(
+        live.id, "Refactor the auth layer", lease=mgr.lease_fence(live.id)
+    )
+
+    # Persisted lane: a closed coordinator (evicted from the manager)
+    # carrying BOTH a title and a user alias — the alias must win.
+    storage.register_workstream(
+        "f" * 32,
+        node_id="console",
+        user_id="bob",
+        name="ws-f0f0",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+    storage.update_workstream_title("f" * 32, "auto-generated title")
+    assert storage.set_workstream_alias("f" * 32, "Bob's pinned name")
+
+    request = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
+    rows = {r["id"]: r for r in _coordinator_rows(request)}
+
+    live_row = rows[live.id]
+    assert live_row["name"] == "Refactor the auth layer"
+    assert live_row["title"] == "Refactor the auth layer"
+
+    closed_row = rows["f" * 32]
+    assert closed_row["name"] == "Bob's pinned name"  # alias > title > name
+    assert closed_row["title"] == "auto-generated title"
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 P1.5 — coord attachment surface parity with interactive
+# ---------------------------------------------------------------------------
+
+
+class TestCoordinatorAttachments:
+    """The lifted ``make_attachment_handlers`` factory exposes
+    upload / list / get_content / delete on coord workstreams using
+    the same kind-agnostic storage layer interactive uses. These
+    tests exercise the surface end-to-end via TestClient."""
+
+    def _upload(self, client, ws_id, *, name="hello.md", body=b"hi", mime="text/markdown"):
+        files = {"file": (name, body, mime)}
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/attachments",
+            files=files,
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_upload_round_trip_lists_pending(self, storage):
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(client, ws.id, name="note.md", body=b"hello world")
+        assert info["filename"] == "note.md"
+        assert info["kind"] == "text"
+        assert info["size_bytes"] == len(b"hello world")
+
+        listing = client.get(f"/v1/api/workstreams/{ws.id}/attachments", headers=_COORD_HEADERS)
+        assert listing.status_code == 200
+        ids = [a["attachment_id"] for a in listing.json()["attachments"]]
+        assert info["attachment_id"] in ids
+
+    def test_get_content_returns_raw_bytes(self, storage):
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(
+            client, ws.id, name="data.json", body=b'{"k":1}', mime="application/json"
+        )
+        resp = client.get(
+            f"/v1/api/workstreams/{ws.id}/attachments/{info['attachment_id']}/content",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        # Text kinds force text/plain to avoid same-origin HTML/SVG rendering.
+        assert resp.headers["content-type"].startswith("text/plain")
+        assert resp.content == b'{"k":1}'
+
+    def test_delete_removes_pending(self, storage):
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(client, ws.id)
+        resp = client.delete(
+            f"/v1/api/workstreams/{ws.id}/attachments/{info['attachment_id']}",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "deleted"}
+
+        listing = client.get(f"/v1/api/workstreams/{ws.id}/attachments", headers=_COORD_HEADERS)
+        ids = [a["attachment_id"] for a in listing.json()["attachments"]]
+        assert info["attachment_id"] not in ids
+
+    def test_send_with_attachment_ids_consumes_pending(self, storage):
+        """End-to-end: stage an attachment, then ``coord_send`` it. The send
+        resolves the staged upload from the buffer (and the committing session
+        writes it content-addressed); the response carries the attached id."""
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        info = self._upload(client, ws.id)
+        resp = client.post(
+            f"/v1/api/workstreams/{ws.id}/send",
+            json={"message": "hi", "attachment_ids": [info["attachment_id"]]},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        # Surfacing parity with interactive: response carries the
+        # attached / dropped lists even when no drops occurred.
+        assert body["attached_ids"] == [info["attachment_id"]]
+        assert body["dropped_attachment_ids"] == []
+
+    def test_send_response_includes_attached_ids_field_when_no_attachments(self, storage):
+        """The unified response shape always carries ``attached_ids`` /
+        ``dropped_attachment_ids`` so SDK consumers don't have to
+        branch on whether attachments were involved."""
+        mgr = _build_mgr(storage)
+        ws = mgr.create(user_id="user-1", name="c1")
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        resp = client.post(
+            f"/v1/api/workstreams/{ws.id}/send",
+            json={"message": "no attachments here"},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["attached_ids"] == []
+        assert body["dropped_attachment_ids"] == []
+
+    def test_coord_attachment_endpoints_404_on_interactive_ws_id(self, storage):
+        """Security regression: an ``admin.coordinator``-scoped caller
+        must NOT be able to read or mutate attachments on
+        **interactive** workstreams via the coord attachment surface.
+        The kind-strict resolver returns 404 (no storage fallback) so
+        a cross-kind ws_id never resolves to its owner."""
+        from turnstone.core.workstream import WorkstreamKind
+
+        # Persist an interactive workstream row directly — never loaded
+        # into the coord_mgr.
+        interactive_ws_id = "i" * 32
+        storage.register_workstream(
+            interactive_ws_id,
+            node_id="some-node",
+            user_id="alice",
+            name="alice-interactive",
+            kind=WorkstreamKind.INTERACTIVE,
+            parent_ws_id=None,
+        )
+        mgr = _build_mgr(storage)
+        client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+        # Upload attempt — must 404, not 200.
+        files = {"file": ("note.md", b"sneaky", "text/markdown")}
+        resp = client.post(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments",
+            files=files,
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404, resp.text
+
+        # List, get-content, delete — same kind-strict 404 behaviour.
+        resp = client.get(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404
+        resp = client.get(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments/anything/content",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404
+        resp = client.delete(
+            f"/v1/api/workstreams/{interactive_ws_id}/attachments/anything",
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 404

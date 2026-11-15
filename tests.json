@@ -1,0 +1,414 @@
+{
+  "description": "turnstone behavior tests \u2014 tool selection, sequencing, and multi-step reasoning",
+  "defaults": {
+    "n_runs": 5,
+    "max_turns": 15
+  },
+  "cases": [
+    {
+      "id": "read-before-edit",
+      "description": "Must read_file before edit_file on the same path",
+      "user_prompt": "Fix the typo in config.py \u2014 change 'recieve' to 'receive'",
+      "setup": {
+        "files": {
+          "config.py": "# Config module\ndef recieve_data(source):\n    \"\"\"Recieve data from source.\"\"\"\n    return source.read()\n"
+        }
+      },
+      "expected_actions": [
+        {
+          "tool": "read_file",
+          "args": {
+            "path": "config.py"
+          }
+        },
+        {
+          "tool": "edit_file",
+          "args": {
+            "path": "config.py"
+          }
+        }
+      ],
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Fix the typo in config.py \u2014 change 'recieve' to 'receive'",
+        "In config.py, correct the misspelling of 'recieve' to 'receive'",
+        "Please update config.py by replacing 'recieve' with the correct spelling 'receive'",
+        "There's a typo in config.py: 'recieve' should be 'receive'. Please fix it.",
+        "Could you change 'recieve' to 'receive' in config.py?",
+        "Go ahead and fix 'recieve' \u2192 'receive' in config.py",
+        "I need the word 'recieve' corrected to 'receive' in the file config.py",
+        "config.py has a spelling error \u2014 'recieve' needs to be changed to 'receive'",
+        "Kindly rectify the typographical error in config.py, replacing 'recieve' with 'receive'",
+        "Hey, swap 'recieve' for 'receive' in config.py"
+      ]
+    },
+    {
+      "id": "write-file-not-bash",
+      "description": "Use write_file for file creation, not bash echo/cat",
+      "user_prompt": "Create a file called hello.py that prints hello world",
+      "expected_actions": [
+        {
+          "tool": "write_file",
+          "args_pattern": {
+            "path": "hello\\.py"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "Create a file called hello.py that prints hello world",
+        "Make a hello.py file that outputs hello world",
+        "Please write a Python file named hello.py which prints hello world",
+        "I need a file called hello.py that prints hello world",
+        "Could you create hello.py with code that prints hello world?",
+        "Write hello.py \u2014 it should print hello world",
+        "Generate a hello.py file that outputs \"hello world\"",
+        "I'd like you to create a file named hello.py that prints hello world",
+        "Set up a file called hello.py to print hello world",
+        "Kindly produce a hello.py file whose purpose is to print hello world"
+      ]
+    },
+    {
+      "id": "bash-for-commands",
+      "description": "Use bash for running system commands",
+      "user_prompt": "What Python version is installed?",
+      "expected_actions": [
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "python"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "What Python version is installed?",
+        "Check which version of Python is currently installed",
+        "Can you tell me the installed Python version?",
+        "python --version please",
+        "I need to know what version of Python is on this system",
+        "Which Python version do we have?",
+        "Could you look up the Python version that's installed here?",
+        "Determine the currently installed Python version",
+        "What's the Python version on this machine?",
+        "Please check the Python version"
+      ]
+    },
+    {
+      "id": "search-for-patterns",
+      "description": "Use search tool for finding code patterns across files",
+      "user_prompt": "Find all functions that start with 'test_' in the project",
+      "setup": {
+        "files": {
+          "tests.py": "def test_one():\n    assert True\n\ndef test_two():\n    assert 1 + 1 == 2\n",
+          "main.py": "def main():\n    print('hello')\n"
+        }
+      },
+      "expected_actions": [
+        {
+          "tool": "search",
+          "args_pattern": {
+            "query": "test_"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "Find all functions that start with 'test_' in the project",
+        "List every function in the project whose name begins with 'test_'",
+        "I need to locate all functions prefixed with 'test_' across the project",
+        "Could you search the project for any functions starting with 'test_'?",
+        "Show me all the test_ prefixed functions in this project",
+        "Hunt down every function that has a 'test_' prefix in the codebase",
+        "I'm looking for all functions named test_* throughout the project",
+        "Search the entire project for functions whose names start with test_",
+        "What functions beginning with 'test_' exist in this project?",
+        "Please identify all functions with the 'test_' prefix in the project files"
+      ]
+    },
+    {
+      "id": "multi-file-edit",
+      "description": "Read and edit multiple files \u2014 must read before editing each, and edit both",
+      "user_prompt": "Change the default port from 8000 to 9000 in both server.py and config.py",
+      "setup": {
+        "files": {
+          "server.py": "import socket\n\ndef run():\n    sock = socket.socket()\n    sock.bind(('localhost', 8000))\n    print('Server running on port 8000')\n",
+          "config.py": "PORT = 8000\nHOST = 'localhost'\n"
+        }
+      },
+      "expected_actions": [
+        {
+          "tool": "read_file"
+        },
+        {
+          "tool": "read_file"
+        },
+        {
+          "tool": "edit_file"
+        },
+        {
+          "tool": "edit_file"
+        }
+      ],
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Change the default port from 8000 to 9000 in both server.py and config.py",
+        "Update the default port to 9000 instead of 8000 in server.py and config.py",
+        "Could you modify the port number from 8000 to 9000 in both config.py and server.py?",
+        "Please replace port 8000 with 9000 in server.py and config.py",
+        "I need the default port switched from 8000 to 9000 in both server.py and config.py",
+        "In server.py and config.py, the default port should be changed from 8000 to 9000",
+        "Swap out port 8000 for 9000 in config.py and server.py",
+        "Would you mind updating the default port value from 8000 to 9000 across both server.py and config.py?",
+        "The default port in server.py and config.py needs to be 9000 instead of 8000 \u2014 please make that change",
+        "Go ahead and change 8000 to 9000 for the default port in both server.py and config.py"
+      ]
+    },
+    {
+      "id": "search-then-edit",
+      "description": "Search to find where something is defined, then read and edit",
+      "user_prompt": "Find where MAX_RETRIES is defined and change it from 3 to 5",
+      "setup": {
+        "files": {
+          "app.py": "import os\n\ndef start():\n    pass\n",
+          "utils.py": "import time\n\ndef helper():\n    pass\n",
+          "config/settings.py": "# Settings\nDEBUG = True\nMAX_RETRIES = 3\nTIMEOUT = 30\n"
+        }
+      },
+      "expected_actions": [
+        {
+          "tool": "search",
+          "args_pattern": {
+            "query": "MAX_RETRIES"
+          }
+        },
+        {
+          "tool": "read_file"
+        },
+        {
+          "tool": "edit_file",
+          "args_pattern": {
+            "old_string": "3"
+          }
+        }
+      ],
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Find where MAX_RETRIES is defined and change it from 3 to 5",
+        "Locate the definition of MAX_RETRIES and update its value from 3 to 5",
+        "Could you search for where MAX_RETRIES is defined and modify it from 3 to 5?",
+        "I need MAX_RETRIES changed from 3 to 5 \u2014 find where it's defined and update it",
+        "Please find the MAX_RETRIES definition and bump it from 3 to 5",
+        "Hunt down MAX_RETRIES in the codebase and change its value from 3 to 5",
+        "Where is MAX_RETRIES set to 3? Change it to 5.",
+        "Search the code for the MAX_RETRIES definition and alter it from 3 to 5",
+        "I'd like you to locate MAX_RETRIES (currently 3) and set it to 5 instead",
+        "Go find MAX_RETRIES and switch it from 3 to 5"
+      ]
+    },
+    {
+      "id": "bash-git-log",
+      "description": "Use bash for git commands, not other tools",
+      "user_prompt": "Show me the git log for the last 5 commits",
+      "expected_actions": [
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "git\\s+log"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "Show me the git log for the last 5 commits",
+        "Display the 5 most recent git commits",
+        "Can you pull up the git log limited to the last five commits?",
+        "I need to see the git log showing only the previous 5 commits",
+        "git log for the 5 latest commits, please",
+        "Would you mind showing me the last five entries in the git log?",
+        "Print out the most recent 5 commits from the git log",
+        "I'd like to review the git log \u2014 just the last 5 commits",
+        "Show the recent 5 commit history using git log",
+        "Could you display the git commit history for the past five commits?"
+      ]
+    },
+    {
+      "id": "write-then-run",
+      "description": "Create a script and run it to verify it works",
+      "user_prompt": "Create a Python script called fib.py that prints the first 10 Fibonacci numbers, then run it to verify",
+      "expected_actions": [
+        {
+          "tool": "write_file",
+          "args_pattern": {
+            "path": "fib\\.py"
+          }
+        },
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "python"
+          }
+        }
+      ],
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Create a Python script called fib.py that prints the first 10 Fibonacci numbers, then run it to verify",
+        "Write a Python file named fib.py that outputs the first 10 Fibonacci numbers, and execute it to confirm it works",
+        "Please make fib.py \u2013 a Python script printing the first ten Fibonacci numbers \u2013 then run it to check the output",
+        "I need a Python script fib.py that prints the first 10 Fibonacci numbers. Execute it afterwards to verify correctness.",
+        "Could you create fib.py to display the first 10 Fibonacci numbers in Python, and then run it to make sure it works?",
+        "Draft a script called fib.py in Python that outputs the first ten Fibonacci numbers, then execute it to validate",
+        "Hey, write me a fib.py that prints the first 10 Fibonacci numbers and run it so we can see it works",
+        "Generate a Python program fib.py which prints the initial 10 Fibonacci numbers, and verify by running it",
+        "Kindly produce a Python script named fib.py to print the first 10 Fibonacci numbers, then execute the script to confirm its output",
+        "Make a file fib.py containing Python code to print the first 10 Fibonacci numbers. Then run it to verify."
+      ]
+    },
+    {
+      "id": "no-bash-for-file-write",
+      "description": "Should NOT use bash (echo/cat/heredoc) to create files \u2014 only write_file",
+      "user_prompt": "Create a new file called README.md with a title and description of this project",
+      "expected_actions": [
+        {
+          "tool": "write_file",
+          "args_pattern": {
+            "path": "README"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "Create a new file called README.md with a title and description of this project",
+        "Make a README.md file that includes a project title and description",
+        "I need a README.md created with a title and a brief description of the project",
+        "Please generate a README.md file containing the project's title and description",
+        "Could you set up a README.md with a title and project description?",
+        "Write a README.md that has a title and describes this project",
+        "Go ahead and create README.md \u2014 it should have a title and a description of the project",
+        "I'd like you to produce a new README.md file featuring a project title and description",
+        "Kindly establish a README.md file incorporating both a title and a description for this project",
+        "Spin up a README.md with a project title and description in it"
+      ]
+    },
+    {
+      "id": "edit-not-rewrite",
+      "description": "Use edit_file for small changes, not write_file to rewrite the entire file",
+      "user_prompt": "Add a docstring to the process_data function in utils.py",
+      "setup": {
+        "files": {
+          "utils.py": "import os\nimport sys\n\n\ndef helper():\n    \"\"\"A helper function.\"\"\"\n    return 42\n\n\ndef process_data(items):\n    results = []\n    for item in items:\n        if item > 0:\n            results.append(item * 2)\n    return results\n\n\ndef cleanup():\n    \"\"\"Clean up resources.\"\"\"\n    pass\n"
+        }
+      },
+      "expected_actions": [
+        {
+          "tool": "read_file",
+          "args": {
+            "path": "utils.py"
+          }
+        },
+        {
+          "tool": "edit_file",
+          "args": {
+            "path": "utils.py"
+          }
+        }
+      ],
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Add a docstring to the process_data function in utils.py",
+        "Please add a docstring to the process_data function in utils.py",
+        "Could you write a docstring for process_data in utils.py?",
+        "Insert a docstring into the process_data function found in utils.py",
+        "I need a docstring added to process_data in utils.py",
+        "Put a docstring on the process_data function in utils.py",
+        "The process_data function in utils.py is missing a docstring \u2014 please add one",
+        "Would you mind adding a docstring to process_data in utils.py?",
+        "In utils.py, the process_data function needs a docstring",
+        "Add documentation via a docstring to the process_data function within utils.py"
+      ]
+    },
+    {
+      "id": "bash-run-tests",
+      "description": "Use bash to run a test suite",
+      "user_prompt": "Run the tests",
+      "setup": {
+        "files": {
+          "test_math.py": "def test_add():\n    assert 1 + 1 == 2\n\ndef test_mul():\n    assert 2 * 3 == 6\n"
+        }
+      },
+      "expected_actions": [
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "pytest|python.*test"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "Run the tests",
+        "Execute the test suite",
+        "Please go ahead and run the tests",
+        "Could you run the tests for me?",
+        "I need the tests to be run",
+        "Kick off the tests",
+        "Let's run the tests",
+        "Fire up the tests",
+        "Go ahead and execute the tests",
+        "I'd like you to run the tests"
+      ]
+    },
+    {
+      "id": "web-fetch-url",
+      "description": "Use web_fetch when asked to retrieve content from a URL",
+      "user_prompt": "Fetch the contents of https://example.com and summarize what's on the page",
+      "expected_actions": [
+        {
+          "tool": "web_fetch",
+          "args_pattern": {
+            "url": "example\\.com"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "Fetch the contents of https://example.com and summarize what's on the page",
+        "Go to https://example.com and give me a summary of what you find there",
+        "Could you pull up https://example.com and tell me what the page is about?",
+        "Retrieve the content from https://example.com, then provide a summary of it",
+        "I need you to grab https://example.com and summarize its contents for me",
+        "Please access https://example.com and give me an overview of the page",
+        "What's on https://example.com? Fetch it and summarize for me.",
+        "Download the page at https://example.com and provide a brief summary",
+        "I'd like a summary of whatever is at https://example.com \u2014 please fetch it first",
+        "Hit https://example.com and let me know what's there in summary form"
+      ]
+    },
+    {
+      "id": "web-search-query",
+      "description": "Use web_search for general knowledge lookups, not web_fetch",
+      "user_prompt": "Search the web for the current population of Tokyo",
+      "expected_actions": [
+        {
+          "tool": "web_search",
+          "args_pattern": {
+            "query": "Tokyo"
+          }
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "Search the web for the current population of Tokyo",
+        "What's Tokyo's current population? Look it up on the web.",
+        "Could you do a web search to find out how many people currently live in Tokyo?",
+        "Please search online for Tokyo's present-day population.",
+        "I need you to look up the current population of Tokyo on the web.",
+        "Find me Tokyo's current population via a web search.",
+        "Web search: what is the current population of Tokyo?",
+        "I'd like to know Tokyo's current population\u2014can you search the web for that?",
+        "Look up how many people live in Tokyo right now using a web search.",
+        "Do a web search for the population of Tokyo as of now."
+      ]
+    }
+  ]
+}

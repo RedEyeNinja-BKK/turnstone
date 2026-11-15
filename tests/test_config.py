@@ -1,0 +1,537 @@
+"""Tests for turnstone.core.config — unified TOML config loading."""
+
+import argparse
+import os
+
+import pytest
+
+import turnstone.core.config as config_mod
+from turnstone.cli import _judge_parallel_evaluations_arg
+
+apply_config = config_mod.apply_config
+load_config = config_mod.load_config
+set_config_path = config_mod.set_config_path
+
+
+def _reset_cache():
+    """Clear the module-level config cache between tests."""
+    config_mod._cache = None
+    config_mod._config_path = None
+
+
+def test_load_config_missing_file(tmp_path, monkeypatch):
+    """A path named by --config or TURNSTONE_CONFIG must exist; only the default may be absent."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    set_config_path(str(tmp_path / "nope.toml"))
+    with pytest.raises(ConfigError, match="nope.toml"):
+        load_config()
+
+
+def test_load_config_valid_toml(tmp_path):
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[database]\nhost = "10.0.0.1"\nport = 5432\nname = "turnstone"\n')
+    set_config_path(str(cfg))
+    result = load_config()
+    assert result["database"]["host"] == "10.0.0.1"
+    assert result["database"]["port"] == 5432
+    assert result["database"]["name"] == "turnstone"
+
+
+def test_load_config_section(tmp_path):
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[api]\nbase_url = "http://x:8000/v1"\n[database]\nhost = "y"\n')
+    set_config_path(str(cfg))
+    assert load_config("database") == {"host": "y"}
+    assert load_config("api") == {"base_url": "http://x:8000/v1"}
+    assert load_config("nonexistent") == {}
+
+
+def test_load_config_invalid_toml_raises(tmp_path, monkeypatch):
+    """A file that exists but cannot be parsed stops the process, every time."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("this is not valid toml [[[")
+    set_config_path(str(cfg))
+    with pytest.raises(ConfigError, match="config.toml"):
+        load_config()
+    with pytest.raises(ConfigError):
+        load_config("api")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_load_config_unreadable_file_raises(tmp_path, monkeypatch):
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[api]\nbase_url = "http://x"\n')
+    cfg.chmod(0o000)
+    set_config_path(str(cfg))
+    try:
+        with pytest.raises(ConfigError):
+            load_config()
+    finally:
+        cfg.chmod(0o600)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root enters any directory")
+def test_load_config_locked_parent_directory_raises(tmp_path, monkeypatch):
+    """A directory the process cannot enter is a failed read, not an absent file."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    locked = tmp_path / "etc"
+    locked.mkdir()
+    cfg = locked / "config.toml"
+    cfg.write_text('[api]\nbase_url = "http://x"\n')
+    locked.chmod(0o000)
+    set_config_path(str(cfg))
+    try:
+        with pytest.raises(ConfigError):
+            load_config()
+    finally:
+        locked.chmod(0o700)
+
+
+def test_named_config_path_that_does_not_exist_raises(tmp_path, monkeypatch, caplog):
+    """TURNSTONE_CONFIG naming a missing file is a mistake, not an empty config, and the log
+    names the path. The --config case is test_load_config_missing_file."""
+    import logging
+
+    from tests._session_helpers import log_has_field
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", None)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    missing = tmp_path / "also-missing.toml"
+    monkeypatch.setenv("TURNSTONE_CONFIG", str(missing))
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="also-missing.toml"):
+        load_config()
+    assert any(
+        "config.missing" in r.getMessage() and log_has_field(r, "path", str(missing))
+        for r in caplog.records
+    )
+
+
+def test_the_default_config_path_may_be_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "_config_path", None)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    monkeypatch.setattr(config_mod, "_DEFAULT_CONFIG_PATH", tmp_path / "absent" / "config.toml")
+    monkeypatch.delenv("TURNSTONE_CONFIG", raising=False)
+    assert load_config() == {}
+
+
+def test_load_config_directory_path_raises(tmp_path, monkeypatch):
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    set_config_path(str(tmp_path))
+    with pytest.raises(ConfigError):
+        load_config()
+
+
+def test_cached_getter_is_not_poisoned_by_a_broken_file(tmp_path, monkeypatch):
+    """A getter that fails on a broken file answers from the fixed file later."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    monkeypatch.setattr(config_mod, "_workspace_dir", None)
+    monkeypatch.setattr(config_mod, "_workspace_dir_loaded", False)
+    monkeypatch.delenv("TURNSTONE_WORKSPACE", raising=False)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[[[")
+    set_config_path(str(cfg))
+    with pytest.raises(ConfigError):
+        config_mod.get_workspace_dir()
+    assert config_mod._workspace_dir_loaded is False
+    cfg.write_text('[tools]\nworkspace_dir = "/srv/work"\n')
+    config_mod._cache = None  # the fixed file is re-read; the path is unchanged
+    assert config_mod.get_workspace_dir() == "/srv/work"
+
+
+def test_apply_config_exits_on_a_broken_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[[[")
+    set_config_path(str(cfg))
+    with pytest.raises(SystemExit):
+        apply_config(argparse.ArgumentParser(), ["api"])
+
+
+def test_load_config_caches(tmp_path):
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[api]\nbase_url = "http://first"\n')
+    set_config_path(str(cfg))
+    first = load_config()
+    assert first["api"]["base_url"] == "http://first"
+
+    # Change file — should NOT be re-read (cached)
+    cfg.write_text('[api]\nbase_url = "http://second"\n')
+    second = load_config()
+    assert second["api"]["base_url"] == "http://first"
+
+
+def test_apply_config_sets_defaults(tmp_path):
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[server]\nhost = "0.0.0.0"\nport = 9090\n[api]\nbase_url = "http://custom/v1"\n'
+    )
+    set_config_path(str(cfg))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--base-url", default="http://localhost:11434/v1")
+
+    apply_config(parser, ["server", "api"])
+    args = parser.parse_args([])
+
+    assert args.host == "0.0.0.0"
+    assert args.port == 9090
+    assert args.base_url == "http://custom/v1"
+
+
+def test_apply_config_cli_overrides(tmp_path):
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[server]\nhost = "config-host"\nport = 7777\n')
+    set_config_path(str(cfg))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8080)
+
+    apply_config(parser, ["server"])
+    # CLI flag overrides config
+    args = parser.parse_args(["--host", "cli-host"])
+
+    assert args.host == "cli-host"  # CLI wins
+    assert args.port == 7777  # config wins (no CLI override)
+
+
+def test_apply_config_missing_keys_keep_defaults(tmp_path):
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[server]\nhost = "only-host"\n')  # no port
+    set_config_path(str(cfg))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8080)
+
+    apply_config(parser, ["server"])
+    args = parser.parse_args([])
+
+    assert args.host == "only-host"
+    assert args.port == 8080  # original default kept
+
+
+def test_apply_config_no_file(tmp_path, monkeypatch):
+    """A named file that is not there stops the process; an absent default is no config."""
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    set_config_path(str(tmp_path / "nope.toml"))
+    with pytest.raises(SystemExit) as exc:
+        apply_config(argparse.ArgumentParser(), ["api"])
+    assert exc.value.code == 1
+    monkeypatch.setattr(config_mod, "_config_path", None)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    monkeypatch.setattr(config_mod, "_DEFAULT_CONFIG_PATH", tmp_path / "absent" / "config.toml")
+    monkeypatch.delenv("TURNSTONE_CONFIG", raising=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", default="http://unchanged")
+    apply_config(parser, ["api"])
+    assert parser.parse_args([]).base_url == "http://unchanged"
+
+
+def test_apply_config_model_section(tmp_path):
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[model]\nname = "qwen-72b"\ntemperature = 0.3\n')
+    set_config_path(str(cfg))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--temperature", type=float, default=0.5)
+
+    apply_config(parser, ["model"])
+    args = parser.parse_args([])
+
+    assert args.model == "qwen-72b"
+    assert args.temperature == 0.3
+
+
+def _reset_searxng_cache():
+    config_mod._searxng_url = None
+    config_mod._searxng_url_loaded = False
+    config_mod._searxng_engines = None
+    config_mod._searxng_engines_loaded = False
+
+
+def test_searxng_url_from_config(tmp_path, monkeypatch):
+    """get_searxng_url() reads from config.toml [tools] searxng_url."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[tools]\nsearxng_url = "http://searx.local:8080"\n')
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_SEARXNG_URL", raising=False)
+
+    assert config_mod.get_searxng_url() == "http://searx.local:8080"
+
+
+def test_searxng_url_fallback_to_env(tmp_path, monkeypatch):
+    """get_searxng_url() falls back to $TURNSTONE_SEARXNG_URL."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    # Config exists but no searxng_url in it
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.setenv("TURNSTONE_SEARXNG_URL", "http://env-searx:8080")
+
+    assert config_mod.get_searxng_url() == "http://env-searx:8080"
+
+
+def test_searxng_url_none_when_unset(tmp_path, monkeypatch):
+    """get_searxng_url() returns None when neither config nor env is set."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_SEARXNG_URL", raising=False)
+
+    assert config_mod.get_searxng_url() is None
+
+
+def test_searxng_engines_config_wins_over_env(tmp_path, monkeypatch):
+    """get_searxng_engines(): config.toml [tools] searxng_engines wins over env."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[tools]\nsearxng_engines = "duckduckgo,wikipedia"\n')
+    set_config_path(str(cfg))
+    monkeypatch.setenv("TURNSTONE_SEARXNG_ENGINES", "ignored")
+
+    assert config_mod.get_searxng_engines() == "duckduckgo,wikipedia"
+
+
+def test_searxng_engines_default_empty(tmp_path, monkeypatch):
+    """get_searxng_engines() defaults to '' when nothing is configured."""
+    _reset_cache()
+    _reset_searxng_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_SEARXNG_ENGINES", raising=False)
+
+    assert config_mod.get_searxng_engines() == ""
+
+
+def _reset_workspace_cache():
+    config_mod._workspace_dir = None
+    config_mod._workspace_dir_loaded = False
+
+
+def test_workspace_dir_from_config(tmp_path, monkeypatch):
+    """get_workspace_dir() reads from config.toml [tools] workspace_dir."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[tools]\nworkspace_dir = "/srv/projects"\n')
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_WORKSPACE", raising=False)
+
+    assert config_mod.get_workspace_dir() == "/srv/projects"
+
+
+def test_workspace_dir_config_wins_over_env(tmp_path, monkeypatch):
+    """get_workspace_dir(): config.toml [tools] workspace_dir wins over env."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[tools]\nworkspace_dir = "/srv/projects"\n')
+    set_config_path(str(cfg))
+    monkeypatch.setenv("TURNSTONE_WORKSPACE", "/ignored")
+
+    assert config_mod.get_workspace_dir() == "/srv/projects"
+
+
+def test_workspace_dir_fallback_to_env(tmp_path, monkeypatch):
+    """get_workspace_dir() falls back to $TURNSTONE_WORKSPACE."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.setenv("TURNSTONE_WORKSPACE", "/workspace")
+
+    assert config_mod.get_workspace_dir() == "/workspace"
+
+
+def test_workspace_dir_none_when_unset(tmp_path, monkeypatch):
+    """get_workspace_dir() returns None when neither config nor env is set."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_WORKSPACE", raising=False)
+
+    assert config_mod.get_workspace_dir() is None
+
+
+def test_apply_config_judge_section(tmp_path):
+    """apply_config() loads [judge] section and maps to argparse dests."""
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[judge]\n"
+        "enabled = true\n"
+        'model = "gpt-5"\n'
+        "confidence_threshold = 0.85\n"
+        "timeout = 30.0\n"
+        "parallel_evaluations = 8\n"
+        "read_only_tools = false\n"
+    )
+    set_config_path(str(cfg))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--judge", dest="judge_enabled", action="store_true", default=False)
+    parser.add_argument("--judge-model", dest="judge_model", default="")
+    parser.add_argument("--judge-confidence", dest="judge_confidence", type=float, default=0.7)
+    parser.add_argument("--judge-timeout", dest="judge_timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--judge-parallel-evaluations",
+        dest="judge_parallel_evaluations",
+        type=int,
+        default=1,
+    )
+    parser.add_argument("--judge-read-only-tools", dest="judge_read_only_tools", default=True)
+
+    apply_config(parser, ["judge"])
+    args = parser.parse_args([])
+
+    assert args.judge_enabled is True
+    assert args.judge_model == "gpt-5"
+    assert args.judge_confidence == 0.85
+    assert args.judge_timeout == 30.0
+    assert args.judge_parallel_evaluations == 8
+    assert args.judge_read_only_tools is False
+
+
+def test_apply_config_judge_cli_overrides(tmp_path):
+    """CLI flags override config.toml [judge] values."""
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[judge]\nenabled = true\nconfidence_threshold = 0.85\nparallel_evaluations = 8\n"
+    )
+    set_config_path(str(cfg))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--judge", dest="judge_enabled", action="store_true", default=False)
+    parser.add_argument("--no-judge", dest="judge_enabled", action="store_false")
+    parser.add_argument("--judge-confidence", dest="judge_confidence", type=float, default=0.7)
+    parser.add_argument(
+        "--judge-parallel-evaluations",
+        dest="judge_parallel_evaluations",
+        type=int,
+        default=1,
+    )
+
+    apply_config(parser, ["judge"])
+    args = parser.parse_args(["--no-judge", "--judge-parallel-evaluations", "3"])
+
+    assert args.judge_enabled is False  # CLI wins
+    assert args.judge_confidence == 0.85  # config wins (no CLI override)
+    assert args.judge_parallel_evaluations == 3
+
+
+def test_judge_parallel_evaluations_cli_type_is_strict_and_bounded():
+    assert _judge_parallel_evaluations_arg("1") == 1
+    assert _judge_parallel_evaluations_arg("16") == 16
+    for invalid in ("0", "17", "01", "+1", "1.0"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _judge_parallel_evaluations_arg(invalid)
+
+
+def test_set_config_path_overrides_default(tmp_path):
+    """set_config_path() overrides the default config location."""
+    _reset_cache()
+    cfg = tmp_path / "custom.toml"
+    cfg.write_text('[api]\nbase_url = "http://custom:9999"\n')
+    set_config_path(str(cfg))
+    assert load_config("api") == {"base_url": "http://custom:9999"}
+
+
+def test_env_var_overrides_default(tmp_path, monkeypatch):
+    """$TURNSTONE_CONFIG env var overrides the default config location."""
+    _reset_cache()
+    cfg = tmp_path / "env.toml"
+    cfg.write_text('[api]\nbase_url = "http://env:7777"\n')
+    monkeypatch.setenv("TURNSTONE_CONFIG", str(cfg))
+    assert load_config("api") == {"base_url": "http://env:7777"}
+
+
+def test_set_config_path_overrides_env_var(tmp_path, monkeypatch):
+    """set_config_path() takes precedence over $TURNSTONE_CONFIG."""
+    _reset_cache()
+    env_cfg = tmp_path / "env.toml"
+    env_cfg.write_text('[api]\nbase_url = "http://env"\n')
+    monkeypatch.setenv("TURNSTONE_CONFIG", str(env_cfg))
+
+    explicit_cfg = tmp_path / "explicit.toml"
+    explicit_cfg.write_text('[api]\nbase_url = "http://explicit"\n')
+    set_config_path(str(explicit_cfg))
+
+    assert load_config("api") == {"base_url": "http://explicit"}
+
+
+def test_warn_migrated_settings_flags_api_section(tmp_path, caplog):
+    """The server no longer reads [api]; a file that still carries it gets a
+    warning naming the replacement (per-definition base_url / api_key)."""
+    import logging
+
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        """[api]
+base_url = "http://localhost:8000/v1"
+api_key = "k"
+"""
+    )
+    set_config_path(str(cfg))
+    with caplog.at_level(logging.WARNING):
+        config_mod.warn_migrated_settings()
+    # structlog renders the console line (template + positional_args repr)
+    # before the record reaches caplog, so match on pieces present either way.
+    text = " | ".join(f"{r.getMessage()} {r.args!r}" for r in caplog.records)
+    assert "has been removed and will be ignored" in text
+    assert "base_url" in text and "Models tab" in text
+    assert "api_key" in text and "OPENAI_API_KEY" in text

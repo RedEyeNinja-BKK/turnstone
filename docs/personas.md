@@ -1,0 +1,172 @@
+# Personas
+
+A **persona** is a named, reusable bundle attached to a workstream **at
+creation** that controls how its system message is composed and what
+capability envelope it runs with. Personas answer a recurring operational
+complaint: the default composition primes every session for heavy tool use,
+and there was no per-workstream dial to launch a "just write prose" or
+"evidence-first research" session.
+
+A persona is exactly four levers — no more:
+
+| Lever | What it does |
+|---|---|
+| **Base prompt** | Replaces the BASE module of the composed system message. *Only* BASE: ENV, CONTEXT, TOOLS, and POLICIES keep composing, so mandatory [prompt policies](governance.md) ride on top of every persona. Built-in personas source their prose from a repo file; operator personas store it inline — see [Where persona prompts live](#where-persona-prompts-live). |
+| **Tool visibility** | Which tools the session advertises. Tri-state: *unrestricted* (tracks tool growth and MCP catalogs), *no tools* (the TOOLS prompt block self-suppresses and zero definitions go on the wire), or an *exact set* of names. Including `tool_search` in a set makes it **soft** — tools the model discovers through search join the visible set; omitting it makes the set **hard** (the search pathway is disabled entirely). On commercial providers a soft set costs one prompt-cache re-prime per `tool_search` expansion, since each expansion rewrites the wire tool set and recomposes the prompt. |
+| **MCP** | Whether the workstream talks to MCP at all. **Session-wide**: off means no MCP tools for the persona's own hands *or* for in-process task agents, no resource/prompt catalogs, and no listener registrations. This lever expresses infrastructure intent, not behavior shaping. |
+| **Memory** | Whether the persona's **own hands** get memory: the immutable metadata index, live metadata pointers, memory-directed metacognitive nudges, and the `memory` tool. Production task agents are memory-disabled in 1.8 regardless of a child persona's memory flag; a persona may narrow the final task-agent capability envelope but cannot add memory to that lane ([follow-up #1017](https://github.com/turnstonelabs/turnstone/issues/1017)). Compaction spill/markers are session mechanics and are never memory-gated. An exact tool set that hides `memory` also suppresses the index, pointers, and memory nudges, while the compaction-resume pointer follows `recall`'s visibility. |
+
+Visibility is behavior shaping, **not** a security boundary: any tool call
+that does reach the wire still clears the same approval, judge, and policy
+machinery as always. RBAC and tool policies remain the enforcement layers.
+
+## Snapshot semantics — resolve once, stamp forever
+
+The persona is resolved **once**, at workstream creation, and stamped into
+`workstream_config` as five keys (`persona`, `persona_prompt`,
+`persona_tools`, `persona_mcp`, `persona_memory`). From then on the session
+reads only the stamp:
+
+- **Editing or archiving a persona never changes an existing workstream.**
+  Every reopen (a pane, `--resume`, the CLI's `/resume`, a watch fire) builds
+  the session from the stamp, and post-compaction resume runs from it too.
+  The CLI's `/new` starts its workstream with the current tab's persona.
+- A workstream outlives its persona — an archived persona keeps labelling
+  the workstreams stamped with it.
+- A partial or unparseable stamp is treated as corruption: session
+  construction fails loudly rather than silently falling back to a default
+  envelope the operator never chose.
+- Workstreams created before personas existed carry no stamp and keep
+  legacy behavior, byte-identical to the `engineer` / `orchestrator`
+  defaults below — with one exception: pre-1.7 workstreams that had
+  `creative_mode` set are converted by migration `063` into full
+  `writer` stamps, so they resume as writing sessions rather than as
+  legacy defaults.
+- Forking (`resume_ws` on create) clones the source's stamped persona into the
+  new workstream; the fork does not re-resolve it.
+
+## Seed personas
+
+Migration `063` seeds six personas. The two per-kind **defaults** carry no
+overrides at all, so a zero-touch launch behaves exactly as it did before
+personas existed:
+
+| Persona | Kind | Base prompt | Tools | MCP | Memory |
+|---|---|---|---|---|---|
+| `engineer` *(default)* | interactive | stock | unrestricted | on | on |
+| `orchestrator` *(default)* | coordinator | stock | unrestricted | on | on |
+| `scribe` | interactive | custom (faithful structuring of given material) | none | off | off |
+| `researcher` | interactive | custom (evidence-first) | `read_file`, `search`, `web_fetch`, `web_search`, `recall`, `memory`, `tool_search` (soft) | off | on |
+| `writer` | interactive | custom (creative writing partner — replaces the removed `/creative`) | none | off | on |
+| `executive` | coordinator | custom (delegate, interrogate plans, judge outcomes) | spawn/inspect/lifecycle tools plus `memory`: `spawn_workstream`, `spawn_batch`, `send_to_workstream`, `wait_for_workstream`, `inspect_workstream`, `list_workstreams`, `list_nodes`, `close_workstream`, `cancel_workstream`, `memory` (hard) | off | on |
+
+Notes:
+
+- `scribe` turns memory off deliberately: an index or live pointer could
+  contaminate faithful summarization with unrelated context.
+- `researcher`'s set is soft (includes `tool_search`): it starts with
+  read and evidence tools but can pull in others on demand — e.g. load
+  `bash` to run a snippet and verify a calculation. It is evidence-first,
+  not sandboxed; any escalated tool still hits the normal approval path.
+- Coordinator sessions merge the live MCP catalog into their main, directly
+  advertised wire-tool surface when the persona MCP lever permits it.
+  Coordinators have no task-agent tool lane. Turning MCP off removes the
+  catalog from both interactive and coordinator sessions.
+
+## Where persona prompts live
+
+Prompt source is explicit in the persona row — two nullable columns, never both empty:
+
+| `base_prompt_file` | `base_prompt` | Meaning |
+|---|---|---|
+| set (e.g. `scribe.md`) | — | **built-in**: prose lives in `prompts/personas/<file>`, code-owned and PR-reviewed |
+| set | set | built-in with an **operator override** layered on top (the inline text wins) |
+| — | set | **operator** persona, inline prose |
+
+A `CHECK` forbids the both-empty row, so resolution is a plain coalesce —
+`base_prompt ?? load(base_prompt_file)` — with no implicit "inherit the default"
+branch in application logic. `base_prompt_file` is set only by the migration/code
+(the admin API never exposes it): it marks a persona as built-in and blocks
+archive, so `engineer` and `orchestrator` can't be removed. To customise a
+built-in, set `base_prompt` on it (clear it to revert), or create your own persona.
+
+The resolved prompt is **frozen into the workstream at creation** — later edits to
+a built-in's file or an operator's row never change a running workstream; only new
+ones pick up the change. "No persona" is not a state: every workstream is stamped,
+and an empty `persona=` resolves to the kind's `is_default` (`engineer` /
+`orchestrator`).
+
+## Choosing a persona
+
+Every creation surface takes an optional persona; empty always means the
+kind's default (or plain legacy behavior on a database with no personas
+seeded):
+
+- **Web/console**: the persona select on the console launcher, the server
+  webui's new-workstream dialog, and the dashboard composer. Selecting a
+  persona requires **no** `persona.*` permission — the picker feed
+  (`GET /v1/api/personas`) is authenticated-only and returns display fields.
+- **API/SDK**: `CreateWorkstreamRequest.persona` (Python:
+  `create_workstream(persona=...)`; TypeScript: `{ persona: ... }`).
+- **CLI**: `turnstone --persona <name>`. Unknown or disabled names error at
+  startup. `--resume` ignores `--persona`: the resumed workstream keeps its
+  stamp.
+- **Coordinator spawn**: `spawn_workstream` / `spawn_batch` take a
+  `persona` argument, validated when the coordinator prepares the spawn
+  and re-checked by the node that creates the child (children are always
+  interactive-kind). Omitted means the interactive **default** — a child
+  never inherits its parent coordinator's persona.
+- **Sub-agents**: `task_agent` takes a `persona` argument setting the
+  sub-agent's identity and capability envelope (resolved against
+  interactive-kind personas, frozen into the task at prep). Omitted keeps
+  the default autonomous task-agent identity — never the parent's persona.
+  The selected persona can only narrow the production task-agent lane; in
+  1.8 that lane remains memory-disabled even when the persona enables memory.
+
+## How agents discover personas
+
+Agents are told, not expected to guess: the live persona list (enabled,
+interactive-kind — children and sub-agents are always interactive) is
+injected into the `persona` parameter description of `task_agent`,
+`spawn_workstream`, and `spawn_batch` whenever the session's tool surface
+is rendered — session start, MCP catalog change, model-registry reload.
+Each entry carries the name, the default marker, and the persona's
+one-line description so the model can pick by purpose (descriptions drop
+out past 25 personas; the name list always enumerates completely).
+
+A persona created after that render is still reachable — pass its name.
+Every resolve failure enumerates the names currently valid for the kind,
+so a stale list (or a typo) self-corrects on the next attempt.
+
+Resolution is forgiving on all surfaces (they share one rule):
+
+- names match case-insensitively (`Writer` resolves `writer`);
+- an input that uniquely matches a persona's **display name**
+  (case-insensitive, among the kind's enabled personas — display names are
+  not unique, and a same-label persona of another kind neither blocks nor
+  wins) resolves to that persona; an ambiguous match errors, listing the
+  candidate slugs;
+- whatever variant matched, the stamped identity, approval chrome, and
+  wire always carry the canonical `name` slug.
+
+## Authoring (console)
+
+Personas are managed in the console's **Manage → Governance → Personas**
+tab. The admin shelf exposes exactly the four levers plus the kind
+list, the default marker, and archive. Rules:
+
+- `name` is an immutable lowercase slug — and the identifier agents and
+  the CLI launch the persona by (`persona=` on the spawn tools,
+  `--persona` on the CLI); the create shelf says so under **Name**.
+  `display_name` is a list label, editable any time, and deliberately
+  not an identifier (a unique display name happens to resolve, as a
+  forgiveness fallback — don't design workflows around it).
+- Exactly one default per kind, storage-enforced: flipping the flag on a
+  successor demotes the incumbent atomically, defaults are single-kind,
+  and a default cannot be archived.
+- **Archive only** — there is no delete verb, so every stamped
+  workstream's provenance stays explicable.
+
+RBAC: `persona.create` / `persona.read` / `persona.write` gate the admin
+CRUD (`/v1/api/admin/personas`); all three are granted to `builtin-admin`
+by migration `063`, and other roles opt in via role permission overrides.

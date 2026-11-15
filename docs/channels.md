@@ -1,0 +1,506 @@
+# Channel Integrations
+
+The `turnstone-channel` gateway connects external messaging platforms to
+turnstone workstreams via direct HTTP to the server (single-node) or the
+console routing proxy (multi-node). Each platform adapter translates
+platform-native events (messages, button clicks, slash commands) into
+turnstone API calls, and renders workstream output back into the
+platform's UI.
+
+Discord and Slack adapters ship today. The adapter protocol is designed
+so new platforms can be added with only a new package under
+`turnstone/channels/<platform>/`.
+
+---
+
+## Architecture
+
+```
+Discord Gateway        Slack (Socket Mode WebSocket)
+       \                  /
+        v                v
+       turnstone-channel  (one or more adapters)
+              |
+              v
+       turnstone-server   (direct HTTP)
+              or
+       turnstone-console  (routing proxy, multi-node)
+```
+
+A single `turnstone-channel` process can run multiple adapters
+simultaneously (e.g. Discord + Slack) — pass the tokens for each
+platform you want to enable.
+
+Key components:
+
+- **ChannelAdapter protocol** (`turnstone/channels/_protocol.py`) — generic
+  interface for any messaging platform. Defines `start()`, `stop()`,
+  `send()`, and `send_notification()`.
+- **ChannelRouter** (`turnstone/channels/_routing.py`) — maps
+  channel/thread IDs to turnstone workstream IDs. Handles workstream
+  creation via HTTP, stale route detection, and user identity resolution.
+- **channel_users table** — maps `(channel_type, channel_user_id)` to a
+  turnstone `user_id`. Messages from unlinked users are silently dropped.
+- **channel_routes table** — persistent channel-to-workstream mappings, including the Discord user
+  who started the conversation. The association and owner survive node and bot restarts. Recovery
+  runs on the next authorized message.
+
+---
+
+## Discord Setup
+
+### 1. Create a Discord Application
+
+1. Go to https://discord.com/developers/applications
+2. Click **New Application** and give it a name
+3. Navigate to the **Bot** tab and click **Reset Token** to generate a
+   bot token. Copy it immediately — it is shown only once.
+4. On the same **Bot** tab, scroll down to **Privileged Gateway Intents**
+   and enable **MESSAGE CONTENT INTENT**
+5. Navigate to **OAuth2 > URL Generator**
+6. Under **Scopes**, check `bot` and `applications.commands`
+7. Under **Bot Permissions**, check:
+   - View Channels
+   - Send Messages
+   - Send Messages in Threads
+   - Create Public Threads
+   - Read Message History
+   - Add Reactions
+   - Embed Links
+8. Copy the generated URL, open it in a browser, and add the bot to your
+   Discord server
+
+### 2. Configure Turnstone
+
+**Environment variables** (recommended for Docker):
+
+```bash
+TURNSTONE_DISCORD_TOKEN=your-bot-token-here
+TURNSTONE_DISCORD_GUILD=123456789  # optional, restrict to one guild
+```
+
+**CLI flags** (bare-metal):
+
+```bash
+turnstone-channel \
+  --discord-token "your-bot-token" \
+  --discord-guild 123456789 \
+  --server-url http://localhost:8080
+```
+
+**Docker Compose** (production profile):
+
+```bash
+# In .env file:
+TURNSTONE_DISCORD_TOKEN=your-bot-token
+TURNSTONE_DISCORD_GUILD=123456789
+```
+
+Then start the stack:
+
+```bash
+docker compose up
+```
+
+The `channel` gateway runs by default; the Discord adapter activates once
+`TURNSTONE_DISCORD_TOKEN` is set.
+
+### 3. Link User Accounts
+
+Discord users must link their account to a turnstone user before they can
+interact with the bot. Unlinked users' messages are silently ignored.
+
+1. The user must have a turnstone API token — created via the admin panel
+   or `turnstone-admin create-token`
+2. In Discord, the user runs `/link`. A modal appears prompting for the
+   API token (the token is never visible in Discord audit logs because it
+   is submitted via modal, not as a slash command argument).
+3. The token is validated against the database. If valid, a
+   `channel_users` mapping is created.
+4. The user can now @mention the bot or use slash commands.
+
+An admin can also force-link or unlink users via the console admin panel
+(Admin > Channels tab).
+
+---
+
+## Slack Setup
+
+Slack uses **Socket Mode**: the bot opens an outbound WebSocket connection to Slack, so no public
+URL or API Gateway is required. Install the Slack extra in your Python 3.13 or newer Turnstone
+virtual environment (see the [quickstart](../README.md#quickstart)):
+
+```bash
+python -m pip install 'turnstone[slack]'
+```
+
+### 1. Create a Slack App
+
+1. Go to https://api.slack.com/apps and click **Create New App**
+2. Under **Settings > Socket Mode**, enable Socket Mode. This generates an
+   **App-Level Token** (prefix `xapp-`) — copy it.
+3. Under **OAuth & Permissions**, add these **Bot Token Scopes**:
+   `chat:write`, `chat:write.public`, `channels:history`, `im:history`,
+   `groups:history`, `mpim:history`, `reactions:write`, `commands`
+4. Under **Event Subscriptions** (Socket Mode delivers events), subscribe
+   to bot events: `message.channels`, `message.im`, `message.groups`
+5. Under **Slash Commands**, create a command (default `/turnstone`)
+6. Install the app to your workspace to generate the **Bot User OAuth
+   Token** (prefix `xoxb-`).
+
+### 2. Configure Turnstone
+
+**Environment variables** (recommended for Docker):
+
+```bash
+TURNSTONE_SLACK_TOKEN=xoxb-...        # Bot User OAuth Token
+TURNSTONE_SLACK_APP_TOKEN=xapp-...    # App-Level Token (Socket Mode)
+TURNSTONE_SLACK_CHANNELS=             # optional, comma-separated channel IDs
+TURNSTONE_SLACK_SLASH_COMMAND=/turnstone
+```
+
+**CLI flags** (bare-metal):
+
+```bash
+turnstone-channel \
+  --slack-token "xoxb-..." \
+  --slack-app-token "xapp-..." \
+  --slack-slash-command /turnstone \
+  --server-url http://localhost:8080
+```
+
+The Slack and Discord adapters can be enabled together — pass tokens for
+both and the gateway hosts both adapters in one process.
+
+### 3. Usage
+
+- **DM the bot**: messages sent directly to the bot create a workstream
+  scoped to that DM; the slash command is not required.
+- **Slash command**: `/turnstone <message>` in any channel the bot can
+  see starts a per-user channel session.
+- Tool approvals render as Slack **Block Kit** buttons; only the user
+  who owns the workstream can approve/reject.
+- Notifications and reply routing work identically to Discord.
+- Session recovery: persisted channel routes are re-subscribed when the
+  bot restarts, so existing Slack conversations keep flowing.
+
+---
+
+## Usage
+
+### Conversations
+
+- **@mention** the bot in any allowed channel to start a new conversation.
+  The bot creates a Discord thread from the message and a turnstone
+  workstream behind it.
+- All subsequent messages in the thread are routed to the same workstream.
+- The bot streams responses via message edits, updated approximately every
+  1.5 seconds.
+- If a persisted channel route is no longer active on its owning node, the router asks the create
+  endpoint to fork the old workstream into a new ID via `resume_ws`. The saved source can still
+  resolve normally; its checkpoint-bounded history, configuration, persona, effective project, and
+  attachment references are cloned before the channel route is repointed. The old route remains
+  durable until the replacement succeeds. The router swaps the mapping atomically, preserving its
+  owner; concurrent recovery cannot overwrite another replacement. Initial messages are sent only
+  after the route is claimed. If the create endpoint returns the ordinary source-not-found response
+  *and* a fresh authoritative storage lookup confirms that the source is gone, the router retries
+  once without `resume_ws` and starts a fresh conversation. Other access, conflict, routing, and
+  storage failures remain visible rather than silently discarding history.
+- Recovery uses the exact saved workstream ID; another conversation's alias cannot replace it.
+  A deleted ID also remains reserved while a channel route references it, preventing a new
+  workstream from receiving that channel's messages under the old identity.
+- A conversation whose model is no longer loaded (deleted, disabled, renamed, or left out of a
+  reload) waits for it instead of moving to another model (#1359). Each message is kept and answered
+  with an error that asks a Turnstone admin to check the model in the Models tab; the first message
+  after the model loads again continues the conversation, which still has the earlier ones. When the
+  model was left out because its secret store couldn't be reached, the error says it should load
+  again shortly instead, and it does, by itself, once the store answers. This applies to a live
+  conversation and to a recovery fork, which names no model, except in a Slack DM with
+  `channels.default_model_alias` set, where the fork continues on that model (unless its own model
+  is out only for now). Chat users can't run `/model`, so otherwise only an admin can end the wait.
+- A missing SSE session stops that subscription without deleting the conversation's route. Discord
+  thread replies, Slack thread replies, and Slack DMs all check the saved association before sending
+  the next message and restore their subscription. With a console, each SSE connection resolves the
+  current node address; console errors trigger retries rather than a fallback to the configured node.
+- Routes do not expire merely because a node is unavailable. An explicit close removes a route only
+  after the node confirms closure (or reports no loaded session), and only if the route still names
+  that workstream. A refused close or concurrent replacement retains the association and reports a
+  retryable failure.
+- Discord recovers uncached threads through the platform API. Missing or inaccessible threads retain
+  their saved routes. Only the original linked invoker may send follow-ups or close the workstream;
+  approval prompts also identify that invoker, including for bot-owned `/ask` threads.
+- Startup recovery subscribes only to already-live workstreams. Direct mode reads the active list
+  once; console mode limits both concurrent liveness probes and the total discovery time. Inactive
+  and temporarily unreachable conversations keep their associations for lazy recovery on a message.
+- `/close` acknowledges privately and archives the thread after confirmed closure.
+- Older Discord routes lack a saved invoker. The bot creates these threads, so Discord's platform
+  owner cannot identify the human who started them. Start a new conversation with `/ask` in the
+  parent channel. Linking an account does not grant ownership of an older thread.
+
+### Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/link` | Link Discord account to turnstone (opens modal for API token) |
+| `/unlink` | Unlink Discord account |
+| `/ask <message>` | Create a new thread and workstream with an initial message |
+| `/status` | Show workstream info for the current thread (ephemeral) |
+| `/close` | Close the workstream, delete the route, and archive the thread |
+
+### Tool Approvals
+
+When manual approval is enabled (the default), tool calls are displayed as
+an orange embed with:
+
+- Tool name and argument preview
+- **Approve** (green), **Reject** (red), **Always Approve** (gray) buttons
+- Only linked users can interact with approval buttons
+- The approval decision is forwarded to the server via HTTP
+
+Buttons use static `custom_id` values so they survive bot restarts.
+Correlation data (`ws_id`, `correlation_id`) is stored in the embed footer.
+
+**Auto-approval:** When `auto_approve` is true (via `--auto-approve`), or when
+all tools in the request match the `auto_approve_tools` list in the adapter
+config, the bot auto-responds with approval and posts a
+"*Tool auto-approved.*" notice to the thread instead of showing buttons. The
+`auto_approve_tools` list is set via the `ChannelConfig.auto_approve_tools`
+field (useful for allowing specific tools like `bash` or `read_file` while
+still requiring manual approval for others).
+
+---
+
+## Configuration Reference
+
+| CLI Flag | Env Var | Default | Description |
+|----------|---------|---------|-------------|
+| `--discord-token` | `TURNSTONE_DISCORD_TOKEN` | — | Discord bot token (required to enable Discord) |
+| `--discord-guild` | — | `0` (all guilds) | Restrict to a single Discord guild |
+| `--discord-channels` | — | empty (all) | Comma-separated Discord channel IDs to allow |
+| `--slack-token` | `TURNSTONE_SLACK_TOKEN` | — | Slack Bot User OAuth token (`xoxb-…`, required to enable Slack) |
+| `--slack-app-token` | `TURNSTONE_SLACK_APP_TOKEN` | — | Slack App-Level token (`xapp-…`, required with `--slack-token`) |
+| `--slack-channels` | `TURNSTONE_SLACK_CHANNELS` | empty (all) | Comma-separated Slack channel IDs to allow |
+| `--slack-slash-command` | `TURNSTONE_SLACK_SLASH_COMMAND` | `/turnstone` | Slash command name registered in the Slack app |
+| `--server-url` | `TURNSTONE_SERVER_URL` | `http://localhost:8080` | Server URL (single-node) |
+| `--console-url` | `TURNSTONE_CONSOLE_URL` | — | Console URL (multi-node routing proxy) |
+| `--model` | — | server default | Discord's model for new workstreams when the `channels.default_model_alias` setting is empty (Slack uses only the setting). A model that isn't loaded, or a setting the bot can't fetch, fails the conversation instead of using another |
+| `--auto-approve` | — | `false` | Auto-approve ALL tool calls (skips approval buttons entirely) |
+| `--http-host` | — | `127.0.0.1` | HTTP server bind address for notify endpoint |
+| `--http-port` | `TURNSTONE_CHANNEL_PORT` | `8091` | HTTP server port |
+| `--log-level` | `TURNSTONE_LOG_LEVEL` | `INFO` | Log level |
+| `--log-format` | `TURNSTONE_LOG_FORMAT` | `auto` | Log format (`auto`/`json`/`text`) |
+
+At least one of `--discord-token` or `--slack-token` must be supplied.
+Passing both starts both adapters in the same process.
+
+---
+
+## User Identity
+
+- The `channel_users` table maps `(channel_type, channel_user_id)` to a
+  turnstone `user_id`
+- Self-service linking via the `/link` slash command (modal input, not
+  visible in Discord audit logs)
+- Admin can force-link or unlink via the console admin panel (Admin >
+  Channels tab). Unlinking uses a styled confirmation modal.
+- Unlinked users' messages are silently dropped
+- A user can be linked across multiple platforms (e.g. Discord + Slack)
+
+See [Security: Database Schema](security.md#database-schema) for the
+`channel_users` table definition.
+
+---
+
+## Workstream Lifecycle
+
+1. **Creation** — @mention or `/ask` creates a Discord thread and a
+   turnstone workstream. The `ChannelRouter` persists the mapping in the
+   `channel_routes` table.
+2. **Active** — messages are routed bidirectionally. The bot streams
+   responses via message edits (updated every ~1.5 seconds).
+3. **Unavailability** — a node restart or capacity eviction can unload a workstream. Its saved source
+   and channel association remain durable. An SSE 404 clears only the listener's transient state;
+   a connection error reconnects with backoff.
+4. **Reactivation** — the next message resolves the saved route and probes
+   whether that workstream is live on its owning node. If it is not, the router
+   creates a distinct workstream with the old `ws_id` as `resume_ws`. The create
+   response confirms the fork and message count; there is no separate resume
+   command or channel-specific resumed event. Only after the replacement
+   succeeds does the router swap the persisted route. If the source was deleted
+   or pruned, an exact source-not-found response plus a second authoritative
+   storage miss triggers one fresh-create retry; other fork failures leave the
+   old route intact and are surfaced normally. A replacement whose model is no
+   longer loaded is held on it, so the conversation waits for that model (see
+   Conversations above).
+5. **Close** — `/close` command closes the workstream via HTTP, deletes the
+   route, unsubscribes from events, and archives the Discord thread.
+
+---
+
+## Notifications
+
+> See also: [Notification Flow diagram](diagrams/png/17-notify-flow.png)
+
+The `notify` tool allows the LLM to proactively send notifications to
+users or channels on external platforms. This is useful for alerting
+people about task completion, errors, or important updates without
+waiting for them to check in.
+
+### Targeting
+
+Two modes:
+
+- **Username** — provide a turnstone `username`. The gateway resolves
+  it via the `channel_users` table and sends to every linked platform
+  the user has (e.g. Discord + Slack).
+- **Direct** — provide `channel_type` + `channel_id` to target a
+  specific platform channel or user DM.
+
+Discord notifications support user mentions (`<@USER_ID>`), role mentions (`<@&ROLE_ID>`), `@everyone`,
+and `@here`. Mention syntax is preserved, and Discord's permissions and each recipient's notification
+settings determine whether a ping is delivered. To send a DM, use the user's Discord ID as `channel_id`;
+a separate server channel ID is not needed.
+
+### Delivery Flow
+
+Notifications use direct HTTP for low latency. The server calls the channel
+gateway directly over HTTP:
+
+1. The LLM calls the `notify` tool with a message and target
+2. `_exec_notify()` queries the `services` table for healthy channel
+   gateways (heartbeat within the last 120 seconds)
+3. The server mints a service JWT (`aud: turnstone-channel`) via
+   `ServiceTokenManager` and POSTs to the first healthy gateway. The
+   payload includes the originating `ws_id` for reply routing.
+4. The gateway validates the JWT, resolves the target, and calls
+   `adapter.send_notification()` which sends the message and tracks
+   the outgoing message ID for reply routing
+5. On failure, the server tries the next gateway. If all fail, it
+   retries up to 2 more times (delays: 1s, 3s), re-querying the
+   service registry on each attempt
+
+### Bidirectional Replies
+
+Notifications support multi-turn DM conversations. When a user replies
+to a notification DM:
+
+1. The bot looks up the originating `ws_id` from the tracked message ID
+   (`_notify_ws_map`)
+2. Verifies the replying user matches the original notification
+   recipient (defence in depth — Discord DMs are already private)
+3. Routes the reply to the workstream via `router.send_message()`
+4. Registers the DM channel for response forwarding
+   (`_notify_reply_channels`)
+5. When the workstream responds (`TurnCompleteEvent`), the response is
+   forwarded to the DM
+6. The response message is itself tracked, so the user can reply again
+   for another turn
+
+This enables scenarios like an oncall engineer responding to a CI/CD
+failure notification from their phone before opening a laptop.
+
+**Limits:**
+
+- Tracking map capped at 100 entries (FIFO eviction of oldest)
+- Entries cleaned up on workstream close/unsubscribe
+- Replying to an expired notification sends
+  *"This notification is no longer active."*
+- DM reply content capped at 4096 characters
+
+### Service Registry
+
+The channel gateway registers itself in the `services` database table
+on startup and sends a heartbeat every 30 seconds. On shutdown it
+deregisters. Services are considered stale after 120 seconds (4 missed
+heartbeats) and are excluded from `list_services()` queries.
+
+The `services` table schema:
+
+| Column | Description |
+|--------|-------------|
+| `service_type` | Service category (e.g. `"channel"`) |
+| `service_id` | Unique instance ID (`channel-<hostname>-<random>`) |
+| `url` | HTTP base URL for the service |
+| `last_heartbeat` | ISO 8601 timestamp of last heartbeat |
+| `created` | ISO 8601 timestamp of initial registration |
+
+### Security
+
+- **Authentication** — the gateway's `POST /v1/api/notify` endpoint requires authentication.
+  Configure the server's signing secret with `TURNSTONE_JWT_SECRET` or `[auth].jwt_secret` in
+  `config.toml`; the environment variable takes precedence. The gateway reads
+  `TURNSTONE_JWT_SECRET`, which must match the server's secret; a `secret://` reference there is
+  resolved when the gateway starts, which then needs the same `[secrets]` table selected with
+  `TURNSTONE_CONFIG`. The server automatically mints JWTs with `aud: turnstone-channel`. If the
+  gateway's secret is not set, it fails closed and rejects all requests with 401. Server JWTs
+  (`aud: turnstone-server`) are rejected.
+- **Rate limit** — maximum 5 notifications per turn. The counter only
+  increments on successful delivery, so failures don't consume the
+  budget.
+- **SSRF protection** — only `http://` and `https://` service URLs are allowed. Other schemes are
+  skipped with a warning.
+- **Discord mentions** — all bot messages allow user, role, `@everyone`, and `@here` mentions, subject
+  to Discord's permissions and the recipient's notification settings.
+- **Error redaction** — generic error messages are returned to the
+  LLM. Internal details (service IDs, URLs, exception messages) are
+  logged server-side only.
+
+### Troubleshooting notifications
+
+Check both the originating server and the channel gateway logs. Each `notify.gateway_failed` event
+identifies the gateway, its URL, the attempt, the workstream (`ws_id`), and the tool call (`call_id`).
+The event records whether an Authorization header was present, plus the HTTP status, request exception
+type, or delivery statuses such as `no_adapter`, `failed`, and `timeout`. Completion notifications log
+the same gateway and workstream details under `notify_completion.*`. Gateway URLs omit credentials,
+query parameters, and fragments; outbound diagnostics omit tokens, message content, and response
+bodies.
+
+A 401 from the gateway occurs before Discord or Slack delivery. `notify.auth_missing` on the server
+means it could not find notification credentials. On the gateway, `notify.auth_not_configured` means
+its signing secret is missing; `notify.auth_rejected` distinguishes a missing Authorization header,
+an invalid scheme or token format, and an invalid JWT. For `invalid_jwt`, check the shared secret, the
+`turnstone-channel` audience, token expiry, and host clocks. `notify.auth_insufficient_scope` indicates
+a valid JWT without the required `write` scope and returns 403.
+
+With debug logging enabled before credentials are first used, `notify.auth_configured` records the
+credential source without its value. A configured `TURNSTONE_CHANNEL_AUTH_TOKEN` overrides automatic
+JWT minting and must itself be a valid JWT for the channel audience with `write` scope. Working Discord
+or Slack conversations do not verify this outbound notification authentication path.
+
+---
+
+## Adding New Adapters
+
+The `ChannelAdapter` protocol defines the interface any platform adapter
+must implement:
+
+```python
+class ChannelAdapter(Protocol):
+    channel_type: str
+
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    async def send(self, channel_id: str, content: str) -> str: ...
+    async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str: ...
+```
+
+`send_notification()` is like `send()` but associates the outgoing
+message with a `ws_id` so that user replies can be routed back to the
+originating workstream. Adapters must track the mapping from outgoing
+message ID to `(ws_id, target_user_id)` and handle DM replies.
+
+Platform-specific concerns — approval prompts, message edits, thread
+creation — live inside the adapter implementation and are not part of
+the protocol surface. Each adapter drives those via its
+own `_on_ws_event` dispatcher using SDK-native APIs.
+
+To add a new platform:
+
+1. Create `turnstone/channels/<platform>/` package
+2. Implement the `ChannelAdapter` protocol
+3. Add a `--<platform>-token` flag and detection logic in
+   `turnstone/channels/cli.py`
+4. Add the optional dependency in `pyproject.toml` (e.g.
+   `turnstone[slack]`)
+
+See `turnstone/channels/discord/` as a reference implementation.

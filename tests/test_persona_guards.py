@@ -1,0 +1,1918 @@
+"""Guard suite for personas (#683) — the invariants the feature must hold.
+
+Each test pins one of the locked design decisions: personas shape the
+persona's own hands (composition + tool visibility) without ever weakening
+the approval path, task-agent identity, compaction mechanics, or the
+stamped-at-create isolation from later persona edits.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from tests._session_helpers import make_result
+from turnstone.core.personas import PersonaSnapshot, snapshot_from_persona
+from turnstone.core.session import ChatSession
+from turnstone.core.storage import get_storage
+from turnstone.core.storage._utils import PERSONA_MUTABLE
+from turnstone.core.tools import TASK_AGENT_TOOLS
+from turnstone.core.trajectory import Turn, turn_from_dict
+from turnstone.core.workstream import WorkstreamKind
+
+if TYPE_CHECKING:
+    from turnstone.core.model_turn import ModelTurnResult
+
+
+def _snap(
+    *,
+    name: str = "guard",
+    prompt: str = "",
+    tools: frozenset[str] | None = None,
+    mcp: bool = True,
+    memory: bool = True,
+) -> PersonaSnapshot:
+    return PersonaSnapshot(name=name, prompt=prompt, tools=tools, mcp=mcp, memory=memory)
+
+
+def _session(mock_openai_client: Any, **kwargs: Any) -> ChatSession:
+    defaults: dict[str, Any] = dict(
+        client=mock_openai_client,
+        model="local-model",
+        ui=MagicMock(),
+        instructions=None,
+        temperature=0.5,
+        max_tokens=1000,
+        tool_timeout=10,
+    )
+    defaults.update(kwargs)
+    return ChatSession(**defaults)
+
+
+def _wire_names(session: ChatSession) -> list[str]:
+    from turnstone.core.providers._protocol import ModelCapabilities
+
+    caps = ModelCapabilities(supports_web_search=True)
+    with patch.object(session, "_get_capabilities", return_value=caps):
+        tools = session._get_active_tools() or []
+    return [t.get("function", {}).get("name") for t in tools]
+
+
+# ---------------------------------------------------------------------------
+# Guard 1 — rank guard: a gated tool call under ANY persona still hits the
+# normal approval path.  Persona visibility shapes what's advertised, never
+# what's approved.
+# ---------------------------------------------------------------------------
+
+
+class TestRankGuard:
+    def test_approval_path_unchanged_under_persona(self, tmp_db, mock_openai_client) -> None:
+        # bash is IN the persona's allowlist, so it survives the visibility
+        # filter — but the REAL preparer must still derive needs_approval
+        # from the tool (not a patched stub), and the gated call must still
+        # route through ui.approve_tools.  Persona visibility shapes what's
+        # advertised, never what's approved.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"bash"})),
+        )
+        tc = {
+            "id": "c1",
+            "function": {"name": "bash", "arguments": json.dumps({"command": "echo hi"})},
+        }
+        # The real _prepare_bash dispatch derives the approval flag.
+        prepared = session._prepare_tool(tc)
+        assert prepared["needs_approval"] is True
+        session.ui.approve_tools.return_value = (True, None)
+        with (
+            patch.object(session, "_exec_bash", return_value=("c1", "ok")) as exec_bash,
+            patch.object(session, "_evaluate_intent"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_check_cancelled"),
+        ):
+            session._execute_tools([tc])
+        session.ui.approve_tools.assert_called_once()
+        # The item the gate actually saw carried the derived flag.
+        gated = session.ui.approve_tools.call_args.args[0]
+        assert gated[0]["needs_approval"] is True
+        exec_bash.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Guard 2 — empty-toolset persona: NO tools block in the composed prompt,
+# zero tool definitions on the wire.  (The wire half also lives in
+# test_server_live.py::test_empty_toolset_persona_no_tools_on_wire, which
+# asserts the provider call itself.)
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyToolset:
+    def test_prompt_has_no_tools_block_and_wire_is_empty(self, tmp_db, mock_openai_client) -> None:
+        session = _session(mock_openai_client, persona_snapshot=_snap(tools=frozenset()))
+        prompt = session.system_messages[0]["content"]
+        # tools.md's IC block opener — self-suppressed on an empty envelope.
+        assert "read_file" not in prompt
+        assert _wire_names(session) == []
+        # Even with a bound principal, the hidden memory tool must prevent
+        # index acquisition and keep the index off the wire.
+        with patch("turnstone.core.session.acquire_memory_index_snapshot") as acquire:
+            session._init_system_messages(principal_id="u")
+        acquire.assert_not_called()
+        assert "<memory-index" not in session.system_messages[0]["content"]
+
+    def test_base_override_replaces_only_base(self, tmp_db, mock_openai_client) -> None:
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(prompt="You are a scribe on a guard test.", tools=frozenset()),
+        )
+        prompt = session.system_messages[0]["content"]
+        assert "You are a scribe on a guard test." in prompt
+        # personas/engineer.md's IC framing is REPLACED...
+        assert "read before you edit" not in prompt
+        # ...but CONTEXT still composes (the removed /creative fork dropped it).
+        assert "Current time:" in prompt or "Session context" in prompt or "User:" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Guard 3 — tool_search escape hatch: included ⇒ soft set (discovered tools
+# join the visible wire); omitted ⇒ hard set (the pathway is disabled).
+# ---------------------------------------------------------------------------
+
+
+class TestToolSearchEscape:
+    def _mcp_client(self) -> MagicMock:
+        mcp = MagicMock()
+        mcp.get_tools.return_value = [
+            {
+                "type": "function",
+                "function": {"name": "mcp_widget", "description": "widget", "parameters": {}},
+            }
+        ]
+        mcp.resource_count_for_user.return_value = 0
+        mcp.prompt_count_for_user.return_value = 0
+        return mcp
+
+    def test_included_keeps_pathway_and_unions_discovered(self, tmp_db, mock_openai_client) -> None:
+        session = _session(
+            mock_openai_client,
+            mcp_client=self._mcp_client(),
+            tool_search="on",
+            persona_snapshot=_snap(tools=frozenset({"read_file", "tool_search"})),
+        )
+        assert session._tool_search is not None
+        names = _wire_names(session)
+        assert set(names) == {"read_file", "tool_search"}
+        # Discovery expands the visible set — the allowlist unions with it.
+        session._tool_search.expand_visible(["mcp_widget"])
+        names = _wire_names(session)
+        assert "mcp_widget" in names
+
+    def test_soft_set_survives_global_setting_off(self, tmp_db, mock_openai_client) -> None:
+        # The authored escape hatch must not silently degrade to a hard set
+        # on deployments where the global setting/threshold wouldn't have
+        # constructed a ToolSearchManager.
+        session = _session(
+            mock_openai_client,
+            mcp_client=self._mcp_client(),
+            tool_search="off",
+            persona_snapshot=_snap(tools=frozenset({"read_file", "tool_search"})),
+        )
+        assert session._tool_search is not None
+        assert "tool_search" in _wire_names(session)
+
+    def test_a_hard_set_stamp_refuses_a_session_built_without_it(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        from turnstone.core.memory import register_workstream, save_message, save_workstream_config
+
+        # Unstamped session (a factory that ignored the stamp) with a live
+        # ToolSearchManager and a discovered tool, for a workstream whose
+        # stored stamp is hard-set (scribe-shaped). The pathway is gated at
+        # construction (test_omitted_is_hard), so the load refuses instead.
+        session = _session(
+            mock_openai_client,
+            ws_id="t" * 32,
+            mcp_client=self._mcp_client(),
+            tool_search="on",
+        )
+        session._tool_search.expand_visible(["mcp_widget"])
+        register_workstream("t" * 32)
+        save_message("t" * 32, "user", "hi")
+        save_workstream_config(
+            "t" * 32, _snap(name="scribe", tools=frozenset(), memory=False).to_config()
+        )
+        with pytest.raises(ValueError, match="built under another persona"):
+            session.rehydrate()
+        assert session.messages == []
+
+    def test_omitted_is_hard(self, tmp_db, mock_openai_client) -> None:
+        session = _session(
+            mock_openai_client,
+            mcp_client=self._mcp_client(),
+            tool_search="on",
+            persona_snapshot=_snap(tools=frozenset({"read_file"})),
+        )
+        # The whole pathway is disabled — covers provider-native
+        # defer_loading mode, which has no synthetic name to filter.
+        assert session._tool_search is None
+        assert session._get_deferred_names() is None
+        assert set(_wire_names(session)) == {"read_file"}
+        # ...and it stays disabled across an MCP catalog refresh.
+        session._rebuild_tool_search()
+        assert session._tool_search is None
+
+    @staticmethod
+    def _native_search_turn(producer: str, name: str) -> Turn:
+        return turn_from_dict(
+            {
+                "role": "assistant",
+                "content": "",
+                "_producer": producer,
+                "_provider_content": [
+                    {
+                        "type": "tool_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": {
+                            "type": "tool_search_tool_search_result",
+                            "tool_references": [{"type": "tool_reference", "tool_name": name}],
+                        },
+                    }
+                ],
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("producer", "name", "visible"),
+        [
+            ("anthropic", "mcp_widget", True),
+            ("anthropic-compatible", "mcp_widget", True),
+            ("openai", "mcp_widget", False),
+            ("anthropic", "mcp_gone", False),
+        ],
+    )
+    def test_native_search_loads_join_a_client_side_wire(
+        self, tmp_db, mock_openai_client, producer, name, visible
+    ) -> None:
+        # A lane whose tool search runs client-side sends only the tools it expanded, but the
+        # history it replays can hold a native search from its replay family, and the API
+        # resolves those references against the request's tools. Another family's blocks
+        # never replay here, and a name the catalog lost is left to the provider's stub.
+        session = _session(mock_openai_client, mcp_client=self._mcp_client(), tool_search="on")
+        session._active_replay_producer = "anthropic"
+        session.messages = [Turn.user("weather?"), self._native_search_turn(producer, name)]
+        assert ("mcp_widget" in _wire_names(session)) is visible
+        # Offered for this request only: nothing is recorded as discovered.
+        assert not session._tool_search.is_expanded("mcp_widget")
+
+    @pytest.mark.parametrize(
+        ("persona_tools", "visible"),
+        [
+            (frozenset({"read_file", "tool_search"}), False),
+            (frozenset({"read_file", "tool_search", "mcp_widget"}), True),
+        ],
+    )
+    def test_native_search_loads_stay_within_a_persona_set(
+        self, tmp_db, mock_openai_client, persona_tools, visible
+    ) -> None:
+        # A persona that restricts tools never runs native tool search, and its stamp, which
+        # a fork copies, cannot change; the offer still goes through the persona's filter.
+        session = _session(
+            mock_openai_client,
+            mcp_client=self._mcp_client(),
+            tool_search="on",
+            persona_snapshot=_snap(tools=persona_tools),
+        )
+        session._active_replay_producer = "anthropic"
+        session.messages = [
+            Turn.user("weather?"),
+            self._native_search_turn("anthropic", "mcp_widget"),
+        ]
+        assert ("mcp_widget" in _wire_names(session)) is visible
+
+    def test_soft_set_expansion_recomposes_prompt(self, tmp_db, mock_openai_client) -> None:
+        # A soft set composed the prompt against the pre-expansion visible
+        # names, so tool-gated policy segments for a just-discovered tool
+        # were dropped.  Expanding a NEW name via tool_search must recompose
+        # so the operator's guidance lands with the tool — but a repeat
+        # (already-expanded) discovery must NOT pay the recompose again.
+        session = _session(
+            mock_openai_client,
+            mcp_client=self._mcp_client(),
+            tool_search="on",
+            persona_snapshot=_snap(tools=frozenset({"read_file", "tool_search"})),
+        )
+        assert session._tool_search is not None
+        widget = next(
+            t
+            for t in session._tool_search.get_deferred_tools()
+            if t["function"]["name"] == "mcp_widget"
+        )
+        with patch.object(session._tool_search, "search", return_value=[widget]):
+            with patch.object(session, "_init_system_messages") as recompose:
+                session._exec_tool_search({"query": "widget", "call_id": "c1"})
+            recompose.assert_called_once()
+            # Second discovery of the same name adds nothing new — no recompose.
+            with patch.object(session, "_init_system_messages") as recompose_again:
+                session._exec_tool_search({"query": "widget", "call_id": "c2"})
+            recompose_again.assert_not_called()
+
+    def test_legacy_expansion_does_not_recompose(self, tmp_db, mock_openai_client) -> None:
+        # Without a persona set (_persona_tools is None) the prompt is
+        # composed against the full catalog, so a tool_search expansion
+        # needn't recompose — the soft-set recompose is persona-specific.
+        session = _session(mock_openai_client, mcp_client=self._mcp_client(), tool_search="on")
+        assert session._tool_search is not None
+        assert session._persona_tools is None
+        widget = next(
+            t
+            for t in session._tool_search.get_deferred_tools()
+            if t["function"]["name"] == "mcp_widget"
+        )
+        with patch.object(session._tool_search, "search", return_value=[widget]):
+            with patch.object(session, "_init_system_messages") as recompose:
+                session._exec_tool_search({"query": "widget", "call_id": "c1"})
+            recompose.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Guard 4 — memory-off: no index or live pointers, memory tool hidden, memory
+# nudges suppressed; compaction mechanics stay untouched.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryOff:
+    def test_memory_levers(self, tmp_db, mock_openai_client) -> None:
+        session = _session(mock_openai_client, persona_snapshot=_snap(memory=False))
+        with patch("turnstone.core.session.acquire_memory_index_snapshot") as acquire:
+            session._init_system_messages(principal_id="u")
+        acquire.assert_not_called()
+        assert "<memory-index" not in session.system_messages[0]["content"]
+        assert "memory" not in _wire_names(session)
+        # Memory-directed nudges are suppressed; behavioural nudges stay.
+        session._memory_config.nudges = True
+        assert not session._nudges_enabled("correction")
+        assert session._nudges_enabled("compaction_pending")
+
+    def test_allowlist_hiding_memory_tool_also_gates_nudges(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        # memory lever ON but the visibility set omits the memory tool —
+        # nudges directing the model at memory(...) must not fire either.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert not session._nudges_enabled("correction")
+        assert session._nudges_enabled("compaction_pending")
+
+    def test_recall_pointer_gates_on_visibility(self, tmp_db, mock_openai_client) -> None:
+        # scribe-shaped: empty toolset hides recall — the compaction pointer
+        # must not direct the model at a tool it can't call.
+        hidden = _session(mock_openai_client, persona_snapshot=_snap(tools=frozenset()))
+        assert not hidden._persona_tool_visible("recall")
+        open_hands = _session(mock_openai_client, persona_snapshot=_snap())
+        assert open_hands._persona_tool_visible("recall")
+
+    @staticmethod
+    def _drive_advised_compaction(session: ChatSession) -> tuple[Any, Any]:
+        """Drive a REAL advised-stop compaction + auto-resume through send().
+
+        Mirrors ``test_cooperative_compaction.py``'s end-to-end recipe: the
+        model pauses mid-task (latching ``_compaction_advised``), the turn is
+        over-threshold, a real summary is produced via ``_utility_completion``,
+        and the loop hands a ``compaction_resume`` user turn back.  Returns the
+        ``_utility_completion`` and ``_append_user_turn`` spies so callers can
+        assert the spill happened and which resume-nudge variant fired.
+        """
+        from types import SimpleNamespace
+
+        from turnstone.core.trajectory import turns_from_dicts
+
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "do the task"},
+                {"role": "assistant", "content": "on it"},
+            ]
+        )
+        session._msg_tokens = [5, 5]
+        session._title_generated = True
+        session.compact_max_tokens = 100
+        session._system_tokens = 0
+        summary = SimpleNamespace(
+            content="## Open tasks\nfinish it",
+            finish_reason="stop",
+            producer="test-summary-provider",
+        )
+        n = {"i": 0}
+
+        def stream(*_a: Any, **_k: Any) -> ModelTurnResult:
+            n["i"] += 1
+            if n["i"] == 1:
+                session._compaction_advised = True  # advisory fired this turn
+                return make_result(content="pausing to compact")
+            return make_result(content="all done")
+
+        def est(*_a: Any, **_k: Any) -> int:
+            return 9_999 if n["i"] <= 1 else 10  # over threshold only on the stop turn
+
+        with (
+            patch.object(session, "_stream_response", side_effect=stream),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_estimated_prompt_tokens", side_effect=est),
+            patch.object(session, "_utility_completion", return_value=summary) as uc,
+            patch.object(session, "_append_user_turn", wraps=session._append_user_turn) as resume,
+        ):
+            session.send("go")
+        return uc, resume
+
+    def test_real_compaction_recall_pointer_when_recall_visible(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        # memory-off hides only the memory tool — recall stays visible, so an
+        # actual compaction spills a summary AND the resume nudge points at
+        # recall (NUDGE_COMPACTION_RESUME).
+        from tests._session_helpers import make_session
+        from turnstone.core.metacognition import NUDGE_COMPACTION_RESUME
+
+        session = make_session(
+            client=mock_openai_client,
+            context_window=10_000,
+            max_tokens=1_000,
+            tool_timeout=10,
+            persona_snapshot=_snap(memory=False),
+        )
+        get_storage().register_workstream(session.ws_id)
+        assert session._persona_tool_visible("recall")
+        uc, resume = self._drive_advised_compaction(session)
+        assert uc.call_count >= 1  # a real summary was produced (the spill)
+        resume_calls = [
+            c for c in resume.call_args_list if c.kwargs.get("source") == "compaction_resume"
+        ]
+        assert len(resume_calls) == 1
+        assert resume_calls[0].args[0] == NUDGE_COMPACTION_RESUME
+
+    def test_real_compaction_recall_pointer_when_recall_hidden(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        # scribe-shaped empty toolset hides recall — the spill still happens
+        # but the resume nudge switches to the no-recall variant.
+        from tests._session_helpers import make_session
+        from turnstone.core.metacognition import NUDGE_COMPACTION_RESUME_NO_RECALL
+
+        session = make_session(
+            client=mock_openai_client,
+            context_window=10_000,
+            max_tokens=1_000,
+            tool_timeout=10,
+            persona_snapshot=_snap(tools=frozenset()),
+        )
+        get_storage().register_workstream(session.ws_id)
+        assert not session._persona_tool_visible("recall")
+        uc, resume = self._drive_advised_compaction(session)
+        assert uc.call_count >= 1
+        resume_calls = [
+            c for c in resume.call_args_list if c.kwargs.get("source") == "compaction_resume"
+        ]
+        assert len(resume_calls) == 1
+        assert resume_calls[0].args[0] == NUDGE_COMPACTION_RESUME_NO_RECALL
+
+
+# ---------------------------------------------------------------------------
+# Guard 5 — MCP-off is session-wide: no merge into _tools OR _task_tools,
+# no listeners, refresh callback inert.
+# ---------------------------------------------------------------------------
+
+
+class TestMcpOff:
+    def test_session_wide_gate(self, tmp_db, mock_openai_client) -> None:
+        mcp = MagicMock()
+        mcp.get_tools.return_value = [
+            {"type": "function", "function": {"name": "mcp_widget", "parameters": {}}}
+        ]
+        session = _session(
+            mock_openai_client,
+            mcp_client=mcp,
+            persona_snapshot=_snap(mcp=False),
+        )
+        assert session._mcp_client is None
+        names = {t["function"]["name"] for t in session._tools if "function" in t}
+        assert "mcp_widget" not in names
+        task_names = {t["function"]["name"] for t in session._task_tools if "function" in t}
+        assert "mcp_widget" not in task_names
+        assert "memory" not in task_names
+        mcp.add_listener.assert_not_called()
+        mcp.add_resource_listener.assert_not_called()
+        mcp.add_prompt_listener.assert_not_called()
+        # A late catalog change can't re-merge.
+        session._on_mcp_tools_changed()
+        names_after = {t["function"]["name"] for t in session._tools if "function" in t}
+        assert "mcp_widget" not in names_after
+        task_names_after = {t["function"]["name"] for t in session._task_tools if "function" in t}
+        assert "memory" not in task_names_after
+
+    def test_memory_off_does_not_touch_task_tools(self, tmp_db, mock_openai_client) -> None:
+        # The deliberate asymmetry with guard 5: memory-off shapes the
+        # persona's OWN hands; task agents keep their identity/envelope.
+        session = _session(mock_openai_client, persona_snapshot=_snap(memory=False))
+        assert [t["function"]["name"] for t in session._task_tools] == [
+            t["function"]["name"] for t in TASK_AGENT_TOOLS
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Guard 6 — spawn: persona honored + validated at prep time; omitted means
+# the KIND default (resolved server-side at child creation), never the
+# parent's persona.
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnPersona:
+    def _coord_session(self, mock_openai_client: Any) -> ChatSession:
+        return _session(
+            mock_openai_client,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=MagicMock(),
+        )
+
+    def test_unknown_persona_is_clean_tool_error(self, tmp_db, mock_openai_client) -> None:
+        session = self._coord_session(mock_openai_client)
+        item = session._prepare_spawn_workstream("c1", {"persona": "nope"})
+        assert item.get("error")
+        assert "nope" in item["error"]
+
+    def test_kind_mismatch_is_clean_tool_error(self, tmp_db, mock_openai_client) -> None:
+        get_storage().create_persona(
+            {
+                "persona_id": "px",
+                "name": "coord-only",
+                "base_prompt": "C",
+                "applies_to_kinds": ["coordinator"],
+            }
+        )
+        session = self._coord_session(mock_openai_client)
+        item = session._prepare_spawn_workstream("c1", {"persona": "coord-only"})
+        assert item.get("error")
+        assert "interactive" in item["error"]
+
+    def test_valid_persona_travels_to_spawn_body(self, tmp_db, mock_openai_client) -> None:
+        get_storage().create_persona(
+            {
+                "persona_id": "py",
+                "name": "scribe",
+                "base_prompt": "S",
+                "applies_to_kinds": ["interactive"],
+            }
+        )
+        session = self._coord_session(mock_openai_client)
+        item = session._prepare_spawn_workstream("c1", {"persona": "scribe"})
+        assert not item.get("error")
+        assert item["persona"] == "scribe"
+        session._coord_client.spawn.return_value = {"ws_id": "w" * 32, "name": "child"}
+        with patch.object(session, "_report_tool_result"):
+            session._exec_spawn_workstream(item)
+        assert session._coord_client.spawn.call_args.kwargs["persona"] == "scribe"
+
+    def test_omitted_persona_is_not_inherited(self, tmp_db, mock_openai_client) -> None:
+        # The parent coordinator has its own persona; the child body must
+        # NOT carry it — the receiving node resolves the interactive
+        # default at child-creation time.
+        session = _session(
+            mock_openai_client,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=MagicMock(),
+            persona_snapshot=_snap(name="executive"),
+        )
+        item = session._prepare_spawn_workstream("c1", {"initial_message": "go"})
+        assert item["persona"] == ""
+        session._coord_client.spawn.return_value = {"ws_id": "w" * 32, "name": "child"}
+        with patch.object(session, "_report_tool_result"):
+            session._exec_spawn_workstream(item)
+        assert session._coord_client.spawn.call_args.kwargs["persona"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Guard 7 — task_agent HAS a persona parameter: a sub-agent's identity comes
+# from a persona (default = the built-in task-agent identity), validated at
+# prep against the interactive kind.  Revises the original "no persona for
+# task agents" stance now that personas are first-class on every path.
+# ---------------------------------------------------------------------------
+
+
+def test_task_agent_schema_has_persona_param() -> None:
+    from turnstone.core.tools import TOOLS
+
+    task_agent = next(t for t in TOOLS if t["function"]["name"] == "task_agent")
+    props = task_agent["function"]["parameters"]["properties"]
+    assert "persona" in props
+    # skill= is capability now — the description frames it that way.
+    assert "capability" in props["skill"]["description"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Guard 8 — immutability: nothing mutates a workstream's persona post-create.
+# The stamp is written from constructor attrs; config rewrites re-emit the
+# SAME stamp, and the persona row's slug is immutable.
+# ---------------------------------------------------------------------------
+
+
+class TestImmutability:
+    def test_save_config_reemits_same_stamp(self, tmp_db, mock_openai_client) -> None:
+        from turnstone.core.memory import load_workstream_config
+
+        snap = _snap(name="scribe", prompt="P", tools=frozenset({"read_file"}), memory=False)
+        session = _session(mock_openai_client, ws_id="w1" * 16, persona_snapshot=snap)
+        before = {
+            k: v for k, v in load_workstream_config("w1" * 16).items() if k.startswith("persona")
+        }
+        session.temperature = 0.9  # any config-touching change
+        session._save_config()
+        after = {
+            k: v for k, v in load_workstream_config("w1" * 16).items() if k.startswith("persona")
+        }
+        assert before == after == snap.to_config()
+
+    def test_persona_slug_is_immutable_in_storage(self) -> None:
+        assert "name" not in PERSONA_MUTABLE
+
+    def test_legacy_ws_never_gets_backstamped(self, tmp_db, mock_openai_client) -> None:
+        from turnstone.core.memory import load_workstream_config
+
+        session = _session(mock_openai_client, ws_id="w2" * 16)  # no persona
+        session._save_config()
+        keys = load_workstream_config("w2" * 16)
+        assert not any(k.startswith("persona") for k in keys)
+
+
+# ---------------------------------------------------------------------------
+# Guard 9 — the stamp survives rehydrate: SessionManager.open threads it
+# pre-construction (the same lane as the saved model alias).
+# ---------------------------------------------------------------------------
+# (resume()-adoption is covered in test_sessions.py::test_resume_restores_config)
+
+
+class TestRehydrateThreading:
+    def test_open_threads_snapshot_into_build_session(self) -> None:
+        from tests.test_session_manager import FakeAdapter, _make_manager
+
+        class RecordingAdapter(FakeAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.last_build_kwargs: dict[str, Any] = {}
+
+            def build_session(self, ws: Any, **kwargs: Any) -> Any:
+                self.last_build_kwargs = dict(kwargs)
+                return super().build_session(ws, **{"model": kwargs.get("model")})
+
+        adapter = RecordingAdapter()
+        mgr, _, storage = _make_manager(adapter)
+        ws = mgr.create(user_id="u1", persona="scribe")
+        ws_id = ws.id
+        snap = _snap(name="scribe", tools=frozenset(), mcp=False, memory=False)
+        storage.ws_config[ws_id] = snap.to_config()
+        mgr.close(ws_id)
+
+        reopened = mgr.open(ws_id)
+        assert reopened is not None
+        assert reopened.persona == "scribe"
+        assert adapter.last_build_kwargs["persona_snapshot"] == snap
+
+    def test_corrupt_stamp_fails_loudly_never_falls_back(self) -> None:
+        from tests.test_session_manager import _make_manager
+
+        mgr, _, storage = _make_manager()
+        ws = mgr.create(user_id="u1")
+        ws_id = ws.id
+        # Partial stamp = corruption (missing companions).
+        storage.ws_config[ws_id] = {"persona": "scribe"}
+        mgr.close(ws_id)
+        with pytest.raises(ValueError, match="corrupt persona snapshot"):
+            mgr.open(ws_id)
+
+    def test_corrupt_stamp_releases_the_slot(self) -> None:
+        # The parse raise must unwind exactly like a build_session failure:
+        # the placeholder slot is released (no max_active pin) and a retry
+        # raises the SAME loud error instead of "already tracked".
+        from tests.test_session_manager import _make_manager
+
+        mgr, _, storage = _make_manager()
+        ws = mgr.create(user_id="u1")
+        ws_id = ws.id
+        storage.ws_config[ws_id] = {"persona": "scribe"}
+        mgr.close(ws_id)
+        with pytest.raises(ValueError, match="corrupt persona snapshot"):
+            mgr.open(ws_id)
+        assert mgr.get(ws_id) is None  # slot released, not a stuck placeholder
+        with pytest.raises(ValueError, match="corrupt persona snapshot"):
+            mgr.open(ws_id)  # retry reproduces the loud error, not RuntimeError
+
+    def test_stamp_survives_compaction_then_resume(self, tmp_db, mock_openai_client) -> None:
+        # Compaction rewrites the conversation, never the persona stamp (it
+        # lives in workstream_config).  After a real compaction on a stamped
+        # workstream, a fresh resume re-adopts all five levers intact.
+        from types import SimpleNamespace
+
+        from turnstone.core.memory import (
+            register_workstream,
+            save_message,
+            save_workstream_config,
+        )
+        from turnstone.core.trajectory import turns_from_dicts
+
+        snap = _snap(
+            name="scribe", prompt="P", tools=frozenset({"read_file"}), mcp=False, memory=False
+        )
+        ws_id = "w" * 32
+        register_workstream(ws_id)
+        save_message(ws_id, "user", "do the thing")
+        save_message(ws_id, "assistant", "did the thing")
+        save_workstream_config(ws_id, snap.to_config())
+
+        session = _session(mock_openai_client, ws_id=ws_id, persona_snapshot=snap)
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "do the thing"},
+                {"role": "assistant", "content": "did the thing"},
+            ]
+        )
+        session._msg_tokens = [5, 5]
+        session.compact_max_tokens = 100
+        session._system_tokens = 0
+        summary = SimpleNamespace(
+            content="## Decisions\ndense",
+            finish_reason="stop",
+            producer="test-summary-provider",
+        )
+        with patch.object(session, "_utility_completion", return_value=summary):
+            assert session._compact_messages(auto=True) is True
+
+        # A fresh load builds from the stamp still stored, as the manager does.
+        from turnstone.core.memory import load_workstream_config
+        from turnstone.core.personas import snapshot_from_config
+
+        stored = snapshot_from_config(load_workstream_config(ws_id))
+        fresh = _session(mock_openai_client, ws_id=ws_id, persona_snapshot=stored)
+        assert fresh.rehydrate()
+        assert fresh._persona_name == "scribe"
+        assert fresh._persona_prompt == "P"
+        assert fresh._persona_tools == frozenset({"read_file"})
+        assert fresh._persona_mcp is False
+        assert fresh._persona_memory is False
+
+
+# ---------------------------------------------------------------------------
+# Guard 9, rehydrate lane — ``rehydrate()`` parses the stored stamp BEFORE
+# mutating session state: a corrupt stamp raises with nothing loaded, and a
+# session built under another persona than the stored one (its MCP lever either
+# way) is refused with nothing loaded.
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateStamp:
+    @staticmethod
+    def _mcp() -> MagicMock:
+        mcp = MagicMock()
+        mcp.get_tools.return_value = [
+            {"type": "function", "function": {"name": "mcp_widget", "parameters": {}}}
+        ]
+        mcp.resource_count_for_user.return_value = 0
+        mcp.prompt_count_for_user.return_value = 0
+        return mcp
+
+    def test_corrupt_stamp_loads_nothing(self, tmp_db, mock_openai_client) -> None:
+        from turnstone.core.memory import (
+            load_workstream_config,
+            register_workstream,
+            save_message,
+            save_workstream_config,
+        )
+
+        b_id = "b" * 32
+        register_workstream(b_id)
+        save_message(b_id, "user", "hi from B")
+        save_workstream_config(b_id, {"persona": "scribe"})  # partial = corrupt
+        b_config_before = load_workstream_config(b_id)
+        session = _session(mock_openai_client, ws_id=b_id)
+
+        with pytest.raises(ValueError, match="corrupt persona snapshot"):
+            session.rehydrate()
+        # Parse-before-mutate: no history loaded, and the stamp is never
+        # "repaired" with a persona the operator did not choose.
+        assert session.messages == []
+        assert load_workstream_config(b_id) == b_config_before
+
+    def test_an_mcp_on_stamp_refuses_a_session_built_mcp_off(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        from turnstone.core.memory import (
+            register_workstream,
+            save_message,
+            save_workstream_config,
+        )
+
+        # A real client was withheld by the persona gate at construction.
+        b_id = "b" * 32
+        session = _session(
+            mock_openai_client,
+            ws_id=b_id,
+            mcp_client=self._mcp(),
+            persona_snapshot=_snap(mcp=False),
+        )
+        register_workstream(b_id)
+        save_message(b_id, "user", "hi")
+        save_workstream_config(b_id, _snap(name="scribe", mcp=True).to_config())
+        with pytest.raises(ValueError, match="built under another persona"):
+            session.rehydrate()
+        assert session.messages == []
+
+    def test_an_mcp_off_stamp_refuses_a_session_built_with_mcp(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        from turnstone.core.memory import (
+            register_workstream,
+            save_message,
+            save_workstream_config,
+        )
+
+        mcp = self._mcp()
+        b_id = "b" * 32
+        session = _session(mock_openai_client, ws_id=b_id, mcp_client=mcp)  # legacy: MCP live
+        register_workstream(b_id)
+        save_message(b_id, "user", "hi")
+        save_workstream_config(b_id, _snap(name="scribe", mcp=False).to_config())
+        with pytest.raises(ValueError, match="built under another persona"):
+            session.rehydrate()
+        # Nothing changed: the live surface stays as built, nothing loaded.
+        assert session._mcp_client is mcp
+        assert session.messages == []
+
+
+# ---------------------------------------------------------------------------
+# Guard 10 — mandatory prompt policies compose under EVERY persona, including
+# empty-toolset ones; tool-gated policies drop with their tool.
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyComposition:
+    def test_db_policy_rides_on_top_of_override(self) -> None:
+        from turnstone.prompts import ClientType, SessionContext, compose_system_message
+
+        ctx = SessionContext(current_datetime="2026-07-02T10:00", timezone="UTC", username="guard")
+        policies = [
+            {"name": "mandatory", "content": "ALWAYS-ON-POLICY", "enabled": True},
+            {
+                "name": "gated",
+                "content": "BASH-GATED-POLICY",
+                "tool_gate": "bash",
+                "enabled": True,
+            },
+        ]
+        composed = compose_system_message(
+            ClientType.CLI,
+            ctx,
+            frozenset(),  # empty visible set — scribe-shaped
+            db_policies=policies,
+            base_override="You are a scribe.",
+        )
+        assert "You are a scribe." in composed
+        assert "ALWAYS-ON-POLICY" in composed
+        assert "BASH-GATED-POLICY" not in composed  # its tool is hidden
+
+
+# ---------------------------------------------------------------------------
+# Guard 11 — CLI --persona resolution: seed persona loads; unknown name
+# errors clearly at startup; --resume adopts the target's stamp.
+# ---------------------------------------------------------------------------
+
+
+class TestCliPersona:
+    def test_seed_persona_loads(self, tmp_db) -> None:
+        from turnstone.cli import resolve_cli_persona_kwargs
+
+        storage = get_storage()
+        storage.create_persona(
+            {
+                "persona_id": "p1",
+                "name": "writer",
+                "base_prompt": "W",
+                "tool_allowlist": [],
+                "mcp_enabled": False,
+                "applies_to_kinds": ["interactive"],
+            }
+        )
+        kwargs = resolve_cli_persona_kwargs(storage, "writer")
+        assert kwargs["persona"] == "writer"
+        assert kwargs["persona_snapshot"].tools == frozenset()
+
+    def test_unknown_name_exits(self, tmp_db, capsys) -> None:
+        from turnstone.cli import resolve_cli_persona_kwargs
+
+        with pytest.raises(SystemExit):
+            resolve_cli_persona_kwargs(get_storage(), "nope")
+        assert "not found or disabled" in capsys.readouterr().out
+
+    def test_kind_mismatch_exits(self, tmp_db) -> None:
+        from turnstone.cli import resolve_cli_persona_kwargs
+
+        storage = get_storage()
+        storage.create_persona(
+            {
+                "persona_id": "p2",
+                "name": "exec",
+                "base_prompt": "E",
+                "applies_to_kinds": ["coordinator"],
+            }
+        )
+        with pytest.raises(SystemExit):
+            resolve_cli_persona_kwargs(storage, "exec")
+
+    def test_no_default_yields_legacy(self, tmp_db) -> None:
+        from turnstone.cli import resolve_cli_persona_kwargs
+
+        assert resolve_cli_persona_kwargs(get_storage(), None) == {}
+
+
+# ---------------------------------------------------------------------------
+# Guard 13 — template independence: edit AND archive the persona after
+# creating a workstream from it — the stamp is untouched.
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateIndependence:
+    def test_edit_and_archive_leave_stamp_alone(self, tmp_db, mock_openai_client) -> None:
+        from turnstone.core.memory import load_workstream_config
+        from turnstone.core.personas import snapshot_from_config
+
+        storage = get_storage()
+        storage.create_persona(
+            {
+                "persona_id": "p1",
+                "name": "scribe",
+                "base_prompt": "ORIGINAL",
+                "tool_allowlist": [],
+                "mcp_enabled": False,
+                "memory_enabled": False,
+                "applies_to_kinds": ["interactive"],
+            }
+        )
+        row = storage.get_persona("p1")
+        assert row is not None
+        session = _session(
+            mock_openai_client, ws_id="w3" * 16, persona_snapshot=snapshot_from_persona(row)
+        )
+        original = session.system_messages[0]["content"]
+        assert "ORIGINAL" in original
+
+        storage.update_persona("p1", base_prompt="EDITED", tool_allowlist=None)
+        storage.update_persona("p1", enabled=False)
+
+        stamped = snapshot_from_config(load_workstream_config("w3" * 16))
+        assert stamped is not None
+        assert stamped.prompt == "ORIGINAL"
+        assert stamped.tools == frozenset()
+        # A fresh construction from the stamp reproduces the ORIGINAL prompt.
+        rehydrated = _session(mock_openai_client, ws_id="w3" * 16, persona_snapshot=stamped)
+        assert "ORIGINAL" in rehydrated.system_messages[0]["content"]
+        assert "EDITED" not in rehydrated.system_messages[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Guard 15 — the collector's delta path carries persona on the rows it
+# builds from ws_created events (the saved-list twin lives in
+# test_saved_handler_unified.py).  Both ws_created builders are exercised
+# behaviourally: the poll-diff additions path (_reconcile_node) and the
+# SSE-relay path (_apply_delta).  Precedent: test_console.py::TestCollectorDelta.
+# ---------------------------------------------------------------------------
+
+
+def _persona_collector() -> Any:
+    from tests._coord_test_helpers import MockStorage
+    from turnstone.console.collector import ClusterCollector
+
+    return ClusterCollector(storage=MockStorage(), discovery_interval=999)
+
+
+def test_ws_created_reconcile_lane_carries_persona() -> None:
+    # Poll-diff additions: a freshly-appeared workstream becomes a ws_created
+    # event AND is stored on the node snapshot — persona rides both.
+    from turnstone.console.collector import NodeSnapshot
+
+    c = _persona_collector()
+    node = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+    c._nodes["node-a"] = node
+    pending = c._reconcile_node(
+        "node-a",
+        node,
+        [{"id": "ws1", "name": "n", "state": "idle", "kind": "interactive", "persona": "scribe"}],
+    )
+    created = [e for e in pending if e["type"] == "ws_created"]
+    assert len(created) == 1
+    assert created[0]["persona"] == "scribe"
+    assert node.workstreams["ws1"]["persona"] == "scribe"
+
+
+def test_ws_created_apply_delta_lane_carries_persona() -> None:
+    # SSE relay: a node's ws_created delta fans out to console listeners AND
+    # seeds node.workstreams — persona rides the emitted row and the store.
+    import queue
+
+    from turnstone.console.collector import NodeSnapshot
+
+    c = _persona_collector()
+    c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+    q: queue.Queue[dict[str, Any]] = queue.Queue()
+    c.register_listener(q)
+    c._apply_delta(
+        "node-a",
+        {"type": "ws_created", "ws_id": "ws1", "name": "new", "persona": "scribe"},
+    )
+    event = q.get_nowait()
+    assert event["type"] == "ws_created"
+    assert event["persona"] == "scribe"
+    assert c._nodes["node-a"].workstreams["ws1"]["persona"] == "scribe"
+
+
+def test_snapshot_roundtrip_via_json() -> None:
+    # The stamp's config form is plain strings — JSON-safe end to end.
+    snap = _snap(name="s", prompt="p", tools=frozenset({"a"}), mcp=False, memory=False)
+    assert json.loads(json.dumps(snap.to_config())) == snap.to_config()
+
+
+# ---------------------------------------------------------------------------
+# Guard 9, fork lane — creating with ``resume_ws`` adopts the SOURCE
+# workstream's stamp at construction time (all four levers, including the
+# construction-time MCP gate), never the kind default; a corrupt source
+# stamp is a loud 400; an unstamped legacy source forks unstamped.
+# ---------------------------------------------------------------------------
+
+
+class TestForkAdoptsStamp:
+    @pytest.fixture()
+    def _fork_app(self, tmp_db):
+        """The production ``make_create_handler`` over a real SessionManager,
+        with a session factory that forwards ``persona_snapshot`` (the same
+        contract the server factory honors)."""
+        import queue
+        import threading
+
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.routing import Mount, Route
+        from starlette.testclient import TestClient
+
+        from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
+        from turnstone.core.auth import AuthResult
+        from turnstone.core.session_manager import SessionManager
+        from turnstone.core.session_routes import SessionEndpointConfig, make_create_handler
+        from turnstone.server import (
+            WebUI,
+            _interactive_create_build_kwargs,
+            _interactive_create_post_install,
+            _interactive_create_pre_commit,
+            _interactive_create_prepare_install,
+            _interactive_create_validate_request,
+            _interactive_manager_lookup,
+            _interactive_tenant_check,
+        )
+
+        class _Auth(BaseHTTPMiddleware):
+            async def dispatch(self, request: Any, call_next: Any) -> Any:
+                request.state.auth_result = AuthResult(
+                    user_id="test-user",
+                    scopes=frozenset({"approve"}),
+                    token_source="config",
+                    permissions=frozenset({"read", "write", "approve"}),
+                )
+                return await call_next(request)
+
+        def _session_factory(ui: Any, model_alias: Any = None, ws_id: Any = None, **kw: Any):
+            return ChatSession(
+                client=MagicMock(),
+                model=model_alias or "test-model",
+                ui=ui,
+                instructions=None,
+                temperature=0.5,
+                max_tokens=1000,
+                tool_timeout=10,
+                ws_id=ws_id,
+                user_id=getattr(ui, "_user_id", ""),
+                project_id=str(kw.get("project_id") or ""),
+                persona_snapshot=kw.get("persona_snapshot"),
+                workstream_lease=kw.get("workstream_lease"),
+            )
+
+        gq: queue.Queue[dict[str, Any]] = queue.Queue()
+        WebUI._global_queue = gq
+        adapter = InteractiveAdapter(
+            global_queue=gq,
+            ui_factory=lambda ws: WebUI(
+                ws_id=ws.id,
+                user_id=ws.user_id,
+                kind=ws.kind,
+                parent_ws_id=ws.parent_ws_id,
+            ),
+            session_factory=_session_factory,
+        )
+        mgr = SessionManager(adapter, storage=get_storage(), max_active=10, event_emitter=adapter)
+        handler = make_create_handler(
+            SessionEndpointConfig(
+                permission_gate=None,
+                manager_lookup=_interactive_manager_lookup,
+                tenant_check=_interactive_tenant_check,
+                not_found_label="Workstream not found",
+                audit_action_prefix="workstream",
+                create_supports_attachments=True,
+                create_supports_user_id_override=True,
+                create_supports_resume=True,
+                create_validate_request=_interactive_create_validate_request,
+                create_build_kwargs=_interactive_create_build_kwargs,
+                create_pre_commit=_interactive_create_pre_commit,
+                create_post_install=_interactive_create_post_install,
+                create_prepare_install=_interactive_create_prepare_install,
+            )
+        )
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[Route("/api/workstreams/new", handler, methods=["POST"])],
+                )
+            ],
+            middleware=[Middleware(_Auth)],
+        )
+        app.state.workstreams = mgr
+        app.state.skip_permissions = True
+        app.state.global_queue = gq
+        app.state.global_listeners = []
+        app.state.global_listeners_lock = threading.Lock()
+
+        try:
+            yield TestClient(app, raise_server_exceptions=False), mgr
+        finally:
+            # Close the sessions this manager created, then release the
+            # process-global WebUI queue so it can't leak into the next test
+            # (precedent: test_coord_rich_ws_state_payload.py teardown).
+            for ws in mgr.list_all():
+                mgr.close(ws.id)
+            WebUI._global_queue = None
+
+    def _seed_default(self) -> None:
+        get_storage().create_persona(
+            {
+                "persona_id": "pd",
+                "name": "engineer",
+                "base_prompt": "D",
+                "applies_to_kinds": ["interactive"],
+                "is_default": True,
+            }
+        )
+
+    def test_fork_adopts_source_stamp_not_default(self, _fork_app) -> None:
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        self._seed_default()  # present, and must LOSE to the source stamp
+        src = "s" * 32
+        register_workstream(src)
+        snap = _snap(name="scribe", tools=frozenset(), mcp=False, memory=False)
+        save_workstream_config(src, snap.to_config())
+
+        resp = client.post("/v1/api/workstreams/new", json={"resume_ws": src})
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.persona == "scribe"
+        assert ws.session._persona_name == "scribe"
+        assert ws.session._persona_tools == frozenset()
+        assert ws.session._persona_mcp is False
+        assert ws.session._persona_memory is False
+
+    def test_fork_accepts_semantically_equivalent_persona_tool_json(self, _fork_app) -> None:
+        """Persona coherence compares the parsed envelope, not JSON bytes."""
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        source_id = "d" * 32
+        destination_id = "e" * 32
+        register_workstream(source_id)
+        config = _snap(
+            name="scribe",
+            prompt="same prompt",
+            tools=frozenset({"bash", "read_file"}),
+            mcp=False,
+            memory=False,
+        ).to_config()
+        # Valid but deliberately noncanonical: reversed order plus whitespace.
+        config["persona_tools"] = '[ "read_file", "bash" ]'
+        save_workstream_config(source_id, config)
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": destination_id, "resume_ws": source_id},
+        )
+
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(destination_id)
+        assert ws is not None and ws.session is not None
+        assert ws.persona == "scribe"
+        assert ws.session._persona_tools == frozenset({"bash", "read_file"})
+
+    def test_canonical_source_id_is_not_reresolved_through_alias_shadow(self, _fork_app) -> None:
+        """Validator canonicalization remains authoritative for config reads.
+
+        The request arrives through the source's ordinary alias.  A second
+        row deliberately owns an alias equal to the source's full ws_id.  Once
+        validation replaces ``resume_ws`` with that full id, generic create
+        must load its config directly; alias-first resolution a second time
+        would construct the fork under the shadow row's persona.
+        """
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        source_id = "1" * 32
+        shadow_id = "2" * 32
+        destination_id = "3" * 32
+        canonical_destination_id = "4" * 32
+        register_workstream(source_id)
+        register_workstream(shadow_id)
+        assert storage.set_workstream_alias(source_id, "source-alias") is True
+        assert storage.set_workstream_alias(shadow_id, source_id) is True
+        source_persona = _snap(
+            name="scribe",
+            prompt="source prompt",
+            tools=frozenset(),
+            mcp=False,
+            memory=False,
+        )
+        shadow_persona = _snap(
+            name="engineer",
+            prompt="shadow prompt",
+            tools=None,
+            mcp=True,
+            memory=True,
+        )
+        save_workstream_config(source_id, source_persona.to_config())
+        save_workstream_config(shadow_id, shadow_persona.to_config())
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": destination_id, "resume_ws": "source-alias"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(destination_id)
+        assert ws is not None and ws.session is not None
+        assert ws.persona == "scribe"
+        assert ws.session._persona_name == "scribe"
+        assert ws.session._persona_tools == frozenset()
+        assert storage.resolve_workstream(source_id) == shadow_id  # race fixture is live
+        assert storage.load_workstream_config(destination_id)["persona"] == "scribe"
+
+        # A routing proxy forwards the canonical full id rather than the
+        # caller's alias.  The node must recognize that id as exact and must
+        # not feed it back through alias-first resolution to the shadow row.
+        canonical_resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": canonical_destination_id, "resume_ws": source_id},
+        )
+        assert canonical_resp.status_code == 200, canonical_resp.text
+        canonical_ws = mgr.get(canonical_destination_id)
+        assert canonical_ws is not None and canonical_ws.session is not None
+        assert canonical_ws.persona == "scribe"
+        assert storage.load_workstream_config(canonical_destination_id)["persona"] == "scribe"
+
+    def test_corrupt_source_stamp_is_400(self, _fork_app) -> None:
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        src = "c" * 32
+        register_workstream(src)
+        save_workstream_config(src, {"persona": "scribe"})  # partial = corrupt
+
+        resp = client.post("/v1/api/workstreams/new", json={"resume_ws": src})
+        assert resp.status_code == 400
+        assert "cannot fork" in resp.json()["error"]
+
+    @pytest.mark.parametrize("source_change", ["different_persona", "corrupt_persona"])
+    def test_source_stamp_change_after_preflight_fails_closed(
+        self,
+        _fork_app,
+        source_change: str,
+    ) -> None:
+        """The atomic snapshot must agree with the construction envelope.
+
+        Fork creation has to construct the destination session before its
+        transactional clone runs.  If the source stamp changes in that gap,
+        adopting the new config into a session built under the old persona
+        would run one security envelope while persisting another.  Worse, the
+        next config save could overwrite the transaction's current (or corrupt)
+        stamp with the stale construction snapshot.  The fork must instead
+        disappear without touching the source's new value.
+        """
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        source_id = "a" * 32
+        destination_id = "b" * 32
+        register_workstream(source_id)
+        initial = _snap(
+            name="scribe",
+            prompt="old prompt",
+            tools=frozenset(),
+            mcp=False,
+            memory=False,
+        )
+        save_workstream_config(source_id, initial.to_config())
+
+        if source_change == "different_persona":
+            replacement = _snap(
+                name="engineer",
+                prompt="new prompt",
+                tools=frozenset({"read_file"}),
+                mcp=True,
+                memory=True,
+            ).to_config()
+        else:
+            replacement = dict(initial.to_config())
+            replacement["persona_tools"] = "{not-json"
+
+        original_load = storage.load_workstream_config
+        original_save = storage.save_workstream_config
+        original_clone = storage.clone_workstream
+        changed = False
+        clone_returned = False
+        post_clone_destination_saves: list[dict[str, str]] = []
+
+        def _change_after_preflight(ws_id: str) -> dict[str, str]:
+            nonlocal changed
+            config = original_load(ws_id)
+            if ws_id == source_id and not changed:
+                changed = True
+                save_workstream_config(source_id, replacement)
+            return config
+
+        def _track_clone(*args: Any, **kwargs: Any) -> Any:
+            nonlocal clone_returned
+            snapshot = original_clone(*args, **kwargs)
+            clone_returned = True
+            return snapshot
+
+        def _track_save(ws_id: str, config: dict[str, str], *, lease: Any = None) -> None:
+            if ws_id == destination_id and clone_returned:
+                post_clone_destination_saves.append(dict(config))
+            original_save(ws_id, config, lease=lease)
+
+        with (
+            patch.object(storage, "load_workstream_config", side_effect=_change_after_preflight),
+            patch.object(storage, "clone_workstream", side_effect=_track_clone),
+            patch.object(storage, "save_workstream_config", side_effect=_track_save),
+        ):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"ws_id": destination_id, "resume_ws": source_id},
+            )
+
+        assert changed is True
+        assert resp.status_code == 409, resp.text
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.load_workstream_config(destination_id) == {}
+        assert storage.get_workstream(source_id) is not None
+        assert storage.load_workstream_config(source_id) == replacement
+        assert post_clone_destination_saves == []
+
+    def test_source_project_archived_after_construction_fails_closed(self, _fork_app) -> None:
+        """An archived project cannot remain live in the fork's memory scope."""
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        project_id = "archive-race-project"
+        source_id = "4" * 32
+        destination_id = "5" * 32
+        storage.create_project(project_id, "Archive race", "test-user", visibility="private")
+        storage.register_workstream(
+            source_id,
+            user_id="test-user",
+            project_id=project_id,
+            kind="interactive",
+        )
+        storage.save_message(source_id, "user", "source stays intact")
+        storage.save_workstream_config(source_id, {"source": "unchanged"})
+
+        original_clone = storage.clone_workstream
+        archived = False
+
+        def _archive_before_clone(*args: Any, **kwargs: Any) -> Any:
+            nonlocal archived
+            if not archived:
+                archived = True
+                assert storage.update_project(project_id, state="archived") is True
+            return original_clone(*args, **kwargs)
+
+        with patch.object(storage, "clone_workstream", side_effect=_archive_before_clone):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"ws_id": destination_id, "resume_ws": source_id},
+            )
+
+        assert archived is True
+        assert resp.status_code == 409, resp.text
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.get_project(project_id)["state"] == "archived"
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
+            "source stays intact"
+        ]
+        assert storage.load_workstream_config(source_id) == {"source": "unchanged"}
+
+    def test_source_member_write_revoked_after_construction_fails_closed(self, _fork_app) -> None:
+        """A public reader cannot inherit stale project-write authority."""
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        project_id = "membership-race-project"
+        source_id = "6" * 32
+        destination_id = "7" * 32
+        storage.create_user("test-user", "test-user", "Test User", "unused")
+        storage.create_role(
+            "project-member-role",
+            "project-member-role",
+            "Project member",
+            "project.read,project.write",
+            False,
+            "",
+        )
+        storage.assign_role("test-user", "project-member-role", assigned_by="test")
+        storage.create_project(project_id, "Membership race", "project-owner", visibility="public")
+        storage.add_project_member(project_id, "test-user")
+        storage.register_workstream(
+            source_id,
+            user_id="project-owner",
+            project_id=project_id,
+            kind="interactive",
+        )
+        storage.save_message(source_id, "user", "public source stays intact")
+        storage.save_workstream_config(source_id, {"source": "unchanged"})
+
+        original_clone = storage.clone_workstream
+        membership_removed = False
+
+        def _remove_member_before_clone(*args: Any, **kwargs: Any) -> Any:
+            nonlocal membership_removed
+            if not membership_removed:
+                membership_removed = True
+                assert storage.remove_project_member(project_id, "test-user") is True
+            return original_clone(*args, **kwargs)
+
+        with patch.object(storage, "clone_workstream", side_effect=_remove_member_before_clone):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"ws_id": destination_id, "resume_ws": source_id},
+            )
+
+        assert membership_removed is True
+        assert resp.status_code == 409, resp.text
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.is_project_member(project_id, "test-user") is False
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
+            "public source stays intact"
+        ]
+        assert storage.load_workstream_config(source_id) == {"source": "unchanged"}
+
+    def test_unstamped_legacy_source_forks_unstamped(self, _fork_app) -> None:
+        from turnstone.core.memory import register_workstream
+
+        client, mgr = _fork_app
+        self._seed_default()  # the default must NOT leak onto the fork
+        src = "l" * 32
+        register_workstream(src)
+
+        resp = client.post("/v1/api/workstreams/new", json={"resume_ws": src})
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session._persona_name == ""  # unstamped, not the default
+        assert not ws.persona
+
+
+# ---------------------------------------------------------------------------
+# Guard 6 (receiving side) — a fresh create resolves the body ``persona`` at
+# creation time and stamps it: no separate persona permission is required
+# (workstreams.create alone suffices); a kind-mismatch / unknown persona is a
+# loud 4xx; an omitted persona takes the kind default; a FAILED default lookup
+# fails closed (503) rather than silently widening to the stock envelope.
+# ---------------------------------------------------------------------------
+
+
+class TestCreateStampsPersona:
+    @pytest.fixture()
+    def _create_app(self, tmp_db):
+        """The production ``make_create_handler`` behind the production
+        permission gate — the caller carries ONLY ``workstreams.create`` (no
+        service scope, no persona-specific permission), so a successful stamp
+        proves persona needs no dedicated permission."""
+        import queue
+        import threading
+
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.routing import Mount, Route
+        from starlette.testclient import TestClient
+
+        from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
+        from turnstone.core.auth import AuthResult
+        from turnstone.core.session_manager import SessionManager
+        from turnstone.core.session_routes import SessionEndpointConfig, make_create_handler
+        from turnstone.server import (
+            WebUI,
+            _interactive_create_build_kwargs,
+            _interactive_create_post_install,
+            _interactive_create_pre_commit,
+            _interactive_create_prepare_install,
+            _interactive_create_validate_request,
+            _interactive_manager_lookup,
+            _interactive_tenant_check,
+        )
+
+        class _Auth(BaseHTTPMiddleware):
+            async def dispatch(self, request: Any, call_next: Any) -> Any:
+                request.state.auth_result = AuthResult(
+                    user_id="test-user",
+                    scopes=frozenset(),  # no service scope — no bypass
+                    token_source="config",
+                    permissions=frozenset({"workstreams.create"}),
+                )
+                return await call_next(request)
+
+        def _session_factory(ui: Any, model_alias: Any = None, ws_id: Any = None, **kw: Any):
+            return ChatSession(
+                client=MagicMock(),
+                model=model_alias or "test-model",
+                ui=ui,
+                instructions=None,
+                temperature=0.5,
+                max_tokens=1000,
+                tool_timeout=10,
+                ws_id=ws_id,
+                persona_snapshot=kw.get("persona_snapshot"),
+                workstream_lease=kw.get("workstream_lease"),
+            )
+
+        gq: queue.Queue[dict[str, Any]] = queue.Queue()
+        WebUI._global_queue = gq
+        adapter = InteractiveAdapter(
+            global_queue=gq,
+            ui_factory=lambda ws: WebUI(
+                ws_id=ws.id,
+                user_id=ws.user_id,
+                kind=ws.kind,
+                parent_ws_id=ws.parent_ws_id,
+            ),
+            session_factory=_session_factory,
+        )
+        mgr = SessionManager(adapter, storage=get_storage(), max_active=10, event_emitter=adapter)
+        handler = make_create_handler(
+            SessionEndpointConfig(
+                permission_gate=None,
+                manager_lookup=_interactive_manager_lookup,
+                tenant_check=_interactive_tenant_check,
+                not_found_label="Workstream not found",
+                audit_action_prefix="workstream",
+                create_supports_attachments=True,
+                create_supports_user_id_override=True,
+                create_supports_resume=True,
+                create_validate_request=_interactive_create_validate_request,
+                create_build_kwargs=_interactive_create_build_kwargs,
+                create_pre_commit=_interactive_create_pre_commit,
+                create_post_install=_interactive_create_post_install,
+                create_prepare_install=_interactive_create_prepare_install,
+            ),
+            accepted_permissions=("workstreams.create", "admin.coordinator"),
+        )
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[Route("/api/workstreams/new", handler, methods=["POST"])],
+                )
+            ],
+            middleware=[Middleware(_Auth)],
+        )
+        app.state.workstreams = mgr
+        app.state.skip_permissions = True
+        app.state.global_queue = gq
+        app.state.global_listeners = []
+        app.state.global_listeners_lock = threading.Lock()
+
+        try:
+            yield TestClient(app, raise_server_exceptions=False), mgr
+        finally:
+            for ws in mgr.list_all():
+                mgr.close(ws.id)
+            WebUI._global_queue = None
+
+    @staticmethod
+    def _seed(name: str, kinds: list[str], **extra: Any) -> None:
+        get_storage().create_persona(
+            {
+                "persona_id": "p_" + name,
+                "name": name,
+                "base_prompt": f"You are {name}.",
+                "applies_to_kinds": kinds,
+                **extra,
+            }
+        )
+
+    def test_create_stamps_persona_with_create_permission_only(self, _create_app) -> None:
+        client, mgr = _create_app
+        self._seed("scribe", ["interactive"], base_prompt="S", tool_allowlist=[], mcp_enabled=False)
+        resp = client.post("/v1/api/workstreams/new", json={"persona": "scribe"})
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.persona == "scribe"
+        assert ws.session._persona_name == "scribe"
+
+    def test_create_kind_mismatch_is_400(self, _create_app) -> None:
+        client, mgr = _create_app
+        self._seed("orchestrator", ["coordinator"])  # coordinator-only
+        resp = client.post("/v1/api/workstreams/new", json={"persona": "orchestrator"})
+        assert resp.status_code == 400
+        assert "does not apply to kind" in resp.json()["error"]
+
+    def test_create_unknown_persona_is_400(self, _create_app) -> None:
+        client, mgr = _create_app
+        resp = client.post("/v1/api/workstreams/new", json={"persona": "nonexistent"})
+        assert resp.status_code == 400
+        assert "not found or disabled" in resp.json()["error"]
+
+    def test_create_omitted_persona_stamps_default(self, _create_app) -> None:
+        client, mgr = _create_app
+        self._seed("engineer", ["interactive"], is_default=True)
+        resp = client.post("/v1/api/workstreams/new", json={"name": "x"})
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session._persona_name == "engineer"
+
+    def test_create_default_lookup_failure_is_503(self, _create_app) -> None:
+        # Fail-closed: a storage blip during default resolution must not
+        # degrade to the stock (unstamped) envelope — the operator may have
+        # promoted a restricted persona to default, and silently widening it
+        # is the failure mode this lane guards against.
+        client, mgr = _create_app
+        storage = get_storage()
+        with patch.object(
+            type(storage), "get_default_persona", side_effect=RuntimeError("db down")
+        ):
+            resp = client.post("/v1/api/workstreams/new", json={"name": "x"})
+        assert resp.status_code == 503
+        assert "persona resolution unavailable" in resp.json()["error"]
+
+    def test_create_clean_none_default_is_unstamped_legacy(self, _create_app) -> None:
+        # No persona in the body and no default configured — a clean ``None``
+        # (not a lookup failure) still creates, unstamped, byte-identical to a
+        # legacy pre-persona workstream.
+        client, mgr = _create_app
+        resp = client.post("/v1/api/workstreams/new", json={"name": "x"})
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session._persona_name == ""
+        assert not ws.persona
+
+
+# ---------------------------------------------------------------------------
+# Guard 10 — discovery: the calling LLM is TOLD which personas exist.  The
+# live enabled interactive-kind list rides the `persona` parameter
+# description of task_agent / spawn_workstream / spawn_batch, rebuilt from
+# the pristine TOOLS base on every render; storage-less sessions keep the
+# base text untouched.  Resolution is forgiving (case, unique display name)
+# but everything downstream carries the canonical slug.
+# ---------------------------------------------------------------------------
+
+
+def _persona_desc(session: ChatSession, tool_name: str) -> str:
+    tool = next(t for t in session._tools if t.get("function", {}).get("name") == tool_name)
+    prop = ChatSession._persona_property(tool["function"]["parameters"]["properties"])
+    assert prop is not None, f"{tool_name} has no persona parameter"
+    return prop["description"]
+
+
+def _pristine_persona_desc(tool_name: str) -> str:
+    from turnstone.core.tools import TOOLS
+
+    tool = next(t for t in TOOLS if t["function"]["name"] == tool_name)
+    prop = ChatSession._persona_property(tool["function"]["parameters"]["properties"])
+    assert prop is not None, f"{tool_name} has no persona parameter"
+    return prop["description"]
+
+
+class TestPersonaDiscovery:
+    def _seed(self) -> None:
+        get_storage().create_persona(
+            {
+                "persona_id": "p-eng",
+                "name": "engineer",
+                "display_name": "Engineer",
+                "description": "Default engineering identity",
+                "base_prompt": "E",
+                "applies_to_kinds": ["interactive"],
+                "is_default": True,
+            }
+        )
+        get_storage().create_persona(
+            {
+                "persona_id": "p-wri",
+                "name": "writer",
+                "display_name": "Creative Writer",
+                "description": "Prose-first writing partner",
+                "base_prompt": "W",
+                "applies_to_kinds": ["interactive"],
+            }
+        )
+
+    def _coord_session(self, mock_openai_client: Any) -> ChatSession:
+        return _session(
+            mock_openai_client,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=MagicMock(),
+        )
+
+    def test_task_agent_description_lists_personas(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = _session(mock_openai_client)
+        desc = _persona_desc(session, "task_agent")
+        assert desc.startswith(_pristine_persona_desc("task_agent"))
+        assert "Available personas:" in desc
+        # Default first, then A→Z, each with its one-line description.
+        assert desc.index("`engineer` (default)") < desc.index("`writer`")
+        assert "Prose-first writing partner" in desc
+
+    def test_spawn_tools_list_personas_for_coordinators(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        for tool_name in ("spawn_workstream", "spawn_batch"):
+            desc = _persona_desc(session, tool_name)
+            assert desc.startswith(_pristine_persona_desc(tool_name))
+            assert "Available personas:" in desc
+            assert "`engineer` (default)" in desc
+
+    def test_coordinator_kind_personas_are_not_offered(self, tmp_db, mock_openai_client) -> None:
+        # Children and sub-agents are always interactive-kind; a
+        # coordinator-only persona in the list would be a guaranteed error.
+        self._seed()
+        get_storage().create_persona(
+            {
+                "persona_id": "p-exe",
+                "name": "executive",
+                "base_prompt": "X",
+                "applies_to_kinds": ["coordinator"],
+            }
+        )
+        session = self._coord_session(mock_openai_client)
+        assert "`executive`" not in _persona_desc(session, "spawn_workstream")
+
+    def test_storage_down_keeps_pristine_base(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        with patch("turnstone.core.storage.is_storage_initialized", return_value=False):
+            session = _session(mock_openai_client)
+        assert _persona_desc(session, "task_agent") == _pristine_persona_desc("task_agent")
+
+    def test_rerender_is_idempotent_and_tracks_archive(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = _session(mock_openai_client)
+        session._render_agent_tool_descriptions()
+        session._render_agent_tool_descriptions()
+        desc = _persona_desc(session, "task_agent")
+        assert desc.count("Available personas:") == 1
+        # Archive one persona; the next render must drop it, not append.
+        storage = get_storage()
+        writer = storage.get_persona_by_name("writer")
+        assert writer is not None
+        storage.update_persona(writer["persona_id"], enabled=False)
+        session._render_agent_tool_descriptions()
+        desc = _persona_desc(session, "task_agent")
+        assert "`writer`" not in desc
+        assert desc.count("Available personas:") == 1
+
+    def test_large_shelf_drops_prose_keeps_every_name(self, tmp_db, mock_openai_client) -> None:
+        storage = get_storage()
+        for i in range(26):
+            storage.create_persona(
+                {
+                    "persona_id": f"p-{i:02d}",
+                    "name": f"persona-{i:02d}",
+                    "description": "UNIQUE-PROSE-MARKER",
+                    "base_prompt": "x",
+                    "applies_to_kinds": ["interactive"],
+                }
+            )
+        session = _session(mock_openai_client)
+        desc = _persona_desc(session, "task_agent")
+        for i in range(26):
+            assert f"`persona-{i:02d}`" in desc
+        assert "UNIQUE-PROSE-MARKER" not in desc
+
+    def test_spawn_forgives_case_and_display_name_but_stamps_slug(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        for variant in ("WRITER", "Writer", "Creative Writer"):
+            item = session._prepare_spawn_workstream("c1", {"persona": variant})
+            assert not item.get("error"), item.get("error")
+            assert item["persona"] == "writer"
+
+    def test_spawn_batch_rows_land_on_canonical_slug(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        item = session._prepare_spawn_batch(
+            "c1",
+            {
+                "children": [
+                    {"initial_message": "a", "persona": "WRITER"},
+                    {"initial_message": "b", "persona": "Creative Writer"},
+                ]
+            },
+        )
+        assert not item.get("error"), item.get("error")
+        personas = [c["persona"] for c in item["children"] if "_error" not in c]
+        assert personas == ["writer", "writer"]
+
+    def test_task_agent_prep_canonicalizes_header_and_stamp(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        self._seed()
+        session = _session(mock_openai_client)
+        item = session._prepare_task("t1", {"prompt": "go", "persona": "Writer"})
+        assert not item.get("error"), item.get("error")
+        assert item["persona"] == "writer"
+        assert "persona: writer" in item["header"]
+
+    def test_unknown_persona_error_enumerates_live_names(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        item = session._prepare_spawn_workstream("c1", {"persona": "nope"})
+        assert item.get("error")
+        assert "Available for interactive: engineer (default), writer" in item["error"]
+
+
+class TestNudgeToolVisibility:
+    """``_nudges_enabled`` generalises from "the memory tool" to
+    ``NUDGE_REQUIRED_TOOL``, so the class split is pinned at the
+    ChatSession level and not only inside the observer."""
+
+    def test_idle_tasks_gated_on_the_tasks_tool(self, tmp_db, mock_openai_client) -> None:
+        # Every branch of the idle_tasks body is a tasks(...) call, so a
+        # persona hiding that tool must suppress it — the same rule the
+        # memory nudges follow, via one map instead of a hardcoded name.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert not session._nudges_enabled("idle_tasks")
+
+    def test_idle_tasks_allowed_when_tasks_visible(self, tmp_db, mock_openai_client) -> None:
+        session = _session(
+            mock_openai_client,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=MagicMock(),
+            persona_snapshot=_snap(tools=frozenset({"tasks"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert session._nudges_enabled("idle_tasks")
+
+    def test_idle_children_is_not_tool_gated(self, tmp_db, mock_openai_client) -> None:
+        # LIVENESS: the body names wait_for_workstream, but the wake
+        # itself is the point and the body has a non-tool branch beside
+        # it.  A persona hiding the tool must not strand the coordinator.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert session._nudges_enabled("idle_children")

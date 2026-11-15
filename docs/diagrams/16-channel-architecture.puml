@@ -1,0 +1,261 @@
+@startuml
+!theme plain
+title Turnstone — Channel Integration Architecture
+
+skinparam class {
+    BackgroundColor<<platform>> #E1BEE7
+    BackgroundColor<<service>> #E8EAF6
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+}
+
+' -- External Platforms --
+class "Discord" as Discord <<platform>> {
+    Gateway WebSocket (v10)
+    Message events
+    Interaction callbacks (buttons)
+    Thread-per-workstream
+    --
+    discord.py 2.x
+    asyncio event loop
+}
+
+class "Slack" as Slack <<platform>> {
+    Socket Mode WebSocket
+    Block Kit messages
+    Slash command (default /turnstone)
+    DM + channel events
+    --
+    slack-bolt (Python)
+    asyncio event loop
+}
+
+class "Teams (future)" as Teams <<platform>> {
+    Bot Framework
+    Adaptive Cards
+    --
+    Planned integration
+}
+
+' -- Channel Service --
+class "turnstone-channel" as ChannelService <<service>> {
+    entry point: turnstone-channel
+    --
+    One process — hosts one or more adapters
+    asyncio event loop
+    Structured logging (structlog)
+    --log-level, --log-format
+    --
+    POST /v1/api/notify (HTTP)
+    GET  /health
+}
+
+class "SlackBot" as SlackBot <<service>> {
+    +on_message(event)
+    +on_action(action)  (Block Kit buttons)
+    +send(channel_id, content)
+    +send_notification(channel_id, content, ws_id)
+    +run(bot_token, app_token)
+    --
+    slack-bolt AsyncApp
+    Socket Mode client
+    Per-user channel sessions via slash command
+    DM routing without slash command
+}
+
+class "DiscordBot" as Bot <<service>> {
+    +on_message(msg)
+    +on_interaction(interaction)
+    +send(channel_id, content)
+    +send_notification(channel_id, content, ws_id)
+    +run(token)
+    --
+    discord.py Client
+    Receives message events
+    Sends replies + embeds
+    Creates threads for workstreams
+    Renders approval buttons
+    Mentions follow Discord permissions
+    --
+    _notify_ws_map: msg_id -> (ws_id, user_id)
+    _notify_reply_channels: ws_id -> (dm, user_id)
+}
+
+class "ChannelRouter" as Router <<service>> {
+    +get_or_create_workstream(channel_type, channel_id)
+    +_is_ws_live(ws_id)
+    +send_message(ws_id, message)
+    +send_approval(ws_id, ...)
+    +resolve_user(channel_type, channel_user_id)
+        -> user_id | None
+    --
+    Maps channels -> workstreams
+    Maps platform users -> turnstone users
+    Conditionally replaces durable routes
+    Resolves SSE destination on reconnect
+}
+
+class "turnstone-console router" as ConsoleRouter <<server>> {
+    POST /v1/api/route/workstreams/new
+    GET  /v1/api/route/workstreams/{ws_id}/live
+    POST /v1/api/route/workstreams/{ws_id}/send
+    POST /v1/api/route/workstreams/{ws_id}/approve
+    GET  /v1/api/route?ws_id=...
+    --
+    Multi-node rendezvous + durable overrides
+}
+
+' -- Server --
+class "turnstone-server" as Server <<server>> {
+    POST /v1/api/workstreams/{ws_id}/send
+    POST /v1/api/workstreams/{ws_id}/approve
+    POST /v1/api/workstreams/new
+    GET  /v1/api/workstreams/{ws_id}/events
+    --
+    LLM execution + tool use
+    SSE event stream
+    --
+    notify tool: _exec_notify()
+    ServiceTokenManager (JWT)
+}
+
+' -- Storage --
+class "channel_users" as CU <<storage>> {
+    channel_user_id (PK)
+    platform: "discord" | "slack"
+    platform_user_id
+    user_id -> users
+    linked_at
+    --
+    /link command creates row
+    Resolved on each inbound message
+}
+
+class "channel_routes" as CR <<storage>> {
+    channel_type (PK)
+    channel_id (PK)
+    ws_id
+    node_id
+    channel_user_id: external owner
+    created
+    --
+    Maps platform channels
+    to turnstone workstreams
+}
+
+class "services" as SVC <<storage>> {
+    service_type (PK)
+    service_id (PK)
+    url
+    last_heartbeat
+    created
+    --
+    Heartbeat every 30s
+    Stale after 120s
+    ON CONFLICT DO UPDATE
+}
+
+' -- Relationships --
+Discord --> Bot : gateway\nevents
+Bot --> Router : on_message\non_interaction
+Router --> CU : resolve identity
+Router --> CR : resolve / register route
+
+Router --> Server : single-node/direct mode\ncreate + send + approve
+Router --> ConsoleRouter : multi-node mode\nroute create/live/send/approve/lookup
+ConsoleRouter --> Server : routed HTTP to owning node
+Bot --> Server : GET /v1/api/workstreams/{ws_id}/events\n(SSE via httpx2)
+Server --> Bot : SSE event stream
+
+Bot --> Discord : reply / embed\nbutton callback
+
+Slack --> SlackBot : socket-mode\nevents
+SlackBot --> Router : on_message / on_action
+SlackBot --> Server : owning-node SSE after route lookup
+SlackBot --> Slack : post / update\nBlock Kit button callbacks
+
+Teams .[hidden]. Slack
+
+ChannelService --> Bot : creates + runs
+ChannelService --> SlackBot : creates + runs
+ChannelService --> Router : creates
+ChannelService --> SVC : register / heartbeat /\nderegister
+
+' -- Notification path (direct HTTP) --
+Server --> ChannelService : POST /v1/api/notify\n(JWT: aud=turnstone-channel)
+Server --> SVC : list_services("channel",\nmax_age_seconds=120)
+
+' -- Notes --
+note right of Bot
+  **Inbound Flow**
+  1. Discord message arrives via gateway
+  2. Bot.on_message() fires
+  3. ChannelRouter gets or creates channel -> ws_id
+     (direct server or multi-node console router)
+  4. ChannelRouter resolves platform user -> user_id
+     via channel_users table
+  5. Router sends through the configured server/console SDK
+
+  **Stale-route recovery (evicted workstreams)**
+  1. Route health check reports the old ws unavailable
+  2. Existing ws_id becomes the fork source
+  3. POST /v1/api/workstreams/new with
+     resume_ws=<ws_id>
+  4. Server atomically clones source history/config/
+     persona/project/attachment refs into a new ws_id
+  5. Router stores the new destination route; source is unchanged
+  6. If the source was pruned, retry one fresh create
+end note
+
+note right of Server
+  **Outbound Flow**
+  1. Server emits SSE events on
+     GET /v1/api/workstreams/{ws_id}/events
+  2. Bot subscribes via httpx2's SSE support
+  3. Bot formats and sends to Discord thread
+end note
+
+note bottom of CR
+  **Approval Flow**
+  1. ApprovalRequestEvent arrives via SSE
+  2. Bot renders Discord buttons (Approve / Deny)
+  3. User clicks button -> on_interaction()
+  4. Router builds ApproveMessage
+  5. Router sends POST /v1/api/workstreams/{ws_id}/approve to server
+end note
+
+note bottom of CU
+  **Identity Linking**
+  1. User runs /link in Discord
+  2. Bot opens modal requesting API token
+  3. User submits ts_... API token
+  4. Bot validates token against storage
+  5. On success, inserts channel_users row
+  6. Subsequent messages carry user_id
+  7. AuthResult scopes applied by server
+end note
+
+note bottom of SVC
+  **Notification Flow** (direct HTTP)
+  1. LLM calls notify tool -> _prepare_notify()
+  2. _exec_notify() checks rate limit (5/turn)
+  3. Queries services table for healthy gateways
+  4. Mints JWT (aud: turnstone-channel) via
+     ServiceTokenManager
+  5. POSTs to first healthy gateway (incl. ws_id)
+  6. Gateway validates JWT, resolves target
+  7. adapter.send_notification() -> Discord API
+     (tracks msg_id -> ws_id for reply routing)
+  8. On failure: retry up to 3x (1s, 3s backoff)
+  9. SSRF: only http(s) URLs allowed
+
+  **Bidirectional DM Replies**
+  1. User replies to notification DM
+  2. Bot looks up ws_id from _notify_ws_map
+  3. Verifies author == notification recipient
+  4. Routes reply via router.send_message()
+  5. Response forwarded to DM on TurnCompleteEvent
+  6. Response tracked for multi-turn conversation
+end note
+
+@enduml

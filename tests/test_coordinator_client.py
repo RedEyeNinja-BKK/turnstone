@@ -1,0 +1,5099 @@
+"""Tests for ``turnstone.console.coordinator_client.CoordinatorClient``.
+
+Uses an httpx2 MockTransport to intercept outbound requests so we verify
+the URL map, headers, and body shape without standing up a real console.
+Read-op tests hit a real in-memory SQLite backend to confirm the
+storage-call path.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+import uuid
+from typing import TYPE_CHECKING, Any
+
+import httpx2
+import pytest
+import sqlalchemy as sa
+
+from tests._http_failure_cases import (
+    MAYBE_PROCESSED_REPLIES,
+    UNREACHABLE_REPLIES,
+    UNSENT_REPLIES,
+)
+from turnstone.console.coordinator_client import (
+    _ROUTE_PATHS,
+    CoordinatorClient,
+    CoordinatorReadError,
+    CoordinatorTokenManager,
+    load_task_envelope,
+)
+from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
+from turnstone.core.child_event_bus import ChildEventBus
+from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
+from turnstone.core.storage._schema import workstreams
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+_SECRET = "x" * 64
+
+
+# ---------------------------------------------------------------------------
+# CoordinatorTokenManager
+# ---------------------------------------------------------------------------
+
+
+def test_token_manager_mints_valid_console_jwt():
+    tm = CoordinatorTokenManager(
+        user_id="user-1",
+        scopes=frozenset({"read", "write", "approve"}),
+        permissions=frozenset({"admin.coordinator"}),
+        secret=_SECRET,
+        coord_ws_id="coord-123",
+        ttl_seconds=300,
+    )
+    token = tm.token
+    result = validate_jwt(token, _SECRET, audience=JWT_AUD_CONSOLE)
+    assert result is not None
+    assert result.user_id == "user-1"
+    assert "approve" in result.scopes
+    assert result.token_source == "coordinator"
+
+
+def test_token_manager_embeds_coord_ws_id_claim():
+    import jwt
+
+    tm = CoordinatorTokenManager(
+        user_id="user-1",
+        scopes=frozenset({"read"}),
+        permissions=frozenset(),
+        secret=_SECRET,
+        coord_ws_id="coord-42",
+    )
+    token = tm.token
+    decoded = jwt.decode(token, _SECRET, algorithms=["HS256"], audience=JWT_AUD_CONSOLE)
+    assert decoded["coord_ws_id"] == "coord-42"
+    assert decoded["src"] == "coordinator"
+
+
+def test_token_manager_refreshes_near_expiry(monkeypatch):
+    """Force the expiry guard to fire and confirm _mint runs again."""
+    tm = CoordinatorTokenManager(
+        user_id="u",
+        scopes=frozenset({"read"}),
+        permissions=frozenset(),
+        secret=_SECRET,
+        coord_ws_id="c",
+        ttl_seconds=10,
+    )
+    calls = {"count": 0}
+    real_mint = tm._mint
+
+    def _counting_mint() -> None:
+        calls["count"] += 1
+        real_mint()
+
+    monkeypatch.setattr(tm, "_mint", _counting_mint)
+    _ = tm.token
+    assert calls["count"] == 1
+    # Not expired yet → no re-mint.
+    _ = tm.token
+    assert calls["count"] == 1
+    # Force expiry.
+    tm._expires_at = 0.0  # type: ignore[attr-defined]
+    _ = tm.token
+    assert calls["count"] == 2
+
+
+def test_token_manager_rejects_nonpositive_ttl():
+    with pytest.raises(ValueError):
+        CoordinatorTokenManager(
+            user_id="u",
+            scopes=frozenset(),
+            permissions=frozenset(),
+            secret=_SECRET,
+            coord_ws_id="c",
+            ttl_seconds=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CoordinatorClient — URL map + header plumbing via MockTransport
+# ---------------------------------------------------------------------------
+
+
+def _mock_client(
+    handler: Callable[[httpx2.Request], httpx2.Response], sqlite_backend_factory
+) -> tuple[CoordinatorClient, list[httpx2.Request]]:
+    """Build a CoordinatorClient with an httpx2 MockTransport recorder.
+
+    Pre-registers the canonical test ws_ids (``ws-x``, ``ws-y``) under
+    ``coord-1`` so the client-side tenant guard on send / close / cancel
+    / delete passes.  The mutating-op tests want to verify the route
+    map + body shape, not the guard.
+    """
+    captured: list[httpx2.Request] = []
+
+    def _trapping(req: httpx2.Request) -> httpx2.Response:
+        captured.append(req)
+        return handler(req)
+
+    transport = httpx2.MockTransport(_trapping)
+    http = httpx2.Client(transport=transport)
+    storage = sqlite_backend_factory(":memory:")
+    storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    storage.register_workstream(
+        "ws-x", kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+    )
+    storage.register_workstream(
+        "ws-y", kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+    )
+    client = CoordinatorClient(
+        console_base_url="http://console",
+        storage=storage,
+        token_factory=lambda: "test-token",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=http,
+        child_event_bus=ChildEventBus(),
+    )
+    return client, captured
+
+
+def _ok_json(payload: dict) -> Callable[[httpx2.Request], httpx2.Response]:
+    def _h(req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=payload)
+
+    return _h
+
+
+def test_route_map_matches_console_routes():
+    """URL paths must match what ``turnstone/console/server.py`` registers.
+
+    The routing proxy's _CONSOLE_ROUTES includes:
+      POST /v1/api/route/workstreams/new
+      POST /v1/api/route/send
+      POST /v1/api/route/approve
+      POST /v1/api/route/cancel
+      POST /v1/api/route/workstreams/close
+
+    Phase B adds /v1/api/route/workstreams/delete; B9 review checks that
+    addition lands alongside the others.  Here we assert our internal map
+    mirrors the shape we expect.
+    """
+    assert _ROUTE_PATHS["spawn"] == "/v1/api/route/workstreams/new"
+    assert _ROUTE_PATHS["send"] == "/v1/api/route/workstreams/{ws_id}/send"
+    assert _ROUTE_PATHS["approve"] == "/v1/api/route/workstreams/{ws_id}/approve"
+    assert _ROUTE_PATHS["cancel"] == "/v1/api/route/workstreams/{ws_id}/cancel"
+    assert _ROUTE_PATHS["rewind"] == "/v1/api/route/workstreams/{ws_id}/rewind"
+    assert _ROUTE_PATHS["retry"] == "/v1/api/route/workstreams/{ws_id}/retry"
+    assert _ROUTE_PATHS["close"] == "/v1/api/route/workstreams/{ws_id}/close"
+    # ``delete`` keeps the body-keyed shape — it has its own
+    # ``route_workstream_delete`` handler instead of going through
+    # the generic route_proxy.
+    assert _ROUTE_PATHS["delete"] == "/v1/api/route/workstreams/delete"
+    # Cascade endpoint lives on the console itself (not a node), so the
+    # path slots in the coord ws_id rather than routing through a proxy.
+    assert _ROUTE_PATHS["close_all_children"] == "/v1/api/workstreams/{ws_id}/close_all_children"
+
+
+def test_route_paths_match_actual_console_mounts():
+    """Every entry in ``_ROUTE_PATHS`` must correspond to an actually
+    mounted Starlette route on the console app. Catches the kind of
+    drift that broke close_workstream / close_all_children when the
+    #422 legacy URL adapter removal deleted the body-keyed
+    /v1/api/route/{verb} routes without a corresponding update to
+    the coord client's route table."""
+    from unittest.mock import MagicMock
+
+    from starlette.routing import Mount, Route
+
+    from turnstone.console.coordinator_client import _ROUTE_PATHS
+    from turnstone.console.server import create_app
+
+    app = create_app(
+        collector=MagicMock(),
+        jwt_secret="x" * 64,
+    )
+
+    def _walk(routes, prefix=""):
+        for r in routes:
+            if isinstance(r, Mount):
+                yield from _walk(r.routes, prefix=prefix + r.path)
+            elif isinstance(r, Route):
+                yield prefix + r.path
+
+    mounted = set(_walk(app.routes))
+
+    for key, template in _ROUTE_PATHS.items():
+        # Starlette's Route.path uses ``{name}`` placeholders just
+        # like our templates, so a literal containment check works.
+        assert template in mounted, (
+            f"_ROUTE_PATHS[{key!r}] = {template!r} is not a mounted "
+            f"console route. Mounted routes containing 'route' or "
+            f"'workstreams': "
+            f"{sorted(p for p in mounted if 'route' in p or 'workstreams' in p)}"
+        )
+
+
+def test_spawn_posts_to_routing_proxy_with_bearer_token(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"ws_id": "child-1", "name": "c", "node_id": "n1"}),
+        sqlite_backend_factory=sqlite_backend_factory,
+    )
+    result = client.spawn(
+        initial_message="hi",
+        parent_ws_id="coord-1",
+        user_id="user-1",
+        skill="my-skill",
+        target_node="n1",
+    )
+    assert result["ws_id"] == "child-1"
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/v1/api/route/workstreams/new"
+    assert req.headers["Authorization"] == "Bearer test-token"
+    body = json.loads(req.content)
+    assert body["kind"] == "interactive"
+    assert body["parent_ws_id"] == "coord-1"
+    assert body["user_id"] == "user-1"
+    assert body["initial_message"] == "hi"
+    assert body["skill"] == "my-skill"
+    assert body["target_node"] == "n1"
+
+
+def test_spawn_omits_optional_empty_fields(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"ws_id": "x"}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    client.spawn(initial_message="hi", parent_ws_id="coord", user_id="u")
+    body = json.loads(captured[0].content)
+    # Optional fields should NOT be present when empty (keeps body lean
+    # and avoids confusing the route proxy's schema).
+    assert "skill" not in body
+    assert "name" not in body
+    assert "model" not in body
+    assert "target_node" not in body
+
+
+# ---------------------------------------------------------------------------
+# spawn resends a create the node's rate limiter refused (#1464)
+# ---------------------------------------------------------------------------
+
+
+def _rate_limited(retry_after: str | None = "1", status: int = 429) -> httpx2.Response:
+    """A node rate limiter's refusal as the console relays it, headers and all."""
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    body = {"error": "Rate limit exceeded", "retry_after": 0.1}
+    return httpx2.Response(status, json=body, headers=headers)
+
+
+def _created() -> httpx2.Response:
+    return httpx2.Response(200, json={"ws_id": "c" * 32, "name": "child", "node_id": "n1"})
+
+
+def _in_turn(
+    *replies: Callable[[], httpx2.Response],
+) -> Callable[[httpx2.Request], httpx2.Response]:
+    """Answer each request with the next reply."""
+    pending = list(replies)
+    return lambda _req: pending.pop(0)()
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The waits the client sits out, recorded instead of slept."""
+    from turnstone.console import coordinator_client
+
+    slept: list[float] = []
+    monkeypatch.setattr(coordinator_client.time, "sleep", slept.append)
+    return slept
+
+
+def _spawn(client: CoordinatorClient, **kwargs: Any) -> dict[str, Any]:
+    return client.spawn(initial_message="hi", parent_ws_id="coord-1", user_id="user-1", **kwargs)
+
+
+def test_spawn_resends_a_create_the_rate_limiter_refused(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["ws_id"] == "c" * 32
+    # The one-second wait, sat out in tenths that each check for a stop.
+    assert waits == [0.1] * 10
+    assert len(captured) == 2
+    assert captured[1].url == captured[0].url
+    assert captured[1].content == captured[0].content
+    assert captured[1].headers["Authorization"] == "Bearer test-token"
+
+
+def test_spawn_resends_only_once(sqlite_backend_factory, waits):
+    client, captured = _mock_client(
+        _in_turn(_rate_limited, _rate_limited, _created), sqlite_backend_factory
+    )
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["status"] == 429
+    assert result["error"] == "Rate limit exceeded"
+    assert waits == [0.1] * 10
+    assert len(captured) == 2
+
+
+def test_spawn_does_not_resend_once_stopped_during_the_wait(sqlite_backend_factory, waits):
+    """A stop that lands during the wait cuts it short at the next tenth of a second."""
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: len(waits) >= 3)
+
+    assert result["status"] == 429
+    assert waits == [0.1] * 3
+    assert len(captured) == 1
+
+
+def test_spawn_does_not_wait_when_already_stopped(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: True)
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "status"),
+    [
+        # A node at capacity refuses a create with no wait to sit out.
+        (None, 429),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 429),
+        ("6", 429),
+        ("1000", 429),
+        ("1", 503),
+    ],
+)
+def test_spawn_does_not_resend_without_a_short_named_wait(
+    sqlite_backend_factory, waits, retry_after, status
+):
+    client, captured = _mock_client(
+        _in_turn(lambda: _rate_limited(retry_after, status), _created), sqlite_backend_factory
+    )
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["status"] == status
+    assert waits == []
+    assert len(captured) == 1
+
+
+def test_spawn_without_resend_unless_returns_the_refusal(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client)
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
+def test_send_does_not_resend_a_refusal(sqlite_backend_factory, waits):
+    """Only creates resend: a send's refusal comes straight back."""
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = client.send("ws-x", "hello")
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
+def test_send_posts_to_send_route(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    client.send("ws-x", "hello")
+    # Path-keyed shape post-#422: ws_id rides in the URL, not the body.
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/send"
+    body = json.loads(captured[0].content)
+    assert body == {"message": "hello"}
+
+
+def test_a_route_reply_too_deep_to_parse_comes_back_raw(sqlite_backend_factory, monkeypatch):
+    """A route reply nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It comes back as raw text, like any
+    other reply that can't be parsed."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    client, _captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    result = client.send("ws-x", "hello")
+    assert "raw" in result
+    assert result["status"] == 200
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b'"queued"'])
+def test_a_route_reply_that_is_not_an_object_comes_back_raw(sqlite_backend_factory, body):
+    """A reply that parses to something other than an object comes back as raw
+    text, so a send the node accepted doesn't read as a failed call."""
+    client, _captured = _mock_client(
+        lambda _req: httpx2.Response(200, content=body),
+        sqlite_backend_factory=sqlite_backend_factory,
+    )
+    assert client.send("ws-x", "hello") == {"raw": body.decode(), "status": 200}
+
+
+def test_close_workstream_posts_to_close_route(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    client.close_workstream("ws-x")
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
+    body = json.loads(captured[0].content)
+    assert body == {}  # no reason → omitted; ws_id rides the path
+
+
+def test_close_workstream_includes_reason_when_provided(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    client.close_workstream("ws-x", reason="done")
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
+    body = json.loads(captured[0].content)
+    assert body == {"reason": "done"}
+
+
+def test_close_all_children_posts_to_console_endpoint(sqlite_backend_factory):
+    """Targets the console directly (not the routing proxy).  The URL
+    embeds the coord's own ws_id so the server can resolve the session.
+    """
+    client, captured = _mock_client(
+        _ok_json(
+            {
+                "status": "ok",
+                "closed": ["c-1", "c-2"],
+                "failed": [],
+                "skipped": [],
+            }
+        ),
+        sqlite_backend_factory=sqlite_backend_factory,
+    )
+    result = client.close_all_children(reason="batch done")
+    assert result["closed"] == ["c-1", "c-2"]
+    assert captured[0].url.path == "/v1/api/workstreams/coord-1/close_all_children"
+    assert captured[0].headers["Authorization"] == "Bearer test-token"
+    body = json.loads(captured[0].content)
+    assert body == {"reason": "batch done"}
+
+
+def test_close_all_children_omits_empty_reason(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": "ok", "closed": [], "failed": [], "skipped": []}),
+        sqlite_backend_factory=sqlite_backend_factory,
+    )
+    client.close_all_children()
+    body = json.loads(captured[0].content)
+    assert body == {}
+
+
+def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
+    def _boom(_req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"error": "internal"})
+
+    client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.close_all_children()
+    assert result["status"] == 500
+    assert "error" in result
+
+
+@UNSENT_REPLIES
+def test_close_all_children_surfaces_transport_error(sqlite_backend_factory, reply):
+    client, _captured = _mock_client(reply, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.close_all_children()
+    assert result["status"] == 0
+    assert result["error"].startswith("upstream unreachable: ")
+    assert "code" not in result
+
+
+@MAYBE_PROCESSED_REPLIES
+def test_a_post_with_no_reply_may_have_been_processed(sqlite_backend_factory, reply):
+    # A create that outlasts the client's timeout may still have made the child.
+    client, captured = _mock_client(reply, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.spawn(initial_message="hi", parent_ws_id="coord-1", user_id="user-1")
+    assert len(captured) == 1
+    assert result["status"] == 0
+    assert result["code"] == UPSTREAM_NO_REPLY_CODE
+    assert result["error"].startswith("no reply was read from upstream (")
+    assert result["error"].endswith("), so the request may have been processed")
+
+
+def test_a_post_to_a_url_it_cannot_build_is_unreachable(sqlite_backend_factory):
+    client, captured = _mock_client(
+        lambda request: httpx2.Response(200, json={}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    result = client._post_url("http://console.example.com/x\x01", {}, log_path="/x")
+    assert captured == []
+    assert result["error"].startswith("upstream unreachable: ")
+
+
+def test_delete_workstream_posts_to_delete_route(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    client.delete("ws-x")
+    assert captured[0].url.path == "/v1/api/route/workstreams/delete"
+
+
+def test_approve_and_cancel_hit_their_routes(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    client.approve("ws-x", call_id="c-1", approved=True, feedback="ok", always=True)
+    client.cancel("ws-x")
+    # Path-keyed shape post-#422: ws_id rides the URL.
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/approve"
+    assert captured[1].url.path == "/v1/api/route/workstreams/ws-x/cancel"
+    approve_body = json.loads(captured[0].content)
+    assert approve_body["approved"] is True
+    assert approve_body["always"] is True
+    assert approve_body["call_id"] == "c-1"
+    # ws_id moved to the URL — make sure we didn't double-encode it.
+    assert "ws_id" not in approve_body
+
+
+def test_http_error_returns_structured_failure(sqlite_backend_factory):
+    def _boom(req: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("no route to host", request=req)
+
+    client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.send("ws-x", "hi")
+    assert "error" in result
+    assert result["status"] == 0
+
+
+def test_non_2xx_response_populates_error(sqlite_backend_factory):
+    def _h(req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"detail": "upstream down"})
+
+    client, _c = _mock_client(_h, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.send("ws-x", "hi")
+    assert result["status"] == 500
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Tenant guard — defense in depth on every model-invoked mutating op
+# ---------------------------------------------------------------------------
+
+
+def test_mutating_ops_reject_foreign_ws_id_without_hitting_proxy(sqlite_backend_factory):
+    """A coordinator must not be able to drive a foreign tenant's
+    workstream even if the upstream node forgets to enforce ownership.
+    Confirm that send / close / cancel / delete short-circuit before
+    the HTTP round-trip when the ws_id isn't in the coordinator's own
+    subtree.  Same 404-shape that inspect / wait_for_workstream use, so
+    the model can't distinguish 'foreign' from 'missing' (no oracle).
+    """
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    # ``ws-foreign`` is not in the coordinator's subtree (the fixture
+    # only registers ws-x and ws-y under coord-1).
+    for call, kwargs in [
+        (client.send, {"message": "hi"}),
+        (client.close_workstream, {"reason": "x"}),
+        (client.cancel, {}),
+        (client.delete, {}),
+    ]:
+        result = call("ws-foreign", **kwargs)  # type: ignore[arg-type]
+        assert result["status"] == 404
+        assert "no workstream matching" in result["error"]
+        # Recovery payload: a roster of the coord's own children rides
+        # along so a garbled id is fixable in one round-trip.
+        assert {c["ws_id"] for c in result["children"]} == {"ws-x", "ws-y"}
+    # No HTTP requests issued — guard rejected before _post.
+    assert captured == []
+
+
+def test_mutating_ops_accept_self_ws_id(sqlite_backend_factory):
+    """The coordinator's own ws_id is in its subtree (trivially true);
+    operations against self should pass the guard.  Currently only send
+    has a meaningful self-targeted use, but the contract should hold
+    uniformly."""
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    client.send("coord-1", "hi")
+    assert len(captured) == 1
+    assert captured[0].url.path == "/v1/api/route/workstreams/coord-1/send"
+
+
+def test_mutating_ops_reject_foreign_hex_id_with_recovery_payload(sqlite_backend_factory):
+    """A well-formed 32-hex id that isn't ours passes format validation
+    and dies on the ownership guard with the SAME recovery payload as a
+    malformed ref — uniform shape, no existence oracle, no HTTP."""
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    result = client.send("f" * 32, "hi")
+    assert result["status"] == 404
+    assert "no workstream matching" in result["error"]
+    assert {c["ws_id"] for c in result["children"]} == {"ws-x", "ws-y"}
+    assert captured == []
+
+
+def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path, sqlite_backend_factory):
+    """A model that pastes a child's display NAME instead of its id is
+    pointed straight at the right ws_id — names are mutable, non-unique
+    labels (the title generator can rewrite what the operator sees), so
+    they are deliberately NOT addresses and nothing resolves silently."""
+    st = sqlite_backend_factory(str(tmp_path / "names.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    real = "7c61eafe470c54caaa89490a4b9c0f7d"
+    st.register_workstream(
+        real,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="running",
+        user_id="user-1",
+        name="minisforum-research",
+    )
+    captured: list[httpx2.Request] = []
+
+    def _trap(req: httpx2.Request) -> httpx2.Response:
+        captured.append(req)
+        return httpx2.Response(200, json={})
+
+    client = CoordinatorClient(
+        console_base_url="http://console",
+        storage=st,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_trap)),
+        child_event_bus=ChildEventBus(),
+    )
+    result = client.send("minisforum-research", "status?")
+    assert result["status"] == 404
+    assert "names are display labels" in result["error"]
+    assert result["did_you_mean"][0]["ws_id"] == real
+    assert captured == []
+
+
+# ---------------------------------------------------------------------------
+# Read ops — storage-backed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def populated_storage(tmp_path, sqlite_backend_factory):
+    st = sqlite_backend_factory(str(tmp_path / "coord.db"))
+    # Coord + 2 interactive children + 1 child coordinator (excluded) +
+    # 1 unrelated ws + 1 cross-tenant child (excluded by the user_id SQL
+    # filter: belongs to user-2 but forged parent_ws_id=coord-1).
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.register_workstream(
+        "child-a",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="idle",
+        skill_id="skill-x",
+        user_id="user-1",
+    )
+    st.register_workstream(
+        "child-b",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="running",
+        skill_id="skill-y",
+        user_id="user-1",
+    )
+    st.register_workstream(
+        "child-coord",
+        kind="coordinator",
+        parent_ws_id="coord-1",
+        user_id="user-1",
+    )
+    st.register_workstream("unrelated", kind="interactive", user_id="user-1")
+    st.register_workstream(
+        "cross-tenant-child",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        user_id="user-2",
+    )
+    return st
+
+
+def _make_read_client(storage: SQLiteBackend) -> CoordinatorClient:
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    http = httpx2.Client(transport=transport)
+    return CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=http,
+        child_event_bus=ChildEventBus(),
+    )
+
+
+def test_list_children_returns_only_interactive_children(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.list_children("coord-1")
+    assert set(result.keys()) == {"children", "truncated"}
+    rows = result["children"]
+    names = {r["ws_id"] for r in rows}
+    # Excludes child-coord (kind filter), unrelated (parent filter),
+    # cross-tenant-child (user_id filter).
+    assert names == {"child-a", "child-b"}
+    for r in rows:
+        assert r["kind"] == "interactive"
+        assert r["parent_ws_id"] == "coord-1"
+    # Well under limit and no filters → not truncated.
+    assert result["truncated"] is False
+
+
+def test_list_children_says_to_retry_when_the_children_cannot_be_read(
+    populated_storage, monkeypatch
+):
+    """A failed read tells the model to retry instead of quoting the storage
+    error, which can carry SQL; the error stays chained for the logs."""
+    client = _make_read_client(populated_storage)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("SELECT ws_id FROM workstreams failed")
+
+    monkeypatch.setattr(populated_storage, "list_workstreams", _down)
+    with pytest.raises(CoordinatorReadError, match="list of your children could not be read") as e:
+        client.list_children("coord-1")
+    assert "SELECT" not in str(e.value)
+    assert str(e.value.__cause__) == "SELECT ws_id FROM workstreams failed"
+
+
+def test_list_children_excludes_cross_tenant_child(populated_storage):
+    """SQL-level user_id filter drops forged parent_ws_id rows owned by another user."""
+    client = _make_read_client(populated_storage)
+    result = client.list_children("coord-1")
+    names = {r["ws_id"] for r in result["children"]}
+    assert "cross-tenant-child" not in names
+
+
+def test_list_children_filters_by_state(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.list_children("coord-1", state="running")
+    assert {r["ws_id"] for r in result["children"]} == {"child-b"}
+
+
+def test_list_children_filters_by_skill_id(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.list_children("coord-1", skill="skill-x")
+    rows = result["children"]
+    assert {r["ws_id"] for r in rows} == {"child-a"}
+    assert rows[0].get("skill_id") == "skill-x"
+
+
+def test_list_children_skill_filter_avoids_n_plus_one(populated_storage, monkeypatch):
+    """skill filter must read skill_id/skill_version from the list_workstreams
+    projection — no per-row get_workstream round-trip (Copilot review #7)."""
+    client = _make_read_client(populated_storage)
+    call_count = {"n": 0}
+    real_get = populated_storage.get_workstream
+
+    def _counting_get(ws_id: str):
+        call_count["n"] += 1
+        return real_get(ws_id)
+
+    monkeypatch.setattr(populated_storage, "get_workstream", _counting_get)
+    result = client.list_children("coord-1", skill="skill-x")
+    assert {r["ws_id"] for r in result["children"]} == {"child-a"}
+    assert result["children"][0]["skill_id"] == "skill-x"
+    assert call_count["n"] == 0
+
+
+def test_list_children_signals_truncation_when_page_full_and_filter_drops(
+    populated_storage,
+):
+    """limit=1 with a state filter that drops the fetched row should
+    flag truncated=True so the model knows more may exist."""
+    client = _make_read_client(populated_storage)
+    # populated_storage has child-a (idle) and child-b (running) under
+    # coord-1.  limit=1 + state=running may return child-a first then
+    # drop it -> truncated=True.  Either order, the row-budget is
+    # exhausted before all matches are considered.
+    result = client.list_children("coord-1", state="running", limit=1)
+    # If the fetched row happens to match, truncated is False; otherwise
+    # True.  Either way, the dict shape is stable.
+    assert "truncated" in result
+    assert isinstance(result["truncated"], bool)
+
+
+def test_inspect_missing_ws_returns_error(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.inspect("does-not-exist")
+    assert "error" in result
+
+
+def test_inspect_not_found_references_ref_but_clips_oversize(populated_storage):
+    """The error string names the unresolvable ref — it sits next to
+    the did-you-mean hints now, so it's load-bearing context — but
+    clips it to a bounded length so a hostile / oversize ws_id can't
+    flood operator-facing text (the prior bare-string design's
+    concern).  The structured ``ws_id`` field carries the full
+    value, and the format note reports the true length."""
+    client = _make_read_client(populated_storage)
+    result = client.inspect("does-not-exist-xyz")
+    assert "does-not-exist-xyz" in result["error"]
+    assert result["ws_id"] == "does-not-exist-xyz"
+    oversize = "z" * 300
+    clipped = client.inspect(oversize)
+    assert oversize not in clipped["error"]
+    assert "(got 300)" in clipped["error"]
+    assert clipped["ws_id"] == oversize
+
+
+def test_inspect_cross_tenant_returns_same_shape_as_missing(populated_storage):
+    """The cross-tenant guard MUST return the exact same shape as a
+    genuinely missing ws_id — the existence-leak defence.  The error
+    text embeds the (caller-supplied) ref, so compare with the refs
+    factored out; same-length refs make the strings otherwise
+    byte-identical."""
+    # ``unrelated`` exists in storage but is not a coord-1 child;
+    # ``missing-x`` (same length) doesn't exist at all.
+    client = _make_read_client(populated_storage)
+    cross_tenant = client.inspect("unrelated")
+    missing = client.inspect("missing-x")
+    assert cross_tenant.keys() == missing.keys()
+    assert "no workstream matching" in missing["error"]
+    assert cross_tenant["error"].replace("unrelated", "X") == missing["error"].replace(
+        "missing-x", "X"
+    )
+    assert cross_tenant["ws_id"] == "unrelated"
+    assert missing["ws_id"] == "missing-x"
+
+
+def test_creating_child_is_unobservable_to_point_and_batch_guards(tmp_path, sqlite_backend_factory):
+    """Matching parent and owner do not authorize an unpublished child."""
+    storage = sqlite_backend_factory(str(tmp_path / "creating-child.db"))
+    storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    ws_id = "a" * 32
+    storage.register_workstream(
+        ws_id,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        user_id="user-1",
+        state="creating",
+    )
+    storage.save_message(ws_id, "assistant", "unpublished child transcript")
+    client = _make_read_client(storage)
+
+    sent = client.send(ws_id, "too early")
+    inspected = client.inspect(ws_id)
+    waited = client.wait_for_workstream([ws_id], timeout=0, mode="any")
+
+    assert sent["status"] == 404
+    assert inspected["status"] == 404
+    assert "messages" not in inspected
+    assert waited["complete"] is False
+    assert waited["results"][ws_id]["state"] == "not_found"
+    assert ws_id in {item["ws_id"] for item in waited["not_found"]}
+
+
+def test_list_children_excludes_closed_by_default(tmp_path, sqlite_backend_factory):
+    """Default ``list_children`` filters out closed / deleted rows —
+    the common "what's still running?" query shouldn't have to
+    post-hoc filter them.  An explicit state filter still wins."""
+    st = sqlite_backend_factory(str(tmp_path / "closed.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.register_workstream(
+        "child-active",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="idle",
+        user_id="user-1",
+    )
+    st.register_workstream(
+        "child-closed",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="closed",
+        user_id="user-1",
+    )
+    st.register_workstream(
+        "child-deleted",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="deleted",
+        user_id="user-1",
+    )
+    client = _make_read_client(st)
+    result = client.list_children("coord-1")
+    ids = {c["ws_id"] for c in result["children"]}
+    assert ids == {"child-active"}
+    # Opt-in surfaces everything.
+    with_closed = client.list_children("coord-1", include_closed=True)
+    all_ids = {c["ws_id"] for c in with_closed["children"]}
+    assert all_ids == {"child-active", "child-closed", "child-deleted"}
+    # Explicit state=closed overrides the default-exclude.
+    closed_only = client.list_children("coord-1", state="closed")
+    closed_ids = {c["ws_id"] for c in closed_only["children"]}
+    assert closed_ids == {"child-closed"}
+
+
+def test_inspect_returns_persisted_fields(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    # Core persisted fields
+    for key in ("ws_id", "state", "kind", "parent_ws_id", "user_id", "created", "updated"):
+        assert key in result
+    assert result["parent_ws_id"] == "coord-1"
+    assert isinstance(result["messages"], list)
+    # Verdicts deliberately not surfaced — see the inline comment in
+    # CoordinatorClient.inspect().
+    assert "verdicts" not in result
+    # The lease holder is a routing hint, not child state.
+    assert "lease_node_id" not in result
+
+
+def test_inspect_refuses_workstreams_outside_coordinator_subtree(populated_storage):
+    """Prompt-injection guard — coordinator must not be able to inspect
+    arbitrary ws_ids (e.g. another tenant's workstream)."""
+    client = _make_read_client(populated_storage)
+    # 'unrelated' has no parent_ws_id and is not coord-1 itself.
+    result = client.inspect("unrelated")
+    assert "error" in result
+    assert "messages" not in result
+
+
+def _make_client_with_cluster_response(
+    storage: SQLiteBackend, status: int, body: dict[str, Any] | None = None
+) -> CoordinatorClient:
+    """Build a CoordinatorClient whose mocked HTTP transport returns
+    ``status`` + ``body`` for any ``/cluster/ws/.../detail`` GET."""
+
+    def _handler(request: httpx2.Request) -> httpx2.Response:
+        if "/v1/api/cluster/ws/" in request.url.path and request.method == "GET":
+            return httpx2.Response(status, json=body or {})
+        return httpx2.Response(200, json={})
+
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
+    return CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=http,
+        child_event_bus=ChildEventBus(),
+    )
+
+
+def test_inspect_merges_live_block_when_cluster_endpoint_returns_200(populated_storage):
+    """Creator has admin.cluster.inspect → cluster endpoint returns
+    live state → inspect() merges `live` onto the storage snapshot."""
+    live_payload = {
+        "persisted": {"ws_id": "child-a"},
+        "live": {
+            "state": "running",
+            "tokens": 42,
+            "activity": "bash ls",
+            "activity_state": "tool",
+            "pending_approval": False,
+        },
+        "messages": [],
+    }
+    client = _make_client_with_cluster_response(populated_storage, status=200, body=live_payload)
+    result = client.inspect("child-a")
+    assert "live" in result
+    assert result["live"]["state"] == "running"
+    assert result["live"]["tokens"] == 42
+
+
+def test_inspect_degrades_to_storage_only_on_cluster_endpoint_403(populated_storage):
+    """Creator lacks admin.cluster.inspect → cluster endpoint returns
+    403 → inspect() falls back to storage-only with no `live` key.
+
+    This documents the permission-inheritance contract: the coordinator
+    cannot see more than its creator, so a 403 at the live endpoint is
+    expected behavior for users without the opt-in permission."""
+    client = _make_client_with_cluster_response(
+        populated_storage, status=403, body={"error": "forbidden"}
+    )
+    result = client.inspect("child-a")
+    assert "live" not in result
+    # Storage fields still present.
+    assert result["ws_id"] == "child-a"
+
+
+def test_inspect_degrades_to_storage_only_on_cluster_endpoint_503(populated_storage):
+    """Live-state endpoint can transiently fail (node unreachable,
+    timeout, 5xx) — same degrade path."""
+    client = _make_client_with_cluster_response(
+        populated_storage, status=503, body={"error": "node unreachable"}
+    )
+    result = client.inspect("child-a")
+    assert "live" not in result
+    assert result["ws_id"] == "child-a"
+
+
+@UNREACHABLE_REPLIES
+def test_inspect_degrades_to_storage_only_when_the_console_is_unreachable(populated_storage, reply):
+    """A transport error on the live-state fetch, or a reply httpx2 can't follow, takes the
+    same degrade path."""
+    attempts: list[str] = []
+
+    def _handler(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(request.url.path)
+        return reply(request)
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_handler)),
+        child_event_bus=ChildEventBus(),
+    )
+    result = client.inspect("child-a")
+    assert attempts == ["/v1/api/cluster/ws/child-a/detail"]
+    assert "live" not in result
+    assert result["ws_id"] == "child-a"
+
+
+def test_list_children_refuses_arbitrary_parent_ws_id(populated_storage):
+    """Prompt-injection guard — coordinator must not be able to enumerate
+    children of some other coordinator."""
+    # Add a sibling coordinator with its own children.
+    populated_storage.register_workstream(
+        "coord-other",
+        kind="coordinator",
+        user_id="user-2",
+    )
+    populated_storage.register_workstream(
+        "child-other",
+        kind="interactive",
+        parent_ws_id="coord-other",
+    )
+    client = _make_read_client(populated_storage)
+    result = client.list_children("coord-other")
+    assert result == {"children": [], "truncated": False}
+
+
+def test_list_children_truncated_signals_db_page_full(populated_storage):
+    """truncated=True whenever the SQL fetch hit the limit, regardless
+    of post-filtering."""
+    client = _make_read_client(populated_storage)
+    # populated_storage has child-a + child-b under coord-1; limit=1
+    # always fills the page so truncated must fire.
+    result = client.list_children("coord-1", limit=1)
+    assert result["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# list_nodes
+# ---------------------------------------------------------------------------
+
+
+def _set_meta(storage, node_id, entries):
+    """Write node metadata the way production writers do — JSON-encoded values.
+
+    ``server.py``, ``admin.py``, and ``console/server.py`` all call
+    ``set_node_metadata[_bulk]`` with ``json.dumps(value)``.  Tests have
+    to use the same encoding so coordinator filter semantics are
+    validated against realistic data.
+    """
+    storage.set_node_metadata_bulk(
+        node_id,
+        [(k, json.dumps(v), src) for (k, v, src) in entries],
+    )
+
+
+def _register_service(storage, node_id: str, url: str = "http://x:8080") -> None:
+    """Register a node in the services table so list_nodes' liveness
+    filter treats it as active (recent heartbeat)."""
+    storage.register_service("server", node_id, url)
+
+
+@pytest.fixture
+def storage_with_nodes(tmp_path, sqlite_backend_factory):
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-a",
+        [
+            ("arch", "x86_64", "auto"),
+            ("cpu_count", 4, "auto"),
+            ("region", "us-east", "user"),
+        ],
+    )
+    _register_service(st, "node-a")
+    _set_meta(
+        st,
+        "node-b",
+        [
+            ("arch", "x86_64", "auto"),
+            ("cpu_count", 16, "auto"),
+            ("region", "us-west", "user"),
+            ("capability", "gpu", "user"),
+        ],
+    )
+    _register_service(st, "node-b")
+    _set_meta(
+        st,
+        "node-c",
+        [("arch", "arm64", "auto"), ("cpu_count", 8, "auto")],
+    )
+    _register_service(st, "node-c")
+    return st
+
+
+def test_list_nodes_no_filters_returns_all_rows_decoded(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes()
+    assert set(result.keys()) == {"nodes", "truncated"}
+    node_ids = {n["node_id"] for n in result["nodes"]}
+    assert node_ids == {"node-a", "node-b", "node-c"}
+    assert result["truncated"] is False
+    # Values round-trip through json.loads — model sees natural types,
+    # not the raw stored JSON text.
+    node_b = next(n for n in result["nodes"] if n["node_id"] == "node-b")
+    assert node_b["metadata"]["arch"] == {"value": "x86_64", "source": "auto"}
+    assert node_b["metadata"]["cpu_count"] == {"value": 16, "source": "auto"}
+    assert node_b["metadata"]["capability"] == {"value": "gpu", "source": "user"}
+
+
+def test_list_nodes_strips_interfaces_by_default(tmp_path, sqlite_backend_factory):
+    """The auto-populated ``interfaces`` key carries internal RFC 1918
+    addresses which trip the private_ip_disclosure output guard and
+    aren't used for routing decisions.  Default response omits it."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            ("arch", "x86_64", "auto"),
+            ("interfaces", {"eth0": ["172.18.0.4"]}, "auto"),
+            ("region", "us-east", "user"),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    node = result["nodes"][0]
+    assert "interfaces" not in node["metadata"]
+    # Other auto keys still land.
+    assert "arch" in node["metadata"]
+    assert "region" in node["metadata"]
+
+
+def test_list_nodes_include_network_detail_opt_in(tmp_path, sqlite_backend_factory):
+    """Operators who need the IP map for debugging opt back in."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            ("arch", "x86_64", "auto"),
+            ("interfaces", {"eth0": ["172.18.0.4"]}, "auto"),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    result = client.list_nodes(include_network_detail=True)
+    node = result["nodes"][0]
+    assert "interfaces" in node["metadata"]
+    assert node["metadata"]["interfaces"]["value"] == {"eth0": ["172.18.0.4"]}
+
+
+def test_list_nodes_filters_stale_registrations_by_default(tmp_path, sqlite_backend_factory):
+    """node_metadata rows persist across restarts but the services
+    table heartbeats expire — list_nodes should intersect against
+    active services so the model doesn't suggest a dead node for
+    target_node pinning.  Regression for the stale-registration bug."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _set_meta(st, "node-dead", [("arch", "x86_64", "auto")])
+    # Only node-live has a fresh heartbeat; node-dead is metadata-only.
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    ids = {n["node_id"] for n in result["nodes"]}
+    assert ids == {"node-live"}
+    # Opt-in surfaces the stale registration for troubleshooting.
+    full = client.list_nodes(include_inactive=True)
+    full_ids = {n["node_id"] for n in full["nodes"]}
+    assert full_ids == {"node-live", "node-dead"}
+
+
+def test_list_nodes_raises_when_the_live_node_list_cannot_be_read(
+    tmp_path, monkeypatch, sqlite_backend_factory
+):
+    """A failed liveness read is an error to retry, not every node that ever
+    registered offered as a live target.  ``include_inactive`` asks for every
+    registration, so it needs no liveness read."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _set_meta(st, "node-dead", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(st, "list_services", _down)
+    for filters in (None, {"arch": "x86_64"}):
+        with pytest.raises(CoordinatorReadError, match="live nodes could not be read") as excinfo:
+            client.list_nodes(filters=filters)
+        assert str(excinfo.value.__cause__) == "storage down"
+    full = client.list_nodes(include_inactive=True)
+    assert {n["node_id"] for n in full["nodes"]} == {"node-live", "node-dead"}
+
+
+@pytest.mark.parametrize("filters", [None, {"arch": "x86_64"}])
+def test_list_nodes_shows_a_value_too_deep_to_parse_raw(
+    tmp_path, monkeypatch, sqlite_backend_factory, filters
+):
+    """A stored value nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It is listed raw, like any other value
+    that can't be parsed, instead of failing the whole cluster's listing."""
+    import types
+
+    from turnstone.console import coordinator_client as cc_module
+
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto"), ("notes", "deep", "user")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _loads(s: Any, *a: Any, **kw: Any) -> Any:
+        if s == '"deep"':
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return json.loads(s, *a, **kw)
+
+    monkeypatch.setattr(cc_module, "json", types.SimpleNamespace(loads=_loads, dumps=json.dumps))
+    (node,) = client.list_nodes(filters=filters)["nodes"]
+    assert node["metadata"]["notes"]["value"] == '"deep"'
+    assert node["metadata"]["arch"]["value"] == "x86_64"
+
+
+@pytest.mark.parametrize(
+    ("read", "filters"),
+    [
+        ("filter_nodes_by_metadata", {"arch": "x86_64"}),
+        ("get_node_metadata", {"arch": "x86_64"}),
+        ("get_all_node_metadata", None),
+    ],
+)
+def test_list_nodes_says_to_retry_when_node_metadata_cannot_be_read(
+    tmp_path, monkeypatch, sqlite_backend_factory, read, filters
+):
+    """A failed metadata read tells the model to retry instead of quoting the
+    storage error, which can carry SQL; the error stays chained for the logs."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("SELECT node_id FROM node_metadata failed")
+
+    monkeypatch.setattr(st, read, _down)
+    with pytest.raises(CoordinatorReadError, match="node metadata could not be read") as excinfo:
+        client.list_nodes(filters=filters)
+    assert "SELECT" not in str(excinfo.value)
+    assert str(excinfo.value.__cause__) == "SELECT node_id FROM node_metadata failed"
+
+
+def test_list_nodes_filter_uses_natural_value_not_quoted(storage_with_nodes, monkeypatch):
+    """Model passes ``{"capability": "gpu"}`` — client re-encodes to
+    ``'"gpu"'`` before filter_nodes_by_metadata so the stored text
+    matches.  Also asserts the filtered path fetches metadata only for
+    the paginated slice (bounded at page_size) rather than the whole
+    cluster — no wide ``get_all_node_metadata`` scan on a narrow filter.
+    """
+    per_node_calls: list[str] = []
+    real = storage_with_nodes.get_node_metadata
+
+    def _spy(nid):  # type: ignore[no-untyped-def]
+        per_node_calls.append(nid)
+        return real(nid)
+
+    all_meta_calls: list[int] = []
+    real_all = storage_with_nodes.get_all_node_metadata
+
+    def _spy_all():  # type: ignore[no-untyped-def]
+        all_meta_calls.append(1)
+        return real_all()
+
+    monkeypatch.setattr(storage_with_nodes, "get_node_metadata", _spy)
+    monkeypatch.setattr(storage_with_nodes, "get_all_node_metadata", _spy_all)
+
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"capability": "gpu"})
+    assert {n["node_id"] for n in result["nodes"]} == {"node-b"}
+    # Filtered path: no wide scan; per-node lookups bounded to the
+    # matching page (1 row matched the filter).
+    assert all_meta_calls == []
+    assert per_node_calls == ["node-b"]
+
+
+def test_list_nodes_filter_accepts_int_and_encodes_correctly(storage_with_nodes):
+    """Model passes ``{"cpu_count": 4}`` — int encoded to ``"4"``; match."""
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"cpu_count": 4})
+    assert {n["node_id"] for n in result["nodes"]} == {"node-a"}
+
+
+def test_list_nodes_int_and_string_filters_are_distinct(storage_with_nodes):
+    """The JSON schema for ``filters`` accepts primitives (string, integer,
+    number, boolean); stringified ints compare as strings, not as ints.
+    The tool description documents this as ``JSON-equal compare``.
+    """
+    client = _make_read_client(storage_with_nodes)
+    # Int filter against int-stored value matches.
+    assert {n["node_id"] for n in client.list_nodes(filters={"cpu_count": 4})["nodes"]} == {
+        "node-a"
+    }
+    # String filter against int-stored value is a distinct comparison and
+    # returns zero rows — ``"4"`` JSON-encodes to ``'"4"'`` but the stored
+    # row is ``'4'``.  Documented in the tool description.
+    assert client.list_nodes(filters={"cpu_count": "4"})["nodes"] == []
+
+
+def test_list_nodes_truncation_signal(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(limit=2)
+    assert len(result["nodes"]) == 2
+    assert result["truncated"] is True
+
+
+def test_list_nodes_empty_on_no_matching_filters(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"region": "nowhere"})
+    assert result["nodes"] == []
+    assert result["truncated"] is False
+
+
+def test_list_nodes_surfaces_healthy_model_aliases(tmp_path, sqlite_backend_factory):
+    """The node's heartbeat loop projects its registry into a ``models``
+    metadata entry shaped like ``[{alias, provider, healthy}, ...]``.
+    ``list_nodes`` flattens that to the healthy-alias list at the top
+    level (under ``model_aliases``) so a coordinator can pass aliases
+    straight to ``spawn_workstream(model=)`` without having to
+    introspect the metadata blob.  The provider-side model identifier
+    (``cfg.model``) is intentionally NOT in the payload — coords kept
+    reaching for it when they should pass the local alias."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            ("arch", "x86_64", "auto"),
+            (
+                "models",
+                [
+                    {"alias": "gpt5", "provider": "openai", "healthy": True},
+                    {"alias": "claude-opus-47", "provider": "anthropic", "healthy": True},
+                    {"alias": "broken", "provider": "openai", "healthy": False},
+                ],
+                "auto",
+            ),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    node = result["nodes"][0]
+    assert node["model_aliases"] == ["gpt5", "claude-opus-47"]
+    # Full per-alias info still available under metadata for callers
+    # that want provider / healthy detail (e.g. surfacing degraded
+    # aliases in a UI).
+    full = node["metadata"]["models"]["value"]
+    assert {row["alias"] for row in full} == {"gpt5", "claude-opus-47", "broken"}
+    # ``model`` (the provider-side identifier) is intentionally absent
+    # — keep the payload to the three values a coord actually uses.
+    for row in full:
+        assert "model" not in row
+
+
+def test_list_nodes_model_aliases_distinct_from_metadata_models(tmp_path, sqlite_backend_factory):
+    """Pin the naming distinction explicitly: the top-level shortlist
+    (``model_aliases``, list of strings) and the rich metadata blob
+    (``metadata.models.value``, list of dicts) live under different
+    keys so a caller that confuses them gets a clear KeyError rather
+    than a silent shape mismatch."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            (
+                "models",
+                [{"alias": "a", "provider": "openai", "healthy": True}],
+                "auto",
+            ),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    node = client.list_nodes()["nodes"][0]
+    # No top-level ``models`` field — only ``model_aliases``.
+    assert "models" not in node
+    assert node["model_aliases"] == ["a"]
+    # Rich shape stays under metadata.
+    assert isinstance(node["metadata"]["models"]["value"], list)
+    assert isinstance(node["metadata"]["models"]["value"][0], dict)
+
+
+def test_list_nodes_model_aliases_empty_when_node_has_not_published(
+    tmp_path, sqlite_backend_factory
+):
+    """Nodes from older builds — or a node mid-startup before its first
+    metadata write — won't have a ``models`` entry.  The top-level
+    ``model_aliases`` field defaults to ``[]`` rather than being
+    omitted so coordinators can rely on the key being present."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-y", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-y")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    assert result["nodes"][0]["model_aliases"] == []
+
+
+def test_list_nodes_models_tolerates_malformed_entries(tmp_path, sqlite_backend_factory):
+    """If a node ever stores a malformed ``models`` entry (wrong outer
+    type, missing alias, non-bool healthy), the projection drops the
+    bad rows rather than raising — the rest of the response should
+    still be useful."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-z",
+        [
+            (
+                "models",
+                [
+                    {"alias": "ok", "provider": "p", "healthy": True},
+                    "not-a-dict",
+                    {"provider": "p", "healthy": True},  # missing alias
+                    {"alias": "", "healthy": True},  # empty alias
+                    {"alias": "degraded", "healthy": False},
+                    {"alias": 42, "healthy": True},  # non-string alias
+                ],
+                "auto",
+            ),
+        ],
+    )
+    _register_service(st, "node-z")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    assert result["nodes"][0]["model_aliases"] == ["ok"]
+
+
+def test_list_nodes_models_handles_non_list_payload(tmp_path, sqlite_backend_factory):
+    """A node with a corrupted models entry (dict, scalar, null) shouldn't
+    blow up the whole list_nodes call.  ``model_aliases`` falls back to ``[]``."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-w",
+        [
+            ("models", {"oops": "not a list"}, "auto"),
+        ],
+    )
+    _register_service(st, "node-w")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    assert result["nodes"][0]["model_aliases"] == []
+
+
+# ---------------------------------------------------------------------------
+# inspect — close_reason + token fallback
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_surfaces_close_reason_when_persisted(populated_storage):
+    """Operator-supplied close reason is persisted to workstream_config
+    by the server's close handler and surfaced by inspect for terminal
+    workstreams (closed/error/deleted).  Live workstreams skip the
+    config read on the hot path."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_workstream_config("child-a", {"close_reason": "task complete"})
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert result.get("close_reason") == "task complete"
+
+
+def test_inspect_omits_close_reason_when_absent(populated_storage):
+    populated_storage.update_workstream_state("child-a", "closed")
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert "close_reason" not in result
+
+
+def test_inspect_surfaces_last_error_when_state_is_error(populated_storage):
+    """A child that crashed (e.g. provider 4xx after retry exhaustion)
+    has its exception text persisted to workstream_config.last_error
+    by the worker-thread error path; inspect surfaces it for terminal
+    error rows so the coordinator can triage without parsing the
+    assistant tail."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "AuthenticationError: invalid api key"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert result.get("last_error") == "AuthenticationError: invalid api key"
+
+
+def test_inspect_omits_last_error_for_non_error_terminal_states(populated_storage):
+    """A historic last_error from an earlier failed turn that was later
+    closed cleanly must NOT surface on the close — the coord would
+    misread the close as an error close.  Gating on state=='error'
+    keeps the surface honest."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "stale error from a previous failed turn"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert "last_error" not in result
+
+
+def test_inspect_skips_workstream_config_read_for_live_workstreams(populated_storage, monkeypatch):
+    """Hot-path optimisation: live (non-terminal) workstreams must NOT
+    pay the per-inspect load_workstream_config round-trip.  close_reason
+    can only be set via the server's close handler, so reading the
+    config row for a still-running child is pure waste."""
+    calls: list[str] = []
+    real = populated_storage.load_workstream_config
+
+    def _spy(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        return real(ws_id)
+
+    monkeypatch.setattr(populated_storage, "load_workstream_config", _spy)
+    client = _make_read_client(populated_storage)
+    # child-a is idle (per the populated_storage fixture) — non-terminal.
+    client.inspect("child-a")
+    assert calls == []
+
+
+def test_inspect_raises_when_the_history_cannot_be_read(populated_storage, monkeypatch):
+    """A failed history read is an error the model can retry, not an
+    empty history that reads as a child that produced nothing."""
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == (
+        "the workstream's history could not be read. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+@pytest.mark.parametrize("state", ["closed", "error"])
+def test_inspect_raises_when_a_terminal_childs_config_cannot_be_read(
+    populated_storage, monkeypatch, state
+):
+    """A terminal child's close reason and last error come from its
+    config row, so a failed read of it is an error rather than a child
+    that has neither."""
+    populated_storage.update_workstream_state("child-a", state)
+    _fail_config_reads(monkeypatch, populated_storage)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == (
+        "the workstream's close reason and last error could not be read. "
+        "Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+def test_inspect_live_falls_back_to_persisted_tokens(populated_storage):
+    """live block carries tokens=0 for an idle child whose node hasn't
+    published a fresh tick — fall back to SUM(usage_events) so the
+    coordinator doesn't read 0 for a child that already burned tokens."""
+    populated_storage.record_usage_event(
+        event_id="ev1",
+        ws_id="child-a",
+        prompt_tokens=100,
+        completion_tokens=50,
+    )
+    populated_storage.record_usage_event(
+        event_id="ev2",
+        ws_id="child-a",
+        prompt_tokens=200,
+        completion_tokens=80,
+    )
+    client = _make_client_with_cluster_response(
+        populated_storage,
+        status=200,
+        body={"persisted": {"ws_id": "child-a"}, "live": {"state": "idle", "tokens": 0}},
+    )
+    result = client.inspect("child-a")
+    assert result["live"]["tokens"] == 100 + 50 + 200 + 80
+
+
+def test_inspect_live_keeps_nonzero_live_tokens(populated_storage):
+    """When the live counter is non-zero, the persisted aggregate is
+    NOT consulted — live wins for in-flight workstreams."""
+    populated_storage.record_usage_event(
+        event_id="ev1",
+        ws_id="child-a",
+        prompt_tokens=999,
+        completion_tokens=999,
+    )
+    client = _make_client_with_cluster_response(
+        populated_storage,
+        status=200,
+        body={
+            "persisted": {"ws_id": "child-a"},
+            "live": {"state": "running", "tokens": 17},
+        },
+    )
+    result = client.inspect("child-a")
+    assert result["live"]["tokens"] == 17
+
+
+def test_inspect_live_leaves_tokens_out_when_the_persisted_sum_cannot_be_read(
+    populated_storage, monkeypatch
+):
+    """A failed read of the persisted sum is not a zero: the live block
+    leaves the count out rather than report a child that spent nothing,
+    and is cached like the other failures, so a burst of inspects reads
+    the sum once."""
+    calls: list[str] = []
+
+    def _broken(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "sum_workstream_tokens", _broken)
+    client = _make_client_with_cluster_response(
+        populated_storage,
+        status=200,
+        body={"persisted": {"ws_id": "child-a"}, "live": {"state": "idle", "tokens": 0}},
+    )
+    assert client.inspect("child-a")["live"] == {"state": "idle"}
+    assert client.inspect("child-a")["live"] == {"state": "idle"}
+    assert calls == ["child-a"]
+
+
+def test_inspect_raises_when_the_row_cannot_be_read(populated_storage, monkeypatch):
+    """The row read reports the same retryable error as inspect's other
+    reads, not the storage exception's own text."""
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "get_workstream", _broken)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == "the workstream could not be read. Retry after storage recovers."
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+def test_inspect_reads_the_tail_its_message_limit_needs(populated_storage, monkeypatch):
+    """inspect bounds its history read to the tail it returns, and reads
+    the whole history only when the bounded read comes back short."""
+    for i in range(30):
+        populated_storage.save_message("child-a", "user", f"message {i}")
+    limits: list[int | None] = []
+    real = populated_storage.load_messages
+
+    def _spy(ws_id: str, **kwargs: Any) -> Any:
+        limits.append(kwargs.get("limit"))
+        return real(ws_id, **kwargs)
+
+    monkeypatch.setattr(populated_storage, "load_messages", _spy)
+    client = _make_read_client(populated_storage)
+    tail = client.inspect("child-a", message_limit=5)["messages"]
+    assert [m["content"] for m in tail] == [f"message {i}" for i in range(25, 30)]
+    assert limits == [18]
+    limits.clear()
+    assert len(client.inspect("child-a", message_limit=50)["messages"]) == 30
+    assert limits == [108, None]
+
+
+def test_inspect_asks_the_detail_route_for_no_messages(populated_storage):
+    """inspect uses only the detail route's live block, so it asks the route
+    for no message tail."""
+    limits: list[str | None] = []
+
+    def _handler(request: httpx2.Request) -> httpx2.Response:
+        limits.append(request.url.params.get("limit"))
+        return httpx2.Response(200, json={"live": {"state": "idle", "tokens": 7}})
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_handler)),
+        child_event_bus=ChildEventBus(),
+    )
+    assert client.inspect("child-a")["live"] == {"state": "idle", "tokens": 7}
+    assert limits == ["0"]
+
+
+def test_inspect_reads_a_detail_reply_too_deep_to_parse_as_no_live_block(
+    populated_storage, monkeypatch
+):
+    """A detail reply nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels, 3.14 when the C
+    stack runs out), so only the patched decoder reaches it here.  It leaves
+    the live block out, like any other reply that can't be parsed."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(
+            transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json={"live": {}}))
+        ),
+        child_event_bus=ChildEventBus(),
+    )
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    assert "live" not in client.inspect("child-a")
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_workstream_returns_immediately_when_already_terminal(
+    populated_storage,
+):
+    """Idle / closed children must not block — wait returns at once."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["mode"] == "any"
+    assert result["results"]["child-a"]["state"] == "idle"
+    # Must finish in well under the requested timeout.
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_for_workstream_any_mode_returns_when_first_terminal(
+    populated_storage,
+):
+    """child-a is idle (terminal), child-b is running (non-terminal) —
+    mode='any' should return without blocking on child-b."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-b", "child-a"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["results"]["child-b"]["state"] == "running"
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_for_workstream_all_mode_times_out_on_running_child(populated_storage):
+    """child-b stays running indefinitely — mode='all' must hit timeout
+    rather than block forever."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=1.0, mode="all")
+    assert result["complete"] is False
+    assert result["elapsed"] >= 1.0
+    # Both states still observed.
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["results"]["child-b"]["state"] == "running"
+
+
+def test_wait_for_workstream_foreign_legacy_ref_fails_validation(populated_storage):
+    """A ref outside the coordinator's subtree that isn't id-shaped
+    ('unrelated') dies at the validation boundary: the call errors
+    immediately with a per-ref recovery payload and performs no
+    waiting at all."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["unrelated"], timeout=5, mode="any")
+    assert result["complete"] is False
+    assert result["elapsed"] == 0.0
+    assert result["results"] == {}
+    assert "no workstream matching" in result["error"]
+    assert result["invalid_ws_ids"][0]["ws_id"] == "unrelated"
+    # Unified channel shape: trimmed per-ref entries, roster once at
+    # top level (same as the in-loop not_found channel).
+    assert "children" not in result["invalid_ws_ids"][0]
+    assert {c["ws_id"] for c in result["children"]} == {"child-a", "child-b", "child-coord"}
+
+
+def test_wait_for_workstream_cross_tenant_child_fails_validation(populated_storage):
+    """Defense-in-depth (Copilot #506): a row whose ``parent_ws_id``
+    matches the coordinator but whose ``user_id`` belongs to a
+    different tenant must stay unobservable.  The validation roster is
+    tenant-filtered in SQL, so the forged row never resolves and the
+    coordinator's LLM can't observe foreign-tenant state through
+    ``wait_for_workstream``.  The ``populated_storage`` fixture's
+    ``cross-tenant-child`` row has exactly this shape
+    (parent_ws_id="coord-1", user_id="user-2")."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["cross-tenant-child"], timeout=5, mode="any")
+    assert result["complete"] is False
+    assert result["results"] == {}
+    assert "no workstream matching" in result["error"]
+
+
+def test_wait_for_workstream_missing_ref_indistinguishable_from_foreign(populated_storage):
+    """A ref that doesn't exist produces the same payload as a foreign
+    one (same-length refs make the error strings byte-identical once
+    the echoed ref is factored out), so the validation boundary can't
+    be used as an existence oracle."""
+    client = _make_read_client(populated_storage)
+    foreign = client.wait_for_workstream(["unrelated"], timeout=5)
+    missing = client.wait_for_workstream(["missing-x"], timeout=5)
+    f_err, m_err = foreign["invalid_ws_ids"][0], missing["invalid_ws_ids"][0]
+    assert f_err.keys() == m_err.keys()
+    assert f_err["error"].replace("unrelated", "X") == m_err["error"].replace("missing-x", "X")
+
+
+def test_wait_for_workstream_mixed_invalid_ref_errors_whole_call(populated_storage):
+    """Successor to the bug-2 false-positive regression: one valid
+    (running) child plus one unresolvable ref must never produce a
+    'complete' wait.  Under the fail-fast contract the whole call
+    errors immediately — a partial wait over the valid subset would
+    hide exactly the lost-lane failure the validation exists to
+    surface."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-b", "unrelated"], timeout=5, mode="any")
+    assert result["complete"] is False
+    assert result["elapsed"] == 0.0
+    assert result["results"] == {}
+    assert result["invalid_ws_ids"][0]["ws_id"] == "unrelated"
+
+    # mode='all' is identical — previously a denied member counted as
+    # 'settled' and the wait completed, silently dropping the lane.
+    result_all = client.wait_for_workstream(["child-a", "unrelated"], timeout=5, mode="all")
+    assert result_all["complete"] is False
+    assert result_all["results"] == {}
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — in-loop not_found fail-fast (32-hex refs)
+# ---------------------------------------------------------------------------
+#
+# Production ws_ids are ``uuid4().hex``.  A well-formed-but-unobservable
+# id passes the validation boundary and must abort the wait on the first
+# tick that sees it — never burn the timeout, never ride along to a
+# "complete" result.  The fixture mirrors the original field incident: a
+# coordinator LLM collapsed the ``aaa`` run in a child's id to a single
+# ``a`` and then read the resulting not-found as a dead child.
+
+REAL_CHILD_HEX = "7c61eafe470c54caaa89490a4b9c0f7d"
+CORRUPTED_CHILD_HEX = "7c61eafe470c54ca89490a4b9c0f7d"  # aaa -> a, 30 chars
+RUNNING_CHILD_HEX = "9cc8205058d528130fb469eaf75650f3"
+FOREIGN_HEX = "f" * 32
+MISSING_HEX = "e" * 32
+FORGED_HEX = "d" * 32  # parent_ws_id forged to coord-1, foreign user_id
+
+
+@pytest.fixture
+def hex_storage(tmp_path, sqlite_backend_factory):
+    st = sqlite_backend_factory(str(tmp_path / "coord-hex.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.register_workstream(
+        REAL_CHILD_HEX,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="idle",
+        user_id="user-1",
+        name="minisforum-research",
+    )
+    st.register_workstream(
+        RUNNING_CHILD_HEX,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="running",
+        user_id="user-1",
+        name="beelink-research",
+    )
+    st.register_workstream(FOREIGN_HEX, kind="interactive", user_id="user-2")
+    st.register_workstream(FORGED_HEX, kind="interactive", parent_ws_id="coord-1", user_id="user-2")
+    return st
+
+
+def test_wait_incident_regression_corrupted_id_gets_did_you_mean(hex_storage):
+    """THE incident: a 30-char id (character-run collapse) must fail the
+    call instantly with the real child id as a did-you-mean — pre-fix
+    it burned the full timeout and read as a dead child."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([CORRUPTED_CHILD_HEX], timeout=300, mode="all")
+    assert result["complete"] is False
+    assert result["elapsed"] == 0.0
+    assert result["results"] == {}
+    bad = result["invalid_ws_ids"][0]
+    assert bad["ws_id"] == CORRUPTED_CHILD_HEX
+    assert bad["did_you_mean"][0]["ws_id"] == REAL_CHILD_HEX
+    assert bad["did_you_mean"][0]["name"] == "minisforum-research"
+    assert "(got 30)" in bad["error"]
+
+
+def test_wait_foreign_hex_id_aborts_on_first_tick(hex_storage):
+    """A well-formed foreign id passes validation, snapshots as
+    ``not_found``, and aborts the wait immediately — even in mode='any'
+    with a real running child alongside (the old contract silently
+    waited out the timeout here)."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([RUNNING_CHILD_HEX, FOREIGN_HEX], timeout=30, mode="any")
+    assert result["complete"] is False
+    assert result["elapsed"] < 5.0
+    assert result["results"][FOREIGN_HEX]["state"] == "not_found"
+    assert result["results"][FOREIGN_HEX]["message"] == (
+        "(no workstream with this id among your children)"
+    )
+    assert result["results"][RUNNING_CHILD_HEX]["state"] == "running"
+    assert [h["ws_id"] for h in result["not_found"]] == [FOREIGN_HEX]
+    assert "no workstream matching" in result["error"]
+    assert {c["ws_id"] for c in result["children"]} == {REAL_CHILD_HEX, RUNNING_CHILD_HEX}
+
+
+def test_wait_mode_all_never_completes_with_not_found_member(hex_storage):
+    """Successor to the silent-ride-along: mode='all' with [idle,
+    foreign] previously returned complete=True (denied counted as
+    'settled'), reporting success while a lane was missing.  Now the
+    unobservable member aborts the call with complete=False."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([REAL_CHILD_HEX, FOREIGN_HEX], timeout=5, mode="all")
+    assert result["complete"] is False
+    assert result["results"][FOREIGN_HEX]["state"] == "not_found"
+    assert result["results"][REAL_CHILD_HEX]["state"] == "idle"
+
+
+def test_wait_foreign_and_missing_hex_payloads_identical(hex_storage):
+    """Existence-oracle pin for the fail-fast path: an existing
+    foreign-tenant id and a nonexistent id produce identical result
+    entries and identical top-level hints (modulo the echoed ref)."""
+    client = _make_read_client(hex_storage)
+    foreign = client.wait_for_workstream([FOREIGN_HEX], timeout=5)
+    missing = client.wait_for_workstream([MISSING_HEX], timeout=5)
+    assert foreign["results"][FOREIGN_HEX] == missing["results"][MISSING_HEX]
+    f_hint, m_hint = foreign["not_found"][0], missing["not_found"][0]
+    assert f_hint.keys() == m_hint.keys()
+    assert f_hint["error"].replace(FOREIGN_HEX, "ID") == m_hint["error"].replace(MISSING_HEX, "ID")
+
+
+def test_wait_results_carry_child_display_name(hex_storage):
+    """Own-child entries carry the display ``name`` for orientation —
+    a label, not an address."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([REAL_CHILD_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][REAL_CHILD_HEX]["name"] == "minisforum-research"
+
+
+def test_wait_mid_wait_hard_delete_aborts(hex_storage, monkeypatch):
+    """A child hard-deleted while a wait is in flight flips to
+    ``not_found`` on the next tick and aborts the wait — the
+    coordinator hears about the vanished lane in seconds, not at
+    timeout."""
+    monkeypatch.setattr(CoordinatorClient, "_WAIT_HEARTBEAT_INTERVAL", 0.05)
+    client = _make_read_client(hex_storage)
+
+    def _delete_soon() -> None:
+        time.sleep(0.3)
+        hex_storage.delete_workstream(RUNNING_CHILD_HEX)
+
+    deleter = threading.Thread(target=_delete_soon)
+    deleter.start()
+    try:
+        result = client.wait_for_workstream([RUNNING_CHILD_HEX], timeout=30, mode="all")
+    finally:
+        deleter.join()
+    assert result["complete"] is False
+    assert result["results"][RUNNING_CHILD_HEX]["state"] == "not_found"
+    assert result["elapsed"] < 10.0
+
+
+def test_inspect_corrupted_id_gets_did_you_mean(hex_storage):
+    """inspect_workstream shares the validation boundary: the incident
+    id gets the did-you-mean pointer, and the real id still inspects."""
+    client = _make_read_client(hex_storage)
+    result = client.inspect(CORRUPTED_CHILD_HEX)
+    assert result["did_you_mean"][0]["ws_id"] == REAL_CHILD_HEX
+    assert "(got 30)" in result["error"]
+    ok = client.inspect(REAL_CHILD_HEX)
+    assert ok["state"] == "idle"
+
+
+def test_inspect_rejects_forged_cross_tenant_hex_row(hex_storage):
+    """Parity with the wait / mutating gates (#506): a row forged with
+    parent_ws_id=coord but a foreign user_id must not be readable
+    through inspect either — same not-found shape, no history leak."""
+    client = _make_read_client(hex_storage)
+    result = client.inspect(FORGED_HEX)
+    assert "no workstream matching" in result["error"]
+    assert "messages" not in result
+
+
+def test_ws_ref_validation_raises_when_the_roster_cannot_be_read(hex_storage, monkeypatch):
+    """A non-hex id is checked against the roster.  When that read fails the
+    call raises the read error: it never resolves blind, and it doesn't
+    reject an id it could not check or report the coordinator childless."""
+    client = _make_read_client(hex_storage)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "list_workstreams", _boom)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.send("not-a-real-id", "hi")
+    assert str(excinfo.value) == (
+        "the list of your children could not be read. Retry after storage recovers."
+    )
+
+
+@pytest.mark.parametrize("verb", ["inspect", "wait"])
+def test_unresolvable_id_carries_no_roster_it_could_not_read(hex_storage, monkeypatch, verb):
+    """An id that names no child is decided by a row read that succeeded.
+    When only the roster read fails, the error leaves the roster and its
+    suggestions out rather than report the coordinator has no children."""
+    client = _make_read_client(hex_storage)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "list_workstreams", _boom)
+    if verb == "inspect":
+        result = client.inspect(MISSING_HEX)
+    else:
+        result = client.wait_for_workstream([MISSING_HEX], timeout=5, mode="all")
+    assert "no workstream matching" in result["error"]
+    assert "children" not in result
+    assert "children_truncated" not in result
+    assert "did_you_mean" not in result
+
+
+def test_a_failed_ownership_read_raises_but_the_trusted_send_check_asks(hex_storage, monkeypatch):
+    """A mutating verb checks ownership with a row read.  When it fails the
+    verb raises the read error rather than answer that the child isn't
+    among the coordinator's children.  The trusted-send check only decides
+    whether to ask first, so it answers False and the send asks for
+    approval, the fail-closed answer."""
+    client = _make_read_client(hex_storage)
+    assert client._is_own_subtree(REAL_CHILD_HEX) is True
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "get_workstream", _boom)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.close_workstream(REAL_CHILD_HEX)
+    assert str(excinfo.value) == "the workstream could not be read. Retry after storage recovers."
+    assert client._is_own_subtree(REAL_CHILD_HEX) is False
+
+
+def test_uppercase_full_hex_ref_case_folds(hex_storage):
+    """Models occasionally upcase hex; a full 32-hex ref resolves
+    case-insensitively."""
+    client = _make_read_client(hex_storage)
+    ok = client.inspect(REAL_CHILD_HEX.upper())
+    assert ok.get("error") is None
+    assert ok["state"] == "idle"
+
+
+def test_wait_since_hint_does_not_mask_not_found(hex_storage):
+    """The not_found fail-fast outranks the since-diff early exit — a
+    diffing since hint must not convert an unobservable-id abort into
+    complete=True."""
+    client = _make_read_client(hex_storage)
+    since = {RUNNING_CHILD_HEX: {"state": "idle", "tokens": 0, "updated": ""}}
+    result = client.wait_for_workstream(
+        [RUNNING_CHILD_HEX, FOREIGN_HEX], timeout=5, mode="any", since=since
+    )
+    assert result["complete"] is False
+    assert result["results"][FOREIGN_HEX]["state"] == "not_found"
+
+
+def test_wait_for_workstream_rejects_invalid_mode(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], mode="bogus")
+    assert "error" in result
+    assert result["complete"] is False
+
+
+def test_wait_for_workstream_rejects_empty_ws_ids(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream([], timeout=5)
+    assert "error" in result
+
+
+def test_wait_for_workstream_rejects_overflow(populated_storage):
+    """Overflow returns an explicit error rather than silently truncating —
+    a mode='all' wait that polled only the first cap entries would have
+    returned complete=True with N>cap dropped ids never tracked."""
+    client = _make_read_client(populated_storage)
+    huge = [f"phantom-{i}" for i in range(CoordinatorClient._WAIT_MAX_WS_IDS + 5)]
+    result = client.wait_for_workstream(huge, timeout=5, mode="any")
+    assert "error" in result
+    assert "too many ws_ids" in result["error"]
+    assert result["complete"] is False
+
+
+def test_wait_for_workstream_caps_timeout(populated_storage):
+    """timeout > _WAIT_MAX_TIMEOUT clamps silently — an oversized
+    timeout is benign (caller can wait less than they asked) so it
+    doesn't deserve an explicit error."""
+    client = _make_read_client(populated_storage)
+    # child-a is already terminal, so the wait completes before any
+    # clamped timeout matters; just verify the call doesn't error.
+    result = client.wait_for_workstream(["child-a"], timeout=9999, mode="any")
+    assert "error" not in result
+    assert result["complete"] is True
+
+
+def test_wait_for_workstream_dedupes_ws_ids(populated_storage):
+    """Duplicate ids collapse before polling so the resolved-count
+    denominator and the polled set agree."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "child-a", "child-a"], timeout=5, mode="any")
+    assert "error" not in result
+    assert list(result["results"].keys()) == ["child-a"]
+
+
+def test_wait_for_workstream_never_falls_back_to_per_id_storage_calls(
+    populated_storage, monkeypatch
+):
+    """All storage reads issued by ``wait_for_workstream`` must go
+    through the batched paths.  At the documented cap (32 ws_ids over
+    a 600 s wait) the naive per-id shape produced ~38k row reads, so
+    a regression to per-id is the meaningful failure mode this test
+    guards against.
+
+    The primary safety net is the ``pytest.fail`` mock on the per-id
+    ``get_workstream`` / ``sum_workstream_tokens`` paths — any call
+    there blows up loudly with the regression message.  The
+    additional ``batch_calls`` / ``sum_calls`` assertions cover the
+    subtler regression where the call IS batched but only covers a
+    subset of ws_ids (e.g. one ws_id per call in a loop).
+    """
+    client = _make_read_client(populated_storage)
+    batch_calls: list[list[str]] = []
+    sum_calls: list[list[str]] = []
+    real_get_batch = populated_storage.get_workstreams_batch
+    real_sum_batch = populated_storage.sum_workstream_tokens_batch
+
+    def _spy_get(ws_ids):  # type: ignore[no-untyped-def]
+        batch_calls.append(list(ws_ids))
+        return real_get_batch(ws_ids)
+
+    def _spy_sum(ws_ids):  # type: ignore[no-untyped-def]
+        sum_calls.append(list(ws_ids))
+        return real_sum_batch(ws_ids)
+
+    monkeypatch.setattr(populated_storage, "get_workstreams_batch", _spy_get)
+    monkeypatch.setattr(populated_storage, "sum_workstream_tokens_batch", _spy_sum)
+    # Fail loudly if anything still calls the non-batched paths.
+    monkeypatch.setattr(
+        populated_storage,
+        "get_workstream",
+        lambda *a, **kw: pytest.fail("wait_for_workstream must use batched get"),
+    )
+    monkeypatch.setattr(
+        populated_storage,
+        "sum_workstream_tokens",
+        lambda *a, **kw: pytest.fail("wait_for_workstream must use batched sum"),
+    )
+
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=5, mode="any")
+    assert result["complete"] is True
+    # Every batched call carried the full ws_id set.  The exact count
+    # (currently 2: one pre-loop ownership filter + one snapshot tick)
+    # is incidental; if either gains another batched read it stays
+    # batched, which is the property under test.
+    assert batch_calls, "no batched get_workstreams_batch call observed"
+    assert sum_calls, "no batched sum_workstream_tokens_batch call observed"
+    first_batch = set(batch_calls[0])
+    first_sum = set(sum_calls[0])
+    assert first_batch == {"child-a", "child-b"}
+    assert first_sum == {"child-a", "child-b"}
+
+
+def test_wait_for_workstream_handles_non_string_mode(populated_storage):
+    """A model that emits ``mode=123`` or ``mode=['any']`` produces a
+    clean error rather than crashing with AttributeError on .strip()."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], mode=123)  # type: ignore[arg-type]
+    assert "error" in result
+    assert "invalid mode" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — event-driven (ChildEventBus wired in)
+# ---------------------------------------------------------------------------
+#
+# When the coord adapter wires its ``child_event_bus`` into the client,
+# the wait loop blocks on a per-call ``threading.Event`` keyed by ws_id
+# and only re-snapshots storage on state-change wakes or the heartbeat
+# cap.  The legacy ``time.sleep`` poll path remains intact for tests
+# that don't wire the bus (above), so this section adds focused
+# coverage of the bus-driven behaviour without re-running the full
+# matrix of mode / since / cross-tenant cases.
+
+
+def _make_read_client_with_bus(storage, bus) -> CoordinatorClient:
+    """Like ``_make_read_client`` but wires a real ``ChildEventBus``.
+
+    Caller owns the bus so the test can call ``bus.notify(ws_id)`` to
+    simulate the dispatch-sink wake-up.
+    """
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    http = httpx2.Client(transport=transport)
+    return CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=http,
+        child_event_bus=bus,
+    )
+
+
+def test_wait_with_bus_returns_immediately_when_already_terminal(populated_storage):
+    """Subscribe-after-terminal race: the wait registers its waiter
+    BEFORE the first snapshot, then re-snapshots — an already-terminal
+    child must return at once without spinning the heartbeat cap.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["elapsed"] < 1.0
+    # Waiter must be unregistered on exit so a long-lived bus doesn't
+    # accumulate dead keys across many waits.
+    assert "child-a" not in bus._waiters
+
+
+def test_wait_with_bus_wakes_on_notify(populated_storage):
+    """The core property of the refactor: a state-change ``notify``
+    must wake the wait promptly — well under the legacy 0.5 s poll
+    cadence AND the 2 s heartbeat cap.  Test fires a state update
+    + notify after a short delay and asserts the wait returns quickly.
+    """
+    import threading as _t
+
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # child-b starts running; flip to idle + notify after the wait
+    # blocks.  100 ms is enough that the wait is parked in event.wait()
+    # but short enough that the test runs fast.
+    timer = _t.Timer(
+        0.1,
+        lambda: (
+            populated_storage.update_workstream_state("child-b", "idle"),
+            bus.notify("child-b"),
+        ),
+    )
+    timer.start()
+    start = time.monotonic()
+    result = client.wait_for_workstream(["child-b"], timeout=5.0, mode="any")
+    elapsed = time.monotonic() - start
+    assert result["complete"] is True
+    assert result["results"]["child-b"]["state"] == "idle"
+    # Bus-driven wake should fire well under 1 s; legacy poll would
+    # take ~0.5 s but bus-driven should be ~0.1 s (the timer delay)
+    # plus a few ms.  Generous 0.6 s budget for CI noise.
+    assert elapsed < 0.6, f"wake-up too slow: {elapsed}s"
+
+
+def test_wait_with_bus_unrelated_notify_does_not_wake(populated_storage):
+    """A notify on a ws_id the wait isn't watching must NOT wake it —
+    otherwise every state change anywhere on the system would shake
+    every concurrent wait into a redundant storage snapshot.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # child-b is running indefinitely; mode='all' will time out unless
+    # a relevant notify fires.  Fire only unrelated notifies — wait
+    # should still hit the full timeout.
+    import threading as _t
+
+    def _fire_unrelated() -> None:
+        for _ in range(5):
+            bus.notify("ws-unrelated-1")
+            bus.notify("ws-unrelated-2")
+            time.sleep(0.05)
+
+    t = _t.Thread(target=_fire_unrelated, daemon=True)
+    t.start()
+    start = time.monotonic()
+    result = client.wait_for_workstream(["child-b"], timeout=0.5, mode="all")
+    elapsed = time.monotonic() - start
+    assert result["complete"] is False, "unrelated notify falsely satisfied wait"
+    # Wait should burn its full timeout (give or take heartbeat
+    # granularity).  The bus path doesn't have a 0.5 s poll, so the
+    # bound is "approximately timeout".
+    assert elapsed >= 0.5
+    t.join(timeout=1.0)
+
+
+def test_wait_with_bus_heartbeat_still_progresses_without_notify(populated_storage):
+    """Without any notify, the wait must still progress through ticks
+    via the heartbeat cap so ``progress_callback`` keeps firing for
+    the sidebar UI.  Verified by counting callback firings over an
+    interval longer than the heartbeat.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # Shrink the heartbeat for test speed via the ClassVar seam —
+    # instance attribute shadows the class-level default.  Production
+    # stays at 2.0 s; the test exercises the heartbeat-fires-without-
+    # notify property in well under 1 s.
+    client._WAIT_HEARTBEAT_INTERVAL = 0.1  # type: ignore[misc]
+    snapshots: list[dict[str, dict[str, object]]] = []
+
+    def _cb(snap: dict[str, dict[str, object]], _elapsed: float) -> None:
+        snapshots.append(snap)
+
+    # child-b is running indefinitely; wait will time out at 0.4 s.
+    # With heartbeat = 0.1 s, we expect ~3-5 callback firings
+    # (initial tick + ~3-4 heartbeats).  Loose lower bound to avoid
+    # CI flakiness.
+    start = time.monotonic()
+    result = client.wait_for_workstream(["child-b"], timeout=0.4, mode="all", progress_callback=_cb)
+    elapsed = time.monotonic() - start
+    assert result["complete"] is False
+    assert elapsed >= 0.4
+    # At least 2 callback firings: the initial snapshot plus at least
+    # one heartbeat-driven re-tick.  Tight upper bound would be
+    # ~ceil(0.4/0.1) + 1 = 5 firings.
+    assert len(snapshots) >= 2, f"heartbeat didn't fire: {len(snapshots)} snapshots"
+
+
+def test_wait_with_bus_unregisters_waiter_on_exit(populated_storage):
+    """Both the success path and the timeout path must unregister the
+    waiter — otherwise a long-lived bus accumulates dead
+    ``threading.Event`` instances forever.
+    """
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    # Success path (already-terminal child).
+    client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert bus._waiters == {}, "success path leaked waiter"
+    # Timeout path (running child, mode='all' that times out).
+    client.wait_for_workstream(["child-a", "child-b"], timeout=0.3, mode="all")
+    assert bus._waiters == {}, "timeout path leaked waiter"
+
+
+def test_wait_with_bus_multi_waiter_independence(populated_storage):
+    """Two concurrent waits on the same ws_id must be independent —
+    one wait completing must not affect the other's wake-up state.
+    Smoke-tests the multi-Event-per-bucket bus behaviour against the
+    real wait-loop.
+    """
+    import threading as _t
+
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+
+    results: dict[str, dict[str, object]] = {}
+
+    def _do_wait(label: str) -> None:
+        results[label] = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+
+    threads = [_t.Thread(target=_do_wait, args=(f"t{i}",), daemon=True) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    for label in ("t0", "t1", "t2"):
+        assert results[label]["complete"] is True
+        assert results[label]["results"]["child-a"]["state"] == "idle"
+    # All waiters must be unregistered after exit.
+    assert bus._waiters == {}
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — ending early for the caller (#1339)
+# ---------------------------------------------------------------------------
+#
+# ``interrupt`` is the caller's reason to stop, consulted where the loop would
+# block; ``wake_event`` is the caller's Event the loop blocks on (registered on
+# the bus), so setting it cuts the block short.  The coordinator session ends
+# a wait this way when the user sends a message.  The wake tests act from the
+# loop's first check, which is past the first tick, and raise the heartbeat to
+# 30 s, so a prompt second tick can only come from the Event.
+
+
+class _Reason:
+    """The caller's ``interrupt`` predicate: returns ``reason``.
+
+    ``on_first_call`` runs inside the loop's first check, after the first
+    tick's clear and snapshot and just before the loop blocks; that check
+    still returns the value ``reason`` held before the hook ran, so whatever
+    the hook sets can only be seen through another tick.
+    """
+
+    def __init__(self, on_first_call: Callable[[], None] | None = None) -> None:
+        self.reason: str | None = None
+        self.calls = 0
+        self._on_first_call = on_first_call
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        reason = self.reason
+        if self.calls == 1 and self._on_first_call is not None:
+            self._on_first_call()
+        return reason
+
+
+def test_wait_interrupt_ends_a_blocked_wait_promptly(populated_storage):
+    """A reason that appears once the loop is past its first tick, followed
+    by a set of the caller's Event, ends the wait on the next tick:
+    ``complete`` is False, ``interrupted`` carries the caller's reason, and
+    the results are the children's current states."""
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    wake = threading.Event()
+
+    def _message_arrives() -> None:
+        reason.reason = "user_message"
+        wake.set()
+
+    reason = _Reason(on_first_call=_message_arrives)
+    start = time.monotonic()
+    result = client.wait_for_workstream(
+        ["child-b"], timeout=20, mode="all", interrupt=reason, wake_event=wake
+    )
+    elapsed = time.monotonic() - start
+    assert result["complete"] is False
+    assert result["interrupted"] == "user_message"
+    assert result["results"]["child-b"]["state"] == "running"
+    assert reason.calls == 2
+    assert elapsed < 1.0, f"the wake did not end the block: {elapsed}s"
+    assert bus._waiters == {}, "caller's Event stayed registered on the bus"
+
+
+@pytest.mark.parametrize("ended_by", ["interrupt", "timeout"])
+def test_wait_that_does_not_complete_carries_states_without_messages(
+    populated_storage, monkeypatch, ended_by
+):
+    """A wait that is interrupted or times out returns states only: a
+    finished child's message is left out (``None``) and nothing is read for
+    it.  The model waits again after either, so only the wait that
+    completes carries the child's text, once."""
+    import turnstone.console.coordinator_client as coordinator_client
+
+    reads: list[str] = []
+    real_message_for = coordinator_client._wait_message_for
+
+    def _counting_message_for(storage, wid, state):
+        reads.append(wid)
+        return real_message_for(storage, wid, state)
+
+    monkeypatch.setattr(coordinator_client, "_wait_message_for", _counting_message_for)
+    populated_storage.save_message("child-a", "assistant", "child-a's findings")
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    if ended_by == "interrupt":
+        reason.reason = "user_message"
+    result = client.wait_for_workstream(
+        ["child-a", "child-b"],
+        timeout=20 if ended_by == "interrupt" else 0,
+        mode="all",
+        interrupt=reason,
+    )
+    assert result["complete"] is False
+    assert result.get("interrupted") == ("user_message" if ended_by == "interrupt" else None)
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["results"]["child-a"]["message"] is None
+    assert result["results"]["child-a"]["truncated"] is False
+    assert result["results"]["child-b"]["message"] is None
+    assert reads == []
+    # The wait that completes carries the finished children's text.
+    populated_storage.update_workstream_state("child-b", "idle")
+    completed = client.wait_for_workstream(["child-a", "child-b"], timeout=0, mode="all")
+    assert completed["complete"] is True
+    assert completed["results"]["child-a"]["message"] == "child-a's findings"
+    assert sorted(reads) == ["child-a", "child-b"]
+
+
+def test_wait_interrupt_pending_at_start_returns_on_the_first_tick(populated_storage):
+    """A reason that already holds when the wait starts (the user typed
+    while the model was writing the call) ends it on the first tick."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    reason.reason = "user_message"
+    ticks: list[float] = []
+    result = client.wait_for_workstream(
+        ["child-b"],
+        timeout=20,
+        mode="all",
+        interrupt=reason,
+        progress_callback=lambda _snap, elapsed: ticks.append(elapsed),
+    )
+    assert result["interrupted"] == "user_message"
+    assert result["complete"] is False
+    assert len(ticks) == 1
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_completion_on_the_same_tick_wins_over_interrupt(populated_storage):
+    """A tick that meets the wait condition reports a complete wait, not an
+    interrupted one: the reason is consulted only where the loop would
+    otherwise block."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    reason.reason = "user_message"
+    result = client.wait_for_workstream(["child-a"], timeout=20, mode="any", interrupt=reason)
+    assert result["complete"] is True
+    assert "interrupted" not in result
+    assert reason.calls == 0
+
+
+def test_wait_timeout_zero_never_consults_interrupt(populated_storage):
+    """A one-shot poll (``timeout=0``) still reports a timeout: the deadline
+    check precedes the interrupt."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    reason.reason = "user_message"
+    result = client.wait_for_workstream(["child-b"], timeout=0, mode="all", interrupt=reason)
+    assert result["complete"] is False
+    assert "interrupted" not in result
+    assert reason.calls == 0
+
+
+def test_wait_wake_without_a_reason_keeps_waiting(populated_storage):
+    """Setting the Event with no reason pending is a spurious wake: the loop
+    re-ticks once and goes back to waiting until the timeout."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    wake = threading.Event()
+    reason = _Reason(on_first_call=wake.set)
+    ticks: list[float] = []
+    result = client.wait_for_workstream(
+        ["child-b"],
+        timeout=0.6,
+        mode="all",
+        interrupt=reason,
+        wake_event=wake,
+        progress_callback=lambda _snap, elapsed: ticks.append(elapsed),
+    )
+    assert result["complete"] is False
+    assert "interrupted" not in result
+    assert result["elapsed"] >= 0.6
+    # The first tick, the wake's re-tick, and the tick that finds the deadline.
+    assert len(ticks) == 3, ticks
+    assert reason.calls == 2
+
+
+def test_wait_caller_event_still_wakes_on_child_notify(populated_storage):
+    """The caller's Event replaces the bus's own, so a child state change
+    still wakes the wait through it."""
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    caller_event = threading.Event()
+    set_by_notify: list[bool] = []
+
+    def _child_finishes() -> None:
+        populated_storage.update_workstream_state("child-b", "idle")
+        bus.notify("child-b")
+        set_by_notify.append(caller_event.is_set())
+
+    reason = _Reason(on_first_call=_child_finishes)
+    start = time.monotonic()
+    result = client.wait_for_workstream(
+        ["child-b"], timeout=20, mode="any", interrupt=reason, wake_event=caller_event
+    )
+    elapsed = time.monotonic() - start
+    assert set_by_notify == [True], "the bus did not set the caller's Event"
+    assert result["complete"] is True
+    assert reason.calls == 1
+    assert elapsed < 1.0, f"child notify did not reach the caller's Event: {elapsed}s"
+    assert bus._waiters == {}
+
+
+def test_wait_caller_event_wakes_a_wait_with_no_registered_ids(populated_storage, monkeypatch):
+    """When the ownership pre-read fails no id is registered on the bus, yet
+    the wait still blocks on the caller's Event, so the caller can end it."""
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    real_batch = populated_storage.get_workstreams_batch
+    calls = {"n": 0}
+
+    def _first_read_fails(ws_ids):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("storage blip")
+        return real_batch(ws_ids)
+
+    monkeypatch.setattr(populated_storage, "get_workstreams_batch", _first_read_fails)
+    wake = threading.Event()
+    registered_mid_wait: list[dict[str, Any]] = []
+
+    def _message_arrives() -> None:
+        registered_mid_wait.append(dict(bus._waiters))
+        reason.reason = "user_message"
+        wake.set()
+
+    reason = _Reason(on_first_call=_message_arrives)
+    start = time.monotonic()
+    result = client.wait_for_workstream(
+        ["child-b"], timeout=20, mode="all", interrupt=reason, wake_event=wake
+    )
+    elapsed = time.monotonic() - start
+    assert registered_mid_wait == [{}], "pre-read failure should leave nothing registered"
+    assert result["interrupted"] == "user_message"
+    assert result["results"]["child-b"]["state"] == "running"
+    assert reason.calls == 2
+    assert elapsed < 1.0, f"the wake did not end the block: {elapsed}s"
+
+
+@pytest.mark.parametrize(
+    ("method", "first_failing_call"),
+    [("get_workstreams_batch", 2), ("sum_workstream_tokens_batch", 1)],
+)
+def test_wait_ends_with_the_read_error_when_a_tick_cannot_read(
+    populated_storage, monkeypatch, method, first_failing_call
+):
+    """A tick whose read fails ends the wait with the read error: rows it
+    could not read are not missing children, and token counts it could not
+    read are not a change since the caller's snapshot.  (The first rows read
+    is the ownership pre-read, which only arms the wake.)"""
+    real = getattr(populated_storage, method)
+    calls: list[Any] = []
+
+    def _fails(ws_ids: Any) -> Any:
+        calls.append(ws_ids)
+        if len(calls) >= first_failing_call:
+            raise RuntimeError("storage down")
+        return real(ws_ids)
+
+    monkeypatch.setattr(populated_storage, method, _fails)
+    client = _make_read_client(populated_storage)
+    since = {"child-b": {"state": "running", "tokens": 1234, "updated": ""}}
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.wait_for_workstream(["child-b"], timeout=5, mode="all", since=since)
+    assert str(excinfo.value) == (
+        "the workstreams being waited on could not be read. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — last-message bundling
+# ---------------------------------------------------------------------------
+#
+# Each terminal child's last assistant turn (or a status sentinel) is
+# bundled inline so the coord LLM doesn't need a follow-up
+# inspect_workstream round-trip per ws.  The fields are additive
+# (``message`` / ``truncated``), so existing wait tests stay green.
+
+
+def test_wait_for_workstream_idle_returns_last_assistant_message(populated_storage):
+    """A child that finished normally surfaces its final assistant
+    turn inline so the coord doesn't have to inspect to read it."""
+    populated_storage.save_message("child-a", "user", "what's the answer?")
+    populated_storage.save_message("child-a", "assistant", "the answer is 42")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    assert snap["message"] == "the answer is 42"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_idle_walks_past_trailing_tool_messages(populated_storage):
+    """The most recent assistant turn often sits behind a few tool
+    messages (assistant emits tool_calls → tool results land → final
+    assistant content follows).  The walk must skip non-assistant
+    rows when picking the last assistant content."""
+    populated_storage.save_message("child-a", "user", "do the thing")
+    populated_storage.save_message("child-a", "assistant", "calling tool")
+    populated_storage.save_message("child-a", "tool", "tool output", tool_call_id="t1")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    # The assistant message above is the most recent assistant turn —
+    # the trailing tool row must not block extraction.
+    assert result["results"]["child-a"]["message"] == "calling tool"
+
+
+def test_wait_for_workstream_idle_skips_empty_assistant_with_tool_calls(populated_storage):
+    """An assistant message with empty content + only tool_calls isn't
+    a final answer — walk further back for the last assistant message
+    that actually has text."""
+    populated_storage.save_message("child-a", "user", "first turn")
+    populated_storage.save_message("child-a", "assistant", "first assistant reply")
+    populated_storage.save_message("child-a", "user", "second turn")
+    populated_storage.save_message(
+        "child-a", "assistant", "", tool_calls='[{"id": "t1", "name": "x"}]'
+    )
+    populated_storage.save_message("child-a", "tool", "tool result", tool_call_id="t1")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    # Last assistant with non-empty content is the FIRST assistant message
+    # — the empty-content tool-calls assistant must be skipped.
+    assert result["results"]["child-a"]["message"] == "first assistant reply"
+
+
+def test_wait_for_workstream_idle_no_assistant_returns_sentinel(populated_storage):
+    """A workstream that reaches idle without an assistant turn in the
+    tail (rare but possible for a freshly registered ws closed before
+    generation, or a long-running ws whose final assistant message is
+    buried beyond the tail window) gets a hedged sentinel rather than
+    null — the model can distinguish 'no recent output' from 'still
+    running'."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    # No messages were saved for child-a in this test — sentinel kicks in.
+    # Wording is hedged ("recent") because the tail-only walk can't
+    # actually prove no assistant output exists in the full history.
+    assert snap["message"] == "(no recent assistant output)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_returns_last_assistant_message(populated_storage):
+    """An errored child still gets its last assistant turn surfaced —
+    that's usually the most useful diagnostic ('I was about to ...
+    when the error happened')."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "partial output before crash"
+
+
+def test_wait_for_workstream_error_with_no_output_returns_sentinel(populated_storage):
+    """When error fires with no assistant content in the tail (e.g. a
+    pre-flight provider auth failure that crashes before the model
+    speaks, or a >18-parallel-tool-call burst whose only assistant
+    row carries empty content), the same hedged sentinel applies.
+    The wording deliberately doesn't claim 'before producing output'
+    — the tail-only walk can't prove that.
+    """
+    populated_storage.update_workstream_state("child-a", "error")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "(no recent assistant output)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_prefers_persisted_last_error(populated_storage):
+    """When the worker thread persists ``last_error`` on a crash (e.g.
+    provider 429 after retry exhaustion, model misconfig), the error
+    text wins over the assistant tail — the actual cause is more
+    actionable than a half-finished prior turn."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "RateLimitError: 429 too many requests after 5 retries"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "RateLimitError: 429 too many requests after 5 retries"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_falls_back_to_assistant_when_no_last_error(populated_storage):
+    """Legacy / pre-fix error rows (state=error, no last_error config)
+    keep the existing assistant-tail behaviour — the upgrade is
+    additive."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    # Note: no save_workstream_config call.
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["message"] == "partial output before crash"
+
+
+def test_wait_for_workstream_error_whose_last_error_cannot_be_read_has_no_message(
+    populated_storage, monkeypatch
+):
+    """A failed last-error read is ``message: null``, the wait's mark for
+    a message it couldn't read.  The assistant tail would report the
+    child's last turn as if no error text were stored."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    populated_storage.save_workstream_config("child-a", {"last_error": "RateLimitError: 429"})
+    _fail_config_reads(monkeypatch, populated_storage)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert result["complete"] is True  # an incomplete wait nulls every message anyway
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] is None
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_closed_returns_sentinel(populated_storage):
+    """Closed children get a status sentinel rather than a partial
+    last message — a half-finished thought from a workstream the
+    operator explicitly closed isn't useful (and could be misleading)."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_message("child-a", "assistant", "mid-thought when closed")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "closed"
+    assert snap["message"] == "(workstream closed)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_not_found_returns_sentinel(hex_storage):
+    """Unobservable ws_ids surface a fixed sentinel message so the
+    coord LLM recognises the rejection without parsing state strings
+    on its own."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([FOREIGN_HEX], timeout=5, mode="any")
+    snap = result["results"][FOREIGN_HEX]
+    assert snap["state"] == "not_found"
+    assert snap["message"] == "(no workstream with this id among your children)"
+    assert snap["truncated"] is False
+    # One key set across real and not_found entries — uniform consumer
+    # access, no per-state conditionals (updated/name empty here).
+    assert set(snap) == {"state", "tokens", "updated", "name", "message", "truncated"}
+    assert snap["updated"] == ""
+    assert snap["name"] == ""
+
+
+def test_wait_for_workstream_running_child_message_is_null(populated_storage):
+    """In a result that bundles messages, a still-running child must
+    report ``message=None`` — anything else would be a partial last
+    message pretending to be a final answer.  mode='any' completes on
+    the idle child-a beside the running child-b, so the bundling path
+    runs for both rows; null marks the one still working."""
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "child-a's findings")
+    populated_storage.save_message("child-b", "assistant", "child-b mid-thought")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"]["child-a"]["message"] == "child-a's findings"
+    assert result["results"]["child-b"]["state"] == "running"
+    assert result["results"]["child-b"]["message"] is None
+    assert result["results"]["child-b"]["truncated"] is False
+
+
+def test_wait_for_workstream_returns_a_long_message_whole(populated_storage):
+    """The client never cuts a message: one far past the 10 KiB the wait
+    used to cap it at comes back whole, ``truncated`` False.  The session
+    fits the result to its budget (``_fit_wait_result``)."""
+    big = "A" * (64 * 1024)
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", big)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["message"] == big
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_storage_failure_leaves_message_null(populated_storage, monkeypatch):
+    """A transient storage error during the message read must not
+    fail the wait — the coord still gets state/tokens/updated, and
+    the per-ws ``message`` collapses to None so the model can fall
+    back to inspect."""
+    populated_storage.update_workstream_state("child-a", "idle")
+
+    def _broken_load(*_a, **_kw):
+        raise RuntimeError("simulated storage outage")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken_load)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    assert snap["message"] is None
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_does_not_pollute_progress_callback(populated_storage):
+    """The wait_progress SSE event shape is documented as separate
+    from the tool result — the per-tick snapshot dicts handed to the
+    progress callback must NOT carry the new ``message`` /
+    ``truncated`` fields, since enrichment happens after the loop
+    exits."""
+    populated_storage.save_message("child-a", "assistant", "ok")
+    client = _make_read_client(populated_storage)
+    captured: list[dict[str, dict[str, Any]]] = []
+
+    def _cb(snap: dict[str, dict[str, Any]], _elapsed: float) -> None:
+        # Deep-copy so a later mutation by enrichment can't fool the
+        # assertion (we want the shape AT CALLBACK TIME, not at end).
+        import copy
+
+        captured.append(copy.deepcopy(snap))
+
+    client.wait_for_workstream(["child-a"], timeout=5, mode="any", progress_callback=_cb)
+    assert captured  # at least one tick fired
+    for tick in captured:
+        for per_ws in tick.values():
+            assert "message" not in per_ws
+            assert "truncated" not in per_ws
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream / inspect — a dispatched message the child hasn't started
+# ---------------------------------------------------------------------------
+#
+# A child's row shows a dispatched message only once its turn reports
+# ``thinking``, seconds after the spawn or send returned.  Until its stored
+# state or token count changes, wait and inspect report the child
+# ``starting``, or ``stalled`` once ``_DISPATCH_STALL_AFTER_S`` has passed.
+
+DISPATCHED_HEX = "5be1d7c2a9f04e6b8d3c1a7e9f2b4c60"
+
+
+class _Console:
+    """The console's routes as the client calls them, each answered by its last path segment."""
+
+    def __init__(self) -> None:
+        self.replies: dict[str, tuple[int, dict[str, Any]]] = {
+            "new": (200, {"ws_id": DISPATCHED_HEX, "name": "child", "node_id": "n1"}),
+            "send": (200, {"status": "ok", "attached_ids": [], "dropped_attachment_ids": []}),
+            "close": (200, {"status": "ok"}),
+            "cancel": (200, {"status": "ok"}),
+            "delete": (200, {"status": "ok"}),
+            "close_all_children": (200, {"closed": [DISPATCHED_HEX], "failed": [], "skipped": []}),
+        }
+
+    def __call__(self, req: httpx2.Request) -> httpx2.Response:
+        status, body = self.replies.get(req.url.path.rsplit("/", 1)[-1], (404, {}))
+        return httpx2.Response(status, json=body)
+
+
+@pytest.fixture
+def dispatch_storage(tmp_path, sqlite_backend_factory):
+    """A coordinator and one idle child, the row a node's create leaves behind."""
+    st = sqlite_backend_factory(str(tmp_path / "coord-dispatch.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.register_workstream(
+        DISPATCHED_HEX, kind="interactive", parent_ws_id="coord-1", user_id="user-1", name="child"
+    )
+    return st
+
+
+def _dispatch_client(storage: SQLiteBackend, console: _Console | None = None) -> CoordinatorClient:
+    return CoordinatorClient(
+        console_base_url="http://console.example.com",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(console or _Console())),
+        child_event_bus=ChildEventBus(),
+    )
+
+
+def _spawn_child(client: CoordinatorClient) -> None:
+    result = client.spawn(
+        initial_message="write the report", parent_ws_id="coord-1", user_id="user-1"
+    )
+    assert result["ws_id"] == DISPATCHED_HEX
+
+
+def _finish_turn(storage: SQLiteBackend, ws_id: str, answer: str, tokens: int = 120) -> None:
+    """Store a finished turn: its answer, the tokens it spent and the idle it ends on."""
+    storage.save_message(ws_id, "assistant", answer)
+    storage.record_usage_event(event_id=uuid.uuid4().hex, ws_id=ws_id, prompt_tokens=tokens)
+    storage.update_workstream_state(ws_id, "idle")
+
+
+def _backdate_dispatch(client: CoordinatorClient, ws_id: str, seconds: float) -> None:
+    """Move the recorded dispatch to ``ws_id`` ``seconds`` into the past."""
+    client._dispatches[ws_id].dispatched_at -= seconds
+
+
+def _wait_once(client: CoordinatorClient, ws_id: str = DISPATCHED_HEX) -> dict[str, Any]:
+    """One tick's results: a zero timeout snapshots once and returns."""
+    return client.wait_for_workstream([ws_id], timeout=0)
+
+
+def _backdate_updated(storage: SQLiteBackend, ws_id: str) -> None:
+    """Make ``ws_id``'s row look created and last changed long ago."""
+    with storage._engine.connect() as conn:
+        conn.execute(
+            sa.update(workstreams)
+            .where(workstreams.c.ws_id == ws_id)
+            .values(created="2020-01-01T00:00:00", updated="2020-01-01T00:00:00")
+        )
+        conn.commit()
+
+
+def test_wait_right_after_a_spawn_reports_the_child_starting(dispatch_storage):
+    """The incident: a wait issued right after a spawn read the new child's
+    ``idle`` row as finished, with no output, and the model resent the brief.
+    The child reads ``starting``, which isn't terminal, so the wait runs on."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.2, mode="any")
+    assert result["complete"] is False
+    assert result["elapsed"] >= 0.2
+    snap = result["results"][DISPATCHED_HEX]
+    assert snap["state"] == "starting"
+    assert 0 <= snap["dispatch_age_s"] < 120
+    assert snap["message"] is None
+    assert "stalled" not in result
+
+
+def test_a_spawned_child_reads_its_stored_state_once_its_turn_begins(dispatch_storage):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "starting"
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    thinking = _wait_once(client)["results"][DISPATCHED_HEX]
+    assert thinking["state"] == "thinking"
+    assert "dispatch_age_s" not in thinking
+
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "the report is done")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    snap = result["results"][DISPATCHED_HEX]
+    assert snap["state"] == "idle"
+    assert snap["tokens"] == 120
+    assert snap["message"] == "the report is done"
+
+
+def test_a_turn_that_ended_between_waits_shows_by_its_tokens(dispatch_storage):
+    """No wait saw the turn's ``thinking``, but the tokens it spent show it ran."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "done already")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+    assert result["results"][DISPATCHED_HEX]["message"] == "done already"
+
+
+@pytest.mark.parametrize(
+    ("initial_message", "extra"),
+    [
+        # The node answers these only when the first message wasn't delivered.
+        ("write the report", {"initial_message_status": "queue_full"}),
+        ("write the report", {"initial_message_status": "refused_closed"}),
+        # A spawn with no initial message dispatches nothing.
+        ("   ", {}),
+    ],
+)
+def test_a_spawn_that_dispatched_no_message_records_nothing(
+    dispatch_storage, initial_message, extra
+):
+    console = _Console()
+    console.replies["new"] = (200, {"ws_id": DISPATCHED_HEX, "name": "child", **extra})
+    client = _dispatch_client(dispatch_storage, console)
+    client.spawn(initial_message=initial_message, parent_ws_id="coord-1", user_id="user-1")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+    assert result["results"][DISPATCHED_HEX]["message"] == "(no recent assistant output)"
+
+
+def test_a_send_that_starts_a_fresh_turn_reports_the_child_starting(dispatch_storage):
+    """After a send the row keeps the last turn's ``idle`` until the new turn
+    begins, and a wait read the previous answer as the reply.  The child reads
+    ``starting`` until its row moves; the wait that completes has the new answer."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    client = _dispatch_client(dispatch_storage)
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+
+    pending = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.2, mode="any")
+    assert pending["complete"] is False
+    assert pending["results"][DISPATCHED_HEX]["state"] == "starting"
+    assert pending["results"][DISPATCHED_HEX]["tokens"] == 50
+    assert pending["results"][DISPATCHED_HEX]["message"] is None
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "thinking"
+
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "the summary")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["message"] == "the summary"
+
+
+@pytest.mark.parametrize("dispatch", ["spawn", "send"])
+def test_the_dispatched_message_landing_in_history_does_not_end_starting(
+    dispatch_storage, dispatch
+):
+    """The child saves the dispatched message, which moves its row's
+    ``updated``, before its turn reports ``thinking``.  Only the state and
+    token count show the turn began, so the child still reads ``starting``
+    and the wait doesn't complete on the last turn's ``idle``."""
+    if dispatch == "send":
+        _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer")
+    # Created and last changed long ago, so the save below moves ``updated``.
+    _backdate_updated(dispatch_storage, DISPATCHED_HEX)
+    client = _dispatch_client(dispatch_storage)
+    if dispatch == "spawn":
+        _spawn_child(client)
+    else:
+        assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "the dispatched message")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0, mode="any")
+    assert result["results"][DISPATCHED_HEX]["updated"] != "2020-01-01T00:00:00"
+    assert result["results"][DISPATCHED_HEX]["state"] == "starting"
+    assert result["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # A live turn took the message, or a send was parked behind a command.
+        {"status": "queued", "priority": "normal", "msg_id": "m-1"},
+        {"status": "queued", "deferred": True, "priority": "normal", "msg_id": "m-1"},
+        {"status": "queue_full", "attached_ids": [], "dropped_attachment_ids": []},
+    ],
+)
+def test_a_send_that_starts_no_fresh_turn_records_nothing(dispatch_storage, reply):
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer")
+    console = _Console()
+    console.replies["send"] = (200, reply)
+    client = _dispatch_client(dispatch_storage, console)
+    client.send(DISPATCHED_HEX, "and another thing")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_send_whose_baseline_cannot_be_read_records_nothing(dispatch_storage, monkeypatch):
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer")
+    client = _dispatch_client(dispatch_storage)
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise RuntimeError("storage down")
+
+    with monkeypatch.context() as m:
+        # Only the pre-send baseline reads token counts on the send path.
+        m.setattr(dispatch_storage, "sum_workstream_tokens_batch", _boom)
+        assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_message_unstarted_past_the_threshold_stalls_and_ends_the_first_wait(
+    dispatch_storage,
+):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=30, mode="all")
+    assert result["complete"] is False
+    assert result["elapsed"] < 5
+    assert result["stalled"] == [DISPATCHED_HEX]
+    snap = result["results"][DISPATCHED_HEX]
+    assert snap["state"] == "stalled"
+    assert snap["dispatch_age_s"] >= 200
+    assert snap["message"] is None
+
+
+def test_a_reported_stall_does_not_end_the_next_wait(dispatch_storage):
+    """The model already heard about the stall, so it can't spin on it, and a
+    later wait that times out isn't listed as ended by it."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, mode="all")
+    assert result["complete"] is False
+    assert result["elapsed"] >= 0.3
+    assert "stalled" not in result
+    assert result["results"][DISPATCHED_HEX]["state"] == "stalled"
+    assert result["results"][DISPATCHED_HEX]["dispatch_age_s"] >= 200
+
+
+def test_a_read_from_before_a_send_leaves_its_record(dispatch_storage, monkeypatch):
+    """Coordinator tools run in parallel, so a wait tick can read a child's row
+    just before a send records its dispatch.  That read can't show the new
+    turn, so it leaves the record alone, and the next read shows the child
+    ``starting`` rather than the last turn's ``idle``."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    # The last turn is still ending when the wait reads the row.
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    client = _dispatch_client(dispatch_storage)
+    sum_tokens = dispatch_storage.sum_workstream_tokens_batch
+    sent: list[bool] = []
+
+    def _send_after_the_row_read(ws_ids: list[str]) -> dict[str, int]:
+        if not sent:
+            sent.append(True)
+            # Between the tick's row and token reads, the last turn ends and
+            # a parallel send records its dispatch.
+            dispatch_storage.update_workstream_state(DISPATCHED_HEX, "idle")
+            assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+        return sum_tokens(ws_ids)
+
+    monkeypatch.setattr(dispatch_storage, "sum_workstream_tokens_batch", _send_after_the_row_read)
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, mode="any")
+    assert sent
+    assert result["complete"] is False
+    assert result["results"][DISPATCHED_HEX]["state"] == "starting"
+
+
+def test_only_a_read_older_than_the_baseline_reads_as_pending(dispatch_storage):
+    """A read taken while the send was in flight, after it read the baseline,
+    shows the dispatched turn when it moved the row (a model failing at once),
+    so it ends the record and shows the stored ``error``.  One taken before the
+    baseline is older news, and reads as pending."""
+    client = _dispatch_client(dispatch_storage)
+    client._record_dispatch(DISPATCHED_HEX, ("idle", 0), baseline_at=100.0)
+    record = client._dispatches[DISPATCHED_HEX]
+    assert client._dispatch_state(DISPATCHED_HEX, ("thinking", 0), read_at=99.0) is not None
+    assert client._dispatches[DISPATCHED_HEX] is record
+    assert client._dispatch_state(DISPATCHED_HEX, ("error", 0), read_at=100.0) is None
+    assert DISPATCHED_HEX not in client._dispatches
+
+
+def test_a_not_found_abort_leaves_a_stall_for_the_next_wait(dispatch_storage):
+    """The abort is an error the model fixes before it waits again, so the
+    stall it saw is neither listed nor used up there."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    aborted = client.wait_for_workstream([DISPATCHED_HEX, "f" * 32], timeout=5)
+    assert aborted["not_found"]
+    assert "stalled" not in aborted
+    assert aborted["results"][DISPATCHED_HEX]["state"] == "stalled"
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+
+
+def test_a_record_lapses_so_a_child_cannot_stay_stalled(dispatch_storage):
+    """A record storage never shows ending (a message cancelled from elsewhere
+    before it started, say) lapses, and the child reads as stored again."""
+    from turnstone.console import coordinator_client
+
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, coordinator_client._DISPATCH_RECORD_TTL_S - 1)
+    assert client.inspect(DISPATCHED_HEX)["state"] == "stalled"
+    _backdate_dispatch(client, DISPATCHED_HEX, 2)
+    assert client.inspect(DISPATCHED_HEX)["state"] == "idle"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="all")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+    assert "stalled" not in result
+
+
+def test_a_wait_that_raised_leaves_its_stall_for_the_next(dispatch_storage):
+    """A stall counts as reported only once a wait returns it, so a wait the
+    coordinator's cancel ended (its progress callback raised) doesn't use it up."""
+
+    class _Cancelled(BaseException):
+        pass
+
+    def _cancel(_snap: object, _elapsed: float) -> None:
+        raise _Cancelled
+
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    with pytest.raises(_Cancelled):
+        client.wait_for_workstream([DISPATCHED_HEX], timeout=5, progress_callback=_cancel)
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+
+
+def test_a_change_after_a_stall_reads_the_stored_state(dispatch_storage):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = _wait_once(client)
+    assert moved["results"][DISPATCHED_HEX]["state"] == "thinking"
+    assert "dispatch_age_s" not in moved["results"][DISPATCHED_HEX]
+    assert "stalled" not in moved
+
+    # The record ended when the row moved: a row back at the baseline (a turn
+    # stopped before it spent anything) reads as stored, not as stalled again.
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "idle")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_stall_on_a_tick_that_meets_the_wait_condition_is_listed(dispatch_storage):
+    """``complete`` follows the wait condition, the stall is listed anyway, and
+    the stall counts as reported for the next wait."""
+    dispatch_storage.register_workstream(
+        REAL_CHILD_HEX, kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+    )
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    result = client.wait_for_workstream([DISPATCHED_HEX, REAL_CHILD_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["stalled"] == [DISPATCHED_HEX]
+    assert result["results"][REAL_CHILD_HEX]["state"] == "idle"
+    assert client.wait_for_workstream([DISPATCHED_HEX], timeout=0.2)["elapsed"] >= 0.2
+
+
+def test_inspect_reports_a_child_that_has_not_started_its_message(dispatch_storage):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    # The child can store the message before its turn reports ``thinking``.
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "write the report")
+
+    starting = client.inspect(DISPATCHED_HEX)
+    assert starting["state"] == "starting"
+    assert 0 <= starting["dispatch_age_s"] < 120
+    assert [m["content"] for m in starting["messages"]] == ["write the report"]
+
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    stalled = client.inspect(DISPATCHED_HEX)
+    assert stalled["state"] == "stalled"
+    assert stalled["dispatch_age_s"] >= 200
+    # Inspect leaves the stall unreported, so the next wait still ends on it.
+    assert client.wait_for_workstream([DISPATCHED_HEX], timeout=5)["stalled"] == [DISPATCHED_HEX]
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = client.inspect(DISPATCHED_HEX)
+    assert moved["state"] == "thinking"
+    assert "dispatch_age_s" not in moved
+
+
+def test_a_send_to_a_child_in_error_records_nothing(dispatch_storage):
+    """The next turn can fail before it shows (a held model) and end in
+    ``error`` with the same tokens, so a record would hide the new failure
+    behind ``starting`` and then ``stalled``.  The child reads as stored."""
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "error")
+    dispatch_storage.save_workstream_config(DISPATCHED_HEX, {"last_error": "provider 500"})
+    client = _dispatch_client(dispatch_storage)
+    assert client.send(DISPATCHED_HEX, "try again")["status"] == "ok"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "error"
+    inspected = client.inspect(DISPATCHED_HEX)
+    assert inspected["state"] == "error"
+    assert inspected["last_error"] == "provider 500"
+
+
+def test_a_send_that_read_a_busy_row_records_nothing(dispatch_storage):
+    """The read raced a turn that was still ending: the new turn's
+    ``thinking`` would match that baseline, and a running child would read
+    ``starting``, then ``stalled``."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    client = _dispatch_client(dispatch_storage)
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    assert DISPATCHED_HEX not in client._dispatches
+    snap = _wait_once(client)["results"][DISPATCHED_HEX]
+    assert snap["state"] == "thinking"
+    assert "dispatch_age_s" not in snap
+
+
+def test_a_since_wait_after_a_send_does_not_return_on_the_dispatch(dispatch_storage):
+    """The usual loop: wait, send, wait with ``since``.  ``starting`` isn't a
+    change in storage, nor is the message landing in the history; the wait
+    returns once the turn shows."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    _backdate_updated(dispatch_storage, DISPATCHED_HEX)
+    client = _dispatch_client(dispatch_storage)
+    hint = _wait_once(client)["results"]
+    assert hint[DISPATCHED_HEX]["state"] == "idle"
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "now the summary")
+
+    pending = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, since=hint)
+    assert pending["changed"] == []
+    assert pending["elapsed"] >= 0.3
+    assert pending["results"][DISPATCHED_HEX]["state"] == "starting"
+    assert pending["results"][DISPATCHED_HEX]["updated"] != hint[DISPATCHED_HEX]["updated"]
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert moved["changed"] == [DISPATCHED_HEX]
+    assert moved["complete"] is False
+    assert moved["results"][DISPATCHED_HEX]["state"] == "thinking"
+
+
+def test_a_since_hint_from_a_starting_child_changes_only_when_its_turn_shows(dispatch_storage):
+    """A hint taken while the child read ``starting`` matches it while it stays
+    unstarted, through the turn to ``stalled``, which ends the first wait as a
+    stall, not a change."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    hint = _wait_once(client)["results"]
+    assert hint[DISPATCHED_HEX]["state"] == "starting"
+
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    stalled = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert stalled["stalled"] == [DISPATCHED_HEX]
+    assert stalled["changed"] == []
+    quiet = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, since=hint)
+    assert quiet["changed"] == []
+    assert quiet["elapsed"] >= 0.3
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert moved["changed"] == [DISPATCHED_HEX]
+
+
+def test_a_since_hint_from_before_an_earlier_turn_sees_its_tokens(dispatch_storage):
+    """A child reported ``starting`` still compares by its tokens: a turn that
+    ran between the hint and the dispatch is a change."""
+    client = _dispatch_client(dispatch_storage)
+    hint = _wait_once(client)["results"]
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "a turn the user started", tokens=80)
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert result["changed"] == [DISPATCHED_HEX]
+    assert result["results"][DISPATCHED_HEX]["state"] == "starting"
+
+
+def test_inspect_shows_the_stored_state_when_its_token_read_fails(dispatch_storage, monkeypatch):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "write the report")
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise RuntimeError("storage down")
+
+    with monkeypatch.context() as m:
+        m.setattr(dispatch_storage, "sum_workstream_tokens_batch", _boom)
+        degraded = client.inspect(DISPATCHED_HEX)
+    assert degraded["state"] == "idle"
+    assert "dispatch_age_s" not in degraded
+    assert [m["content"] for m in degraded["messages"]] == ["write the report"]
+    # The record survives the failed read.
+    assert client.inspect(DISPATCHED_HEX)["state"] == "starting"
+
+
+def test_inspect_of_a_turn_that_ended_during_the_read_shows_its_reply_as_stored(
+    dispatch_storage, monkeypatch
+):
+    """The row is read before the history, so a turn that ended in between
+    leaves the row at its baseline; the token count read after the history
+    shows the turn ran, rather than ``starting`` beside its own reply."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    load_messages = dispatch_storage.load_messages
+    finished: list[bool] = []
+
+    def _load_after_the_turn(ws_id: str, **kwargs: Any) -> list[Any]:
+        if not finished:
+            finished.append(True)
+            _finish_turn(dispatch_storage, DISPATCHED_HEX, "the report is done")
+        return load_messages(ws_id, **kwargs)
+
+    monkeypatch.setattr(dispatch_storage, "load_messages", _load_after_the_turn)
+    result = client.inspect(DISPATCHED_HEX)
+    assert result["state"] == "idle"
+    assert "dispatch_age_s" not in result
+    assert [m["content"] for m in result["messages"]] == ["the report is done"]
+
+
+def test_inspect_skeleton_keeps_the_dispatch_age():
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    result = {**_make_inspect_result(state="starting", n_messages=50), "dispatch_age_s": 0}
+    parsed = json.loads(_format_inspect_tiered(result, budget=100))
+    assert parsed["_tier"] == "skeleton"
+    assert parsed["state"] == "starting"
+    assert parsed["dispatch_age_s"] == 0
+
+
+@pytest.mark.parametrize(
+    "end",
+    [
+        lambda client: client.close_workstream(DISPATCHED_HEX),
+        lambda client: client.cancel(DISPATCHED_HEX),
+        lambda client: client.delete(DISPATCHED_HEX),
+        lambda client: client.close_all_children(),
+    ],
+    ids=["close", "cancel", "delete", "close_all_children"],
+)
+def test_ending_a_childs_turn_forgets_its_dispatch(dispatch_storage, end):
+    """A cancelled message may never start and leave the row at its baseline,
+    so the record goes with the verb rather than reading ``stalled`` later."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    assert not end(client).get("error")
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_cancel_that_failed_keeps_the_dispatch(dispatch_storage):
+    console = _Console()
+    console.replies["cancel"] = (502, {"error": "upstream node unreachable"})
+    client = _dispatch_client(dispatch_storage, console)
+    _spawn_child(client)
+    assert client.cancel(DISPATCHED_HEX)["error"]
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "starting"
+
+
+def test_the_dispatch_record_forgets_its_oldest_past_the_cap(dispatch_storage, monkeypatch):
+    from turnstone.console import coordinator_client
+
+    monkeypatch.setattr(coordinator_client, "_DISPATCH_RECORD_MAX", 2)
+    others = ["1" * 32, "2" * 32]
+    for ws_id in others:
+        dispatch_storage.register_workstream(
+            ws_id, kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+        )
+    client = _dispatch_client(dispatch_storage)
+    for ws_id in [DISPATCHED_HEX, *others]:
+        assert client.send(ws_id, "go")["status"] == "ok"
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "idle"
+    states = client.wait_for_workstream(others, timeout=0)["results"]
+    assert [states[ws_id]["state"] for ws_id in others] == ["starting", "starting"]
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — helper-function unit tests
+# ---------------------------------------------------------------------------
+
+
+def _wait_result_with(messages: dict[str, str | None]) -> dict[str, Any]:
+    """A completed wait result whose children carry ``messages``, as the client builds it."""
+    return {
+        "results": {
+            wid: {
+                "state": "idle" if message is not None else "running",
+                "tokens": 7,
+                "updated": "2026-11-04T10:00:00",
+                "name": f"child-{wid}",
+                "message": message,
+                "truncated": False,
+            }
+            for wid, message in messages.items()
+        },
+        "complete": True,
+        "elapsed": 1.5,
+        "mode": "any",
+    }
+
+
+def _whole_count(out: str) -> int:
+    return sum(1 for entry in json.loads(out)["results"].values() if not entry.get("truncated"))
+
+
+def test_fit_wait_result_sends_a_result_that_fits_as_it_is():
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    result = _wait_result_with({"a": "x" * 500, "b": None})
+    whole = _wait_result_json(result)
+    assert _fit_wait_result(result, budget=len(whole)) == whole
+
+
+def test_fit_wait_result_cuts_a_lone_message_to_fill_the_budget():
+    """A lone message gets all the room the rest of the result leaves, cut from the end and
+    marked with its whole length, and nothing but the message fields changes."""
+    from turnstone.console.coordinator_client import _fit_wait_result
+
+    text = "".join(f"line {i}: findings " for i in range(2000))
+    result = _wait_result_with({"a": text})
+    out = _fit_wait_result(result, budget=4000)
+    # Plain ASCII takes one character a character, so the cut fills the budget exactly.
+    assert len(out) == 4000
+    parsed = json.loads(out)
+    entry = parsed["results"]["a"]
+    assert entry["truncated"] is True
+    assert entry["message_chars"] == len(text)
+    assert text.startswith(entry["message"])
+    fields = ("message", "truncated", "message_chars")
+    assert {k: v for k, v in entry.items() if k not in fields} == {
+        k: v for k, v in result["results"]["a"].items() if k not in fields
+    }
+    assert {k: v for k, v in parsed.items() if k != "results"} == {
+        k: v for k, v in result.items() if k != "results"
+    }
+    # The input is never mutated.
+    assert result["results"]["a"]["message"] == text
+    assert result["results"]["a"]["truncated"] is False
+    assert "message_chars" not in result["results"]["a"]
+
+
+def test_fit_wait_result_keeps_the_smallest_whole_so_the_fewest_are_cut():
+    """As many messages as fit stay whole, smallest first, and only the rest are cut, sharing
+    what is left evenly."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    texts = {"short": "s" * 300, "mid": "m" * 2000, "long_a": "a" * 9000, "long_b": "b" * 12000}
+    result = _wait_result_with({**texts, "busy": None})
+    whole_len = len(_wait_result_json(result))
+    # Room for all but the longest whole: only it is cut, and the cut fills the budget.
+    out = _fit_wait_result(result, budget=whole_len - 1000)
+    assert len(out) == whole_len - 1000
+    entries = json.loads(out)["results"]
+    for wid in ("short", "mid", "long_a", "busy"):
+        assert entries[wid] == result["results"][wid]
+    assert entries["long_b"]["truncated"] is True
+    assert entries["long_b"]["message_chars"] == 12000
+    # Room for the two shortest whole: the two longest share the rest.
+    out = _fit_wait_result(result, budget=whole_len - 15000)
+    assert len(out) <= whole_len - 15000
+    entries = json.loads(out)["results"]
+    assert entries["short"] == result["results"]["short"]
+    assert entries["mid"] == result["results"]["mid"]
+    assert entries["long_a"]["truncated"] is entries["long_b"]["truncated"] is True
+    assert abs(len(entries["long_a"]["message"]) - len(entries["long_b"]["message"])) <= 1
+
+
+def test_fit_wait_result_cuts_the_fewest_of_many_equal_answers():
+    """A wide fan-out of one-line answers just over the room loses one or two of them, not
+    every answer cut to a sliver."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    answers = {f"{i:032x}": "Merged PR #100 after the test suite passed." for i in range(32)}
+    result = _wait_result_with(answers)
+    whole_len = len(_wait_result_json(result))
+    for over, kept in ((1, 31), (10, 31), (50, 30)):
+        out = _fit_wait_result(result, budget=whole_len - over)
+        assert len(out) <= whole_len - over
+        assert _whole_count(out) == kept
+
+
+def test_fit_wait_result_never_sends_a_fit_longer_than_the_result():
+    """Cutting a message shorter than the cut marker would lengthen the result: when nothing
+    fits, the result goes out whole for the fold's own cut, never grown."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    result = _wait_result_with({f"{i:032x}": "done." for i in range(32)})
+    whole = _wait_result_json(result)
+    assert _fit_wait_result(result, budget=len(whole) - 50) == whole
+
+
+def test_fit_wait_result_counts_escapes_at_their_serialized_width():
+    """Newlines, quotes and non-ASCII text take more room in the JSON than their length; the fit
+    measures what the model reads, so the result stays within the budget, a cut never splits an
+    escape, and a result whose length fits but whose escapes don't is still cut."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    piece = "caf" + chr(0xE9) + chr(10) + '"quoted"' + chr(0x1F600) + " "
+    text = piece * 400
+    result = _wait_result_with({"a": text, "b": "plain " * 1000})
+    whole_len = len(_wait_result_json(result))
+    for budget in (1500, 1501, 1502, 1503, 3000, 7777, whole_len - 1):
+        out = _fit_wait_result(result, budget=budget)
+        assert len(out) <= budget
+        entry = json.loads(out)["results"]["a"]
+        assert text.startswith(entry["message"])
+        assert entry["truncated"] is True
+        assert entry["message_chars"] == len(text)
+
+
+def test_fit_wait_result_never_drops_a_child_under_a_tight_budget():
+    """However little room the messages get, every child keeps its entry and
+    state; a budget below the result without its messages empties them."""
+    from turnstone.console.coordinator_client import _fit_wait_result
+
+    ids = [f"{i:032x}" for i in range(5)]
+    result = _wait_result_with({wid: "m" * 5000 for wid in ids})
+    for budget in (2000, 100):
+        parsed = json.loads(_fit_wait_result(result, budget=budget))
+        assert list(parsed["results"]) == ids
+        assert all(entry["state"] == "idle" for entry in parsed["results"].values())
+        assert all(entry["truncated"] is True for entry in parsed["results"].values())
+    tiny = json.loads(_fit_wait_result(result, budget=100))
+    assert all(entry["message"] == "" for entry in tiny["results"].values())
+
+
+def test_fit_wait_result_refit_keeps_cut_messages_cut_with_their_whole_length():
+    """The post-guard re-cut fits what admission already fitted: a message the first fit cut
+    stays cut and keeps the whole message's length, and the re-fit stays within its budget.  Its
+    old cut never counts as a whole message, so the re-fit cuts it further before it cuts a
+    message that is still whole."""
+    from turnstone.console.coordinator_client import _fit_wait_result
+
+    texts = {"a": "a" * 30_000, "b": "b" * 3_000, "c": "c" * 400}
+    result = _wait_result_with(texts)
+    first = json.loads(_fit_wait_result(result, budget=5_000))
+    assert [first["results"][wid]["truncated"] for wid in texts] == [True, False, False]
+    out = _fit_wait_result(first, budget=4_500)
+    assert len(out) <= 4_500
+    again = json.loads(out)["results"]
+    assert again["a"]["truncated"] is True
+    assert again["a"]["message_chars"] == 30_000
+    assert len(again["a"]["message"]) < len(first["results"]["a"]["message"])
+    assert again["b"] == first["results"]["b"]
+    assert again["c"] == first["results"]["c"]
+
+
+def test_fit_wait_result_skips_a_status_text_that_doesnt_fit():
+    """A status text that doesn't fit whole is passed over, not a place to stop: a shorter
+    answer after it stays whole while it fits beside the status text cut.  Once the status text
+    fits whole it goes first, as a cut status would read as a message to re-read.  No whole
+    message is marked cut, and below the room for every message cut to nothing the result goes
+    out in its shortest form."""
+    from turnstone.console.coordinator_client import (
+        _WAIT_SENTINEL_NOT_FOUND,
+        _fit_wait_result,
+        _wait_result_json,
+    )
+
+    answer = "Merged after the docs fix."
+    result = _wait_result_with({"gone": _WAIT_SENTINEL_NOT_FOUND, "done": answer})
+
+    def _with(**messages: str) -> int:
+        entries = dict(result["results"])
+        for wid, kept in messages.items():
+            whole = entries[wid]["message"]
+            entries[wid] = {**entries[wid], "message": kept, "truncated": True}
+            entries[wid]["message_chars"] = len(whole)
+        return len(_wait_result_json({**result, "results": entries}))
+
+    shortest = _with(gone="", done="")
+    answer_whole = _with(gone="")
+    status_whole = _with(done="")
+    whole_len = len(_wait_result_json(result))
+    assert shortest < answer_whole < status_whole < whole_len
+    for budget in range(shortest - 20, whole_len):
+        out = _fit_wait_result(result, budget=budget)
+        assert len(out) == shortest if budget < shortest else len(out) <= budget
+        entries = json.loads(out)["results"]
+        if answer_whole <= budget < status_whole:
+            assert entries["done"] == result["results"]["done"]
+        if budget >= status_whole:
+            assert entries["gone"] == result["results"]["gone"]
+        assert not (entries["done"]["truncated"] and entries["done"]["message"] == answer)
+
+
+def test_fit_wait_result_stays_within_budget_for_odd_entry_shapes():
+    """Hand-built entries never push a fit past its budget or past the result whole: a string
+    message_chars only overprices a cut, and an entry marked truncated without a whole length
+    isn't treated as one an earlier fit cut."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    odd = _wait_result_with({f"m{i}": "x" * (300 * (i + 1)) for i in range(4)})
+    for entry in odd["results"].values():
+        entry["message_chars"] = "12"
+    shortest = len(_fit_wait_result(odd, budget=0))
+    for budget in range(shortest, len(_wait_result_json(odd)), 7):
+        assert len(_fit_wait_result(odd, budget=budget)) <= budget
+    marked = _wait_result_with({f"e{i}": "" for i in range(5)})
+    for entry in marked["results"].values():
+        entry["truncated"] = True
+    assert _fit_wait_result(marked, budget=10) == _wait_result_json(marked)
+
+
+def test_fit_wait_result_keeps_status_texts_whole_first():
+    """A closed child's, an unknown id's or a silent child's status text stays whole before any
+    other message, so it never reads as a cut message while anything can stay whole."""
+    from turnstone.console.coordinator_client import (
+        _WAIT_SENTINEL_CLOSED,
+        _WAIT_SENTINEL_NO_RECENT_ASSISTANT,
+        _WAIT_SENTINEL_NOT_FOUND,
+        _fit_wait_result,
+        _wait_result_json,
+    )
+
+    statuses = {
+        "closed": _WAIT_SENTINEL_CLOSED,
+        "gone": _WAIT_SENTINEL_NOT_FOUND,
+        "quiet": _WAIT_SENTINEL_NO_RECENT_ASSISTANT,
+    }
+    result = _wait_result_with({**statuses, "long": "z" * 10_000})
+    long_cut = {**result["results"]["long"], "message": "", "truncated": True}
+    expected = {**result, "results": {**result["results"], "long": long_cut}}
+    expected["results"]["long"]["message_chars"] = 10_000
+    budget = len(_wait_result_json(expected)) + 50
+    expected["results"]["long"]["message"] = "z" * 50
+    assert _fit_wait_result(result, budget=budget) == _wait_result_json(expected)
+
+
+def test_json_text_chars_measures_with_the_serializer_the_result_uses():
+    """The width the fit gives a message is its width in the result's own serialization, so a
+    change to that serializer moves both together."""
+    from turnstone.console.coordinator_client import _json_text_chars, _wait_result_json
+
+    for text in ("plain", "caf" + chr(0xE9), chr(0x1F600) + chr(10) + '"', chr(0x4E2D) * 5):
+        assert _json_text_chars(text) == len(_wait_result_json({"m": text})) - len('{"m":""}')
+
+
+def test_wait_states_leave_out_the_message_fields():
+    from turnstone.console.coordinator_client import _wait_states
+
+    entries = {
+        "a": {
+            "state": "idle",
+            "tokens": 3,
+            "updated": "t",
+            "name": "n",
+            "message": "x",
+            "truncated": True,
+            "message_chars": 9,
+        },
+        "b": {"state": "starting", "tokens": 0, "dispatch_age_s": 4, "message": None},
+    }
+    assert _wait_states(entries) == {
+        "a": {"state": "idle", "tokens": 3, "updated": "t", "name": "n"},
+        "b": {"state": "starting", "tokens": 0, "dispatch_age_s": 4},
+    }
+
+
+def test_share_room_gives_small_entries_what_they_need():
+    from turnstone.console.coordinator_client import _share_room
+
+    assert _share_room({"a": 10, "b": 50, "c": 100}, 120) == {"a": 10, "b": 50, "c": 60}
+    assert _share_room({"a": 10, "b": 50, "c": 100}, 1000) == {"a": 10, "b": 50, "c": 100}
+    assert _share_room({"a": 10, "b": 50}, 0) == {"a": 0, "b": 0}
+    assert _share_room({"a": 10, "b": 50}, -5) == {"a": 0, "b": 0}
+
+
+def test_json_text_prefix_stops_before_an_escape_that_would_overflow():
+    from turnstone.console.coordinator_client import _json_text_prefix
+
+    quote = 'a"b'
+    assert _json_text_prefix(quote, 2) == "a"
+    assert _json_text_prefix(quote, 3) == 'a"'
+    assert _json_text_prefix(quote, 4) == quote
+    astral = "x" + chr(0x1F600)
+    assert _json_text_prefix(astral, 12) == "x"
+    assert _json_text_prefix(astral, 13) == astral
+    assert _json_text_prefix("anything", 0) == ""
+
+
+def test_last_assistant_text_returns_content_when_present(populated_storage):
+    """Pins the third leg of the tri-state contract: a populated tail
+    returns the actual assistant content string (not ``""``, not
+    ``None``).  Integration tests cover this through enrichment, but a
+    direct unit test makes the contract harder to break in a refactor."""
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    populated_storage.save_message("child-a", "user", "hello")
+    populated_storage.save_message("child-a", "assistant", "hi back")
+    assert _last_assistant_text(populated_storage, "child-a") == "hi back"
+
+
+def test_last_assistant_text_returns_empty_when_no_messages(populated_storage):
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    # child-a has no messages saved.
+    assert _last_assistant_text(populated_storage, "child-a") == ""
+
+
+def test_last_assistant_text_returns_none_on_storage_failure(populated_storage, monkeypatch):
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken)
+    assert _last_assistant_text(populated_storage, "child-a") is None
+
+
+# ---------------------------------------------------------------------------
+# tasks
+# ---------------------------------------------------------------------------
+
+
+def _task_client(tmp_path, sqlite_backend_factory) -> CoordinatorClient:
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    return _make_read_client(st)
+
+
+def test_tasks_get_empty_envelope_on_fresh_ws(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    env = client.tasks_get("coord-1")
+    assert env == {"version": 1, "tasks": []}
+
+
+def test_tasks_add_then_get_roundtrip(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="spawn worker")
+    assert task["title"] == "spawn worker"
+    assert task["status"] == "pending"
+    env = client.tasks_get("coord-1")
+    assert len(env["tasks"]) == 1
+    assert env["tasks"][0]["id"] == task["id"]
+
+
+def test_tasks_add_rejects_empty_title(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_add("coord-1", title="   ")
+    assert "error" in result
+
+
+def test_tasks_add_rejects_invalid_status(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_add("coord-1", title="x", status="nonsense")
+    assert "error" in result
+
+
+def test_tasks_add_rejects_title_over_200(tmp_path, sqlite_backend_factory):
+    """Silent truncation is a data-integrity footgun: the model may
+    rely on the title it sent, not the one stored.  Reject instead."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    long_title = "a" * 201
+    result = client.tasks_add("coord-1", title=long_title)
+    assert "error" in result
+    assert "too long" in result["error"]
+    # Exactly 200 chars is the boundary and still accepted.
+    boundary = "a" * 200
+    task = client.tasks_add("coord-1", title=boundary)
+    assert "error" not in task
+    assert len(task["title"]) == 200
+
+
+def test_tasks_update_rejects_title_over_200(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    added = client.tasks_add("coord-1", title="original")
+    result = client.tasks_update("coord-1", task_id=added["id"], title="b" * 201)
+    assert "error" in result
+    assert "too long" in result["error"]
+    # Original title untouched when update rejected.
+    env = client.tasks_get("coord-1")
+    assert env["tasks"][0]["title"] == "original"
+
+
+def test_tasks_update_by_id(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    added = client.tasks_add("coord-1", title="plan")
+    updated = client.tasks_update(
+        "coord-1", task_id=added["id"], status="done", child_ws_id="ws-child"
+    )
+    assert updated["status"] == "done"
+    assert updated["child_ws_id"] == "ws-child"
+
+
+def test_tasks_update_missing_id(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_update("coord-1", task_id="nope", status="done")
+    assert "error" in result
+
+
+def test_tasks_remove(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    added = client.tasks_add("coord-1", title="plan")
+    first = client.tasks_remove("coord-1", task_id=added["id"])
+    assert first.get("ok") is True
+    assert first.get("task_id") == added["id"]
+    # Second remove of the same id returns a distinguishable not-found
+    # error (NOT a silent False that would mask a corrupt envelope).
+    second = client.tasks_remove("coord-1", task_id=added["id"])
+    assert "error" in second
+    assert "not found" in second["error"]
+    assert client.tasks_get("coord-1")["tasks"] == []
+
+
+def test_tasks_reorder_requires_permutation(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    a = client.tasks_add("coord-1", title="a")
+    b = client.tasks_add("coord-1", title="b")
+    # Partial set — must reject.
+    bad = client.tasks_reorder("coord-1", task_ids=[a["id"]])
+    assert "error" in bad
+    # Wrong id — reject.
+    wrong = client.tasks_reorder("coord-1", task_ids=[a["id"], "ghost"])
+    assert "error" in wrong
+    # Valid permutation — accept.
+    ok = client.tasks_reorder("coord-1", task_ids=[b["id"], a["id"]])
+    assert ok.get("ok") is True
+    env = client.tasks_get("coord-1")
+    assert [t["id"] for t in env["tasks"]] == [b["id"], a["id"]]
+
+
+def test_tasks_cross_ws_scope_violation_is_noop(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    # Client is bound to coord-1; anything else returns an empty envelope
+    # or an error without touching storage.
+    assert client.tasks_get("other-ws") == {"version": 1, "tasks": []}
+    res_add = client.tasks_add("other-ws", title="sneak")
+    assert "error" in res_add
+    res_remove = client.tasks_remove("other-ws", task_id="x")
+    assert "error" in res_remove
+    assert "scope violation" in res_remove["error"]
+
+
+def test_tasks_corrupt_json_returns_empty_envelope(tmp_path, sqlite_backend_factory):
+    """A hand-edited / corrupt config row must not crash the tool."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.save_workstream_config("coord-1", {"tasks": "{not json"})
+    client = _make_read_client(st)
+    env = client.tasks_get("coord-1")
+    assert env == {"version": 1, "tasks": []}
+
+
+def test_tasks_mutations_refuse_corrupt_envelope(tmp_path, sqlite_backend_factory):
+    """When the envelope is corrupt on disk, mutators must error out
+    (rather than silently overwrite — lost-data safety)."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.save_workstream_config("coord-1", {"tasks": "{not json"})
+    client = _make_read_client(st)
+    add_result = client.tasks_add("coord-1", title="new")
+    assert "error" in add_result
+    assert "corrupt" in add_result["error"]
+    # Also: the corrupt blob is preserved after the refused mutation.
+    assert st.load_workstream_config("coord-1").get("tasks") == "{not json"
+    update_result = client.tasks_update("coord-1", task_id="x", status="done")
+    assert "error" in update_result
+    reorder_result = client.tasks_reorder("coord-1", task_ids=[])
+    assert "error" in reorder_result
+    remove_result = client.tasks_remove("coord-1", task_id="x")
+    assert "error" in remove_result
+    assert "corrupt" in remove_result["error"]
+
+
+def _fail_config_reads(monkeypatch, storage: SQLiteBackend) -> None:
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_workstream_config", _broken)
+
+
+def test_load_task_envelope_raises_on_a_failed_read(tmp_path, monkeypatch, sqlite_backend_factory):
+    """A read that failed is never an empty envelope; a caller that wants
+    one catches the raise and chooses it (#1416)."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    _fail_config_reads(monkeypatch, st)
+    with pytest.raises(RuntimeError, match="storage down"):
+        load_task_envelope(st, "coord-1")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda c, ids: c.tasks_add("coord-1", title="new"), id="add"),
+        pytest.param(
+            lambda c, ids: c.tasks_update("coord-1", task_id=ids[0], status="done"),
+            id="update",
+        ),
+        pytest.param(lambda c, ids: c.tasks_remove("coord-1", task_id=ids[0]), id="remove"),
+        pytest.param(lambda c, ids: c.tasks_reorder("coord-1", task_ids=[]), id="reorder-empty"),
+        pytest.param(lambda c, ids: c.tasks_reorder("coord-1", task_ids=ids[::-1]), id="reorder"),
+        pytest.param(lambda c, ids: c.tasks_get("coord-1"), id="get"),
+    ],
+)
+def test_tasks_failed_read_raises_and_leaves_the_stored_list(
+    call, tmp_path, monkeypatch, sqlite_backend_factory
+):
+    """#1416: a task call whose storage read fails acts on nothing.  An
+    empty list stands in for none of them: an add or a reorder to ``[]``
+    would save over the stored list, update and remove would answer
+    "task not found", reorder would name an empty current set, and a
+    list would answer that there are no tasks.  The error is written for
+    the model, with the storage exception kept as its cause."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    client = _make_read_client(st)
+    ids = [client.tasks_add("coord-1", title=title)["id"] for title in ("first", "second")]
+    read_stored = st.load_workstream_config
+    stored = read_stored("coord-1")["tasks"]
+    _fail_config_reads(monkeypatch, st)
+
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        call(client, ids)
+
+    assert str(excinfo.value) == (
+        "the stored task list could not be read; no task was changed. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+    assert read_stored("coord-1")["tasks"] == stored
+
+
+def test_tasks_envelope_nested_too_deeply_is_corrupt(tmp_path, monkeypatch, sqlite_backend_factory):
+    """JSON nested deeper than the parser can follow raises
+    ``RecursionError``: Python 3.13 at about 10,000 levels, 3.14 when the
+    thread's C stack runs out.  The read succeeded, so it is a corrupt
+    envelope the mutators refuse to overwrite, not a storage failure to
+    retry.  The seed is a valid envelope, so only the patched decoder can
+    make it read as corrupt."""
+    import types
+
+    from turnstone.console import coordinator_client as cc_module
+
+    def _too_deep(*_a, **_kw):
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    seed = json.dumps({"version": 1, "tasks": [{"id": "tsk_a", "title": "kept"}]})
+    st.save_workstream_config("coord-1", {"tasks": seed})
+    client = _make_read_client(st)
+    monkeypatch.setattr(cc_module, "json", types.SimpleNamespace(loads=_too_deep, dumps=json.dumps))
+
+    assert load_task_envelope(st, "coord-1") == ({"version": 1, "tasks": []}, True)
+    result = client.tasks_add("coord-1", title="new")
+    assert "corrupt" in result["error"]
+    assert st.load_workstream_config("coord-1")["tasks"] == seed
+
+
+def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch, sqlite_backend_factory):
+    from turnstone.console import coordinator_client as cc_module
+
+    monkeypatch.setattr(cc_module, "_TASKS_MAX", 3)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    for i in range(3):
+        client.tasks_add("coord-1", title=f"t{i}")
+    overflow = client.tasks_add("coord-1", title="no-room")
+    assert "error" in overflow
+    assert "capacity" in overflow["error"]
+    # After a remove, add succeeds again.
+    env = client.tasks_get("coord-1")
+    client.tasks_remove("coord-1", task_id=env["tasks"][0]["id"])
+    added = client.tasks_add("coord-1", title="retry")
+    assert "error" not in added
+
+
+def test_tasks_save_preserves_other_workstream_config_keys(tmp_path, sqlite_backend_factory):
+    """_save_tasks writes only the 'tasks' key so other keys survive."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.save_workstream_config("coord-1", {"reasoning_effort": "high"})
+    client = _make_read_client(st)
+    client.tasks_add("coord-1", title="plan")
+    config = st.load_workstream_config("coord-1")
+    assert config.get("reasoning_effort") == "high"
+    assert config.get("tasks")  # tasks wrote its key too
+
+
+def test_live_cache_lru_eviction_caps_memory(tmp_path, sqlite_backend_factory):
+    """_live_cache must evict the oldest entry when inserting past the
+    cap — long-running coordinators that walk many children otherwise
+    grow the cache monotonically."""
+    st = sqlite_backend_factory(str(tmp_path / "cache.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    client = _make_read_client(st)
+    # Use the internal store helper directly — the HTTP-driven path is
+    # exercised elsewhere; here we just verify the eviction semantics.
+    cap = client._LIVE_CACHE_MAX
+    for i in range(cap + 10):
+        client._store_live_cache(f"ws-{i:04x}", 0.0, None)
+    assert len(client._live_cache) == cap
+    # The oldest 10 entries should have been evicted.
+    for i in range(10):
+        assert f"ws-{i:04x}" not in client._live_cache
+    # The newest entries survived.
+    for i in range(cap, cap + 10):
+        assert f"ws-{i:04x}" in client._live_cache
+
+
+def test_live_cache_touch_on_hit_moves_to_end(tmp_path, sqlite_backend_factory):
+    """A cache hit must reset the entry's LRU position so it's not
+    evicted just because it was old by insertion order."""
+    st = sqlite_backend_factory(str(tmp_path / "cache.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    client = _make_read_client(st)
+    cap = client._LIVE_CACHE_MAX
+    for i in range(cap):
+        client._store_live_cache(f"ws-{i:04x}", 0.0, None)
+    # "Touch" the oldest entry by reading it — use an HTTP stub that
+    # would normally 200 but we want the cache path to intercept.
+    # Simulate by directly calling the touch pathway.
+    with client._live_cache_lock:
+        client._live_cache.move_to_end("ws-0000")
+    # Now insert one more — the SECOND-oldest should be evicted, not
+    # the touched ws-0000.
+    client._store_live_cache("ws-new", 0.0, None)
+    assert "ws-0000" in client._live_cache
+    assert "ws-0001" not in client._live_cache
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — since= hint + progress_callback (#bug-5, #18, #perf-3)
+# ---------------------------------------------------------------------------
+
+
+def test_wait_since_missing_entry_does_not_force_early_exit(populated_storage):
+    """Regression for #bug-5: a ``since`` dict that does NOT contain
+    the polled ws_id must not short-circuit the wait with
+    complete=True on tick one.  Only ws_ids present in since_map are
+    considered for the diff-exit check — others fall through to the
+    normal mode='any'/'all' conditions.
+
+    Scenario: single running child (``child-b``) + a ``since`` dict
+    keyed on a disjoint id (``unrelated``).  mode='all' forces a full
+    wait so the run can't early-return on a real terminal — we expect
+    the wait to time out with complete=False, not exit immediately
+    with complete=True because the previous (broken) _diff_since
+    treated ``prev is None`` as changed for every polled wid.
+    """
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(
+        ["child-b"],
+        timeout=1.0,
+        mode="all",
+        since={"unrelated": {"state": "idle", "tokens": 0, "updated": "prior"}},
+    )
+    assert result["complete"] is False
+    assert result["elapsed"] >= 1.0
+    assert result["results"]["child-b"]["state"] == "running"
+
+
+def test_wait_since_matching_snapshot_falls_through_to_mode(populated_storage):
+    """A ``since`` entry that exactly matches the current snapshot
+    (state + tokens + updated all unchanged) does not trigger the
+    diff-exit — the wait falls through to the normal mode condition
+    for that wid."""
+    client = _make_read_client(populated_storage)
+    # First, grab the current snapshot.
+    first = client.wait_for_workstream(["child-a"], timeout=1.0, mode="any")
+    assert first["complete"] is True
+    snap = first["results"]
+    # Re-issue with since=<current snapshot> — nothing changed, but
+    # child-a is real-terminal ('idle') so mode='any' completes again.
+    second = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        since=snap,
+    )
+    assert second["complete"] is True
+    # Elapsed should be sub-second: the mode='any' condition fired on
+    # tick one, not a tick-one false-positive from _diff_since.
+    assert second["elapsed"] < 1.0
+
+
+def test_wait_since_malformed_input_drops_silently(populated_storage):
+    """Hostile / malformed since hints (non-dict top-level, non-dict
+    values) degrade to empty since_map rather than raising — the wait
+    is advisory, not a gatekeeper."""
+    client = _make_read_client(populated_storage)
+    # Non-dict since — coerced to empty.
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        since=["not", "a", "dict"],  # type: ignore[arg-type]
+    )
+    assert "error" not in result
+    assert result["complete"] is True
+
+    # Dict with non-dict values — those entries silently drop.
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        since={"child-a": "not-a-dict"},  # type: ignore[dict-item]
+    )
+    assert "error" not in result
+    assert result["complete"] is True
+
+
+def test_wait_since_change_alone_is_not_complete(populated_storage):
+    """The incident: ``since`` is the snapshot from before the child started
+    (``idle``, meaning "wait until it finishes") and the child has moved on to
+    ``thinking``.  The change still ends the wait at once, but the mode
+    condition did not hold, so ``complete`` stays False, ``changed`` names the
+    child, and a child still at work carries no message."""
+    client = _make_read_client(populated_storage)
+    populated_storage.update_workstream_state("child-b", "idle")
+    before = client.wait_for_workstream(["child-b"], timeout=0, mode="any")["results"]
+    populated_storage.update_workstream_state("child-b", "thinking")
+    result = client.wait_for_workstream(["child-b"], timeout=5, mode="any", since=before)
+    assert result["complete"] is False
+    assert result["changed"] == ["child-b"]
+    assert result["results"]["child-b"]["state"] == "thinking"
+    assert result["results"]["child-b"]["message"] is None
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_since_change_to_terminal_bundles_only_that_childs_message(
+    populated_storage, monkeypatch
+):
+    """Under ``mode='all'``, one child finishing while another still runs ends
+    a ``since`` wait without completing it.  The finished child is in
+    ``changed`` and delivers its answer now; every other child's ``message``
+    stays null with nothing read for it, as on a timeout, even one that had
+    already finished when the snapshot was taken."""
+    from turnstone.console import coordinator_client
+
+    reads: list[str] = []
+    real_message_for = coordinator_client._wait_message_for
+
+    def _counting_message_for(storage, wid, state):
+        reads.append(wid)
+        return real_message_for(storage, wid, state)
+
+    monkeypatch.setattr(coordinator_client, "_wait_message_for", _counting_message_for)
+    populated_storage.register_workstream(
+        "child-c", kind="interactive", parent_ws_id="coord-1", state="idle", user_id="user-1"
+    )
+    populated_storage.update_workstream_state("child-a", "running")
+    client = _make_read_client(populated_storage)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    ids = ["child-a", "child-b", "child-c"]
+    before = client.wait_for_workstream(ids, timeout=0, mode="all")["results"]
+    wake = threading.Event()
+
+    def _child_a_finishes() -> None:
+        populated_storage.save_message("child-a", "assistant", "child-a's findings")
+        populated_storage.update_workstream_state("child-a", "idle")
+        wake.set()
+
+    # The change lands once the wait is past its first tick, so only the
+    # wake's re-tick can see it before the 30 s heartbeat.
+    reason = _Reason(on_first_call=_child_a_finishes)
+    result = client.wait_for_workstream(
+        ids, timeout=20, mode="all", since=before, interrupt=reason, wake_event=wake
+    )
+    assert result["complete"] is False
+    assert result["changed"] == ["child-a"]
+    assert "interrupted" not in result
+    assert result["elapsed"] < 1.0
+    child_a, child_b, child_c = (result["results"][wid] for wid in ids)
+    assert (child_a["state"], child_a["message"]) == ("idle", "child-a's findings")
+    assert (child_b["state"], child_b["message"]) == ("running", None)
+    assert (child_c["state"], child_c["message"]) == ("idle", None)
+    assert reads == ["child-a"]
+
+
+def test_wait_since_change_that_meets_the_mode_completes(populated_storage):
+    """A change that also meets the mode condition completes the wait:
+    ``complete`` is True, ``changed`` still names the child, and its message
+    comes with it."""
+    populated_storage.save_message("child-b", "assistant", "child-b's findings")
+    client = _make_read_client(populated_storage)
+    before = client.wait_for_workstream(["child-b"], timeout=0, mode="any")["results"]
+    populated_storage.update_workstream_state("child-b", "idle")
+    result = client.wait_for_workstream(["child-b"], timeout=5, mode="any", since=before)
+    assert result["complete"] is True
+    assert result["changed"] == ["child-b"]
+    assert result["results"]["child-b"]["message"] == "child-b's findings"
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_since_changed_follows_the_requested_order(populated_storage):
+    """``changed`` lists the changed children in the order the wait asked for
+    them, not in the ``since`` dict's order."""
+    client = _make_read_client(populated_storage)
+    since = {
+        "child-b": {"state": "idle", "tokens": 0, "updated": ""},
+        "child-a": {"state": "running", "tokens": 0, "updated": ""},
+    }
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=5, mode="all", since=since)
+    assert result["complete"] is False
+    assert result["changed"] == ["child-a", "child-b"]
+
+
+@pytest.mark.parametrize("since", [None, {}, ["not", "a", "dict"], {"child-a": "not-a-dict"}])
+def test_wait_without_a_usable_since_has_no_changed_key(populated_storage, since):
+    """``changed`` answers a ``since``: a wait without one, or with one that
+    parses to nothing, carries no ``changed`` key."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=1.0, mode="any", since=since)
+    assert result["complete"] is True
+    assert "changed" not in result
+
+
+@pytest.mark.parametrize("ended_by", ["mode", "timeout", "interrupt"])
+def test_wait_since_reports_no_change_when_something_else_ends_it(populated_storage, ended_by):
+    """With a usable ``since``, ``changed`` is ``[]`` when the wait ended for
+    another reason: the mode condition alone, a timeout or an interrupt."""
+    client = _make_read_client(populated_storage)
+    ws_ids = ["child-a" if ended_by == "mode" else "child-b"]
+    before = client.wait_for_workstream(ws_ids, timeout=0, mode="all")["results"]
+    reason = _Reason()
+    if ended_by == "interrupt":
+        reason.reason = "user_message"
+    result = client.wait_for_workstream(
+        ws_ids,
+        timeout=0 if ended_by == "timeout" else 20,
+        mode="all",
+        since=before,
+        interrupt=reason,
+    )
+    assert result["complete"] is (ended_by == "mode")
+    assert result.get("interrupted") == ("user_message" if ended_by == "interrupt" else None)
+    assert result["changed"] == []
+
+
+def test_wait_progress_callback_invoked_per_tick(populated_storage):
+    """The progress_callback is invoked once per poll tick with the
+    current snapshot + elapsed seconds.  Snapshots carry state/tokens/
+    updated for each polled ws_id."""
+    client = _make_read_client(populated_storage)
+    ticks: list[tuple[dict, float]] = []
+
+    def _cb(snap, elapsed):  # type: ignore[no-untyped-def]
+        ticks.append((dict(snap), elapsed))
+
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        progress_callback=_cb,
+    )
+    assert result["complete"] is True
+    assert len(ticks) >= 1
+    first_snap, _ = ticks[0]
+    assert "child-a" in first_snap
+    assert first_snap["child-a"]["state"] == "idle"
+
+
+def test_wait_progress_callback_errors_dont_break_loop(populated_storage):
+    """A buggy progress_callback must not break the wait — exceptions
+    are swallowed so a broken observer can't wedge the model's tool call."""
+    client = _make_read_client(populated_storage)
+
+    def _bad_cb(snap, elapsed):  # type: ignore[no-untyped-def]
+        raise RuntimeError("observer exploded")
+
+    result = client.wait_for_workstream(
+        ["child-a"],
+        timeout=1.0,
+        mode="any",
+        progress_callback=_bad_cb,
+    )
+    # Wait itself still returns normally.
+    assert result["complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# inspect_workstream — three-tier output compression
+# ---------------------------------------------------------------------------
+#
+# A coord doing a fan-out wave against tool-heavy children would
+# otherwise blow the context budget on raw output alone.  Mirrors the
+# search tool's Tier-1/Tier-2/Tier-3 ladder.
+
+
+def _make_inspect_result(
+    *, ws_id: str = "ws-test", state: str = "running", n_messages: int = 5
+) -> dict[str, Any]:
+    """Build an inspect-result dict shaped like ``coordinator_client.inspect()``.
+
+    Production output keys (``ws_id``, ``skill_id``) mirror the storage
+    row that ``inspect()`` spreads from ``get_workstream``.  Tests that
+    synthesize an inspect result must match these keys — otherwise a
+    formatter that looks at the production keys silently emits null
+    values against a fixture that uses different ones (real bug-1
+    regression source: skeleton tier read ``skill`` from a fixture
+    that wrote ``skill`` while production wrote ``skill_id``).
+    """
+    return {
+        "ws_id": ws_id,
+        "state": state,
+        "title": "test workstream",
+        "skill_id": "researcher",
+        "messages": [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i} content"}
+            for i in range(n_messages)
+        ],
+    }
+
+
+def test_format_inspect_tiered_full_fits_returns_full_tier():
+    """Small payloads pass through with `_tier='full'` — no compression."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    result = _make_inspect_result(n_messages=3)
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "full"
+    # Every message verbatim.
+    assert len(parsed["messages"]) == 3
+    assert parsed["messages"][0]["content"] == "msg 0 content"
+
+
+def test_format_inspect_tiered_compact_when_full_exceeds_budget():
+    """Large messages trigger the compact tier — head/tail-snipped
+    content with the rest of the row intact."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_MSG_CONTENT_HEAD,
+        _INSPECT_MSG_CONTENT_TAIL,
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # Each message ~5KB; with 20 messages, full tier blows the 32KB budget.
+    fat = "X" * 5000
+    result = {
+        "id": "ws-fat",
+        "state": "running",
+        "messages": [{"role": "assistant", "content": fat} for _ in range(20)],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    # Every message preserved (compact keeps the count, just snips content).
+    assert len(parsed["messages"]) == 20
+    # Head/tail snip kicked in.
+    msg_content = parsed["messages"][0]["content"]
+    assert msg_content.startswith("X" * _INSPECT_MSG_CONTENT_HEAD)
+    assert msg_content.endswith("X" * _INSPECT_MSG_CONTENT_TAIL)
+    assert "chars elided" in msg_content
+    # Budget invariant — the load-bearing contract of the formatter.
+    # Without this assertion, a future change to ``_tier_note`` or
+    # ``_compact_message`` could push the output over budget and the
+    # ``_truncate_output`` head+tail safety net would silently mask
+    # the regression, re-introducing the middle-message-drop pathology.
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_compact_when_content_below_snip_threshold():
+    """When per-message content is below the snip threshold but the
+    message COUNT alone overflows the budget, compact tier must still
+    stay within budget — by trimming the message list (head + tail of
+    messages) rather than degrading straight to skeleton.  Bug-3
+    regression cover: with 400 × 100-char messages, the original
+    formatter fell through to skeleton because adding ``_tier_note``
+    to an un-snipped tier-2 produced output strictly larger than
+    tier-1 (both over budget).  The fix preserves messages from both
+    ends of the list and inserts an ``_omitted`` sentinel."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # 400 × ~100 chars → Tier-1 ~53 KB (over budget), per-message
+    # content under the 964-char snip threshold so content-snipping
+    # saves nothing.  Without the list-trim rung the formatter would
+    # fall to skeleton and drop all 400 messages.
+    smallish = "S" * 100
+    result = {
+        "ws_id": "ws-many-small",
+        "state": "running",
+        "messages": [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": smallish} for i in range(400)
+        ],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    # Should NOT fall through to skeleton — message-list trim preserves
+    # head + tail of the conversation.
+    assert parsed["_tier"] == "compact"
+    assert "messages" in parsed
+    # Some messages must survive; the trim shape is head + tail with an
+    # ``_omitted`` sentinel between them.
+    assert len(parsed["messages"]) > 0
+    assert len(parsed["messages"]) < 400
+    # Budget invariant.
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_skeleton_when_compact_also_exceeds_budget():
+    """Tier 3 fallback: counts + last assistant preview only.  Trigger by
+    flooding with messages whose content is a multi-block list — the
+    snipper correctly leaves non-string content unchanged (mirrors
+    Anthropic/OpenAI multi-block content shape), so even after the
+    (5, 10) message-list trim the surviving 15 messages don't fit in
+    the 32 KB budget."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # 50 messages × multi-block content (~30 KB each — list-shape
+    # content bypasses the head/tail string snipper because lists
+    # aren't strings).  Even (5, 10) trim leaves 15 × 30 KB which
+    # blows the 32 KB budget — forces skeleton.
+    fat_block = {"type": "text", "text": "Y" * 3000}
+    result = {
+        "ws_id": "ws-flood",
+        "state": "running",
+        "title": "flood",
+        "skill_id": "researcher",
+        "messages": [
+            {
+                "role": "assistant" if i % 2 == 0 else "user",
+                "content": [fat_block] * 10,
+            }
+            for i in range(50)
+        ],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "skeleton"
+    assert parsed["message_count"] == 50
+    # Role distribution surfaces — the "what shape of activity" signal.
+    assert parsed["roles"]["assistant"] == 25
+    assert parsed["roles"]["user"] == 25
+    # No `messages` field at skeleton tier — only the aggregate signal.
+    assert "messages" not in parsed
+    # Budget invariant.
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_skeleton_keeps_terminal_state_fields():
+    """``close_reason`` / ``last_error`` survive the skeleton fall — they're
+    small, load-bearing, and the operator needs them to understand WHY
+    a terminal child landed in its state."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_OUTPUT_BUDGET,
+        _format_inspect_tiered,
+    )
+
+    # Same flood pattern as the bare-skeleton test (multi-block content
+    # bypasses the string snipper) — paired with terminal-state fields
+    # that must survive the skeleton fall.
+    fat_block = {"type": "text", "text": "Z" * 3000}
+    result = {
+        "ws_id": "ws-closed",
+        "state": "closed",
+        "title": "done",
+        "skill_id": "researcher",
+        "messages": [{"role": "user", "content": [fat_block] * 10} for _ in range(50)],
+        "close_reason": "task complete: report attached",
+        "live": None,  # filtered by truthy check
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "skeleton"
+    assert parsed["close_reason"] == "task complete: report attached"
+    # Falsy ``live`` doesn't bleed through.
+    assert "live" not in parsed
+    assert len(out) <= _INSPECT_OUTPUT_BUDGET
+
+
+def test_format_inspect_tiered_error_shapes_bypass_tiering():
+    """Cross-tenant / not-found responses keep their original shape — they
+    carry no messages, are already tiny, and changing them would break
+    callers that key on the ``error`` field."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    result = {"error": "workstream not found", "ws_id": "ws-foreign"}
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed == {"error": "workstream not found", "ws_id": "ws-foreign"}
+    # No `_tier` annotation — error shapes are self-describing.
+    assert "_tier" not in parsed
+
+
+def test_format_inspect_tiered_compact_preserves_tool_call_linkage():
+    """Compact tier keeps ``tool_name`` / ``tool_call_id`` / ``name`` so a
+    model reading the snipped trace can still pair a tool call to its
+    response — the linkage is load-bearing for "what happened" signal."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    fat = "Q" * 5000
+    result = {
+        "ws_id": "ws-tools",
+        "state": "running",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": fat,
+                "tool_name": "bash",
+                "tool_call_id": "call-1",
+            }
+            for _ in range(20)
+        ],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    first = parsed["messages"][0]
+    assert first["tool_name"] == "bash"
+    assert first["tool_call_id"] == "call-1"
+
+
+def test_format_inspect_tiered_compact_preserves_assistant_tool_calls():
+    """Compact tier must preserve the assistant-side ``tool_calls`` list
+    (OpenAI shape: ``[{id, type, function: {name, arguments}}]``) so a
+    model reading the snipped trace can see WHICH tool was called and
+    pair it with the corresponding result row via ``id`` ↔ ``tool_call_id``.
+    Bug-2 regression cover: the pre-fix compactor stripped ``tool_calls``,
+    leaving the audit reader with a tool-result orphan against an
+    invisible call.
+
+    ``function.arguments`` strings are snipped head/tail (analogous to
+    content) because they can be multi-KB JSON; ``id`` and
+    ``function.name`` are preserved verbatim — they're the linkage."""
+    from turnstone.console.coordinator_client import (
+        _INSPECT_TOOL_ARG_HEAD,
+        _INSPECT_TOOL_ARG_TAIL,
+        _format_inspect_tiered,
+    )
+
+    fat_content = "C" * 5000  # forces compact tier
+    fat_args = "A" * 5000  # forces argument snipping
+    tool_calls = [
+        {
+            "id": "call-abc-123",
+            "type": "function",
+            "function": {"name": "bash", "arguments": fat_args},
+        },
+        {
+            "id": "call-def-456",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": fat_args},
+        },
+    ]
+    result = {
+        "ws_id": "ws-tool-calls",
+        "state": "running",
+        "messages": [
+            {"role": "assistant", "content": fat_content, "tool_calls": tool_calls}
+            for _ in range(20)
+        ],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    first = parsed["messages"][0]
+    # tool_calls survives compaction.
+    assert "tool_calls" in first
+    assert len(first["tool_calls"]) == 2
+    # Linkage fields verbatim.
+    assert first["tool_calls"][0]["id"] == "call-abc-123"
+    assert first["tool_calls"][0]["function"]["name"] == "bash"
+    assert first["tool_calls"][1]["id"] == "call-def-456"
+    assert first["tool_calls"][1]["function"]["name"] == "read_file"
+    # arguments snipped head/tail — both prefix and suffix preserved.
+    snipped_args = first["tool_calls"][0]["function"]["arguments"]
+    assert snipped_args.startswith("A" * _INSPECT_TOOL_ARG_HEAD)
+    assert snipped_args.endswith("A" * _INSPECT_TOOL_ARG_TAIL)
+    assert "chars elided" in snipped_args
+
+
+def test_format_inspect_tiered_compact_passes_small_messages_through_unsnipped():
+    """Messages under the snip threshold pass through verbatim at compact
+    tier — snipping a 100-byte message costs more bytes (the elision
+    marker) than it saves."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    # Mix: a few large messages force compact tier; small messages must
+    # not be snipped.
+    big = "B" * 5000
+    small = "S" * 50
+    result = {
+        "id": "ws-mixed",
+        "state": "running",
+        "messages": [{"role": "assistant", "content": big} for _ in range(15)]
+        + [{"role": "user", "content": small}],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "compact"
+    # The trailing small message is exact, not snipped.
+    assert parsed["messages"][-1]["content"] == small
+
+
+def test_format_inspect_tiered_emits_tier_note_when_compressed():
+    """The ``_tier_note`` advisory tells the LLM how to ask for a tighter
+    or fuller view next time — actionable feedback rather than a bare
+    "we compressed your output" signal."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    fat = "F" * 5000
+    result = {
+        "id": "ws-noted",
+        "state": "running",
+        "messages": [{"role": "assistant", "content": fat} for _ in range(20)],
+    }
+    out = _format_inspect_tiered(result)
+    parsed = json.loads(out)
+    assert "_tier_note" in parsed
+    assert "message_limit" in parsed["_tier_note"]
+
+
+def test_format_inspect_tiered_full_tier_omits_tier_note():
+    """When the full tier fits, no note is emitted — the absence of a
+    note is the signal that nothing was compressed."""
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    out = _format_inspect_tiered(_make_inspect_result(n_messages=2))
+    parsed = json.loads(out)
+    assert parsed["_tier"] == "full"
+    assert "_tier_note" not in parsed
+
+
+# ---------------------------------------------------------------------------
+# needs_user status + note field
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_add_accepts_needs_user_status(tmp_path, sqlite_backend_factory):
+    """The status that marks a task as parked on the operator — the one
+    signal the idle-tasks nudge gates on."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="pick a backend", status="needs_user")
+    assert "error" not in task
+    assert task["status"] == "needs_user"
+
+
+def test_tasks_add_still_rejects_unknown_status(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    assert "error" in client.tasks_add("coord-1", title="t", status="needs-operator")
+
+
+def test_tasks_add_omits_note_key_when_unset(tmp_path, sqlite_backend_factory):
+    """Absent-by-default keeps the envelope small: it is read and
+    re-serialised on every mutation and fed back to the model by
+    ``tasks(action='list')``, where an always-present empty string would
+    spend budget on nothing."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="plain")
+    assert "note" not in task
+
+
+def test_tasks_add_stores_note_when_set(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="ask", note="which backend is canonical?")
+    assert task["note"] == "which backend is canonical?"
+
+
+def test_tasks_add_rejects_note_over_200(tmp_path, sqlite_backend_factory):
+    """Same reject-don't-truncate rule as the title, for the same reason:
+    the note is the operator-facing ask, which is precisely the string
+    where silent trimming loses what the field exists to carry."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_add("coord-1", title="t", note="a" * 201)
+    assert "error" in result
+    assert "too long" in result["error"]
+    boundary = client.tasks_add("coord-1", title="t2", note="a" * 200)
+    assert "error" not in boundary
+    assert len(boundary["note"]) == 200
+
+
+def test_tasks_update_sets_and_clears_note(tmp_path, sqlite_backend_factory):
+    """``note`` follows ``child_ws_id``, not ``title``: it is optional, so
+    an empty string is a CLEAR rather than an error."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="ask")
+    updated = client.tasks_update("coord-1", task_id=task["id"], note="need a decision")
+    assert updated["note"] == "need a decision"
+    cleared = client.tasks_update("coord-1", task_id=task["id"], note="")
+    assert "note" not in cleared
+
+
+def test_tasks_update_rejects_note_over_200_and_leaves_task_intact(
+    tmp_path, sqlite_backend_factory
+):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="ask", note="short")
+    result = client.tasks_update("coord-1", task_id=task["id"], note="a" * 201)
+    assert "error" in result
+    envelope = client.tasks_get("coord-1")
+    assert envelope["tasks"][0]["note"] == "short"
+
+
+def test_tasks_note_survives_reorder(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    a = client.tasks_add("coord-1", title="a", note="keep me")
+    b = client.tasks_add("coord-1", title="b")
+    client.tasks_reorder("coord-1", task_ids=[b["id"], a["id"]])
+    envelope = client.tasks_get("coord-1")
+    by_id = {t["id"]: t for t in envelope["tasks"]}
+    assert by_id[a["id"]]["note"] == "keep me"
+
+
+def test_legacy_task_row_without_note_round_trips(tmp_path, sqlite_backend_factory):
+    """There is no backfill — rows written before the field existed have
+    no ``note`` key, and every reader must tolerate its absence."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="legacy")
+    assert "note" not in task
+    updated = client.tasks_update("coord-1", task_id=task["id"], status="in_progress")
+    assert updated["status"] == "in_progress"
+    assert "note" not in updated
+
+
+# ---------------------------------------------------------------------------
+# write-path sanitisation (title / note)
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_stores_title_and_note_verbatim(tmp_path, sqlite_backend_factory):
+    """Storage is NOT sanitised.  The strict sanitiser strips angle
+    brackets, so sanitising here would rewrite ordinary planning text —
+    "cut p99 latency to <200ms" would store as "...to 200ms", inverting
+    the constraint.  That is the silent mutation the reject-don't-truncate
+    rule forbids.  Sanitisation lives at each render instead, in the
+    flavour that audience needs: ``sanitize_display`` (brackets kept) on
+    the operator surfaces, ``sanitize_name`` (brackets deleted) in the
+    model-facing nudge body."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add(
+        "coord-1",
+        title="cut p99 latency to <200ms",
+        note="which of <staging|prod> is canonical?",
+    )
+    assert task["title"] == "cut p99 latency to <200ms"
+    assert task["note"] == "which of <staging|prod> is canonical?"
+
+
+def test_tasks_length_check_measures_what_the_model_sent(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_add("coord-1", title="a" * 201)
+    assert "error" in result and "201 chars" in result["error"]
+
+
+def test_tasks_add_rejects_unrenderable_title(tmp_path, sqlite_backend_factory):
+    """The one carve-out from verbatim storage: text that sanitises to
+    NOTHING renders on no operator surface while ``tasks(list)`` feeds it
+    back to the model every call — an operator-invisible, model-visible
+    payload channel.  Rejected with a hint, mirroring reject-don't-truncate.
+
+    The fixture is genuinely-invisible text (zero-width + bidi), which
+    is the whole of the class now that the oracle is
+    ``sanitize_display``; ``"<>"`` used to live here and is covered by
+    the accept case below."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_add("coord-1", title=chr(0x200B) + chr(0x202E))
+    assert "error" in result
+    assert "no renderable characters" in result["error"]
+    assert "retry" in result["error"]
+
+
+def test_tasks_add_accepts_bracket_only_title(tmp_path, sqlite_backend_factory):
+    """Angle brackets RENDER on every operator surface now, so a
+    bracket-only title is ordinary text: stored verbatim and shown
+    verbatim by the pane's display sanitiser.  Refusing it was the
+    unreachable rejection the display fix removed."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="<>")
+    assert "error" not in task
+    assert task["title"] == "<>"
+    shown = _sanitize_task_envelope_for_display(client.tasks_get("coord-1"))
+    assert shown["tasks"][0]["title"] == "<>"
+
+
+def test_tasks_add_rejects_unrenderable_note(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_add("coord-1", title="t", note=chr(0x200B) * 2)
+    assert "error" in result and "no renderable characters" in result["error"]
+
+
+def test_tasks_update_rejects_unrenderable_title_and_note(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="keep", note="keep note")
+    res_t = client.tasks_update("coord-1", task_id=task["id"], title=chr(0x202E) + chr(0x200B))
+    assert "error" in res_t and "no renderable characters" in res_t["error"]
+    res_n = client.tasks_update("coord-1", task_id=task["id"], note=chr(0x200B) * 3)
+    assert "error" in res_n and "no renderable characters" in res_n["error"]
+    # Either reject leaves the stored row untouched.
+    row = client.tasks_get("coord-1")["tasks"][0]
+    assert row["title"] == "keep" and row["note"] == "keep note"
+
+
+def test_bracket_only_note_survives_update_and_renders(tmp_path, sqlite_backend_factory):
+    """The update branch's half of the accept case: brackets are not the
+    unrenderable class any more, on either mutation path."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="keep")
+    updated = client.tasks_update("coord-1", task_id=task["id"], note="<>")
+    assert "error" not in updated
+    assert updated["note"] == "<>"
+    shown = _sanitize_task_envelope_for_display(client.tasks_get("coord-1"))
+    assert shown["tasks"][0]["note"] == "<>"
+
+
+def test_tasks_unrenderable_check_runs_after_length(tmp_path, sqlite_backend_factory):
+    """Order ruling: length first (measured on what the model sent), then
+    renderability — a 250-char zero-width run hears "too long", not
+    "unrenderable", so the two hints cannot mask each other."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.tasks_add("coord-1", title=chr(0x200B) * 250)
+    assert "error" in result and "too long" in result["error"]
+
+
+def test_tasks_update_empty_note_still_clears_after_the_reject(tmp_path, sqlite_backend_factory):
+    """The reject must not eat the legal CLEAR: ``note=""`` stays a
+    clear; only a NON-empty note that sanitises to nothing is rejected."""
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    task = client.tasks_add("coord-1", title="t", note="real")
+    cleared = client.tasks_update("coord-1", task_id=task["id"], note="")
+    assert "error" not in cleared
+    assert "note" not in cleared
+
+
+def test_display_sanitiser_cleans_the_operator_facing_copy(tmp_path, sqlite_backend_factory):
+    """The pane's copy IS sanitised — a bidi override must not make the
+    operator read an ask in an order different from the stored one."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    client.tasks_add("coord-1", title="plain", note="do not \u202eevorppa")
+    envelope = client.tasks_get("coord-1")
+    shown = _sanitize_task_envelope_for_display(envelope)
+    assert "\u202e" not in shown["tasks"][0]["note"]
+    # ...and the stored copy is untouched.
+    assert "\u202e" in client.tasks_get("coord-1")["tasks"][0]["note"]
+
+
+def test_display_sanitiser_preserves_angle_brackets(tmp_path, sqlite_backend_factory):
+    """The direct regression pin.  A stored "hold p99 <200ms" reached
+    the tasks pane as "hold p99 200ms" — the constraint inverted on the
+    operator's surface — while ``tasks(action='list')`` handed the model
+    the original.  The display sanitiser keeps brackets; only the
+    model-facing nudge body deletes them."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
+    client.tasks_add(
+        "coord-1",
+        title="hold p99 <200ms",
+        child_ws_id="ws-<a>",
+        note="which of <staging|prod> is canonical?",
+    )
+    row = _sanitize_task_envelope_for_display(client.tasks_get("coord-1"))["tasks"][0]
+    assert row["title"] == "hold p99 <200ms"
+    assert row["note"] == "which of <staging|prod> is canonical?"
+    # ``child_ws_id`` joined the display sanitiser in the same change,
+    # so it is cleaned but not bracket-stripped either.
+    assert row["child_ws_id"] == "ws-<a>"
+
+
+def test_display_sanitiser_cleans_child_ws_id(tmp_path):
+    """It is model-supplied and renders on the pane, so it carries the
+    same steering risk as title/note — unlike the server-minted ``id``,
+    which is coerced only."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    out = _sanitize_task_envelope_for_display(
+        {"version": 1, "tasks": [{"id": "t", "child_ws_id": "ws" + chr(0x202E) + "1"}]}
+    )
+    assert out["tasks"][0]["child_ws_id"] == "ws 1"
+
+
+def test_display_sanitiser_passes_ragged_rows_through(tmp_path):
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    out = _sanitize_task_envelope_for_display({"version": 1, "tasks": ["not a dict", 42]})
+    assert out["tasks"] == ["not a dict", 42]
+
+
+def test_display_sanitiser_coerces_ragged_rows_like_the_nudge_card(tmp_path):
+    """Shared ``field_str`` coercion: ``str(x or "")`` mapped ``0`` to
+    ``""`` while the nudge card's producer rendered ``"0"`` — two
+    operator-facing surfaces disagreeing on the same stored row.  And a
+    coerced ``status`` means the FE's ``task.status || "pending"``
+    fallback cannot mislabel a ragged row as pending."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    out = _sanitize_task_envelope_for_display(
+        {"version": 1, "tasks": [{"id": "t", "title": 0, "status": 0, "child_ws_id": None}]}
+    )
+    row = out["tasks"][0]
+    assert row["title"] == "0"
+    assert row["status"] == "0"
+    assert row["child_ws_id"] == ""

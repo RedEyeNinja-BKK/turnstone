@@ -1,0 +1,526 @@
+"""Completed no-answer responses must not silently park a conversation (#1070)."""
+
+from dataclasses import replace
+from unittest.mock import patch
+
+import httpx2
+import pytest
+from openai import APIConnectionError
+
+from tests._session_helpers import (
+    REASONING_SENTINEL,
+    NullUI,
+    replace_session_lane,
+    scripted_session,
+)
+from turnstone.core.completion_recovery import ModelTurnLocalError
+from turnstone.core.memory import load_last_error
+from turnstone.core.session import ConversationPersistenceError, GenerationCancelled
+from turnstone.core.trajectory import dicts_from_turns
+from turnstone.core.workstream import WorkstreamKind
+
+_KINDS = [WorkstreamKind.INTERACTIVE, WorkstreamKind.COORDINATOR]
+# Runtime sample for recovery; every shape in _EMPTY_SHAPES is recoverable.
+_RECOVERY_SHAPES = [
+    ("separate", True),
+    ("separate", False),
+    ("inline", False),
+]
+_EMPTY_SHAPES = _RECOVERY_SHAPES + [
+    ("unclosed", False),
+    ("empty", True),
+    ("whitespace", False),
+]
+
+
+class _CounterUI(NullUI):
+    def __init__(self):
+        super().__init__()
+        self.stream_ends = 0
+        self.stream_discards = 0
+
+    def on_state_change(self, state):
+        pass
+
+    def on_stream_end(self):
+        self.stream_ends += 1
+        super().on_stream_end()
+
+    def on_stream_discarded(self):
+        self.stream_discards += 1
+        super().on_stream_discarded()
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("shape,server_parses", _EMPTY_SHAPES)
+def test_empty_completion_exhaustion(tmp_db, kind, shape, server_parses):
+    with (
+        scripted_session(kind, [shape] * 3, server_parses=server_parses) as (session, ui, requests),
+        pytest.raises(RuntimeError, match="no answer"),
+    ):
+        session.send("Continue the requested work.")
+
+    assert len(requests) == 3
+    assert ui.of("state")[-1] == "error"
+    assert not [turn for turn in session.messages if turn.role == "assistant"]
+    assert ui.kinds().count("stream_end") == 3
+    assert ui.kinds().count("stream_discarded") == 3
+    assert ui.kinds().count("turn_committed") == 0
+    assert len(ui.of("status")) == 3
+    assert sum(usage["completion_tokens"] for usage in ui.of("status")) == 129
+    assert {usage["model"] for usage in ui.of("status")} == {"served-model"}
+    error = load_last_error(session.ws_id)
+    assert error and "no answer" in error
+    assert REASONING_SENTINEL not in error
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("shape,server_parses", _RECOVERY_SHAPES)
+def test_empty_completion_recovers_once(tmp_db, kind, shape, server_parses):
+    with scripted_session(kind, [shape, "answer"], server_parses=server_parses) as (
+        session,
+        ui,
+        requests,
+    ):
+        session.send("Continue the requested work.")
+
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    assert ui.of("state")[-1] == "idle"
+    assistant = [turn for turn in dicts_from_turns(session.messages) if turn["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0]["content"] == "The work is complete."
+    assert ui.kinds().count("turn_committed") == 1
+    assert ui.kinds().count("stream_discarded") == 1
+    assert ui.kinds().count("stream_end") == 2
+    assert len(ui.of("status")) == 2
+    assert not load_last_error(session.ws_id)
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_stop_in_empty_backoff_preserves_marker(tmp_db, kind):
+    with scripted_session(kind, ["separate"]) as (session, ui, requests):
+        original_backoff = session._backoff_or_cancelled
+
+        def stop_in_backoff(delay, generation):
+            session.cancel()
+            original_backoff(delay, generation)
+
+        with patch.object(session, "_backoff_or_cancelled", side_effect=stop_in_backoff):
+            session.send("Continue the requested work.")
+
+    assert len(requests) == 1
+    assert ui.of("state")[-1] == "idle"
+    assistant = [turn for turn in dicts_from_turns(session.messages) if turn["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert "cancel" in assistant[0]["content"].lower()
+    assert REASONING_SENTINEL not in assistant[0]["content"]
+    assert len(ui.of("status")) == 1
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("family", ["openai-compatible", "openai", "anthropic-compatible"])
+def test_server_parsed_literal_tags_are_an_answer(tmp_db, kind, family):
+    with scripted_session(kind, ["literal"], family=family) as (session, ui, requests):
+        session.send("Explain the literal tags.")
+    assert len(requests) == 1
+    assert session.messages[-1].text == "<think>literal text</think>"
+    assert not ui.of("error")
+
+
+@pytest.mark.parametrize("finish", ["length", "content_filter", "unknown_stop"])
+def test_nonordinary_finish_does_not_reissue(tmp_db, finish):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"], finish=finish) as (
+        session,
+        ui,
+        requests,
+    ):
+        session.send("Continue the requested work.")
+    assert len(requests) == 1
+    assert "stream_discarded" not in ui.kinds()
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_native_search_empty_completion_is_not_reissued(tmp_db, kind):
+    # Keep this tool visible in both kinds; the adapter replaces it with
+    # web_search_options={}, whose empty value still enables native search.
+    with (
+        scripted_session(kind, ["separate"], native=True) as (session, ui, requests),
+        patch.object(
+            session,
+            "_get_active_tools",
+            return_value=[
+                {
+                    "type": "function",
+                    "function": {"name": "web_search", "parameters": {}},
+                }
+            ],
+        ),
+        pytest.raises(RuntimeError, match="server-side tools"),
+    ):
+        session.send("Continue the requested work.")
+    assert len(requests) == 1
+    assert requests[0]["web_search_options"] == {}
+    assert ui.of("state")[-1] == "error"
+    assert len(ui.of("status")) == 1
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_deferred_client_tools_do_not_disable_empty_recovery(tmp_db, kind):
+    with scripted_session(kind, ["separate", "answer"]) as (session, ui, requests):
+        replace_session_lane(
+            session,
+            capabilities=replace(session._get_capabilities(), supports_tool_search=True),
+        )
+        with (
+            patch.object(
+                session,
+                "_get_active_tools",
+                return_value=[
+                    {"type": "function", "function": {"name": "lookup", "parameters": {}}}
+                ],
+            ),
+            patch.object(session, "_get_deferred_names", return_value=frozenset({"lookup"})),
+        ):
+            session.send("Continue the requested work.")
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    assert requests[0]["tools"][0]["defer_loading"] is True
+    assert session.messages[-1].text == "The work is complete."
+    assert ui.kinds().count("stream_end") == 2
+
+
+def test_empty_recovery_surfaces_recreate_connection_failure(tmp_db):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
+        session._MAX_RETRIES = 0
+        provider = session._primary_lane().provider
+        create = provider.create_streaming
+        error = APIConnectionError(
+            request=httpx2.Request("POST", "https://provider.example.com/v1/chat/completions")
+        )
+
+        def recreate(**kwargs):
+            if requests:
+                raise error
+            return create(**kwargs)
+
+        with (
+            patch.object(provider, "create_streaming", side_effect=recreate) as attempts,
+            pytest.raises(APIConnectionError) as caught,
+        ):
+            session.send("Continue the requested work.")
+    assert caught.value is error
+    assert attempts.call_count == 2
+    assert len(requests) == 1
+    assert ui.kinds().count("stream_end") == 1
+    assert ui.kinds().count("stream_discarded") == 1
+    assert not any("no answer" in message for message in ui.of("error"))
+
+
+def test_unknown_request_posture_is_not_assumed_safe(tmp_db):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
+        provider = session._primary_lane().provider
+        original = provider.create_streaming
+
+        def without_metrics(**kwargs):
+            kwargs.pop("request_metrics_ref", None)
+            return original(**kwargs)
+
+        with (
+            patch.object(provider, "create_streaming", side_effect=without_metrics),
+            pytest.raises(RuntimeError, match="server-side tools"),
+        ):
+            session.send("Continue the requested work.")
+    assert len(requests) == 1
+    assert ui.of("state")[-1] == "error"
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    [
+        ["death", "separate", "separate"],
+        ["separate", "death", "separate"],
+    ],
+)
+def test_stream_death_and_empty_completion_share_one_budget(tmp_db, shapes):
+    with (
+        scripted_session(WorkstreamKind.INTERACTIVE, shapes) as (session, ui, requests),
+        pytest.raises(RuntimeError, match="no answer"),
+    ):
+        session.send("Continue the requested work.")
+    assert len(requests) == 3
+    assert ui.of("state")[-1] == "error"
+    assert len(ui.of("status")) == 2
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_empty_recovery_does_not_repeat_committed_tools(tmp_db, kind):
+    with (
+        scripted_session(kind, ["tool", "separate", "answer"]) as (session, ui, requests),
+        patch.object(
+            session,
+            "_execute_tools",
+            return_value=(
+                [("call-once", "lookup receipt")],
+                "",
+            ),
+        ) as execute,
+    ):
+        session.send("Look it up and report back.")
+    execute.assert_called_once()
+    assert len(requests) == 3
+    assert requests[1] == requests[2]
+    assert sum(turn.role == "tool" for turn in session.messages) == 1
+    assert session.messages[-1].text == "The work is complete."
+
+
+def test_refusal_survives_the_main_loop(tmp_db):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["refusal"]) as (session, ui, requests):
+        session.send("Continue the requested work.")
+    assert len(requests) == 1
+    assert session.messages[-1].text == "[Refused: Cannot help.]"
+    assert ui.of("error")
+    assert "stream_discarded" not in ui.kinds()
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("stage", ["rejection", "usage", "usage_cancelled"])
+def test_stop_during_empty_rejection_finalizes_display_and_preserves_marker(tmp_db, stage, kind):
+    with scripted_session(kind, ["separate"]) as (session, ui, requests):
+        target = session if stage == "rejection" else ui
+        method = "_remember_serving_failure_context" if stage == "rejection" else "on_status"
+        original = getattr(target, method)
+
+        def stop_at_rejection(*args):
+            original(*args)
+            session.cancel()
+            if stage == "usage_cancelled":
+                raise GenerationCancelled()
+
+        with patch.object(target, method, stop_at_rejection):
+            session.send("Continue the requested work.")
+    assert len(requests) == 1
+    assert session.messages[-1].text == "[generation cancelled before completion]"
+    assert ui.kinds().count("stream_end") == 1
+    assert len(ui.of("status")) == 1
+    assert ui.of("status")[0]["total_tokens"] == 24081
+    assert not ui.of("error")
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_stop_during_armed_transport_death_records_one_marker(tmp_db, kind):
+    with scripted_session(kind, ["death"]) as (session, ui, requests):
+        remember = session._remember_serving_failure_context
+
+        def stop_at_death(error, lane):
+            remember(error, lane)
+            session.cancel()
+
+        with patch.object(session, "_remember_serving_failure_context", stop_at_death):
+            session.send("Continue the requested work.")
+    assert len(requests) == 1
+    assistant = [turn.text for turn in session.messages if turn.role == "assistant"]
+    assert assistant == ["[generation cancelled before completion]"]
+    assert ui.kinds().count("stream_end") == 1
+    assert not ui.of("error")
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("stop", [False, True])
+def test_rejected_usage_callback_failure_finalizes_then_reraises(tmp_db, error_type, stop):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
+        error = error_type("status callback failed")
+
+        def fail_status(*args):
+            assert session._generation_lock._is_owned()
+            if stop:
+                session.cancel()
+            raise error
+
+        with patch.object(ui, "on_status", fail_status), pytest.raises(error_type) as caught:
+            session.send("Continue the requested work.")
+    if isinstance(error, Exception):
+        assert isinstance(caught.value, ModelTurnLocalError)
+        assert caught.value.__cause__ is error
+    else:
+        assert caught.value is error
+    assert len(requests) == 1
+    assert ui.kinds().count("stream_end") == 1
+    assert ui.kinds().count("stream_discarded") == 1
+    assert not [turn for turn in session.messages if turn.role == "assistant"]
+    assert session._cancelled_partial_msg is None
+
+
+@pytest.mark.parametrize("invalidate", ["supersede", "close"])
+def test_rejected_usage_failure_cannot_finalize_a_successor(tmp_db, invalidate):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
+        session._generation = 1
+        error = RuntimeError("status callback failed")
+        at_invalidation = []
+
+        def fail_status(*args):
+            if invalidate == "supersede":
+                session._generation += 1
+            else:
+                session._publication_shutdown = True
+            at_invalidation.extend(ui.events)
+            raise error
+
+        with patch.object(ui, "on_status", fail_status), pytest.raises(RuntimeError) as caught:
+            session._stream_response(1)
+    assert isinstance(caught.value, ModelTurnLocalError)
+    assert caught.value.__cause__ is error
+    assert len(requests) == 1
+    assert ui.events == at_invalidation
+    assert session._cancelled_partial_msg is None
+
+
+@pytest.mark.parametrize("cleanup_fault", [None, "on_stream_end", "on_stream_discarded"])
+def test_rejected_usage_preserves_conversation_persistence_failure(tmp_db, cleanup_fault):
+    ui = _CounterUI()
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"], ui=ui) as (
+        session,
+        _,
+        requests,
+    ):
+        error = ConversationPersistenceError("unresolved conversation boundary")
+        remember = session._remember_serving_failure_context
+        queued = "Keep this queued until storage recovers."
+        if cleanup_fault is not None:
+            original_callback = getattr(ui, cleanup_fault)
+
+            def fail_cleanup():
+                original_callback()
+                raise ValueError("private display state")
+
+            setattr(ui, cleanup_fault, fail_cleanup)
+
+        def poison_at_rejection(exc, lane):
+            remember(exc, lane)
+            session.queue_message(queued)
+            session._conversation_persistence_error = error
+
+        with (
+            patch.object(session, "_remember_serving_failure_context", poison_at_rejection),
+            pytest.raises(ConversationPersistenceError) as caught,
+        ):
+            session.send("Continue the requested work.")
+    assert caught.value is error
+    assert session._conversation_persistence_error is error
+    assert len(requests) == 1
+    assert ui.stream_ends == 1
+    assert ui.stream_discards == (0 if cleanup_fault == "on_stream_end" else 1)
+    assert not [turn for turn in session.messages if turn.role == "assistant"]
+    assert session._cancelled_partial_msg is None
+    assert queued not in [turn.text for turn in session.messages]
+    assert len(session._queued_messages) == 1
+    assert not session._pending_conversation_commits
+    assert session.conversation_persistence_fatal_revision() == 1
+    assert load_last_error(session._ws_id) == f"ConversationPersistenceError: {error}"
+
+
+@pytest.mark.parametrize("invalidate", ["supersede", "close"])
+def test_invalidated_empty_attempt_cannot_publish_or_retry(tmp_db, invalidate):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
+        session._generation = 1
+        remember = session._remember_serving_failure_context
+        at_invalidation = []
+
+        def invalidate_at_rejection(error, lane):
+            remember(error, lane)
+            if invalidate == "supersede":
+                session._generation += 1
+            else:
+                session._publication_shutdown = True
+            at_invalidation.extend(ui.events)
+
+        with (
+            patch.object(session, "_remember_serving_failure_context", invalidate_at_rejection),
+            pytest.raises((GenerationCancelled, RuntimeError)),
+        ):
+            session._stream_response(1)
+    assert len(requests) == 1
+    assert ui.events == at_invalidation
+    assert not ui.of("status")
+    assert session._cancelled_partial_msg is None
+
+
+@pytest.mark.parametrize("storage_fails", [False, True])
+def test_rejected_usage_reaches_live_counters_and_storage_outside_generation_lock(
+    tmp_db, storage_fails
+):
+    from turnstone.core.storage import get_storage
+
+    ui = _CounterUI()
+    storage = get_storage()
+    write_usage = storage.record_usage_event
+    writes = []
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate", "answer"], ui=ui) as (
+        session,
+        _,
+        requests,
+    ):
+
+        def record_usage(**kwargs):
+            assert not session._generation_lock._is_owned()
+            writes.append(kwargs)
+            if storage_fails:
+                raise RuntimeError("usage reporting sink failed")
+            write_usage(**kwargs)
+
+        with patch.object(storage, "record_usage_event", side_effect=record_usage):
+            session.send("Continue the requested work.")
+    assert len(requests) == len(writes) == 2
+    assert ui.stream_ends == 2
+    assert ui.stream_discards == 1
+    assert ui._ws_prompt_tokens == 24038 * 2
+    assert ui._ws_completion_tokens == 43 * 2
+    assert {row["model"] for row in writes} == {"served-model"}
+
+
+def test_recovery_after_lane_rebind_reports_the_actual_serving_model(tmp_db):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate", "answer"]) as (
+        session,
+        ui,
+        requests,
+    ):
+        original_backoff = session._backoff_or_cancelled
+
+        def rebind_in_backoff(delay, generation):
+            replace_session_lane(session, model="replacement-model", alias="replacement")
+            original_backoff(delay, generation)
+
+        with patch.object(session, "_backoff_or_cancelled", side_effect=rebind_in_backoff):
+            session.send("Continue the requested work.")
+    assert [request["model"] for request in requests] == ["served-model", "replacement-model"]
+    assert [usage["model"] for usage in ui.of("status")] == ["served-model", "replacement-model"]
+    assert session.messages[-1].meta.extra["provenance"]["backend_model_id"] == "replacement-model"
+
+
+@pytest.mark.parametrize("family", ["openai", "anthropic-compatible"])
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("recovers", [True, False])
+@pytest.mark.parametrize(
+    "shape,server_parses", [pair for pair in _EMPTY_SHAPES if pair[0] != "empty"]
+)
+def test_native_reasoning_only_completion_uses_the_same_recovery(
+    tmp_db, family, kind, recovers, shape, server_parses
+):
+    shapes = [shape, "answer"] if recovers else [shape] * 3
+    with scripted_session(kind, shapes, family=family, server_parses=server_parses) as (
+        session,
+        ui,
+        requests,
+    ):
+        if recovers:
+            session.send("Continue the requested work.")
+        else:
+            with pytest.raises(RuntimeError, match="no answer"):
+                session.send("Continue the requested work.")
+    assert len(requests) == len(shapes)
+    assert len(ui.of("status")) == len(shapes)
+    assert ui.of("state")[-1] == ("idle" if recovers else "error")
+    assert sum(turn.role == "assistant" for turn in session.messages) == int(recovers)
+    if recovers:
+        assert session.messages[-1].text == "The work is complete."
+        assert requests[0] == requests[1]

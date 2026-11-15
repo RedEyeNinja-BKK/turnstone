@@ -1,0 +1,201 @@
+# Turnstone local inference — 3 models co-resident on ONE unified-memory
+# accelerator (NVIDIA DGX Spark / GB10, or AMD Ryzen AI MAX "Strix Halo"),
+# behind a LiteLLM gateway serving BOTH chat API routes at once:
+#
+#   /v1/messages          (Anthropic)  -> qwen      reasoning + tools
+#   /v1/chat/completions  (OpenAI)     -> gemma     perception (vision + audio)
+#   (direct)              /rerank      -> reranker  retrieval rerank
+#
+# Models load by HF id into a mounted HF_HOME cache (set HF_TOKEN for gated
+# repos; first `up` downloads them, then they're cached on disk under HF_CACHE).
+# This file targets NVIDIA/CUDA; for AMD ROCm see README.md.
+#
+# Validated on a GB10 Spark (128 GiB): qwen 256K, gemma 131072, reranker,
+# ~117/121 GiB used. Two hard rules on one unified-memory card
+# (see README -> Troubleshooting): drop the page cache before `up`, and start
+# sequentially (enforced via depends_on) so each model profiles clean memory.
+#
+# gpu-memory-utilization is a fraction of TOTAL unified memory; the three must
+# sum below ~0.9. Tune for your card.
+name: turnstone-inference
+
+services:
+  # --- reasoning + tools : Qwen 3.6 27B (NVFP4, MTP spec-decode, full 256K) ----
+  # max-num-seqs is a scheduler limit, not a memory allocator — bump from the
+  # default 2 to 8 for better throughput under concurrent load.
+  vllm-qwen:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    command:
+      - --model
+      - ${QWEN_MODEL:-nvidia/Qwen3.6-27B-NVFP4}
+      - --served-model-name
+      - qwen3.6-27b
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --trust-remote-code
+      - --load-format
+      - runai_streamer
+      - --gpu-memory-utilization
+      - "0.50"
+      - --max-model-len
+      - "262144"
+      - --max-num-batched-tokens
+      - "8192"
+      - --max-num-seqs
+      - "8"
+      - --enable-prefix-caching
+      - --speculative-config
+      - '{"method": "mtp", "num_speculative_tokens": 2}'
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --default-chat-template-kwargs
+      - '{"preserve_thinking": true, "enable_thinking": true}'
+    environment:
+      HF_HOME: /hf
+      HF_TOKEN: ${HF_TOKEN:-}
+      TRITON_CACHE_DIR: /root/.triton/cache
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch/inductor
+    volumes:
+      - ${HF_CACHE:-./hf-cache}:/hf
+      - ${COMPILE_CACHE:-./compile-cache}/triton:/root/.triton/cache
+      - ${COMPILE_CACHE:-./compile-cache}/torch:/root/.cache/torch/inductor
+      - ${COMPILE_CACHE:-./compile-cache}/flashinfer:/root/.cache/flashinfer
+    ports:
+      - "${QWEN_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 120
+      start_period: 1800s          # first run also downloads the weights
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia        # AMD: delete this deploy: block, see README
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # --- perception : Gemma 4 12B (vision + audio) via the OpenAI lane -----------
+  # FP16 KV cache is fine here — sliding_window keeps KV cheap at 131K context.
+  vllm-gemma:
+    build:
+      context: .
+      dockerfile: gemma.Dockerfile   # adds vllm[audio] for the audio path
+      args:
+        VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    image: turnstone-inference/vllm-gemma-audio
+    command:
+      - --model
+      - ${GEMMA_MODEL:-google/gemma-4-12b-it}
+      - --served-model-name
+      - gemma-4-12b
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --trust-remote-code
+      - --gpu-memory-utilization
+      - "0.24"
+      - --max-model-len
+      - "131072"
+      - --max-num-batched-tokens
+      - "4096"
+      - --enable-auto-tool-choice
+      - --reasoning-parser
+      - gemma4
+      - --tool-call-parser
+      - gemma4
+      - --default-chat-template-kwargs
+      - '{"enable_thinking": false}'
+    environment:
+      HF_HOME: /hf
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${HF_CACHE:-./hf-cache}:/hf
+    ports:
+      - "${GEMMA_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 120
+      start_period: 1800s
+    depends_on:
+      vllm-qwen:
+        condition: service_healthy   # SEQUENTIAL STARTUP — qwen claims KV first
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia          # AMD: delete this deploy: block, see README
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # --- retrieval : Qwen3-Reranker 4B (Cohere/Jina /rerank, direct) ---------------
+  # Light 4B reranker so it co-resides with the full 12B perception model. Its
+  # chat template ships in the repo (vLLM loads it); add --chat-template if your
+  # build needs it explicitly.
+  vllm-reranker:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    command:
+      - --model
+      - ${RERANKER_MODEL:-Qwen/Qwen3-Reranker-4B}
+      - --served-model-name
+      - qwen3-reranker-4b
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --runner
+      - pooling
+      - --hf-overrides
+      - '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}'
+      - --gpu-memory-utilization
+      - "0.10"
+    environment:
+      HF_HOME: /hf
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${HF_CACHE:-./hf-cache}:/hf
+    ports:
+      - "${RERANKER_PORT:-8002}:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 80
+      start_period: 900s
+    depends_on:
+      vllm-gemma:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia          # AMD: delete this deploy: block, see README
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # --- gateway : both chat API routes on :4000 -------------------------------
+  litellm:
+    image: ghcr.io/berriai/litellm:${LITELLM_TAG:-main-stable}
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    volumes:
+      - ./litellm-config.yaml:/etc/litellm/config.yaml:ro
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    depends_on:
+      vllm-qwen:
+        condition: service_healthy
+      vllm-gemma:
+        condition: service_healthy
+    restart: unless-stopped

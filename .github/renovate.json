@@ -1,0 +1,152 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":separateMajorReleases"
+  ],
+  "baseBranchPatterns": ["main"],
+  "gitIgnoredAuthors": [
+    "41898282+github-actions[bot]@users.noreply.github.com"
+  ],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "schedule": ["before 9am on Monday"],
+  "timezone": "America/New_York",
+  "pre-commit": {
+    "enabled": true
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 9am on Monday"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track vendored KaTeX version",
+      "managerFilePatterns": ["/pyproject\\.toml$/"],
+      "matchStrings": ["katex-(?<currentValue>[\\d.]+)/"],
+      "depNameTemplate": "katex",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track vendored Highlight.js version",
+      "managerFilePatterns": ["/pyproject\\.toml$/"],
+      "matchStrings": ["hljs-(?<currentValue>[\\d.]+)/"],
+      "depNameTemplate": "highlight.js",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track vendored Mermaid version",
+      "managerFilePatterns": ["/pyproject\\.toml$/"],
+      "matchStrings": ["mermaid-(?<currentValue>[\\d.]+)/"],
+      "depNameTemplate": "mermaid",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track vendored hls.js version",
+      "managerFilePatterns": ["/pyproject\\.toml$/"],
+      "matchStrings": ["hls-(?<currentValue>[\\d.]+)/"],
+      "depNameTemplate": "hls.js",
+      "datasourceTemplate": "npm"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "LLM SDKs — always review manually",
+      "groupName": "LLM SDKs",
+      "matchPackageNames": ["openai", "httpx2", "httpcore2", "anthropic", "mcp"],
+      "schedule": ["before 9am on Monday"],
+      "automerge": false
+    },
+    {
+      "description": "Web framework stack",
+      "groupName": "Web Framework",
+      "matchPackageNames": [
+        "starlette",
+        "uvicorn",
+        "sse-starlette",
+        "pydantic"
+      ],
+      "schedule": ["before 9am on Wednesday"],
+      "automerge": true,
+      "matchUpdateTypes": ["patch"]
+    },
+    {
+      "description": "Database layer",
+      "groupName": "Database",
+      "matchPackageNames": ["sqlalchemy", "alembic", "psycopg"],
+      "schedule": ["before 9am on Wednesday"],
+      "automerge": true,
+      "matchUpdateTypes": ["patch"]
+    },
+    {
+      "description": "Security-critical — always review manually",
+      "groupName": "Security",
+      "matchPackageNames": ["PyJWT", "pyjwt", "bcrypt"],
+      "automerge": false
+    },
+    {
+      "description": "Infrastructure dependencies",
+      "groupName": "Infrastructure",
+      "matchPackageNames": ["structlog", "croniter", "discord.py"],
+      "schedule": ["before 9am on the first day of the month"],
+      "automerge": true,
+      "matchUpdateTypes": ["patch"]
+    },
+    {
+      "description": "Vendored JS — CI workflow downloads files automatically",
+      "groupName": "Vendored JS",
+      "matchPackageNames": ["katex", "highlight.js", "mermaid", "hls.js"],
+      "schedule": ["before 9am on the first day of the month"],
+      "automerge": false
+    },
+    {
+      "description": "Dev/test tooling",
+      "groupName": "Tooling",
+      "matchPackageNames": ["mypy", "pytest", "pytest-cov"],
+      "schedule": ["before 9am on the first day of the month"],
+      "automerge": true,
+      "matchUpdateTypes": ["patch"]
+    },
+    {
+      "description": "ruff — the dev extra pin and the pre-commit hook move together",
+      "groupName": "ruff",
+      "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"],
+      "schedule": ["before 9am on the first day of the month"],
+      "automerge": false
+    },
+    {
+      "description": "Docker base images",
+      "groupName": "Docker Images",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "schedule": ["before 9am on the first day of the month"],
+      "automerge": false
+    },
+    {
+      "description": "TypeScript SDK dev dependencies",
+      "groupName": "TypeScript SDK",
+      "matchFileNames": ["sdk/typescript/**"],
+      "schedule": ["before 9am on the first day of the month"],
+      "automerge": true,
+      "matchUpdateTypes": ["patch"]
+    },
+    {
+      "description": "GitHub Actions — group all action updates",
+      "groupName": "GitHub Actions",
+      "matchManagers": ["github-actions"],
+      "automerge": false
+    },
+    {
+      "description": "uv — the version CI installs and the image's copy move together",
+      "groupName": "uv",
+      "matchPackageNames": ["ghcr.io/astral-sh/uv", "astral-sh/uv"],
+      "schedule": ["before 9am on Monday"],
+      "automerge": false
+    }
+  ]
+}

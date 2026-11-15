@@ -1,0 +1,1915 @@
+"""Tests for the SSE reconnect-with-replay foundation.
+
+Covers the three commits of the reconnect-with-replay PR at the
+boundaries that matter:
+
+  - :meth:`SessionUIBase.register_listener_with_replay` — the
+    per-ws ring buffer + ``Last-Event-ID`` slice semantics
+    (replay_ok / truncated / empty-buffer edge cases, order
+    preservation under concurrent emit, no skipped ids on
+    ``queue.Full``, cross-thread emit/replay consistency).
+  - :func:`make_events_handler` — ``id:`` field on every yielded
+    event from the buffer (replay or live), jittered ``retry:`` on
+    the first yield, ``replay_truncated`` envelope on stale
+    ``Last-Event-ID``, snapshot skip when replay covers the gap.
+
+The browser-side guard for the ``onerror`` close pattern lives in
+``test_app_js.py`` alongside the other static JS guards.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import queue
+import threading
+from types import SimpleNamespace as SimpleNS
+from typing import Any
+from unittest.mock import MagicMock
+
+from starlette.requests import Request
+
+from turnstone.core.session_routes import (
+    SessionEndpointConfig,
+    make_events_handler,
+)
+from turnstone.core.session_ui_base import SessionUIBase
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class _ConcreteUI(SessionUIBase):
+    """Minimal concrete subclass for direct UI tests."""
+
+
+def _make_ui(ws_id: str = "ws-1") -> _ConcreteUI:
+    return _ConcreteUI(ws_id=ws_id, user_id="u1")
+
+
+def _fake_request(
+    *,
+    headers: dict[str, str] | None = None,
+    query: dict[str, str] | None = None,
+    path_params: dict[str, str] | None = None,
+    user_id: str = "viewer-1",
+) -> Request:
+    """Construct a Starlette ``Request`` for the events handler.
+
+    The handler reads ``request.headers``, ``request.query_params``,
+    ``request.path_params``, and awaits ``request.is_disconnected()``.
+    Building a real ASGI scope keeps the test honest about the values
+    those properties resolve from.
+    """
+    header_list = []
+    if headers:
+        for k, v in headers.items():
+            header_list.append((k.lower().encode(), v.encode()))
+    query_string = "&".join(f"{k}={v}" for k, v in query.items()).encode() if query else b""
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "headers": header_list,
+        "path": "/events",
+        "raw_path": b"/events",
+        "query_string": query_string,
+        "path_params": path_params or {},
+        "app": MagicMock(),
+    }
+
+    async def _recv() -> dict[str, Any]:  # noqa: RUF029 — async signature required
+        return {"type": "http.disconnect"}
+
+    request = Request(scope, receive=_recv)
+    request.state.auth_result = SimpleNS(user_id=user_id)
+    return request
+
+
+# ---------------------------------------------------------------------------
+# register_listener_with_replay — per-ws ring buffer slice semantics
+# ---------------------------------------------------------------------------
+
+
+def test_replay_holds_events_through_empty_listeners_period() -> None:
+    """The load-bearing property of the new ring buffer: events fired
+    while NO listener is registered must still be replayable to a
+    later subscriber whose ``Last-Event-ID`` predates them.  Pre-PR,
+    events to an empty listener list went on the floor — that's the
+    behaviour the entire reconnect-with-replay foundation replaces.
+    """
+    ui = _make_ui()
+    # No listeners — fire 10 events.
+    for i in range(10):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    # Reconnect-style register with Last-Event-ID=0 (client saw nothing).
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(0)
+    assert status == "replay_ok"
+    assert lost == 0
+    assert earliest == 1
+    assert len(replay) == 10
+    assert [ev["name"] for ev in replay] == [f"t{i}" for i in range(10)]
+    # Each replayed event carries its _event_id so the events handler
+    # can emit the SSE id: field — verified by inspecting the slice.
+    assert [ev["_event_id"] for ev in replay] == list(range(1, 11))
+
+
+def test_replay_with_last_event_id_skips_already_seen_events() -> None:
+    """Client says it last saw id=5 — replay yields only events 6+,
+    not the whole buffer."""
+    ui = _make_ui()
+    for i in range(8):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(5)
+    assert status == "replay_ok"
+    assert lost == 0
+    assert [ev["_event_id"] for ev in replay] == [6, 7, 8]
+
+
+def test_replay_truncated_when_last_event_id_predates_buffer() -> None:
+    """When the buffer has evicted events the client wanted, return
+    ``truncated`` with the lost-count gap so the handler can emit the
+    explicit envelope and fall through to snapshot recovery."""
+    ui = _make_ui()
+    # Override the buffer cap for the test so we don't have to fire
+    # 2001 events to trigger eviction.
+    import collections
+
+    ui._event_buffer = collections.deque(maxlen=5)
+    for i in range(20):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    # Buffer now holds ids 16..20 (5 most recent of 20 emitted).
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(3)
+    assert status == "truncated"
+    assert earliest == 16
+    assert lost == 12  # earliest-1 - last_event_id = 15 - 3
+    assert replay == []
+
+
+def test_replay_empty_buffer_returns_replay_ok_empty() -> None:
+    """Cold-start ws with zero events ever: replay_ok / empty list.
+    A spurious ``replay_truncated`` envelope on a freshly-opened
+    workstream would be confusing and incorrect.  (This is the
+    regression guard for the derived-staleness rule's ``snap_seq > 0``
+    gate — an empty ring is only truncated when the counter proves
+    events once existed.)"""
+    ui = _make_ui()
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(0)
+    assert status == "replay_ok"
+    assert replay == []
+    assert lost == 0
+    assert earliest == 0
+
+
+def test_replay_empty_buffer_with_seeded_counter_reports_truncated() -> None:
+    """Rehydrate case: the UI instance was rebuilt over an existing
+    conversation (``_seed_event_id_from_storage`` reseeds ``_event_id``
+    from ``MAX(conversations.event_id)``) but the ring died with the old
+    process.  A client whose cursor sits below the counter provably lost
+    events no ring can replay — report ``truncated`` so the client runs
+    its /history resync, instead of the pre-fix silent ``replay_ok``
+    (stuck-busy panes and committed turns missing until a manual
+    reload)."""
+    ui = _make_ui()
+    ui._event_id = 500  # what _seed_event_id_from_storage does on rehydrate
+    lq, replay, status, lost, earliest, snap = ui.register_listener_with_replay(400)
+    assert status == "truncated"
+    assert replay == []
+    assert lost == 100  # exact (not a lower bound) on the empty-ring path
+    assert earliest == 501  # next id that will exist; nothing below is retained
+    assert snap["seq"] == 500
+
+
+def test_replay_empty_buffer_cursor_at_counter_is_lossless_replay_ok() -> None:
+    """Strict ``<`` is load-bearing: a client that saw everything before
+    the rebuild (cursor == seeded counter) lost nothing — ``replay_ok``
+    with an empty slice, no spurious resync churn on every
+    reconnect-after-rehydrate."""
+    ui = _make_ui()
+    ui._event_id = 500
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(500)
+    assert status == "replay_ok"
+    assert replay == []
+    assert lost == 0
+
+
+def test_replay_empty_buffer_negative_cursor_reports_truncated() -> None:
+    """A negative cursor was never issued by the per-workstream stream.
+
+    Even on a cold workstream it must fail closed to the authoritative
+    recovery floor, not claim that an empty ring covered the cursor.
+    """
+    ui = _make_ui()
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(-1)
+    assert status == "truncated"
+    assert replay == []
+    assert lost == 1
+    assert earliest == 1
+
+
+def test_replay_future_cursor_reports_truncated() -> None:
+    """A cursor beyond the captured high-water mark cannot be server-issued."""
+    ui = _make_ui()
+    ui._enqueue({"type": "tool_started", "name": "only-event"})
+
+    _, replay, status, lost, earliest, snapshot = ui.register_listener_with_replay(99)
+
+    assert status == "truncated"
+    assert replay == []
+    assert lost == 0  # unknown/corrupt future gap: conservative lower bound
+    assert earliest == 1
+    assert snapshot["seq"] == 1
+
+
+def test_can_replay_from_stays_false_on_empty_ring_despite_seeded_counter() -> None:
+    """Deliberate asymmetry with the register path (ruled 2026-07-20 —
+    see the ``can_replay_from`` docstring; do not "fix"): on an empty
+    ring with a stale cursor, ``register_listener_with_replay`` reports
+    ``truncated`` (the recovery MESSAGE) while ``can_replay_from`` stays
+    ``False`` (the recovery ROUTE — ``/history`` keeps the in-flight
+    turn and withholds the cursor, because a cursor pointing into an
+    empty ring would immediately re-truncate on connect and loop the
+    client through resync)."""
+    ui = _make_ui()
+    ui._event_id = 500
+    assert ui.can_replay_from(400) is False
+
+
+def test_replay_registers_listener_atomically_with_buffer_snapshot() -> None:
+    """Atomicity contract: under ``_listeners_lock`` we both snapshot
+    the buffer AND register the listener.  A writer's ``_enqueue``
+    takes the same lock, so an event landing after the snapshot
+    arrives in the listener queue (live) — never in BOTH the replay
+    and the live queue, and never in NEITHER."""
+    ui = _make_ui()
+    ui._enqueue({"type": "tool_started", "name": "before"})
+    lq, replay, _, _, _, _ = ui.register_listener_with_replay(0)
+    # Now fire after registration — must arrive live, NOT in replay.
+    ui._enqueue({"type": "tool_started", "name": "after"})
+    assert [ev["name"] for ev in replay] == ["before"]
+    live = lq.get_nowait()
+    assert live["name"] == "after"
+    assert live["_event_id"] == 2
+
+
+def test_event_id_monotonic_under_concurrent_writers() -> None:
+    """Load-bearing invariant for any replay protocol — if monotonicity
+    ever breaks (e.g. someone moves the id-increment outside the
+    lock), reconnect-with-replay silently re-orders events.  Stress
+    with multiple writer threads."""
+    ui = _make_ui()
+    n_writers = 4
+    per_writer = 200
+    barrier = threading.Barrier(n_writers)
+
+    def _writer(tag: str) -> None:
+        barrier.wait()
+        for i in range(per_writer):
+            ui._enqueue({"type": "tool_started", "name": f"{tag}-{i}"})
+
+    threads = [threading.Thread(target=_writer, args=(f"w{w}",)) for w in range(n_writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Walk the buffer in deque order — ids must be strictly monotonic.
+    ids = [eid for eid, _ in ui._event_buffer]
+    assert ids == sorted(ids), "event_id ordering broke under concurrent writers"
+    assert ids == list(range(ids[0], ids[-1] + 1)), "event_id skipped under concurrency"
+    assert ids[-1] == n_writers * per_writer
+
+
+def test_event_id_does_not_skip_when_listener_queue_full() -> None:
+    """If a slow listener's queue is full, the per-listener put is
+    rejected (the first rejection poisons the listener; later ones are
+    latch refusals) — but the counter must NOT skip.  A subsequently-
+    registered listener with ``Last-Event-ID=0`` must see ALL the ids
+    from the buffer (1..N), not a sparse subset.  Pre-bug-class:
+    moving the id-increment inside the per-listener loop would create
+    phantom "gaps" the truncation detector would misread."""
+    ui = _make_ui()
+    slow_lq = ui._register_listener(maxsize=1)
+    slow_lq.put_nowait({"placeholder": True})  # full immediately
+    # Fire 10 events — none can land in the full/poisoned queue.
+    for i in range(10):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    # Replay from id=0 — fresh listener gets all 10, ids 1..10 dense.
+    _, replay, status, _, _, _ = ui.register_listener_with_replay(0)
+    assert status == "replay_ok"
+    assert [ev["_event_id"] for ev in replay] == list(range(1, 11))
+
+
+def test_cross_thread_writer_and_replay_observer_consistent() -> None:
+    """A worker thread fires ``_enqueue`` while another thread calls
+    ``register_listener_with_replay``.  The replay snapshot must be
+    gap-free — no half-written deque state visible to the reader.
+    Guards against the iteration-during-mutation hazard that a casual
+    implementation could introduce if the buffer copy out of the lock
+    isn't taken correctly."""
+    ui = _make_ui()
+    n = 500
+    done = threading.Event()
+
+    def _writer() -> None:
+        for i in range(n):
+            ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+        done.set()
+
+    snap_box: dict[str, Any] = {}
+
+    def _reader() -> None:
+        # Wait briefly so the writer is mid-flight.
+        threading.Event().wait(0.001)
+        _, replay, status, _, earliest, _ = ui.register_listener_with_replay(0)
+        snap_box["replay"] = replay
+        snap_box["status"] = status
+        snap_box["earliest"] = earliest
+
+    w = threading.Thread(target=_writer)
+    r = threading.Thread(target=_reader)
+    w.start()
+    r.start()
+    w.join()
+    r.join()
+
+    replay = snap_box["replay"]
+    # Replay snapshot is consistent — ids contiguous, no gaps.
+    ids = [ev["_event_id"] for ev in replay]
+    assert ids == sorted(ids)
+    if ids:
+        assert ids == list(range(ids[0], ids[-1] + 1)), (
+            "gap observed in replay snapshot — torn deque state visible"
+        )
+
+
+def test_event_id_persists_across_turn_boundaries(monkeypatch: Any) -> None:
+    """Resetting ``_event_id`` to 0 at turn boundaries would silently
+    mis-replay a long-lived SSE subscriber whose ``Last-Event-ID``
+    was from a prior turn.  Mirrors the pre-existing
+    ``test_inflight_seq_monotonic_across_turn_boundaries`` invariant
+    on the snap_seq side, extended to the buffer/replay side.
+
+    Batch window forced to 0 (per-token flush) — this test pins id
+    numbering across turn boundaries, not the batching cadence."""
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui.on_content_token("turn-N tok1 ")
+    ui.on_content_token("turn-N tok2 ")
+    seq_before = ui._event_id
+    ui.on_turn_committed()
+    ui.on_turn_start()
+    ui.on_content_token("turn-N+1 tok1")
+    seq_after = ui._event_id
+    assert seq_after > seq_before, "counter regressed across turn boundary"
+    # Replay from mid-turn-N must still serve turn-N+1's content.
+    _, replay, status, _, _, _ = ui.register_listener_with_replay(seq_before)
+    assert status == "replay_ok"
+    assert len(replay) == 1
+    assert replay[0]["text"] == "turn-N+1 tok1"
+
+
+def test_replay_ok_skips_in_progress_snapshot_path() -> None:
+    """When ``last_event_id`` is provided AND replay covers the gap,
+    ``register_listener_with_replay`` returns ``replay_ok`` without
+    touching the inflight content/reasoning snapshot machinery.  The
+    events handler uses this branch to skip emitting the
+    ``in_progress_snapshot`` event (which would otherwise double-
+    render content the buffered events already contain)."""
+    ui = _make_ui()
+    ui.on_content_token("partial ")
+    # Replay path: returns replay_ok and a synthetic snap is NOT taken
+    # (we test the handler-side behavior in the handler tests below).
+    lq, replay, status, _, _, snap = ui.register_listener_with_replay(0)
+    assert status == "replay_ok"
+    # The buffered event carries the partial content as a content event.
+    assert any(ev.get("type") == "content" for ev in replay)
+    # Snapshot is captured atomically too (used on truncated path to
+    # drive live-drain ``_seq <= snap_seq`` dedup); for replay_ok the
+    # caller ignores it but the contract returns one regardless.
+    assert isinstance(snap, dict)
+    assert snap["seq"] >= 1
+
+
+def test_truncated_path_snapshot_captures_real_snap_seq(monkeypatch: Any) -> None:
+    """Regression for PR #542 review comment 1 (Copilot, low-confidence).
+
+    On the truncated path the caller used to set ``snap_seq=0``, which
+    disabled the events handler's live-drain ``_seq <= snap_seq``
+    dedup.  A token writer racing between
+    ``register_listener_with_replay`` returning and the live drain's
+    first read would land in the listener queue AND in the captured
+    snapshot text, causing the client to render the token twice
+    (once via the ``in_progress_snapshot`` content text, once via the
+    live event delivery).
+
+    The fix lifts the snapshot capture INTO
+    ``register_listener_with_replay`` under the same nested-lock
+    acquire as the listener registration + buffer slice + counter
+    read, so ``snap_seq`` returned in the snapshot is the exact
+    high-water mark the snapshot text corresponds to.
+
+    Batch window forced to 0 so each token is its own ring entry —
+    the truncation scenario needs 10 distinct buffered events."""
+    import collections
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    # Fire enough events to trigger truncation on reconnect with a
+    # stale ``Last-Event-ID``.
+    for i in range(10):
+        ui.on_content_token(f"t{i}")
+    _, _, status, _, _, snap = ui.register_listener_with_replay(1)
+    assert status == "truncated"
+    # The snapshot's seq must be the LATEST event_id, not 0 — that's
+    # what gates the live-drain dedup filter in the events handler.
+    assert snap["seq"] == ui._event_id
+    assert snap["seq"] >= 10
+    # And the content is captured (not empty).
+    assert "t0" in snap["content"]
+    assert "t9" in snap["content"]
+
+
+def test_snap_seq_high_water_mark_holds_under_writer_race() -> None:
+    """Regression for PR #561 review comment 1.
+
+    The invariant: every token whose text appears in
+    ``snapshot["content"]`` (or ``"reasoning"``) must have its
+    ``_event_id`` <= ``snapshot["seq"]``.  Equivalently, any token
+    that fires AFTER the snapshot was captured must have
+    ``_event_id > snap_seq``.  Otherwise the events handler's
+    ``_seq <= snap_seq`` live-drain filter would let the new token
+    through AND its text would already be in the snapshot text →
+    double-render.
+
+    The pre-fix race: ``on_content_token`` took ``_ws_lock``,
+    appended to inflight, released ``_ws_lock``, then called
+    ``_enqueue`` (which bumps ``_event_id``).  A snapshot reader
+    interleaving between the release and the ``_enqueue`` would
+    capture inflight (with the new text) and read a STALE
+    ``_event_id``.  Snap_seq below new event's id → filter slips →
+    double-render.
+
+    The race window in plain Python is narrow (a few bytecodes
+    between lock release and the emit call), so a pure barrier-based
+    race rarely hits it.  This test injects a deterministic sleep
+    into ``_enqueue_direct`` — the inner emit point the token
+    batcher's flush calls under ``_ws_lock`` — to widen the window
+    enough to be reliably observed if the flush's inflight-append
+    and enqueue are ever split across ``_ws_lock`` sections, AND to
+    be reliably AVOIDED under the correct code path (the flush holds
+    ``_ws_lock`` across both, so the snapshot reader can't acquire
+    it until the writer is fully done).
+    """
+    import queue
+    import threading
+    import time
+
+    ui = _make_ui()
+    marker = "RACE-MARKER"
+    original_direct = ui._enqueue_direct
+
+    # Widen the race window: sleep just BEFORE the inner emit runs
+    # (which is where ``_event_id`` advances).  Under the correct
+    # locking this sleep happens while the writer still holds
+    # ``_ws_lock`` — readers block.  If the flush ever releases
+    # ``_ws_lock`` before its enqueue, the reader gets a clean
+    # window to capture an inconsistent ``(inflight, _event_id)``
+    # pair and the invariant below trips.
+    def slow_direct(data: dict[str, Any]) -> int:
+        time.sleep(0.05)  # 50 ms — orders of magnitude wider than the GIL switch interval
+        return original_direct(data)
+
+    ui._enqueue_direct = slow_direct  # type: ignore[method-assign]
+
+    snap_box: dict[str, Any] = {}
+    writer_done = threading.Event()
+
+    def _writer() -> None:
+        ui.on_content_token(marker)
+        writer_done.set()
+
+    def _reader() -> None:
+        # Give the writer time to enter ``on_content_token`` and
+        # (pre-fix) release ``_ws_lock`` before the snapshot.  50 ms
+        # is conservative; 5 ms would also work in practice.
+        time.sleep(0.025)
+        _, _, _, _, _, snap = ui.register_listener_with_replay(0)
+        snap_box["snap"] = snap
+        snap_box["event_id_at_snapshot_return"] = ui._event_id
+
+    wt = threading.Thread(target=_writer)
+    rt = threading.Thread(target=_reader)
+    wt.start()
+    rt.start()
+    wt.join(timeout=5)
+    rt.join(timeout=5)
+    assert writer_done.is_set(), "writer thread did not complete"
+
+    snap = snap_box["snap"]
+    final_event_id = ui._event_id
+
+    # Core invariant: if the snapshot's content includes the marker
+    # text, snap.seq must be >= the writer's final _event_id.
+    # Pre-fix this fails (snap.seq=0 while final_event_id=1 and
+    # snap.content="RACE-MARKER"); post-fix the reader can't acquire
+    # ``_ws_lock`` until the writer completes, so snap is either
+    # (content="", seq=0) — reader won first — or
+    # (content="RACE-MARKER", seq=1) — writer won first.
+    assert marker in snap["content"] or snap["content"] == "", (
+        f"unexpected snap content: {snap['content']!r}"
+    )
+    if marker in snap["content"]:
+        assert snap["seq"] >= final_event_id, (
+            f"snap captured '{marker}' but snap.seq={snap['seq']} < "
+            f"final _event_id={final_event_id}; the live emission of "
+            f"this token would slip past the events handler's "
+            f"_seq <= snap_seq filter and double-render text the "
+            f"snapshot already contained.  Pre-fix race window "
+            f"opened by ``_enqueue`` running outside ``_ws_lock``."
+        )
+
+    # Sanity: also exercise the post-truncated drain shape so the
+    # test file pins both the contract AND the no-backfill behaviour
+    # (a future change that adds backfill into the listener queue
+    # must keep the dedup invariant above true).
+    ui2 = _make_ui()
+    for j in range(5):
+        ui2.on_content_token(f"x{j}")
+    lq, _, status, _, _, snap2 = ui2.register_listener_with_replay(0)
+    captured_seq = snap2["seq"]
+    drained = 0
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except queue.Empty:
+            break
+        drained += 1
+        if ev.get("type") == "content":
+            assert ev["_seq"] <= captured_seq, f"token _seq={ev['_seq']} > snap_seq={captured_seq}"
+    assert drained == 0, (
+        f"register_listener_with_replay backfilled {drained} events "
+        f"into the listener queue; if intentional, the dedup "
+        f"invariant above must still hold and this assertion should "
+        f"be updated."
+    )
+
+
+# ---------------------------------------------------------------------------
+# make_events_handler — id: / retry: / replay_truncated / branch behaviour
+# ---------------------------------------------------------------------------
+
+
+def _wire_events_handler(
+    ui: _ConcreteUI,
+    *,
+    state: str = "idle",
+    session: Any = None,
+    events_replay: Any = None,
+) -> Any:
+    """Build a minimal ``make_events_handler`` closure that returns
+    yields suitable for the EventSourceResponse generator.
+
+    Calls the closure with a fake request; returns the inner generator
+    AFTER it has been started so the test can iterate yields directly.
+
+    ``state`` sets the workstream's ``ws.state.value`` so a test can
+    exercise the error-state branch (the persisted ``last_error``
+    surface) without a real session.
+    """
+    ws = SimpleNS(id=ui.ws_id, ui=ui, state=SimpleNS(value=state), session=session)
+    mgr = MagicMock()
+    mgr.get.return_value = ws
+
+    cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda _r: (mgr, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        events_replay=events_replay,
+    )
+    return make_events_handler(cfg)
+
+
+def _drain_handler_yields(
+    ui: _ConcreteUI,
+    *,
+    headers: dict[str, str] | None = None,
+    query: dict[str, str] | None = None,
+    max_yields: int = 10,
+    state: str = "idle",
+    session: Any = None,
+    events_replay: Any = None,
+) -> tuple[list[Any], str]:
+    """Synchronous helper: spin up the handler, drain up to N yields,
+    return ``(raw_yields, decoded_blob)``.  Uses ``asyncio.run`` so
+    tests don't depend on pytest-asyncio / pytest-anyio plugin config.
+
+    The decoded blob is the textual SSE concatenation — assertion
+    targets in the tests below grep against it.  Raw yields are
+    returned for shape-level assertions (e.g. the first-yield
+    ``retry`` check).
+    """
+    handler = _wire_events_handler(
+        ui,
+        state=state,
+        session=session,
+        events_replay=events_replay,
+    )
+    req = _fake_request(headers=headers, query=query, path_params={"ws_id": ui.ws_id})
+
+    async def _run() -> list[Any]:
+        resp = await handler(req)
+        out: list[Any] = []
+        async for chunk in resp.body_iterator:
+            out.append(chunk)
+            if len(out) >= max_yields:
+                break
+        await resp.body_iterator.aclose()
+        return out
+
+    yields = asyncio.run(_run())
+    # The events handler yields plain dicts ({"data": ..., "id": ...,
+    # "retry": ..., ...}); sse-starlette's response layer encodes
+    # them into SSE wire format at serve-time.  For introspection,
+    # render each dict into the equivalent SSE textual form so the
+    # tests can grep against the canonical encoded representation
+    # AND have access to the raw dicts for shape-level assertions.
+    text_parts: list[str] = []
+    for y in yields:
+        if isinstance(y, bytes):
+            text_parts.append(y.decode(errors="replace"))
+        elif isinstance(y, str):
+            text_parts.append(y)
+        elif isinstance(y, dict):
+            # Mirror sse-starlette's encoding contract — one field
+            # per line, terminating blank line per event.
+            for field in ("id", "event", "retry", "data", "comment"):
+                if field in y:
+                    text_parts.append(f"{field}: {y[field]}")
+            text_parts.append("")
+        elif hasattr(y, "encode"):
+            encoded = y.encode()
+            text_parts.append(
+                encoded.decode(errors="replace") if isinstance(encoded, bytes) else str(encoded)
+            )
+        else:
+            text_parts.append(str(y))
+    return yields, "\n".join(text_parts)
+
+
+def test_handler_emits_retry_on_first_yield() -> None:
+    """First yield of the events handler must include a jittered
+    ``retry`` field in the [2500, 4500] ms range so 6-pane reconnects
+    don't lockstep on EventSource's default ~3 s interval."""
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(ui, max_yields=1)
+    # The retry: SSE field appears in the encoded blob.
+    import re
+
+    match = re.search(r"retry:\s*(\d+)", blob)
+    assert match is not None, f"first yield missing retry: line\n{blob}"
+    retry = int(match.group(1))
+    assert 2500 <= retry <= 4500, f"retry {retry} outside jitter band [2500, 4500]"
+
+
+def test_handler_resolves_project_off_loop_and_preserves_legacy_replay_callback() -> None:
+    """Project metadata uses the viewer off-loop; replay keeps its 3-arg API."""
+    from turnstone.core.session_replay import (
+        request_replay_project_name,
+        session_replay_preamble,
+    )
+
+    event_loop_thread = threading.get_ident()
+    resolver_threads: list[int] = []
+    principals: list[str] = []
+    callback_calls: list[tuple[Any, Any, Any]] = []
+
+    session = MagicMock()
+    session.model = "test"
+    session.model_alias = ""
+    session._last_usage = None
+
+    def _project_name(principal_id: str) -> str:
+        resolver_threads.append(threading.get_ident())
+        principals.append(principal_id)
+        return "Visible Project"
+
+    session.project_name_for_principal.side_effect = _project_name
+
+    def _replay(ws: Any, ui: Any, request: Any) -> Any:
+        callback_calls.append((ws, ui, request))
+        yield from session_replay_preamble(
+            ws.session,
+            ui,
+            project_name=request_replay_project_name(request),
+        )
+        yield {"type": "tail"}
+
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(
+        ui,
+        session=session,
+        events_replay=_replay,
+        max_yields=4,
+    )
+
+    assert principals == ["viewer-1"]
+    assert resolver_threads and resolver_threads[0] != event_loop_thread
+    assert len(callback_calls) == 1
+    assert '"type": "connected"' in blob
+    assert '"project_name": "Visible Project"' in blob
+    assert '"type": "tail"' in blob
+
+
+def test_handler_project_lookup_failure_keeps_connected_event() -> None:
+    """Optional project metadata fails closed without losing bootstrap."""
+    from turnstone.core.session_replay import (
+        request_replay_project_name,
+        session_replay_preamble,
+    )
+
+    session = MagicMock()
+    session.model = "test"
+    session.model_alias = ""
+    session._last_usage = None
+    session.project_name_for_principal.side_effect = RuntimeError("storage unavailable")
+
+    def _replay(ws: Any, ui: Any, request: Any) -> Any:
+        yield from session_replay_preamble(
+            ws.session,
+            ui,
+            project_name=request_replay_project_name(request),
+        )
+
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(
+        ui,
+        session=session,
+        events_replay=_replay,
+        max_yields=3,
+    )
+
+    assert '"type": "connected"' in blob
+    assert '"project_name": ""' in blob
+
+
+def test_handler_replay_ok_skips_snapshot_emits_id(monkeypatch: Any) -> None:
+    """``Last-Event-ID`` + buffer covers gap → emit buffered events
+    with SSE ``id:`` field, SKIP the in-progress snapshot (it would
+    double-render content the buffered events already carry).
+
+    Batch window forced to 0 so the two tokens are two ring entries
+    (the assertion wants two distinct ``id:`` lines)."""
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui.on_content_token("hello ")
+    ui.on_content_token("world")
+    _, blob = _drain_handler_yields(ui, headers={"Last-Event-ID": "0"}, max_yields=6)
+    # No in_progress_snapshot anywhere on the replay_ok path.
+    assert "in_progress_snapshot" not in blob, (
+        "replay_ok must not emit in_progress_snapshot — it duplicates "
+        f"buffered content. blob:\n{blob}"
+    )
+    # Every buffered content event got an id: line.
+    assert "id: 1" in blob, f"missing id: 1 in:\n{blob}"
+    assert "id: 2" in blob, f"missing id: 2 in:\n{blob}"
+
+
+def test_handler_truncated_emits_envelope_then_snapshot(monkeypatch: Any) -> None:
+    """Stale ``Last-Event-ID`` + buffer too short → emit
+    ``replay_truncated`` envelope, THEN fall through to the
+    fresh-style replay (state_change + in_progress_snapshot) as the
+    recovery floor.
+
+    Batch window forced to 0 so each token is its own ring entry —
+    the truncation scenario needs the deque to evict."""
+    import collections
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    for i in range(10):
+        ui.on_content_token(f"t{i}")
+    _, blob = _drain_handler_yields(ui, headers={"Last-Event-ID": "1"}, max_yields=8)
+
+    assert "replay_truncated" in blob, (
+        f"stale Last-Event-ID must emit replay_truncated envelope; got:\n{blob}"
+    )
+    # Recovery floor: in_progress_snapshot carries the partial content
+    # the evicted events represented.
+    assert "in_progress_snapshot" in blob, (
+        f"truncated path must fall through to in_progress_snapshot; got:\n{blob}"
+    )
+
+
+def test_handler_fresh_connect_replays_active_agent_context_without_text() -> None:
+    """Task-agent state is independently replayable from assistant text."""
+    ui = _make_ui()
+    ui.on_agent_context("task-A", 41_000, 128_000, generation=2)
+
+    _, blob = _drain_handler_yields(ui, max_yields=4)
+
+    assert blob.count('"type": "agent_context"') == 1
+    assert '"parent_call_id": "task-A"' in blob
+    assert '"prompt_tokens": 41000' in blob
+    assert "in_progress_snapshot" not in blob
+
+
+def test_handler_truncated_replays_active_agent_context(monkeypatch: Any) -> None:
+    """An evicted live context event is restored by the active snapshot."""
+    import collections
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    ui.on_agent_context("task-A", 80, 100, generation=2)
+    for i in range(8):
+        ui.on_content_token(str(i))
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "1"},
+        max_yields=6,
+    )
+
+    assert "replay_truncated" in blob
+    assert blob.count('"type": "agent_context"') == 1
+    assert '"prompt_tokens": 80' in blob
+
+
+def test_handler_replay_ok_uses_buffered_agent_context_only() -> None:
+    """Covered reconnects must not add a synthetic duplicate reading."""
+    ui = _make_ui()
+    ui.on_agent_context("task-A", 79, 100, generation=2)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "0"},
+        max_yields=3,
+    )
+
+    assert blob.count('"type": "agent_context"') == 1
+    assert "id: 1" in blob
+
+
+def _start_task_compaction(ui: Any) -> None:
+    ui.on_compaction(
+        {
+            "phase": "start",
+            "trigger": "auto",
+            "target": "task_agent",
+            "parent_call_id": "task-A",
+            "compaction_id": 17,
+            "_generation": 2,
+        }
+    )
+
+
+def test_handler_fresh_connect_replays_active_task_compaction() -> None:
+    """Task compaction progress is recoverable without becoming history."""
+    ui = _make_ui()
+    _start_task_compaction(ui)
+
+    _, blob = _drain_handler_yields(ui, max_yields=4)
+
+    assert blob.count('"type": "compaction"') == 1
+    assert '"target": "task_agent"' in blob
+    assert '"parent_call_id": "task-A"' in blob
+    assert '"compaction_id": 17' in blob
+    assert "_generation" not in blob
+
+
+def test_handler_truncated_replays_active_task_compaction(monkeypatch: Any) -> None:
+    """An evicted task-compaction start is restored from transient state."""
+    import collections
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    _start_task_compaction(ui)
+    for i in range(8):
+        ui.on_content_token(str(i))
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "1"},
+        max_yields=6,
+    )
+
+    assert "replay_truncated" in blob
+    assert blob.count('"type": "compaction"') == 1
+    assert '"compaction_id": 17' in blob
+
+
+def test_handler_replay_ok_uses_buffered_task_compaction_only() -> None:
+    """Covered reconnects must not add a synthetic compaction duplicate."""
+    ui = _make_ui()
+    _start_task_compaction(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "0"},
+        max_yields=3,
+    )
+
+    assert blob.count('"type": "compaction"') == 1
+    assert "id: 1" in blob
+
+
+def test_handler_tokenless_fresh_path_forces_old_client_history_repair() -> None:
+    """A pre-handoff browser repairs in place without a reconnect loop."""
+    ui = _make_ui()
+    ui.on_content_token("hello ")
+    _, blob = _drain_handler_yields(ui, max_yields=5)
+
+    assert '"type": "clear_ui"' in blob
+    assert "tokenless_history_bootstrap" in blob
+    assert "replay_truncated" not in blob
+    # Fresh connect emits the snapshot.
+    assert "in_progress_snapshot" in blob
+
+
+def test_handler_malformed_last_event_id_falls_back_to_fresh() -> None:
+    """Defence against intermediaries that mangle the header — a
+    non-integer ``Last-Event-ID`` must not be treated as ``0`` (which
+    could trigger spurious replays) nor crash the handler.  Falls
+    through to the fresh-connect path."""
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "abc-not-an-int"},
+        max_yields=3,
+    )
+    assert "tokenless_history_bootstrap" in blob
+    assert '"type": "clear_ui"' in blob
+
+
+def test_handler_cursor_zero_fresh_bootstrap_does_not_repair_loop() -> None:
+    """An explicit cursor 0 is numeric proof, never tokenless bootstrap."""
+
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=4,
+    )
+
+    assert "tokenless_history_bootstrap" not in blob
+    assert "replay_truncated" not in blob
+    assert "state_change" in blob
+
+
+def test_handler_negative_last_event_id_emits_truncated_recovery() -> None:
+    """A parsed-but-invalid negative cursor must not take replay_ok-empty."""
+    ui = _make_ui()
+
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "-1"},
+        max_yields=4,
+    )
+
+    assert "replay_truncated" in blob
+    assert '"earliest_available_id": 1' in blob
+
+
+def test_handler_future_last_event_id_emits_truncated_recovery() -> None:
+    """A cursor beyond the stream high-water mark forces a resync floor."""
+    ui = _make_ui()
+    ui._enqueue({"type": "tool_started", "name": "only-event"})
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "99"},
+        max_yields=5,
+    )
+
+    assert "replay_truncated" in blob
+    assert '"lost_count": 0' in blob
+    assert "only-event" not in blob
+
+
+def test_handler_query_param_fallback_is_honoured() -> None:
+    """The manual-reconnect path can't set custom headers on
+    ``new EventSource(url)`` — the browser sends
+    ``?last_event_id=N`` instead.  Handler must honour the query
+    param identically to the header."""
+    ui = _make_ui()
+    ui.on_content_token("hello")
+    _, blob = _drain_handler_yields(ui, query={"last_event_id": "0"}, max_yields=4)
+
+    # Replay path: in_progress_snapshot SKIPPED, id:1 present.
+    assert "in_progress_snapshot" not in blob
+    assert "id: 1" in blob
+
+
+def test_user_turn_capability_projects_canonical_or_pre_row_repair_cursor() -> None:
+    """Typed listeners get the row; incapable listeners retain repair intent."""
+
+    ui = _make_ui()
+    event_id = ui.on_user_turn(
+        "shared prompt",
+        attachments=[],
+        sender="alice",
+        source=None,
+        client_send_ids=["send-1"],
+    )
+    assert event_id == 1
+
+    capable_yields, capable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0", "user_turn": "1"},
+        max_yields=3,
+    )
+    capable_payloads = [
+        json.loads(item["data"])
+        for item in capable_yields
+        if isinstance(item, dict) and "data" in item
+    ]
+    user_turn = next(item for item in capable_payloads if item.get("type") == "user_turn")
+    assert user_turn == {
+        "type": "user_turn",
+        "content": "shared prompt",
+        "client_send_ids": ["send-1"],
+        "sender": "alice",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    user_wire = next(
+        item
+        for item in capable_yields
+        if isinstance(item, dict) and '"type": "user_turn"' in item.get("data", "")
+    )
+    assert user_wire["id"] == "1"
+    assert "user_turn_projection_unsupported" not in capable_blob
+
+    # A later frame may advance the live cursor, but replay_truncated records
+    # the first frame's explicit pre-row cursor (0). A failed history repair
+    # reconnects from that frozen cursor and must receive the same repair
+    # projection again rather than skip canonical row 1.
+    ui._enqueue({"type": "content", "text": "later assistant bytes"})
+    incapable_yields, incapable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=4,
+    )
+    repair_wire = next(
+        item
+        for item in incapable_yields
+        if isinstance(item, dict) and "user_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert repair_wire["id"] == "0"
+    repair_payload = json.loads(repair_wire["data"])
+    assert repair_payload == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "user_turn_projection_unsupported",
+    }
+    assert "shared prompt" not in incapable_blob
+    assert "id: 2" in incapable_blob
+
+    retry_yields, _ = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=3,
+    )
+    retry_repair = next(
+        item
+        for item in retry_yields
+        if isinstance(item, dict) and "user_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert retry_repair["id"] == "0"
+
+
+def test_tool_turn_capability_projects_canonical_or_redacted_pre_row_repair() -> None:
+    """Accepted TOOL data reaches capable panes and never leaks to legacy ones."""
+
+    ui = _make_ui()
+    preview = {"attachment_id": "preview-secret", "kind": "html"}
+    event_id = ui.on_tool_turn_accepted(
+        "call-capability",
+        "secret_tool_name",
+        "secret final output",
+        is_error=True,
+        preview=preview,
+        effect_status="unknown",
+    )
+    assert event_id == 1
+
+    capable_yields, capable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0", "tool_turn": "1"},
+        max_yields=3,
+    )
+    accepted_wire = next(
+        item
+        for item in capable_yields
+        if isinstance(item, dict) and '"accepted": true' in item.get("data", "")
+    )
+    assert accepted_wire["id"] == "1"
+    assert json.loads(accepted_wire["data"]) == {
+        "type": "tool_result",
+        "accepted": True,
+        "call_id": "call-capability",
+        "name": "secret_tool_name",
+        "output": "secret final output",
+        "is_error": True,
+        "preview": preview,
+        "effect_status": "unknown",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    assert "tool_turn_projection_unsupported" not in capable_blob
+
+    # Advance the ring after the accepted row. A legacy reconnect is anchored
+    # at N-1 and receives the same repair again if its REST heal fails.
+    ui._enqueue({"type": "content", "text": "later assistant bytes"})
+    incapable_yields, incapable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=4,
+    )
+    repair_wire = next(
+        item
+        for item in incapable_yields
+        if isinstance(item, dict) and "tool_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert repair_wire["id"] == "0"
+    assert json.loads(repair_wire["data"]) == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "tool_turn_projection_unsupported",
+    }
+    for secret in ("secret final output", "secret_tool_name", "preview-secret"):
+        assert secret not in incapable_blob
+    assert "id: 2" in incapable_blob
+
+    retry_yields, _ = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=3,
+    )
+    retry_repair = next(
+        item
+        for item in retry_yields
+        if isinstance(item, dict) and "tool_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert retry_repair["id"] == "0"
+
+
+class _HandoffSession:
+    """Route-seam double for ChatSession's atomic history registration.
+
+    Carries the concrete fields the REAL shared preamble reads — the
+    lifted replay_ok path now calls ``session_replay_preamble`` directly
+    (the per-kind wrapper indirection is deleted), so the double must be
+    preamble-readable for the bootstrap pins to exercise the true path.
+    """
+
+    def __init__(self, ui: _ConcreteUI, token: str = "revision-7") -> None:
+        self.ui = ui
+        self.token = token
+        self.calls: list[tuple[str, int | None]] = []
+        self.model = "test"
+        self.model_alias = ""
+        self.context_window = 1000
+        self.reasoning_effort = "low"
+        self._last_usage = {"prompt_tokens": 12, "completion_tokens": 0}
+        self.project_name_principals: list[str] = []
+
+    def project_name_for_principal(self, principal_id: str) -> str:
+        self.project_name_principals.append(principal_id)
+        return ""
+
+    def register_listener_for_history_handoff(
+        self,
+        token: str,
+        *,
+        last_event_id: int | None = None,
+        maxsize: int = 500,
+    ) -> Any:
+        self.calls.append((token, last_event_id))
+        if token != self.token:
+            return None
+        if last_event_id is None:
+            listener, snap = self.ui.register_listener_with_in_progress_snapshot(maxsize=maxsize)
+            return listener, [], "fresh", 0, 0, snap
+        return self.ui.register_listener_with_replay(last_event_id, maxsize=maxsize)
+
+
+def test_valid_history_handoff_fresh_connect_skips_legacy_repair_floor() -> None:
+    """Current clients present a token and incur no compatibility refetch."""
+
+    ui = _make_ui()
+    session = _HandoffSession(ui)
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"history_token": session.token},
+        session=session,
+        max_yields=4,
+    )
+
+    assert session.calls == [(session.token, None)]
+    assert "tokenless_history_bootstrap" not in blob
+    assert "replay_truncated" not in blob
+
+
+def test_history_handoff_mismatch_forces_resync_without_numeric_replay() -> None:
+    """A stale history revision cannot fall through to a coverable ring slice."""
+    ui = _make_ui()
+    ui.on_content_token("ring data that must not be used")
+    session = _HandoffSession(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"history_token": "stale-revision", "last_event_id": "0"},
+        session=session,
+        max_yields=4,
+    )
+
+    assert session.calls == [("stale-revision", 0)]  # cursor 0 survives parsing
+    assert "history_resync" in blob
+    assert "handoff_mismatch" in blob
+    assert "ring data that must not be used" not in blob
+    assert "id: 1" not in blob
+
+
+def test_malformed_native_header_retains_initial_handoff_validation() -> None:
+    """A mangled native header cannot suppress a crossed-token mismatch.
+
+    The initial URL still carries both its REST handoff token and cursor.  If
+    the native header is unusable, those URL bootstrap hints remain
+    authoritative and the stale token must produce ``history_resync``.
+    """
+    ui = _make_ui()
+    ui.on_content_token("ring data that must not bridge the crossed token")
+    session = _HandoffSession(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "mangled-by-proxy"},
+        query={"history_token": "stale-revision", "last_event_id": "0"},
+        session=session,
+        max_yields=4,
+    )
+
+    assert session.calls == [("stale-revision", 0)]
+    assert "history_resync" in blob
+    assert "handoff_mismatch" in blob
+    assert "ring data that must not bridge the crossed token" not in blob
+    assert "id: 1" not in blob
+
+
+def test_native_last_event_id_ignores_stale_initial_history_token() -> None:
+    """Native reconnect headers take priority over the one-shot URL token."""
+    ui = _make_ui()
+    ui.on_content_token("native replay")
+    session = _HandoffSession(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "0"},
+        query={"history_token": "stale-revision", "last_event_id": "999"},
+        session=session,
+        max_yields=8,
+    )
+
+    assert session.calls == []
+    assert "history_resync" not in blob
+    assert "native replay" in blob
+    assert "id: 1" in blob
+
+
+def test_handoff_cursor_replay_keeps_preamble_without_pending_control_duplicate() -> None:
+    """Initial cursor replay retains idempotent bootstrap fields only.
+
+    The full replay callback includes pending operator controls and must not run
+    on replay_ok; the ring delta is the single owner of any such controls.
+    """
+    ui = _make_ui()
+    ui.on_content_token("covered delta")
+    session = _HandoffSession(ui)
+
+    def _full_replay(_ws: Any, _ui: Any, _request: Any) -> Any:
+        # The kind-specific tail must NOT run on replay_ok; the lifted body
+        # calls the shared preamble directly and the ring owns controls.
+        yield {"type": "approve_request", "items": [{"call_id": "duplicate"}]}
+
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"history_token": session.token, "last_event_id": "0"},
+        session=session,
+        events_replay=_full_replay,
+        max_yields=10,
+        state="running",
+    )
+
+    assert session.calls == [(session.token, 0)]
+    assert session.project_name_principals == ["viewer-1"]
+    assert '"type": "connected"' in blob
+    assert '"type": "status"' in blob
+    assert '"type": "state_change"' in blob
+    assert "covered delta" in blob
+    assert "approve_request" not in blob
+    assert "in_progress_snapshot" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Fresh-connect replay completeness — persisted last_error surface
+# (sibling to the tool-call ``pending`` fix; the fresh-connect synthetic
+# path must reconstruct the same render state a reconnect's ring-buffer
+# replay would carry).
+# ---------------------------------------------------------------------------
+
+
+def test_handler_fresh_connect_in_error_state_surfaces_last_error(monkeypatch: Any) -> None:
+    """Fresh connect to a workstream sitting in the error state must
+    surface the persisted ``last_error`` so the operator sees WHY it
+    failed (the ``error`` text bubble), not just the bare error state +
+    retry.  ``on_error`` is never persisted as a message, so ``/history``
+    can't rebuild it — the ``last_error`` config row is the only durable
+    source.  Gated on the error state: a healthy (idle) ws skips the
+    storage read and surfaces nothing (no stale error on every load).
+
+    The surfaced event carries the SSE ``id:`` (registration-time buffer
+    cursor ``snap_seq``) so a native EventSource reconnect advances
+    ``lastEventId`` and resumes via ``replay_ok`` instead of re-running
+    this fresh path and APPENDING a duplicate bubble — the client's
+    ``error`` handler is append-only (not idempotent like
+    ``state_change`` / ``in_progress_snapshot``).  The reconnect half is
+    pinned by ``test_handler_replay_ok_does_not_resurface_last_error``.
+    """
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "load_last_error", lambda _ws: "boom: kaboom")
+
+    # Error state → surfaced.  A prior buffered event gives a non-zero
+    # cursor (snap_seq == 1) for the id assertion below.
+    err_ui = _make_ui()
+    err_ui.on_content_token("x")  # _event_id -> 1
+    err_yields, err_blob = _drain_handler_yields(err_ui, state="error", max_yields=8)
+    assert '"type": "error"' in err_blob
+    assert "boom: kaboom" in err_blob
+    # The surfaced error advances the reconnect cursor (carries id: snap_seq).
+    err_events = [
+        y for y in err_yields if isinstance(y, dict) and "boom: kaboom" in y.get("data", "")
+    ]
+    assert len(err_events) == 1
+    assert err_events[0].get("id") == "1"
+
+    # Idle state → the gate skips it.
+    idle_ui = _make_ui()
+    _, idle_blob = _drain_handler_yields(idle_ui, state="idle", max_yields=8)
+    assert "boom: kaboom" not in idle_blob
+
+
+def test_handler_replay_ok_does_not_resurface_last_error(monkeypatch: Any) -> None:
+    """On the ``replay_ok`` (reconnect) path the ring buffer already
+    carries the original ``error`` event, so the synthetic last_error
+    surface must NOT fire — otherwise a reconnect to an errored ws would
+    double the error bubble.  The surface is fresh/truncated-only."""
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "load_last_error", lambda _ws: "boom")
+
+    ui = _make_ui()
+    ui.on_content_token("hi")  # one buffered event so Last-Event-ID=0 → replay_ok
+    _, blob = _drain_handler_yields(ui, headers={"Last-Event-ID": "0"}, state="error", max_yields=8)
+    assert "boom" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Poison-on-overflow (Fix A) — queue.Full stops being a silent drop
+# ---------------------------------------------------------------------------
+#
+# Silent per-listener drops at queue.Full left permanent holes BELOW the
+# client's advancing lastEventId (scattered interleaved drops once the
+# queue saturates), which reconnect-with-replay can never heal (the slice
+# is ``eid > last_event_id`` only).  The listener queue now latches
+# ``poisoned`` atomically at the FIRST rejected put and refuses every
+# later put, freezing its contents as a contiguous prefix; the drain
+# loop closes the stream (after an id-less ``stream_overflow`` frame)
+# and the native EventSource reconnect replays the contiguous tail.
+#
+# Poisoning at the first full (not after N) is load-bearing: any
+# delivered-while-dropping window advances lastEventId past interior
+# holes -> permanent gap even after a "successful" reconnect.
+
+
+def _fake_live_request(
+    *,
+    path_params: dict[str, str] | None = None,
+    query: dict[str, str] | None = None,
+) -> Request:
+    """A request whose ``receive()`` never resolves, so
+    ``is_disconnected()`` stays ``False`` — the poison check, not
+    disconnect detection, must be what terminates the drain loop."""
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "headers": [],
+        "path": "/events",
+        "raw_path": b"/events",
+        "query_string": (
+            "&".join(f"{key}={value}" for key, value in query.items()).encode() if query else b""
+        ),
+        "path_params": path_params or {},
+        "app": MagicMock(),
+    }
+
+    async def _recv() -> dict[str, Any]:
+        await asyncio.Event().wait()  # pends forever
+        return {"type": "http.disconnect"}  # unreachable
+
+    return Request(scope, receive=_recv)
+
+
+def test_live_user_turn_projection_is_per_listener_and_ring_stays_canonical() -> None:
+    """One enqueue fans out typed and compatibility views without mutating the ring."""
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        capable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0", "user_turn": "1"},
+            )
+        )
+        incapable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0"},
+            )
+        )
+        capable_gen = capable.body_iterator
+        incapable_gen = incapable.body_iterator
+        try:
+            # replay_ok preamble: retry then current state. Both listeners are
+            # now atomically registered and waiting at the same live boundary.
+            await capable_gen.__anext__()
+            await capable_gen.__anext__()
+            await incapable_gen.__anext__()
+            await incapable_gen.__anext__()
+            capable_next = asyncio.create_task(capable_gen.__anext__())
+            incapable_next = asyncio.create_task(incapable_gen.__anext__())
+            await asyncio.sleep(0)
+
+            event_id = ui.on_user_turn(
+                "one canonical row",
+                attachments=[],
+                sender="alice",
+                source=None,
+                client_send_ids=["live-send"],
+            )
+            assert event_id == 1
+            return (
+                await asyncio.wait_for(capable_next, timeout=2),
+                await asyncio.wait_for(incapable_next, timeout=2),
+            )
+        finally:
+            await capable_gen.aclose()
+            await incapable_gen.aclose()
+
+    capable_frame, incapable_frame = asyncio.run(_run())
+    assert capable_frame["id"] == "1"
+    assert json.loads(capable_frame["data"]) == {
+        "type": "user_turn",
+        "content": "one canonical row",
+        "client_send_ids": ["live-send"],
+        "sender": "alice",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    assert incapable_frame["id"] == "0"
+    assert json.loads(incapable_frame["data"]) == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "user_turn_projection_unsupported",
+    }
+    assert len(ui._event_buffer) == 1
+    assert ui._event_buffer[0][1]["type"] == "user_turn"
+    assert ui._event_buffer[0][1]["content"] == "one canonical row"
+
+
+def test_live_tool_turn_projection_is_per_listener_and_ring_stays_canonical() -> None:
+    """Capability projection is listener-local; the replay ring keeps truth."""
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        capable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0", "tool_turn": "1"},
+            )
+        )
+        incapable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0"},
+            )
+        )
+        capable_gen = capable.body_iterator
+        incapable_gen = incapable.body_iterator
+        try:
+            await capable_gen.__anext__()
+            await capable_gen.__anext__()
+            await incapable_gen.__anext__()
+            await incapable_gen.__anext__()
+            capable_next = asyncio.create_task(capable_gen.__anext__())
+            incapable_next = asyncio.create_task(incapable_gen.__anext__())
+            await asyncio.sleep(0)
+
+            event_id = ui.on_tool_turn_accepted(
+                "call-live",
+                "bash",
+                "final output",
+                effect_status="none",
+            )
+            assert event_id == 1
+            return (
+                await asyncio.wait_for(capable_next, timeout=2),
+                await asyncio.wait_for(incapable_next, timeout=2),
+            )
+        finally:
+            await capable_gen.aclose()
+            await incapable_gen.aclose()
+
+    capable_frame, incapable_frame = asyncio.run(_run())
+    assert capable_frame["id"] == "1"
+    assert json.loads(capable_frame["data"]) == {
+        "type": "tool_result",
+        "accepted": True,
+        "call_id": "call-live",
+        "name": "bash",
+        "output": "final output",
+        "effect_status": "none",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    assert incapable_frame["id"] == "0"
+    assert json.loads(incapable_frame["data"]) == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "tool_turn_projection_unsupported",
+    }
+    assert len(ui._event_buffer) == 1
+    assert ui._event_buffer[0][1]["type"] == "tool_result"
+    assert ui._event_buffer[0][1]["accepted"] is True
+    assert ui._event_buffer[0][1]["output"] == "final output"
+
+
+def test_listener_queue_poisons_at_first_full_and_refuses_after() -> None:
+    """The first rejected put latches ``poisoned`` (atomically, under
+    the queue's own mutex) and every later put is refused even if the
+    consumer frees slots — otherwise a racing consumer pop would let a
+    later event land BEHIND the hole and the drain would deliver past
+    it, advancing lastEventId beyond an unreplayable gap."""
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=2)
+    ui._enqueue({"type": "a"})
+    ui._enqueue({"type": "b"})
+    assert getattr(lq, "poisoned", None) is False
+    ui._enqueue({"type": "c"})  # first overflow -> latch
+    assert lq.poisoned is True
+    lq.get_nowait()  # consumer frees a slot
+    ui._enqueue({"type": "d"})  # must be refused — queue contents frozen
+    leftover = []
+    while True:
+        try:
+            leftover.append(lq.get_nowait())
+        except queue.Empty:
+            break
+    assert [ev["type"] for ev in leftover] == ["b"], (
+        "a post-poison put landed in the freed slot — interior hole"
+    )
+    # The ring is untouched by listener poisoning: ids stay dense.
+    _, replay, status, _, _, _ = ui.register_listener_with_replay(0)
+    assert status == "replay_ok"
+    assert [ev["_event_id"] for ev in replay] == [1, 2, 3, 4]
+
+
+def test_poisoned_gap_is_contiguous_tail_fully_replayable() -> None:
+    """Recovery math at the poison instant: delivered ids form a
+    contiguous prefix, the ring holds everything, and a reconnect with
+    ``Last-Event-ID = <last delivered>`` replays exactly the missing
+    tail — no duplicate, no loss, no off-by-one."""
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=3)
+    for i in range(5):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    # Queue froze at [1,2,3]; 4 latched poison; 5 was refused.
+    delivered = []
+    while True:
+        try:
+            delivered.append(lq.get_nowait()["_event_id"])
+        except queue.Empty:
+            break
+    assert delivered == [1, 2, 3]
+    _, replay, status, lost, _, _ = ui.register_listener_with_replay(delivered[-1])
+    assert status == "replay_ok"
+    assert lost == 0
+    assert [ev["_event_id"] for ev in replay] == [4, 5]
+    assert delivered + [ev["_event_id"] for ev in replay] == [1, 2, 3, 4, 5]
+
+
+def test_poison_isolated_to_slow_listener() -> None:
+    """One slow tab must not degrade its siblings: the healthy listener
+    keeps receiving every event after the slow one is poisoned (and the
+    poisoned one stops consuming fan-out puts entirely)."""
+    ui = _make_ui()
+    slow = ui._register_listener(maxsize=1)
+    healthy = ui._register_listener(maxsize=100)
+    for i in range(6):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    assert slow.poisoned is True
+    got = []
+    while True:
+        try:
+            got.append(healthy.get_nowait()["name"])
+        except queue.Empty:
+            break
+    assert got == [f"t{i}" for i in range(6)]
+
+
+def test_drain_loop_closes_with_overflow_frame_on_poison() -> None:
+    """Once its queue is poisoned the drain loop must terminate the SSE
+    response — discarding the queued backlog (the replay covers it) —
+    after yielding a final id-less ``stream_overflow`` frame so the
+    client can count overflow closes (reconnect-limiter + the
+    drop-vs-render-wedge field instrumentation) without advancing
+    ``lastEventId`` past the gap."""
+    from turnstone.core.session_ui_base import _DEFAULT_LISTENER_QUEUE_MAX
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(
+        path_params={"ws_id": ui.ws_id},
+        query={"last_event_id": "0"},
+    )
+
+    async def _run() -> list[Any]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        yields = [await agen.__anext__()]  # retry frame
+        yields.append(await agen.__anext__())  # synthetic state_change
+        # Overflow the registered listener's queue: cap fills, +1 poisons.
+        for i in range(_DEFAULT_LISTENER_QUEUE_MAX + 1):
+            ui._enqueue({"type": "info", "message": f"m{i}"})
+        yields.append(await agen.__anext__())  # overflow frame, then close
+        try:
+            extra = await agen.__anext__()
+        except StopAsyncIteration:
+            extra = None
+        yields.append(extra)
+        return yields
+
+    yields = asyncio.run(_run())
+    assert yields[-1] is None, "drain loop kept yielding after poison"
+    overflow = yields[-2]
+    assert isinstance(overflow, dict)
+    assert "stream_overflow" in overflow["data"]
+    assert "id" not in overflow, (
+        "the overflow frame must not carry an SSE id — advancing "
+        "lastEventId here would strand the dropped gap below the cursor"
+    )
+    # The 500-event backlog was discarded, not delivered: nothing
+    # between the synthetic replay and the overflow frame.
+    assert all("m0" not in str(y) for y in yields)
+
+
+def test_drain_loop_delivers_until_poison_then_stops_before_backlog() -> None:
+    """Pre-poison delivery works normally; at poison the loop closes
+    BEFORE delivering the queued backlog (check precedes the blocking
+    get), so the client's lastEventId freezes at the contiguous prefix
+    and reconnect replays everything else."""
+    from turnstone.core.session_ui_base import _DEFAULT_LISTENER_QUEUE_MAX
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(
+        path_params={"ws_id": ui.ws_id},
+        query={"last_event_id": "0"},
+    )
+
+    async def _run() -> tuple[list[Any], Any, Any]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        head = [await agen.__anext__(), await agen.__anext__()]  # retry + state
+        ui._enqueue({"type": "info", "message": "live-1"})
+        live = await agen.__anext__()
+        for i in range(_DEFAULT_LISTENER_QUEUE_MAX + 1):
+            ui._enqueue({"type": "info", "message": f"m{i}"})
+        tail = await agen.__anext__()
+        try:
+            await agen.__anext__()
+            closed = False
+        except StopAsyncIteration:
+            closed = True
+        return head, live, (tail, closed)
+
+    _, live, (tail, closed) = asyncio.run(_run())
+    assert "live-1" in live["data"]
+    assert "stream_overflow" in tail["data"]
+    assert closed, "generator must return right after the overflow frame"
+
+
+def test_overflow_reconnect_replays_full_gap_through_handler() -> None:
+    """End-to-end recovery shape: after an overflow close, a reconnect
+    carrying the pre-poison ``Last-Event-ID`` replays the whole gap via
+    ``replay_ok`` — the poisoned stream lost nothing durable."""
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=3)
+    for i in range(5):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    delivered_ids = []
+    while True:
+        try:
+            delivered_ids.append(lq.get_nowait()["_event_id"])
+        except queue.Empty:
+            break
+    ui._unregister_listener(lq)  # what the drain loop's finally does
+    _, blob = _drain_handler_yields(
+        ui, headers={"Last-Event-ID": str(delivered_ids[-1])}, max_yields=6
+    )
+    assert "replay_truncated" not in blob
+    assert "t3" in blob
+    assert "t4" in blob
+
+
+def test_listener_queue_basic_put_get_semantics() -> None:
+    """Stdlib-drift canary for ``_ListenerQueue.put_nowait``'s
+    reimplementation against ``queue.Queue``'s documented extension
+    surface (``mutex`` / ``_qsize`` / ``_put`` / ``unfinished_tasks`` /
+    ``not_empty``): normal put/get round-trips work, FIFO order holds,
+    a blocked ``get(timeout=...)`` is woken by a put (the
+    ``not_empty.notify`` path the drain loop's executor get relies on),
+    and the poison latch engages exactly at the first rejected put."""
+    from turnstone.core.session_ui_base import _ListenerQueue
+
+    q = _ListenerQueue(maxsize=2)
+    q.put_nowait({"n": 1})
+    q.put_nowait({"n": 2})
+    assert q.qsize() == 2
+    try:
+        q.put_nowait({"n": 3})
+        raise AssertionError("third put must raise queue.Full")
+    except queue.Full:
+        pass
+    assert q.poisoned is True
+    assert q.get_nowait()["n"] == 1  # FIFO preserved
+    try:
+        q.put_nowait({"n": 4})
+        raise AssertionError("post-poison put must be refused")
+    except queue.Full:
+        pass
+    assert q.get_nowait()["n"] == 2
+
+    # A blocked get() must be woken by a concurrent put_nowait — the
+    # notify path the events handler's executor get depends on.
+    fresh = _ListenerQueue(maxsize=2)
+    got: list[dict[str, Any]] = []
+
+    def _getter() -> None:
+        got.append(fresh.get(timeout=5))
+
+    t = threading.Thread(target=_getter)
+    t.start()
+    fresh.put_nowait({"n": 42})
+    t.join(timeout=5)
+    assert not t.is_alive(), "get(timeout) never woke — not_empty.notify broken"
+    assert got == [{"n": 42}]
+
+
+def test_closing_queue_unwinds_clean_not_overflow_when_poisoned() -> None:
+    """Review finding [1]: a ws closing/evicting while a slow pane's
+    queue is full must unwind as a CLEAN close, not a false
+    ``stream_overflow``.  The poison latch rejects the in-band
+    ``ws_closed`` sentinel, so ``mark_closing`` carries the signal
+    out-of-band and the drain loop honours it BEFORE the poison check —
+    otherwise a clean close of a slow consumer is mis-reported as a
+    send-overflow (polluting the client's drop-vs-wedge counter and
+    tripping its reconnect limiter on a ws that is simply gone)."""
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(
+        path_params={"ws_id": ui.ws_id},
+        query={"last_event_id": "0"},
+    )
+
+    async def _run() -> tuple[Any, bool]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        await agen.__anext__()  # retry frame
+        await agen.__anext__()  # synthetic state_change
+        # Overflow the listener queue so it poisons, exactly as a slow
+        # consumer would, THEN close the ws (evict/delete/close path).
+        from turnstone.core.session_ui_base import _DEFAULT_LISTENER_QUEUE_MAX
+
+        for i in range(_DEFAULT_LISTENER_QUEUE_MAX + 1):
+            ui._enqueue({"type": "info", "message": f"m{i}"})
+        assert ui._listeners, "listener should still be registered pre-close"
+        lq = ui._listeners[0]
+        assert lq.poisoned is True
+        # Simulate _broadcast_ws_closed_to_listeners' out-of-band flag.
+        lq.mark_closing()
+        try:
+            frame = await agen.__anext__()
+            closed = False
+        except StopAsyncIteration:
+            frame = None
+            closed = True
+        return frame, closed
+
+    frame, closed = asyncio.run(_run())
+    assert closed, "closing queue must end the stream"
+    assert frame is None, f"closing ws must NOT emit a stream_overflow frame; got {frame!r}"
+
+
+def test_broadcast_ws_closed_marks_closing_on_poisoned_queue() -> None:
+    """The teardown broadcaster must set the out-of-band ``closing``
+    flag even when the queue is poisoned/full (its in-band ``ws_closed``
+    put is refused by the poison latch).  Pins the wiring finding [1]
+    depends on: ``mark_closing`` is called for every listener."""
+    from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
+
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=2)
+    ui._enqueue({"type": "a"})
+    ui._enqueue({"type": "b"})
+    ui._enqueue({"type": "c"})  # overflow -> poison
+    assert lq.poisoned is True
+    assert lq.closing is False
+    _broadcast_ws_closed_to_listeners(ui)
+    assert lq.closing is True, "teardown must flag the poisoned queue closing"
+    # Broadcaster clears the listener list (no re-fire on a closed ws).
+    assert ui._listeners == []
+
+
+def test_healthy_queue_close_still_delivers_ws_closed_sentinel() -> None:
+    """The out-of-band flag must not regress the normal path: a
+    non-full queue still receives the in-band ``ws_closed`` sentinel
+    (so a drain loop blocked in ``get`` wakes immediately) AND gets the
+    ``closing`` flag."""
+    from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
+
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=100)
+    _broadcast_ws_closed_to_listeners(ui)
+    assert lq.closing is True
+    drained = []
+    while True:
+        try:
+            drained.append(lq.get_nowait())
+        except queue.Empty:
+            break
+    assert {ev["type"] for ev in drained} == {"ws_closed"}
+
+
+def test_healthy_closing_queue_drains_tail_before_close() -> None:
+    """Review round-2 finding [0]: a healthy (non-poisoned) client that is
+    momentarily behind must still receive its queued tail — the turn's
+    final content batch + ``stream_end`` — at ws teardown.  A close has no
+    reconnect+replay, so dropping that tail truncates the last assistant
+    message permanently.  The ``closing`` flag must therefore NOT
+    short-circuit the FIFO drain for a healthy queue (an earlier revision
+    checked it at the top of the loop and did exactly that); the in-band
+    ``ws_closed`` sentinel — which fits, the queue isn't full — closes the
+    stream AFTER the drain delivers everything."""
+    from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+
+    async def _run() -> list[str]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        await agen.__anext__()  # retry frame
+        await agen.__anext__()  # synthetic state_change
+        # Enqueue the turn's tail into a HEALTHY (roomy) queue, then close
+        # the ws while those events are still undrained.
+        ui.on_content_token("final answer")
+        ui.on_stream_end()
+        _broadcast_ws_closed_to_listeners(ui)  # mark_closing + ws_closed sentinel
+        out: list[str] = []
+        while True:
+            try:
+                frame = await agen.__anext__()
+            except StopAsyncIteration:
+                break
+            out.append(frame["data"] if isinstance(frame, dict) else str(frame))
+        return out
+
+    blob = "\n".join(asyncio.run(_run()))
+    assert "final answer" in blob, "healthy closing queue dropped its content tail"
+    assert "stream_end" in blob, "healthy closing queue dropped stream_end"
+    assert "stream_overflow" not in blob, "a healthy close must not emit an overflow frame"

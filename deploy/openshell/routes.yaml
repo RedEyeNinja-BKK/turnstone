@@ -1,0 +1,53 @@
+# OpenShell inference routing for Turnstone.
+#
+# When using inference routing, the sandbox process connects to
+# https://inference.local instead of the real LLM API. The OpenShell
+# proxy intercepts, rewrites credentials, and forwards to the backend.
+#
+# This keeps real API keys out of the sandbox entirely — the process
+# only sees opaque placeholder tokens in its environment.
+#
+# Usage:
+#   openshell sandbox run \
+#     --inference-routes deploy/openshell/routes.yaml \
+#     ...
+#
+# Then point a model definition at the proxy — in config.toml:
+#   [models.sandbox]
+#   base_url = "https://inference.local"
+#   model = "gpt-5"                       # the id the route below serves
+# (or the same fields in the console Models tab) — and start turnstone:
+#   python3 -m turnstone.server
+#
+# CUSTOMIZE: uncomment one of the provider blocks below.
+
+routes:
+
+  # --- OpenAI ---
+  # - name: inference.local
+  #   endpoint: https://api.openai.com/v1
+  #   model: gpt-5
+  #   provider_type: openai
+  #   protocols:
+  #     - openai_chat_completions
+  #     - model_discovery
+  #   api_key_env: OPENAI_API_KEY
+
+  # --- Anthropic ---
+  # - name: inference.local
+  #   endpoint: https://api.anthropic.com
+  #   model: claude-sonnet-4-6
+  #   provider_type: anthropic
+  #   protocols:
+  #     - anthropic_messages
+  #   api_key_env: ANTHROPIC_API_KEY
+
+  # --- Local model server (vLLM / llama.cpp) ---
+  # No secret resolution needed — local servers typically have no auth.
+  # Omit both api_key and api_key_env to skip credential injection.
+  # - name: inference.local
+  #   endpoint: http://localhost:8000/v1
+  #   model: meta-llama/Llama-3.1-70B-Instruct
+  #   protocols:
+  #     - openai_chat_completions
+  #     - model_discovery

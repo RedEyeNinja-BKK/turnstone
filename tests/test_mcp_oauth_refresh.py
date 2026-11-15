@@ -1,0 +1,2100 @@
+"""Refresh-grant tests for ``get_user_access_token``.
+
+The refresh path is the hottest hot-path in OAuth-MCP: every dispatch
+call funnels through it, and any bug — double-refresh, swallowed
+``revoke``, lost ``refresh_token`` — manifests as either a thundering
+herd against the AS or a stuck "consent required" loop.
+
+The concurrency test is the protocol-correctness highlight: TWO
+``asyncio.create_task(get_user_access_token(...))`` against an expired
+token, and we assert that the AS sees exactly ONE refresh POST and
+both coroutines return the same access_token.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import socket
+import threading
+import time
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx2
+import pytest
+import sqlalchemy as sa
+from aiohttp import web
+
+from tests._oauth_runtime_helpers import make_oauth_context, run_adapter
+from tests.conftest import _run_on_loop, make_mcp_token_cipher
+from turnstone.core.mcp_client import MCPClientManager
+from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.mcp_oauth import (
+    _AMBIGUOUS_ESCALATION_THRESHOLD,
+    _REFRESH_FAILURE_EVENTS,
+    MCPOAuthIssuerChangedError,
+    _BackoffSnapshot,
+    _handle_refresh_failure,
+    discover_authorization_server,
+    get_user_access_token,
+    get_user_access_token_classified,
+)
+from turnstone.core.oauth import http as oauth_http
+from turnstone.core.oauth.context import OAuthContext, TokenCoordination, oauth_context
+from turnstone.core.oauth.http import json_http_client
+from turnstone.core.oauth.runtime import OAuthRuntime
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+# Generous CI ceiling — cancel/drain is sub-millisecond on a healthy loop.
+_CANCEL_WAIT_S = 5.0
+
+
+class _ObservableLockCm:
+    """Class-based context manager whose ``__exit__`` is observable.
+
+    Used by :class:`TestPgRefreshLock` cancellation tests instead of
+    ``@contextlib.contextmanager`` so the test can distinguish:
+
+      * an explicit ``cm.__exit__(None, None, None)`` call from the drain
+        coroutine (records ``(None, None, None)`` in :attr:`exit_calls`)
+      * ``GeneratorExit`` thrown by the cm's generator finalizer during
+        garbage collection (records ``(GeneratorExit, ...)``)
+
+    Class-based ``__exit__`` runs only when called explicitly — generator
+    finalization doesn't go through it — so an empty ``exit_calls`` is
+    proof the drain didn't run, not just that GC didn't fire.
+    """
+
+    def __init__(
+        self,
+        *,
+        enter_started: threading.Event | None = None,
+        enter_release: threading.Event | None = None,
+        enter_raises: BaseException | None = None,
+    ) -> None:
+        self.enter_thread: int | None = None
+        self.exit_thread: int | None = None
+        self.exit_calls: list[tuple[Any, Any, Any]] = []
+        self._enter_started = enter_started
+        self._enter_release = enter_release
+        self._enter_raises = enter_raises
+
+    def __enter__(self) -> None:
+        self.enter_thread = threading.get_ident()
+        if self._enter_started is not None:
+            self._enter_started.set()
+        if self._enter_release is not None:
+            self._enter_release.wait(timeout=_CANCEL_WAIT_S)
+        if self._enter_raises is not None:
+            raise self._enter_raises
+        return None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
+        self.exit_thread = threading.get_ident()
+        self.exit_calls.append((exc_type, exc, tb))
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _make_app_state(storage: SQLiteBackend, *, http_client: httpx2.AsyncClient) -> SimpleNamespace:
+    cipher = make_mcp_token_cipher()
+    state = SimpleNamespace(
+        auth_storage=storage,
+        mcp_oauth_coordination=TokenCoordination(),
+        mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, cipher, node_id="test"), http_client=http_client
+        ),
+    )
+    return state
+
+
+def _seed_server(backend: SQLiteBackend, *, server_id: str = "srv-id") -> None:
+    backend.create_mcp_server(
+        server_id=server_id,
+        name="srv-oauth",
+        transport="streamable-http",
+        url="https://mcp.example.com/sse",
+        auth_type="oauth_user",
+        oauth_client_id="client-abc",
+        oauth_scopes="openid profile",
+        oauth_audience="https://mcp.example.com",
+    )
+    backend.update_mcp_server(server_id, oauth_as_issuer_cached="https://as.example.com")
+
+
+def _seed_token(
+    state: SimpleNamespace,
+    *,
+    user_id: str = "user-1",
+    server_name: str = "srv-oauth",
+    expires_in_seconds: int = 3600,
+    refresh: str | None = "refresh-rrr",
+    as_issuer: str = "https://as.example.com",
+) -> None:
+    expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in_seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    oauth_context(state).token_store.create_user_token(
+        user_id,
+        server_name,
+        access_token="access-aaa",
+        refresh_token=refresh,
+        expires_at=expires_at,
+        scopes="openid profile",
+        as_issuer=as_issuer,
+        audience="https://mcp.example.com",
+    )
+
+
+@pytest.fixture
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
+
+
+def _good_as_metadata_doc() -> dict[str, Any]:
+    return {
+        "issuer": "https://as.example.com",
+        "authorization_endpoint": "https://as.example.com/authorize",
+        "token_endpoint": "https://as.example.com/token",
+        "jwks_uri": "https://as.example.com/jwks",
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }
+
+
+def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
+    resp = MagicMock(spec=httpx2.Response)
+    resp.status_code = status_code
+    resp.headers = {}
+    body = "" if json_body is None else str(json_body)
+    resp.content = body.encode("utf-8")
+    if json_body is not None:
+        resp.json.return_value = json_body
+    else:
+        resp.json.side_effect = ValueError("no body")
+    resp.text = body
+    return resp
+
+
+def _public_addr_patch() -> contextlib.AbstractContextManager[Any]:
+    return patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))])
+
+
+@pytest.fixture
+def mint_manager() -> Iterator[MCPClientManager]:
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    try:
+        manager.start()
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def test_refresh_discovery_and_post_stay_off_the_browser_loop(
+    storage: SQLiteBackend, mint_manager: MCPClientManager
+) -> None:
+    """Warm real connections on both live loops; discover with an empty metadata cache."""
+    _seed_server(storage)
+
+    async def _run() -> None:
+        requests: list[tuple[str, httpx2.AsyncClient, asyncio.AbstractEventLoop]] = []
+
+        def observe_client(client: httpx2.AsyncClient) -> httpx2.AsyncClient:
+            async def on_request(request: httpx2.Request) -> None:
+                requests.append((request.url.path, client, asyncio.get_running_loop()))
+
+            client.event_hooks["request"].append(on_request)
+            return client
+
+        def transient_client(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
+            return observe_client(json_http_client(*args, **kwargs))
+
+        async def handle(request: web.Request) -> web.Response:
+            if request.path == "/.well-known/oauth-authorization-server":
+                metadata = _good_as_metadata_doc()
+                metadata.update(
+                    issuer=origin,
+                    authorization_endpoint=f"{origin}/authorize",
+                    token_endpoint=f"{origin}/token",
+                    jwks_uri=f"{origin}/jwks",
+                )
+                return web.json_response(metadata)
+            if request.path == "/token":
+                assert request.headers["Accept"] == "application/json"
+                assert (await request.post())["grant_type"] == "refresh_token"
+                return web.json_response(
+                    {
+                        "access_token": "fresh-bbb",
+                        "refresh_token": "refresh-rotated",
+                        "expires_in": 3600,
+                    }
+                )
+            assert request.path == "/warm"
+            return web.json_response({})
+
+        app = web.Application()
+        app.router.add_route("*", "/{path:.*}", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            await web.TCPSite(runner, "127.0.0.1", 0).start()
+            origin = f"http://127.0.0.1:{runner.addresses[0][1]}"
+            # A loopback authorization server is reachable only for a server that is itself
+            # local, so the row names one on the same origin.
+            storage.update_mcp_server("srv-id", url=f"{origin}/sse", oauth_as_issuer_cached=origin)
+            async with httpx2.AsyncClient() as browser_client:
+                observe_client(browser_client)
+                state = _make_app_state(storage, http_client=observe_client(json_http_client()))
+                state.mcp_oauth_http_client = browser_client
+                _seed_token(state, expires_in_seconds=-1000, as_issuer=origin)
+                mint_manager.set_app_state(state)
+                runtime = oauth_context(state).runtime
+                assert runtime is not None
+                runtime_client = oauth_context(state).http_client
+                loop = mint_manager._loop
+                assert loop is not None
+                await browser_client.get(f"{origin}/warm")
+                await runtime.call(lambda: runtime_client.get(f"{origin}/warm"))
+                assert state.mcp_oauth_metadata_cache == {}
+                with patch("turnstone.core.oauth.http.json_http_client", transient_client):
+                    result = await asyncio.wait_for(
+                        asyncio.wrap_future(
+                            asyncio.run_coroutine_threadsafe(
+                                get_user_access_token_classified(
+                                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                                ),
+                                loop,
+                            ),
+                        ),
+                        timeout=10,
+                    )
+
+                assert result.kind == "token", result
+                assert result.token == "fresh-bbb"
+                assert [path for path, _, _ in requests] == [
+                    "/warm",
+                    "/warm",
+                    "/.well-known/oauth-authorization-server",
+                    "/token",
+                ]
+                # Client identity survives keepalive expiry between requests.
+                discovery_client, token_client = (client for _, client, _ in requests[2:])
+                assert discovery_client is token_client
+                assert token_client is not browser_client
+                assert token_client is runtime_client
+                assert all(owner_loop is runtime._loop for _, _, owner_loop in requests[1:])
+                token = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+                assert token is not None
+                assert token["refresh_token"] == "refresh-rotated"
+                # The browser's own client remains usable on its original loop.
+                assert (await browser_client.get(f"{origin}/warm")).status_code == 200
+        finally:
+            await runner.cleanup()
+
+    run_adapter(_run())
+
+
+@pytest.mark.parametrize("keepalive", [False, True], ids=["expiry", "keepalive"])
+@pytest.mark.parametrize(
+    "failure", [None, "invalid_grant", "temporarily_unavailable", "provider_error"]
+)
+def test_sweep_refreshes_with_no_browser_client(
+    storage: SQLiteBackend, mint_manager: MCPClientManager, keepalive: bool, failure: str | None
+) -> None:
+    """A real sweep needs no browser client and only observes failed grants."""
+    _seed_server(storage)
+    state = SimpleNamespace(
+        auth_storage=storage,
+        mcp_oauth_coordination=TokenCoordination(),
+        oauth_context=OAuthContext(
+            token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test")
+        ),
+    )
+    # Age the stored creation timestamp without aging the access-token expiry.
+    _seed_token(state, expires_in_seconds=3600 if keepalive else -1000)
+    with storage._engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "UPDATE oauth_tokens SET created = :created "
+                "WHERE user_id = :uid AND token_key = :sn"
+            ),
+            {
+                "created": (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S"),
+                "uid": "user-1",
+                "sn": "srv-oauth",
+            },
+        )
+    mint_manager.set_storage(storage)
+    mint_manager.set_app_state(state)
+    mint_manager._oauth_user_server_names = {"srv-oauth"}
+    mint_manager._user_token_refresh_keepalive_s = 3600 if keepalive else 0
+    requests: list[str] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request.method)
+        if request.method == "GET":
+            return httpx2.Response(200, json=_good_as_metadata_doc())
+        assert request.method == "POST"
+        if failure:
+            # A 400 reaches the error-code classifier even for the transient code.
+            return httpx2.Response(400, json={"error": failure})
+        return httpx2.Response(200, json={"access_token": "fresh-bbb", "expires_in": 3600})
+
+    context = oauth_context(state)
+    runtime = OAuthRuntime(
+        context, client_factory=lambda: httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    )
+    context.runtime = runtime
+    runtime.start()
+
+    async def _tick() -> None:
+        with _public_addr_patch():
+            await mint_manager._sweep_user_token_freshness()
+
+    loop = mint_manager._loop
+    assert loop is not None
+    _run_on_loop(loop, _tick())
+    assert requests == ["GET", "POST"]
+    token = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+    assert token is not None
+    assert token["access_token"] == ("access-aaa" if failure else "fresh-bbb")
+    assert token["refresh_token"] == "refresh-rrr"
+    assert state.mcp_oauth_coordination.backoff == {}
+    assert bool(mint_manager._token_sweep_warned) == (failure == "invalid_grant")
+
+
+# ---------------------------------------------------------------------------
+# Refresh-failure classification (#714 follow-up + hardening): a TRANSIENT
+# failure (network / 5xx / 429 / operator-fixable code) keeps the token and
+# returns a retryable kind; an explicit dead-grant / re-consent signal
+# (``invalid_grant`` at any 4xx, ``invalid_scope``, an OIDC interaction-required
+# code) revokes consent; and an unclassifiable 400/401 is AMBIGUOUS — kept until
+# a sustained run escalates to re-consent. A per-(user,server) cooldown
+# short-circuits the AS round-trip during an outage. All exercised through the
+# real AS HTTP boundary so an AS/network blip on the live 401-retry path can
+# never revoke a user, while a genuinely dead grant can't strand one forever.
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshFailureClassification:
+    def _lookup(self, state: SimpleNamespace) -> Any:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        async def _run() -> Any:
+            with _public_addr_patch():
+                return await get_user_access_token_classified(
+                    app_state=state,
+                    user_id="user-1",
+                    server_name="srv-oauth",
+                    force_refresh=True,
+                )
+
+        return run_adapter(_run())
+
+    def test_transient_503_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A 503 from the token endpoint is transient: keep the token, retryable kind."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        # Token survives a transient failure — no cluster-wide revoke; self-heals.
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_transient_network_error_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A network error (httpx2.HTTPError) is transient: keep the token, retryable kind."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(side_effect=httpx2.ConnectError("connection refused"))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        # Token survives a transient failure — no cluster-wide revoke; self-heals.
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_oversized_error_body_stays_transient_for_oauth_user(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: routing refresh_token() through the shared
+        _hardened_token_post must NOT change the oauth_user oversized-error
+        behavior. On main an over-cap error body was TRANSIENT (default class,
+        token kept, retryable forever); the OBO-only status-based escalation must
+        not leak onto oauth_user, or a large upstream error could escalate a
+        pre-existing consent to an unexpected re-consent. oauth_user keeps
+        TRANSIENT; the token survives."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        # 401 with an error body over the 64KB cap.
+        client.post = AsyncMock(
+            return_value=_mk_response(401, {"error": "invalid_grant", "pad": "x" * (70 * 1024)})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        # Kept (TRANSIENT), not revoked — and the ambiguous streak did not advance.
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+        from turnstone.core.oauth.tokens import _refresh_backoff_state
+
+        assert (
+            _refresh_backoff_state(
+                state.mcp_oauth_coordination, "user-1", "srv-oauth"
+            ).ambiguous_streak
+            == 0
+        )
+
+    def test_permanent_invalid_grant_revokes(self, storage: SQLiteBackend) -> None:
+        """Contrast: 400 invalid_grant IS permanent — deletion is correct and the
+        eventual fix MUST preserve it."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_invalid_target_keeps_token(self, storage: SQLiteBackend) -> None:
+        """``invalid_target`` (RFC 8707 §2.2) means the AS will not cover the
+        ``resource=`` asked for — an operator-side fix (the Server URL or the
+        Audience on the row), not a dead grant. Re-consenting would send the
+        same value, so the token is kept and the failure stays ambiguous."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_target"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_permanent_revoke_audits_even_when_row_concurrently_deleted(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: gating the token_revoked audit on delete-returned-True
+        (the obo spam fix) must NOT suppress the oauth_user audit when a
+        concurrent admin/user revoke deletes the row first. For oauth_user a
+        refresh failure means a grant EXISTED (a real revocation), so the audit
+        fires even on an empty delete — an operator's SIEM must not miss it."""
+        from unittest.mock import patch
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        # Simulate a concurrent external revoke: the dispatch-side delete finds
+        # the row already gone (returns False).
+        with patch.object(
+            oauth_context(state).token_store, "delete_user_token", return_value=False
+        ):
+            result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
+        assert len(events) == 1  # audited despite the empty delete
+
+    def test_400_invalid_client_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A 400 ``invalid_client`` is operator-fixable, NOT a dead grant: keep
+        the token. Pins the discriminator on the *error code*, not the 4xx
+        status — broadening ``permanent`` to "any 400" would silently revoke
+        consent on a config blip (the regression this guards)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_client"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_400_unrecognised_body_is_ambiguous_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A single 400 with a non-JSON / no-``error`` body is ambiguous: keep
+        the token — one oddity must not revoke. Escalation only bites after a
+        sustained run (see ``test_ambiguous_streak_escalates_to_revoke``)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, None))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_403_invalid_grant_revokes(self, storage: SQLiteBackend) -> None:
+        """``invalid_grant`` is a dead grant at ANY client-error status, not just
+        400/401 — a 403 invalid_grant must still revoke + re-consent."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(403, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_interaction_required_revokes(self, storage: SQLiteBackend) -> None:
+        """An OIDC interaction-required code (Entra surfaces these) means the user
+        must re-consent / re-auth — treat as permanent, revoke."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(401, {"error": "interaction_required"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_ambiguous_streak_escalates_to_revoke(self, storage: SQLiteBackend) -> None:
+        """A *sustained* run of unclassifiable 400s is treated as a dead grant in
+        a non-standard shape: the token survives below the threshold, then the
+        threshold-crossing attempt escalates to re-consent so the user isn't
+        stranded on a retryable error forever."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, None))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        with (
+            patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 3),
+            patch("turnstone.core.oauth.tokens._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
+        ):
+            # Below threshold: the token survives each attempt.
+            for _ in range(2):
+                assert self._lookup(state).kind == "refresh_failed_transient"
+                assert (
+                    oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+                    is not None
+                )
+            # The threshold-crossing attempt escalates to a revoke.
+            result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_sustained_5xx_never_escalates(self, storage: SQLiteBackend) -> None:
+        """Outage safety: infra failures (5xx) never feed the escalation counter,
+        so even a long AS outage — far past the ambiguous threshold — keeps the
+        token. A blip must never revoke consent, however long it lasts."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        with (
+            patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 2),
+            patch("turnstone.core.oauth.tokens._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
+        ):
+            for _ in range(5):
+                assert self._lookup(state).kind == "refresh_failed_transient"
+                assert (
+                    oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+                    is not None
+                )
+
+    def test_transient_cooldown_skips_as_roundtrip(self, storage: SQLiteBackend) -> None:
+        """After a transient failure, a follow-up lookup inside the cooldown
+        window returns the retryable kind WITHOUT a second token-endpoint
+        round-trip — so a down AS isn't hammered once per tool call."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        first = self._lookup(state)
+        second = self._lookup(state)
+
+        assert first.kind == "refresh_failed_transient"
+        assert second.kind == "refresh_failed_transient"
+        # The cooldown short-circuited the second attempt: exactly one AS POST.
+        assert client.post.call_count == 1
+
+    def test_backoff_and_lock_cleared_when_token_vanishes(self, storage: SQLiteBackend) -> None:
+        """A transient failure retains BOTH sibling per-(user,server) entries — the
+        refresh lock (for serialization) and the backoff (for the cooldown). If
+        the token is then deleted cluster-wide (another node's permanent revoke),
+        the next lookup returns ``missing`` AND prunes both, so neither in-process
+        dict grows unboundedly on the missing path."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        # First lookup: a transient 503 records a backoff entry AND retains the
+        # refresh lock (the keep-path must not drop it — bug-1).
+        assert self._lookup(state).kind == "refresh_failed_transient"
+        assert ("user-1", "srv-oauth") in state.mcp_oauth_coordination.backoff
+        assert ("user-1", "srv-oauth") in state.mcp_oauth_coordination.locks
+
+        # Another node revokes the token cluster-wide (shared Postgres store).
+        oauth_context(state).token_store.delete_user_token("user-1", "srv-oauth")
+
+        # Next lookup sees the row gone -> missing -> both stale entries cleared.
+        assert self._lookup(state).kind == "missing"
+        assert ("user-1", "srv-oauth") not in state.mcp_oauth_coordination.backoff
+        assert ("user-1", "srv-oauth") not in state.mcp_oauth_coordination.locks
+
+
+class TestObserveOnlyLookup:
+    """``revoke_on_failure=False`` (the background token-freshness sweep): still
+    refresh a healthy token, but on failure NEVER delete a token or mutate the
+    shared streak — a timer must not destroy consent or move a foreground user's
+    revoke threshold. A permanent rejection surfaces as ``refresh_failed`` with
+    the row INTACT; an ambiguous one as transient with the streak untouched."""
+
+    def _lookup(self, state: SimpleNamespace) -> Any:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        async def _run() -> Any:
+            with _public_addr_patch():
+                return await get_user_access_token_classified(
+                    app_state=state,
+                    user_id="user-1",
+                    server_name="srv-oauth",
+                    force_refresh=True,
+                    revoke_on_failure=False,
+                )
+
+        return run_adapter(_run())
+
+    def test_permanent_invalid_grant_does_not_revoke(self, storage: SQLiteBackend) -> None:
+        """The exact contrast to ``test_permanent_invalid_grant_revokes``: same
+        dead-grant signal, but observe-only leaves the row for the lazy path."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_ambiguous_does_not_touch_shared_streak(self, storage: SQLiteBackend) -> None:
+        """Repeated observe-mode ambiguous failures never bump the shared
+        ambiguous_streak, so a later foreground dispatch is not pushed over the
+        escalation edge by background activity (the finding this guards)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, None))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        with patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 2):
+            for _ in range(5):
+                assert self._lookup(state).kind == "refresh_failed_transient"
+
+        backoff = state.mcp_oauth_coordination.backoff
+        entry = backoff.get(("user-1", "srv-oauth"))
+        assert entry is None or entry.ambiguous_streak == 0
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_expired_no_refresh_does_not_revoke(self, storage: SQLiteBackend) -> None:
+        """An expired token with no refresh token surfaces as a dead grant but is
+        NOT deleted on the observe path."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, refresh=None)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_healthy_token_still_refreshes(self, storage: SQLiteBackend) -> None:
+        """Observe mode is not read-only: a near-expiry token is still refreshed
+        (only the destructive failure paths change)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200, {"access_token": "fresh-bbb", "expires_in": 3600, "token_type": "Bearer"}
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "token"
+        assert result.token == "fresh-bbb"
+
+
+class TestRefreshStaysWithTheGrantIssuer:
+    """A refresh never moves the pin, and a grant's credentials go only to the issuer behind it."""
+
+    @staticmethod
+    def _lookup(state: SimpleNamespace, getaddrinfo: Any, *, revoke_on_failure: bool) -> Any:
+        async def _run() -> Any:
+            with patch("socket.getaddrinfo", side_effect=getaddrinfo):
+                return await get_user_access_token_classified(
+                    app_state=state,
+                    user_id="user-1",
+                    server_name="srv-oauth",
+                    force_refresh=True,
+                    revoke_on_failure=revoke_on_failure,
+                )
+
+        return run_adapter(_run())
+
+    @staticmethod
+    def _client() -> MagicMock:
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "fresh-bbb", "expires_in": 3600})
+        )
+        return client
+
+    @staticmethod
+    def _public(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+        return [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+            OSError("resolver unreachable"),
+            "10.0.0.1",
+        ],
+        ids=["nxdomain", "oserror", "private-answer"],
+    )
+    def test_a_pin_failing_its_checks_keeps_the_token_and_the_pin(
+        self, storage: SQLiteBackend, failure: BaseException | str
+    ) -> None:
+        _seed_server(storage)
+        client = self._client()
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        def _getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+            if host != "as.example.com":
+                return self._public(host)
+            if isinstance(failure, str):
+                return [(2, 1, 6, "", (failure, 0))]
+            raise failure
+
+        result = self._lookup(state, _getaddrinfo, revoke_on_failure=True)
+
+        assert result.kind == "refresh_failed_transient"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None
+        assert row["oauth_as_issuer_cached"] == "https://as.example.com"
+        client.get.assert_not_called()
+        client.post.assert_not_called()
+
+    def test_a_grant_from_another_issuer_is_revoked_without_a_request(
+        self, storage: SQLiteBackend
+    ) -> None:
+        _seed_server(storage)
+        client = self._client()
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, as_issuer="https://old-as.example.com")
+
+        result = self._lookup(state, self._public, revoke_on_failure=True)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+        events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
+        details = [
+            json.loads(ev["detail"]) if isinstance(ev["detail"], str) else ev["detail"]
+            for ev in events
+        ]
+        assert [detail["reason"] for detail in details] == ["issuer_changed"]
+        client.get.assert_not_called()
+        client.post.assert_not_called()
+
+    def test_the_sweep_leaves_a_grant_from_another_issuer_in_place(
+        self, storage: SQLiteBackend
+    ) -> None:
+        _seed_server(storage)
+        client = self._client()
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, as_issuer="https://old-as.example.com")
+
+        result = self._lookup(state, self._public, revoke_on_failure=False)
+
+        assert result.kind == "refresh_failed"
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
+        client.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Happy paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("clear_metadata_cache", [False, True])
+@pytest.mark.parametrize("rejected_issuer", [None, "http://legacy-as.example.com"])
+def test_shared_issuer_refresh_survives_resource_metadata_outage(
+    storage: SQLiteBackend, clear_metadata_cache: bool, rejected_issuer: str | None
+) -> None:
+    """A second server reuses AS metadata, persists its issuer, then refreshes without PRM.
+
+    The rejected case is a pin refused on its text, the one kind of pin that is dropped and
+    rediscovered; it ends pinned like the rest.
+    """
+    issuer = "https://as.example.com"
+    requests: list[tuple[str, str]] = []
+    prm_available = True
+    servers = {
+        "srv-first": "https://first.example.com/sse",
+        "srv-oauth": "https://mcp.example.com/sse",
+    }
+    prm_urls = {
+        "https://first.example.com/.well-known/oauth-protected-resource/sse": servers["srv-first"],
+        "https://mcp.example.com/.well-known/oauth-protected-resource/sse": servers["srv-oauth"],
+    }
+    metadata_url = f"{issuer}/.well-known/oauth-authorization-server"
+    token_url = f"{issuer}/token"
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        url = str(request.url)
+        requests.append((request.method, url))
+        if request.method == "GET" and request.url.host != "as.example.com":
+            if not prm_available:
+                return httpx2.Response(503)
+            return httpx2.Response(
+                200, json={"resource": prm_urls[url], "authorization_servers": [issuer]}
+            )
+        if request.method == "GET" and url == metadata_url:
+            return httpx2.Response(200, json=_good_as_metadata_doc())
+        if request.method == "POST" and url == token_url:
+            return httpx2.Response(
+                200,
+                json={
+                    "access_token": "fresh-bbb",
+                    "refresh_token": "refresh-rotated",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {url}")
+
+    async def _run() -> None:
+        nonlocal prm_available
+        with patch(
+            "socket.getaddrinfo",
+            side_effect=lambda host, *a, **kw: [(2, 1, 6, "", ("93.184.216.34", 0))],
+        ):
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
+                state = _make_app_state(storage, http_client=client)
+                for name, url in servers.items():
+                    storage.create_mcp_server(
+                        server_id=name,
+                        name=name,
+                        transport="streamable-http",
+                        url=url,
+                        auth_type="oauth_user",
+                        oauth_client_id="client-abc",
+                        oauth_scopes="openid profile",
+                        oauth_audience="https://mcp.example.com",
+                    )
+                    cached_issuer = rejected_issuer if name == "srv-oauth" else None
+                    if cached_issuer:
+                        storage.update_mcp_server(name, oauth_as_issuer_cached=cached_issuer)
+                    await discover_authorization_server(
+                        server_name=name,
+                        server_url=url,
+                        override_url=None,
+                        cached_issuer=cached_issuer,
+                        http_client=client,
+                        storage=storage,
+                        server_id=name,
+                        trusted_hosts=frozenset(),
+                        metadata_cache=oauth_context(state).metadata_cache,
+                    )
+                assert requests == [
+                    ("GET", "https://first.example.com/.well-known/oauth-protected-resource/sse"),
+                    ("GET", metadata_url),
+                    ("GET", "https://mcp.example.com/.well-known/oauth-protected-resource/sse"),
+                ]
+                _seed_token(state, expires_in_seconds=-1000)
+                if clear_metadata_cache:
+                    oauth_context(state).metadata_cache.clear()
+                requests.clear()
+                prm_available = False
+
+                result = await get_user_access_token_classified(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+                assert result.kind == "token", result
+                assert result.token == "fresh-bbb"
+                expected = [("GET", metadata_url)] if clear_metadata_cache else []
+                assert requests == [*expected, ("POST", token_url)]
+                for name in servers:
+                    row = storage.get_mcp_server_by_name(name)
+                    assert row is not None
+                    assert row["oauth_as_issuer_cached"] == issuer
+                token = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+                assert token is not None
+                assert token["refresh_token"] == "refresh-rotated"
+
+    run_adapter(_run())
+
+
+class TestUnchangedToken:
+    def test_returns_existing_token_when_not_expired(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock()
+        client.post = AsyncMock()
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        async def _run():
+            return await get_user_access_token(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        token = run_adapter(_run())
+        assert token == "access-aaa"
+        # No AS calls were made.
+        client.get.assert_not_called()
+        client.post.assert_not_called()
+
+    def test_no_token_returns_none(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+
+        async def _run():
+            return await get_user_access_token(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        assert run_adapter(_run()) is None
+
+    def test_get_user_access_token_handles_decrypt_error(self, storage: SQLiteBackend) -> None:
+        """A decrypt failure on the stored token must not crash dispatch.
+
+        When the operator rotates ``mcp_token_encryption_key`` and drops
+        the prior key, every existing user-token row decrypts to
+        :class:`TokenDecryptError`. ``get_user_access_token`` MUST
+        catch that and return ``None`` (forcing the user back through
+        the consent flow) rather than propagating the exception up to
+        the dispatch caller.
+        """
+        from turnstone.core.token_store.crypto import TokenDecryptError
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        # Replace the get_user_token method on the store to raise the
+        # canonical key-mismatch error.
+        original_get = oauth_context(state).token_store.get_user_token
+
+        def _raise_decrypt(*args, **kwargs):
+            raise TokenDecryptError(
+                "no installed key can decrypt",
+                key_fingerprints_attempted=("aabbccdd",),
+            )
+
+        oauth_context(state).token_store.get_user_token = _raise_decrypt
+
+        try:
+
+            async def _run():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+            result = run_adapter(_run())
+            assert result is None
+        finally:
+            oauth_context(state).token_store.get_user_token = original_get
+
+
+# ---------------------------------------------------------------------------
+# Refresh path
+# ---------------------------------------------------------------------------
+
+
+class TestRefresh:
+    def test_refreshes_when_expired(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": 3600,
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        # Seed an expired token.
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        token = run_adapter(_run())
+        assert token == "access-NEW"
+        # The refresh endpoint was hit exactly once.
+        assert client.post.call_count == 1
+        assert client.post.call_args.kwargs["data"]["resource"] == "https://mcp.example.com/sse"
+        # Verify the new tokens were persisted.
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+        assert plain is not None
+        assert plain["access_token"] == "access-NEW"
+        assert plain["refresh_token"] == "refresh-NEW"
+
+    def test_refresh_failure_deletes_row_and_returns_none(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        # AS rejects the refresh — token should be revoked.
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                400,
+                {"error": "invalid_grant"},
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        emitted: list[str] = []
+
+        async def _run():
+            from turnstone.core import mcp_oauth as mod
+
+            real_record_audit = mod.record_audit
+
+            def _capture(*args, **kwargs):
+                # signature: (storage, user_id, action, resource_type, resource_id, detail)
+                emitted.append(args[2] if len(args) >= 3 else kwargs.get("action", ""))
+                return real_record_audit(*args, **kwargs)
+
+            with (
+                patch.object(mod, "record_audit", side_effect=_capture),
+                _public_addr_patch(),
+            ):
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        result = run_adapter(_run())
+        assert result is None
+        # Row was deleted.
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+        # Audit emitted the revoke event.
+        assert "mcp_server.oauth.token_revoked" in emitted
+
+    def test_concurrent_callers_via_lock(self, storage: SQLiteBackend) -> None:
+        """Two concurrent refresh calls must produce exactly one AS POST.
+
+        Both callers see the same access_token.
+        """
+        _seed_server(storage)
+
+        # Coordinate the AS POST so both callers race the lock.
+        post_started = threading.Event()
+        post_release = threading.Event()
+
+        async def _post(url, *args, **kwargs):
+            post_started.set()
+            assert await asyncio.to_thread(post_release.wait, 5)
+            return _mk_response(
+                200,
+                {
+                    "access_token": "access-ONE",
+                    "refresh_token": "refresh-ONE",
+                    "expires_in": 3600,
+                },
+            )
+
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(side_effect=_post)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _both():
+            with _public_addr_patch():
+                t1 = asyncio.create_task(
+                    get_user_access_token(
+                        app_state=state, user_id="user-1", server_name="srv-oauth"
+                    )
+                )
+                # Wait for the first task to enter the AS POST so the
+                # second task is forced to take the lock contended.
+                assert await asyncio.to_thread(post_started.wait, 5)
+                t2 = asyncio.create_task(
+                    get_user_access_token(
+                        app_state=state, user_id="user-1", server_name="srv-oauth"
+                    )
+                )
+                # Give t2 a chance to queue on the lock.
+                await asyncio.sleep(0.05)
+                post_release.set()
+                return await asyncio.gather(t1, t2)
+
+        a, b = run_adapter(_both())
+        assert a == "access-ONE"
+        assert b == "access-ONE"
+        # Exactly one POST.
+        assert client.post.call_count == 1
+
+    def test_refresh_omitted_refresh_token_preserves_existing(self, storage: SQLiteBackend) -> None:
+        """RFC 6749 §6 — AS MAY omit refresh_token; we PRESERVE the existing one.
+
+        Production ASes (Google, default Auth0, default Okta) do NOT
+        rotate refresh tokens. Clearing the column on every refresh
+        would force the user to re-consent every hour. The contract:
+        replace the persisted refresh token only when the AS issues a
+        new one; otherwise pass the prior refresh token through to
+        ``update_user_token_after_refresh``. The ``refresh_token=None``
+        sentinel still means "clear" at the storage layer (Phase 3
+        contract preserved); the *_refresh_and_persist_* layer
+        translates "omitted" into "pass through existing".
+        """
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                # No refresh_token in response.
+                {"access_token": "access-NEW", "expires_in": 3600},
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, refresh="refresh-original")
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        token = run_adapter(_run())
+        assert token == "access-NEW"
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+        assert plain is not None
+        # Refresh column was PRESERVED — the original refresh token is
+        # still usable for the next refresh cycle.
+        assert plain["refresh_token"] == "refresh-original"
+
+    def test_refresh_rotated_refresh_token_replaces_existing(self, storage: SQLiteBackend) -> None:
+        """When AS issues a fresh refresh_token, the new value REPLACES the prior."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": 3600,
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, refresh="refresh-original")
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        token = run_adapter(_run())
+        assert token == "access-NEW"
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+        assert plain is not None
+        assert plain["refresh_token"] == "refresh-NEW"
+
+    def test_expired_no_refresh_token_revokes(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, refresh=None)
+
+        async def _run():
+            return await get_user_access_token(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = run_adapter(_run())
+        assert result is None
+        # Row was deleted (re-consent path).
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_refresh_grant_sends_server_url_as_resource_not_audience(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """RFC 8707 ``resource=`` is the canonical MCP server URL.
+
+        Earlier code passed ``oauth_audience`` as the resource value;
+        Auth0-style ASes that honor a separate ``audience=`` parameter
+        would then receive the wrong URL in ``resource=``, and ASes that
+        validate ``resource`` against their RS allowlist would reject
+        the refresh. The refresh-grant MUST send the canonical server
+        URL on ``resource=``.
+        """
+        _seed_server(storage)
+        # Override the audience on the seed server so it diverges from
+        # the canonical server URL.
+        backend_row = storage.get_mcp_server_by_name("srv-oauth")
+        assert backend_row is not None
+        storage.update_mcp_server(
+            backend_row["server_id"],
+            oauth_audience="https://different-audience.example.com/api",
+        )
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": 3600,
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        run_adapter(_run())
+        # The refresh POST was made; assert the form payload sent
+        # ``resource=server_url`` not ``resource=audience``.
+        assert client.post.call_count == 1
+        post_kwargs = client.post.call_args.kwargs
+        sent_resource = post_kwargs["data"]["resource"]
+        assert sent_resource == "https://mcp.example.com/sse"
+        assert sent_resource != "https://different-audience.example.com/api"
+
+
+# ---------------------------------------------------------------------------
+# expires_in parsing — bug-2
+# ---------------------------------------------------------------------------
+
+
+class TestExpiresInParsing:
+    """``_expires_at_from_response`` must accept int, float, and string.
+
+    Real ASes have been seen returning ``3600.0`` (float) and ``"3600"``
+    (string) — the prior ``int(str(3600.0))`` raised ValueError, leaving
+    ``expires_at=None``. ``None`` then made ``_token_needs_refresh``
+    return False, so the token was never refreshed and effectively never
+    expired (it accumulated until the AS revoked it server-side).
+    """
+
+    def test_expires_in_float_parsed_correctly(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": 3600.0,
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        token = run_adapter(_run())
+        assert token == "access-NEW"
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+        assert plain is not None
+        # expires_at must be populated — a None value here means the
+        # float was rejected and the next refresh cycle would skip it.
+        assert plain["expires_at"] is not None
+
+    def test_expires_in_str_with_decimal_parsed_correctly(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": "3600.0",
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        token = run_adapter(_run())
+        assert token == "access-NEW"
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+        assert plain is not None
+        assert plain["expires_at"] is not None
+
+    def test_expires_in_int_string_parsed_correctly(self, storage: SQLiteBackend) -> None:
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": "3600",
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        token = run_adapter(_run())
+        assert token == "access-NEW"
+
+    def test_expires_in_garbage_returns_none(self) -> None:
+        from turnstone.core.oauth.tokens import _expires_at_from_response
+
+        assert _expires_at_from_response({}) is None
+        assert _expires_at_from_response({"expires_in": "abc"}) is None
+        assert _expires_at_from_response({"expires_in": None}) is None
+        assert _expires_at_from_response({"expires_in": True}) is None
+        assert _expires_at_from_response({"expires_in": 0}) is None
+        assert _expires_at_from_response({"expires_in": -5}) is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-node refresh lock — advisory lock plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestAdvisoryLock:
+    """The refresh path must take the storage advisory lock as the OUTER
+    serialization layer (cluster-wide), with the in-process asyncio.Lock
+    as the inner layer. SQLite returns ``nullcontext`` so single-node
+    deployments are untouched.
+    """
+
+    def test_advisory_lock_acquired_during_refresh(self, storage: SQLiteBackend) -> None:
+        """The storage advisory lock must be acquired when refresh runs."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {
+                    "access_token": "access-NEW",
+                    "refresh_token": "refresh-NEW",
+                    "expires_in": 3600,
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        keys_seen: list[str] = []
+        original = storage.acquire_advisory_lock_sync
+
+        def _spy(key: str):  # type: ignore[no-untyped-def]
+            keys_seen.append(key)
+            return original(key)
+
+        with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_spy):
+
+            async def _run():
+                with _public_addr_patch():
+                    return await get_user_access_token(
+                        app_state=state, user_id="user-1", server_name="srv-oauth"
+                    )
+
+            run_adapter(_run())
+
+        assert keys_seen == ["mcp_refresh:user-1:srv-oauth"]
+
+    def test_advisory_lock_is_noop_on_sqlite(self, storage: SQLiteBackend) -> None:
+        """The SQLite backend's advisory lock is a ``nullcontext`` no-op."""
+        import contextlib as _contextlib
+
+        cm = storage.acquire_advisory_lock_sync("mcp_refresh:any:any")
+        # ``nullcontext`` returns this exact object from __enter__.
+        with cm as value:
+            assert value is None
+        assert isinstance(cm, _contextlib.nullcontext)
+
+
+# ---------------------------------------------------------------------------
+# _PgRefreshLock executor topology — independent of advisory-lock semantics
+# ---------------------------------------------------------------------------
+
+
+class TestPgRefreshLock:
+    """Topology of the ``_PgRefreshLock`` async wrapper itself.
+
+    These tests patch ``acquire_advisory_lock_sync`` with a fake context
+    manager and assert behaviour of the per-instance executor, the
+    cancellation-safety drain, and other lifecycle properties — not the
+    advisory-lock semantics under it (those live in ``TestAdvisoryLock``).
+    """
+
+    def test_pg_refresh_lock_per_key_concurrency(self, storage: SQLiteBackend) -> None:
+        """Two ``_PgRefreshLock`` instances with different keys must enter in parallel.
+
+        Regression for the global single-worker executor shape: if every
+        instance shared one ``ThreadPoolExecutor(max_workers=1)``, the
+        second instance's ``__aenter__`` would queue behind the first
+        even though the advisory keys are unrelated, so a single slow
+        ``pg_try_advisory_xact_lock`` spin would block every other
+        refresh on the node. Per-instance executors keep enter/exit on
+        the same thread (psycopg2 thread-affinity) without globally
+        serializing the spin loop.
+        """
+        from turnstone.core.oauth.locking import _PgRefreshLock
+        from turnstone.core.oauth.work import OAuthWork
+
+        in_flight = 0
+        max_in_flight = 0
+        counter_lock = threading.Lock()
+        enter_hold_s = 0.1
+
+        @contextlib.contextmanager
+        def _slow_lock_cm(_key_text: str = "") -> Any:
+            nonlocal in_flight, max_in_flight
+            with counter_lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            try:
+                # Block INSIDE __enter__, before the yield, so concurrent
+                # callers overlap on this stretch of the call.
+                time.sleep(enter_hold_s)
+                yield
+            finally:
+                with counter_lock:
+                    in_flight -= 1
+
+        with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_slow_lock_cm):
+
+            async def _hold(key: str) -> None:
+                async with _PgRefreshLock(storage, key, work=OAuthWork(asyncio.get_running_loop())):
+                    pass
+
+            async def _two_concurrent() -> None:
+                await asyncio.gather(_hold("key-a"), _hold("key-b"))
+
+            run_adapter(_two_concurrent())
+
+        assert max_in_flight == 2, (
+            "_PgRefreshLock instances serialized through a shared executor: "
+            f"max_in_flight={max_in_flight}; expected 2 with per-instance executors."
+        )
+
+    def _run_cancel_scenario(
+        self,
+        storage: SQLiteBackend,
+        *,
+        enter_raises: BaseException | None = None,
+    ) -> _ObservableLockCm:
+        """Run the cancellation scenario shared by both cancellation tests.
+
+        Patches ``acquire_advisory_lock_sync`` with a factory that returns
+        a fresh :class:`_ObservableLockCm`, starts a ``_PgRefreshLock``
+        acquire on a task, waits for the worker to enter ``cm.__enter__``,
+        cancels the task, then releases the worker to either succeed
+        (default) or raise (``enter_raises``). Awaits in-flight drain
+        tasks via the runtime-owned drain set so callers can inspect
+        the cm deterministically.
+
+        Test integrity:
+        * Class-based cm — drain's explicit ``__exit__(None, None, None)``
+          is recorded as a real method call, distinguishable from
+          ``GeneratorExit`` thrown by GC of a generator-based cm.
+        * Strong ref via ``created_cms`` — keeps the cm alive past the
+          test's awaits, so a no-op drain genuinely fails the assertion
+          rather than papering over via GC finalization timing.
+        * Deterministic drain wait via the runtime-owned drain set —
+          no fixed-duration sleeps.
+
+        Returns the single cm the factory created.
+        """
+        from turnstone.core.oauth.locking import _PgRefreshLock
+        from turnstone.core.oauth.work import OAuthWork
+
+        enter_started = threading.Event()
+        enter_release = threading.Event()
+        created_cms: list[_ObservableLockCm] = []
+
+        def _factory(_key_text: str) -> _ObservableLockCm:
+            cm = _ObservableLockCm(
+                enter_started=enter_started,
+                enter_release=enter_release,
+                enter_raises=enter_raises,
+            )
+            created_cms.append(cm)
+            return cm
+
+        with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_factory):
+
+            async def _run() -> None:
+                lock = _PgRefreshLock(
+                    storage, "key-cancel", work=OAuthWork(asyncio.get_running_loop())
+                )
+
+                async def _attempt() -> None:
+                    async with lock:
+                        pass  # body never runs — we cancel before it does
+
+                task = asyncio.create_task(_attempt())
+                # Wait until the worker is inside cm.__enter__.
+                await asyncio.to_thread(enter_started.wait, _CANCEL_WAIT_S)
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                    await task
+                # Release the worker — succeed (default) or raise
+                # (``enter_raises`` set via factory closure).
+                enter_release.set()
+                # Wait deterministically for any in-flight drain task.
+                assert lock._work is not None
+                drains = list(lock._work.drains)
+                if drains:
+                    await asyncio.gather(*drains, return_exceptions=True)
+
+            run_adapter(_run())
+
+        assert len(created_cms) == 1, (
+            f"factory was called {len(created_cms)} times — expected exactly 1"
+        )
+        return created_cms[0]
+
+    def test_pg_refresh_lock_cancellation_releases_on_same_thread(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Cancelling ``__aenter__`` mid-acquire MUST release on the same thread.
+
+        Regression for: cancellation between submit and the worker
+        completing ``cm.__enter__`` would otherwise leave an acquired
+        Postgres advisory lock + open transaction whose paired
+        ``cm.__exit__`` runs on a non-deterministic GC thread —
+        violating psycopg2's connection thread-affinity (the very
+        invariant the per-instance executor was introduced to enforce).
+        The fire-and-forget drain coroutine waits for the worker to
+        settle (via a fresh ``asyncio.wrap_future`` of the underlying
+        ``concurrent.futures.Future``, NOT a re-await of the cancelled
+        asyncio wrapper) and runs ``cm.__exit__`` on the same executor.
+        """
+        cm = self._run_cancel_scenario(storage)
+        assert cm.exit_calls, (
+            "drain did NOT call cm.__exit__ — orphan Postgres lock + open transaction"
+        )
+        # Drain calls __exit__(None, None, None); GC GeneratorExit would
+        # have args (GeneratorExit, ..., ...). Distinguish.
+        assert cm.exit_calls == [(None, None, None)], (
+            f"cm.__exit__ called with {cm.exit_calls[0]} — expected "
+            "(None, None, None) from drain. A non-(None,None,None) call would "
+            "indicate the drain came in via GeneratorExit / GC instead of an "
+            "explicit drain invocation."
+        )
+        assert cm.exit_thread == cm.enter_thread, (
+            f"cm.__exit__ ran on thread {cm.exit_thread} but cm.__enter__ on "
+            f"{cm.enter_thread} — psycopg2 thread-affinity violated"
+        )
+
+    def test_pg_refresh_lock_cancellation_no_lock_no_orphan(self, storage: SQLiteBackend) -> None:
+        """If ``cm.__enter__`` raised, the drain must NOT call ``cm.__exit__``.
+
+        The drain pairs only with successful acquires. If the worker
+        raised (e.g., ``TimeoutError`` from the spin loop), there is no
+        transaction to commit — calling ``__exit__`` on an unentered cm
+        would itself raise.
+        """
+        cm = self._run_cancel_scenario(
+            storage,
+            enter_raises=TimeoutError("simulated spin-loop timeout"),
+        )
+        assert not cm.exit_calls, (
+            "drain incorrectly called cm.__exit__ on an unentered cm "
+            f"(calls: {cm.exit_calls}). Would attempt to commit a transaction "
+            "that never began."
+        )
+
+
+# ---------------------------------------------------------------------------
+# get_user_access_token_classified — tagged-result variant
+# ---------------------------------------------------------------------------
+
+
+class TestClassifiedGetter:
+    """The classified getter distinguishes ``missing`` vs ``decrypt_failure``
+    vs ``refresh_failed`` vs ``token`` so the dispatcher can map each to
+    the right user-facing error.
+    """
+
+    def test_returns_token_on_happy_path(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = run_adapter(_run())
+        assert result.kind == "token"
+        assert result.token == "access-aaa"
+
+    def test_missing_token_returns_missing(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = run_adapter(_run())
+        assert result.kind == "missing"
+
+    def test_decrypt_failure_returns_decrypt_failure(self, storage: SQLiteBackend) -> None:
+        """A key-mismatch must NOT collapse to ``missing``.
+
+        RFC §5.3 — the dispatcher MUST distinguish "row missing" from
+        "row present but undecryptable" so it can avoid emitting fake
+        ``mcp_consent_required`` events on every operator misconfig.
+        """
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+        from turnstone.core.token_store.crypto import TokenDecryptError
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        def _raise_decrypt(*args, **kwargs):
+            raise TokenDecryptError(
+                "no installed key can decrypt",
+                key_fingerprints_attempted=("aabbccdd",),
+            )
+
+        oauth_context(state).token_store.get_user_token = _raise_decrypt
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = run_adapter(_run())
+        assert result.kind == "decrypt_failure"
+        assert result.decrypt_fingerprints == ("aabbccdd",)
+
+    def test_refresh_failure_returns_refresh_failed(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        async def _run():
+            with _public_addr_patch():
+                return await get_user_access_token_classified(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+        result = run_adapter(_run())
+        assert result.kind == "refresh_failed"
+        # Row was deleted (re-consent path).
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_no_refresh_token_returns_refresh_failed(self, storage: SQLiteBackend) -> None:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, refresh=None)
+
+        async def _run():
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        result = run_adapter(_run())
+        assert result.kind == "refresh_failed"
+
+    def test_classified_does_not_break_legacy_helper(self, storage: SQLiteBackend) -> None:
+        """The legacy ``get_user_access_token`` keeps its ``str | None`` contract."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=3600)
+
+        async def _run():
+            return await get_user_access_token(
+                app_state=state, user_id="user-1", server_name="srv-oauth"
+            )
+
+        token = run_adapter(_run())
+        assert token == "access-aaa"
+
+
+# ---------------------------------------------------------------------------
+# A grant replaced while its refresh is in flight
+# ---------------------------------------------------------------------------
+
+_OLD_AS = "https://as.example.com"
+_NEW_AS = "https://new-as.example.net"
+
+
+def _as_doc(issuer: str) -> dict[str, Any]:
+    return {
+        "issuer": issuer,
+        "authorization_endpoint": issuer + "/authorize",
+        "token_endpoint": issuer + "/token",
+        "jwks_uri": issuer + "/jwks",
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+    }
+
+
+def _reconsent_at_the_new_as(state: SimpleNamespace, storage: SQLiteBackend) -> None:
+    """The operator points the server at a new authorization server (pin cleared, grants
+    purged), and the user consents there."""
+    storage.update_mcp_server(
+        "srv-id", oauth_authorization_server_url=_NEW_AS, oauth_as_issuer_cached=None
+    )
+    storage.delete_mcp_oauth_rows_by_server_name("srv-oauth")
+    oauth_context(state).token_store.create_user_token(
+        "user-1",
+        "srv-oauth",
+        access_token="new-as-access",
+        refresh_token="new-as-refresh",
+        expires_at=(datetime.now(UTC) + timedelta(seconds=3600)).strftime("%Y-%m-%dT%H:%M:%S"),
+        scopes="openid profile",
+        as_issuer=_NEW_AS,
+        audience="https://mcp.example.com",
+    )
+
+
+@pytest.mark.parametrize("reconsent_in_flight", [True, False], ids=["race", "control"])
+def test_a_refresh_in_flight_never_overwrites_a_grant_consented_meanwhile(
+    storage: SQLiteBackend, reconsent_in_flight: bool
+) -> None:
+    _seed_server(storage)
+    routes = {
+        _OLD_AS + "/.well-known/oauth-authorization-server": _mk_response(200, _as_doc(_OLD_AS)),
+        _NEW_AS + "/.well-known/oauth-authorization-server": _mk_response(200, _as_doc(_NEW_AS)),
+    }
+    posts: list[tuple[str, dict[str, Any]]] = []
+    holder: dict[str, SimpleNamespace] = {}
+
+    async def _get(url: str, *a: Any, **kw: Any) -> Any:
+        return routes[url]
+
+    async def _post(url: str, *a: Any, **kw: Any) -> Any:
+        posts.append((url, dict(kw.get("data") or {})))
+        if url == _OLD_AS + "/token" and reconsent_in_flight:
+            _reconsent_at_the_new_as(holder["state"], storage)
+        return _mk_response(
+            200,
+            {
+                "access_token": "old-as-access-2",
+                "refresh_token": "old-as-refresh-2",
+                "expires_in": 3600,
+            },
+        )
+
+    client = MagicMock(spec=httpx2.AsyncClient)
+    client.is_closed = False
+    client.get = AsyncMock(side_effect=_get)
+    client.post = AsyncMock(side_effect=_post)
+    state = _make_app_state(storage, http_client=client)
+    holder["state"] = state
+    _seed_token(state, expires_in_seconds=-1000, as_issuer=_OLD_AS)
+
+    async def _lookup() -> Any:
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth", force_refresh=True
+            )
+
+    result = run_adapter(_lookup())
+    plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+
+    assert plain is not None
+    if reconsent_in_flight:
+        # The old authorization server's tokens are neither stored nor served.
+        assert result.kind == "refresh_failed_transient"
+        assert (plain["as_issuer"], plain["access_token"], plain["refresh_token"]) == (
+            _NEW_AS,
+            "new-as-access",
+            "new-as-refresh",
+        )
+    else:
+        assert (result.kind, result.token) == ("token", "old-as-access-2")
+        assert plain["refresh_token"] == "old-as-refresh-2"
+    assert [url for url, _ in posts] == [_OLD_AS + "/token"]
+
+
+def test_an_issuer_changed_delete_spares_a_grant_consented_meanwhile(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_server(storage)
+    state = _make_app_state(storage, http_client=MagicMock(spec=httpx2.AsyncClient))
+    _seed_token(state, expires_in_seconds=-1000, as_issuer=_OLD_AS)
+
+    async def _discover(**_kwargs: Any) -> Any:
+        _reconsent_at_the_new_as(state, storage)
+        raise MCPOAuthIssuerChangedError("the server's authorization server has changed")
+
+    async def _lookup() -> Any:
+        return await get_user_access_token_classified(
+            app_state=state, user_id="user-1", server_name="srv-oauth"
+        )
+
+    with patch("turnstone.core.mcp_oauth.discover_authorization_server", side_effect=_discover):
+        result = run_adapter(_lookup())
+
+    assert result.kind == "refresh_failed_transient"
+    plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+    assert plain is not None and plain["as_issuer"] == _NEW_AS
+    revoked = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
+    assert revoked == []
+
+
+def _reconsent_at_the_same_as(state: SimpleNamespace) -> None:
+    """The user consents again while a refresh of their old grant is at the token endpoint."""
+    oauth_context(state).token_store.delete_user_token("user-1", "srv-oauth")
+    oauth_context(state).token_store.create_user_token(
+        "user-1",
+        "srv-oauth",
+        access_token="reconsented-access",
+        refresh_token="reconsented-refresh",
+        expires_at=(datetime.now(UTC) + timedelta(seconds=3600)).strftime("%Y-%m-%dT%H:%M:%S"),
+        scopes="openid profile",
+        as_issuer=_OLD_AS,
+        audience="https://mcp.example.com",
+    )
+
+
+@pytest.mark.parametrize("reconsent_in_flight", [True, False], ids=["race", "control"])
+def test_a_rejected_refresh_spares_a_grant_consented_meanwhile(
+    storage: SQLiteBackend, reconsent_in_flight: bool
+) -> None:
+    """The authorization server rejects the old refresh token, revoked by the new consent."""
+    _seed_server(storage)
+    holder: dict[str, SimpleNamespace] = {}
+
+    async def _get(url: str, *a: Any, **kw: Any) -> Any:
+        return _mk_response(200, _as_doc(_OLD_AS))
+
+    async def _post(url: str, *a: Any, **kw: Any) -> Any:
+        if reconsent_in_flight:
+            _reconsent_at_the_same_as(holder["state"])
+        return _mk_response(400, {"error": "invalid_grant"})
+
+    client = MagicMock(spec=httpx2.AsyncClient)
+    client.is_closed = False
+    client.get = AsyncMock(side_effect=_get)
+    client.post = AsyncMock(side_effect=_post)
+    state = _make_app_state(storage, http_client=client)
+    holder["state"] = state
+    _seed_token(state, expires_in_seconds=-1000, as_issuer=_OLD_AS)
+
+    async def _lookup() -> Any:
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            return await get_user_access_token_classified(
+                app_state=state, user_id="user-1", server_name="srv-oauth", force_refresh=True
+            )
+
+    result = run_adapter(_lookup())
+    plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+    revoked = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
+
+    if reconsent_in_flight:
+        assert result.kind == "refresh_failed_transient"
+        assert plain is not None and plain["access_token"] == "reconsented-access"
+        assert revoked == []
+    else:
+        assert result.kind == "refresh_failed"
+        assert plain is None
+        assert len(revoked) == 1
+
+
+def test_an_expired_grant_without_a_refresh_token_spares_one_consented_meanwhile(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_server(storage)
+    state = _make_app_state(storage, http_client=MagicMock(spec=httpx2.AsyncClient))
+    _seed_token(state, expires_in_seconds=-1000, as_issuer=_OLD_AS, refresh=None)
+    token_store = oauth_context(state).token_store
+    conditional_delete = token_store.delete_user_token_if_unchanged
+
+    def _consent_first(*args: Any, **kwargs: Any) -> bool:
+        _reconsent_at_the_same_as(state)
+        return conditional_delete(*args, **kwargs)
+
+    async def _lookup() -> Any:
+        return await get_user_access_token_classified(
+            app_state=state, user_id="user-1", server_name="srv-oauth"
+        )
+
+    with patch.object(token_store, "delete_user_token_if_unchanged", side_effect=_consent_first):
+        result = run_adapter(_lookup())
+
+    assert result.kind == "refresh_failed_transient"
+    plain = token_store.get_user_token("user-1", "srv-oauth")
+    assert plain is not None and plain["access_token"] == "reconsented-access"
+
+
+def test_an_escalated_refresh_failure_spares_a_grant_consented_meanwhile(
+    storage: SQLiteBackend,
+) -> None:
+    """The streak of ambiguous rejections that escalates to a delete deletes only the grant the
+    refresh read."""
+    _seed_server(storage)
+    state = _make_app_state(storage, http_client=MagicMock(spec=httpx2.AsyncClient))
+    _seed_token(state, expires_in_seconds=-1000, as_issuer=_OLD_AS)
+    token_store = oauth_context(state).token_store
+    read = token_store.get_user_token_and_version("user-1", "srv-oauth")
+    assert read is not None
+    _reconsent_at_the_same_as(state)
+
+    async def _fail() -> Any:
+        return await _handle_refresh_failure(
+            oauth_http.OAuthRefreshError(
+                "rejected", failure_class=oauth_http.RefreshFailureClass.AMBIGUOUS
+            ),
+            app_state=oauth_context(state),
+            user_id="user-1",
+            server_name="srv-oauth",
+            server_id_for_audit="srv-id",
+            token_store=token_store,
+            backoff=_BackoffSnapshot(0.0, _AMBIGUOUS_ESCALATION_THRESHOLD - 1),
+            revoke_on_failure=True,
+            revoke_ambiguous_escalation=True,
+            events=_REFRESH_FAILURE_EVENTS,
+            permanent_reason="refresh_failed",
+            escalation_reason="refresh_failed_ambiguous_escalated",
+            grant=(_OLD_AS, read[1]),
+        )
+
+    outcome = oauth_context(state).runtime.call_sync(_fail)
+
+    assert outcome.result.kind == "refresh_failed_transient"
+    plain = token_store.get_user_token("user-1", "srv-oauth")
+    assert plain is not None and plain["access_token"] == "reconsented-access"

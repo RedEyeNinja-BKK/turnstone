@@ -1,0 +1,21 @@
+# --- Required ---
+
+# VPC and subnet IDs from your existing AWS infrastructure.
+# The VPC must have DNS support and DNS hostnames enabled.
+vpc_id             = "vpc-0123456789abcdef0"
+private_subnet_ids = ["subnet-aaa111", "subnet-bbb222"]
+public_subnet_ids  = ["subnet-ccc333", "subnet-ddd444"]
+
+# LLM API key. Model backends (OpenAI, a self-hosted vLLM, ...) are defined
+# in the console Models tab; a definition that leaves api_key empty falls
+# back to this value.
+openai_api_key = "sk-..."
+
+# --- Optional ---
+
+# aws_region       = "us-east-1"
+# image_repository = "ghcr.io/turnstonelabs/turnstone"
+# image_tag        = "0.3.0"
+# environment      = "production"
+# name_prefix      = "turnstone"
+# auth_token       = "my-secret-token"

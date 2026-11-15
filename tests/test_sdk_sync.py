@@ -1,0 +1,295 @@
+"""Tests for synchronous SDK wrappers (TurnstoneServer, TurnstoneConsole)."""
+
+from __future__ import annotations
+
+import json
+
+import httpx2
+
+from turnstone.sdk._sync import _SyncRunner
+from turnstone.sdk.console import AsyncTurnstoneConsole, TurnstoneConsole
+from turnstone.sdk.server import AsyncTurnstoneServer, TurnstoneServer
+
+
+def _json_response(data: dict, status: int = 200) -> httpx2.Response:
+    return httpx2.Response(status, json=data)
+
+
+# ---------------------------------------------------------------------------
+# _SyncRunner
+# ---------------------------------------------------------------------------
+
+
+def test_sync_runner_basic():
+    """_SyncRunner can execute a simple async coroutine."""
+    runner = _SyncRunner()
+    try:
+        import asyncio
+
+        async def _add(a: int, b: int) -> int:
+            await asyncio.sleep(0)
+            return a + b
+
+        result = runner.run(_add(1, 2))
+        assert result == 3
+    finally:
+        runner.close()
+
+
+def test_sync_runner_iter():
+    """_SyncRunner.run_iter iterates over an async generator."""
+    runner = _SyncRunner()
+    try:
+
+        async def _gen():
+            for i in range(3):
+                yield i
+
+        items = list(runner.run_iter(_gen()))
+        assert items == [0, 1, 2]
+    finally:
+        runner.close()
+
+
+def test_sync_runner_iter_empty():
+    """_SyncRunner.run_iter handles empty async generator via sentinel."""
+    runner = _SyncRunner()
+    try:
+
+        async def _empty():
+            return
+            yield  # pragma: no cover  # makes this an async generator
+
+        items = list(runner.run_iter(_empty()))
+        assert items == []
+    finally:
+        runner.close()
+
+
+# ---------------------------------------------------------------------------
+# TurnstoneServer (sync)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_server_list_workstreams():
+    """Sync server client delegates to async and returns correct model."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return _json_response({"workstreams": [{"ws_id": "ws1", "name": "test", "state": "idle"}]})
+
+    # We need to create the async client with a mock transport,
+    # then wrap it in the sync client
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
+    async_client = AsyncTurnstoneServer(httpx_client=hc)
+
+    server = TurnstoneServer.__new__(TurnstoneServer)
+    server._runner = _SyncRunner()
+    server._async = async_client
+
+    try:
+        resp = server.list_workstreams()
+        assert len(resp.workstreams) == 1
+        # Row key renamed id → ws_id in the Stage 2 list-verb lift.
+        assert resp.workstreams[0].ws_id == "ws1"
+    finally:
+        server.close()
+
+
+def test_sync_server_save_memory_preserves_omission_and_explicit_type():
+    bodies: list[dict[str, object]] = []
+    current_type = "feedback"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal current_type
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "type" in body:
+            current_type = str(body["type"])
+        return _json_response(
+            {
+                "memory_id": f"m{len(bodies)}",
+                "name": body["name"],
+                "description": body["description"],
+                "type": current_type,
+                "scope": body["scope"],
+                "scope_id": "",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
+    async_client = AsyncTurnstoneServer(httpx_client=hc)
+    server = TurnstoneServer.__new__(TurnstoneServer)
+    server._runner = _SyncRunner()
+    server._async = async_client
+
+    try:
+        defaulted = server.save_memory("key", "v2", description="Updated body")
+        explicit = server.save_memory(
+            "key",
+            "v3",
+            description="Reclassified body",
+            mem_type="general",
+        )
+        assert defaulted.type == "feedback"
+        assert explicit.type == "general"
+        assert "type" not in bodies[0]
+        assert bodies[1]["type"] == "general"
+    finally:
+        server.close()
+
+
+def test_sync_server_get_history():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.params["limit"] == "25"
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "messages": [],
+                "cursor": None,
+                "handoff_token": "epoch.1",
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
+    async_client = AsyncTurnstoneServer(httpx_client=hc)
+    server = TurnstoneServer.__new__(TurnstoneServer)
+    server._runner = _SyncRunner()
+    server._async = async_client
+
+    try:
+        history = server.get_history("ws1", limit=25)
+        assert history.handoff_token == "epoch.1"
+    finally:
+        server.close()
+
+
+def test_sync_server_context_manager():
+    """TurnstoneServer can be used as a context manager."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return _json_response(
+            {"status": "ok", "version": "0.3.0", "uptime_seconds": 1.0, "model": "gpt-5"}
+        )
+
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
+    async_client = AsyncTurnstoneServer(httpx_client=hc)
+
+    server = TurnstoneServer.__new__(TurnstoneServer)
+    server._runner = _SyncRunner()
+    server._async = async_client
+
+    with server as s:
+        resp = s.health()
+        assert resp.status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# TurnstoneConsole (sync)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_console_overview():
+    """Sync console client delegates to async and returns correct model."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return _json_response(
+            {
+                "nodes": 1,
+                "workstreams": 3,
+                "states": {"idle": 3},
+                "aggregate": {"total_tokens": 100, "total_tool_calls": 0},
+                "version_drift": False,
+                "versions": ["0.3.0"],
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
+    async_client = AsyncTurnstoneConsole(httpx_client=hc)
+
+    console = TurnstoneConsole.__new__(TurnstoneConsole)
+    console._runner = _SyncRunner()
+    console._async = async_client
+
+    try:
+        resp = console.overview()
+        assert resp.nodes == 1
+        assert resp.workstreams == 3
+    finally:
+        console.close()
+
+
+def test_sync_console_sends_mcp_booleans_as_given_and_leaves_out_defaults():
+    """A value other than the default goes as the caller passed it, so the console refuses the
+    string "false" instead of the SDK sending true, and None, sent as null, too; a default is left
+    out."""
+    url = "https://kvm.example.com/mcp"
+    bodies: list[dict] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/test"):
+            return _json_response({"ok": True, "tools": [], "resources": 0, "prompts": 0})
+        return _json_response(
+            {
+                "server_id": "s1",
+                "name": "kvm",
+                "transport": "streamable-http",
+                "created": "2026-10-25T00:00:00",
+                "updated": "2026-10-25T00:00:00",
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
+    console = TurnstoneConsole.__new__(TurnstoneConsole)
+    console._runner = _SyncRunner()
+    console._async = AsyncTurnstoneConsole(httpx_client=hc)
+
+    try:
+        console.create_mcp_server("kvm", "streamable-http", url=url, tls_skip_verify=True)
+        console.create_mcp_server("plain", "streamable-http", url=url)
+        console.create_mcp_server(
+            "off", "streamable-http", url=url, auto_approve=True, enabled=False
+        )
+        console.create_mcp_server(
+            "typo",
+            "streamable-http",
+            url=url,
+            auto_approve="false",  # type: ignore[arg-type]
+            enabled="false",  # type: ignore[arg-type]
+            tls_skip_verify="false",  # type: ignore[arg-type]
+        )
+        console.create_mcp_server(
+            "unset",
+            "streamable-http",
+            url=url,
+            enabled=None,  # type: ignore[arg-type]
+        )
+        console.test_mcp_server(url, tls_skip_verify=True)
+        console.test_mcp_server(url, tls_skip_verify="0")  # type: ignore[arg-type]
+    finally:
+        console.close()
+
+    common = {"transport": "streamable-http", "url": url}
+    assert bodies == [
+        {"name": "kvm", **common, "tls_skip_verify": True},
+        {"name": "plain", **common},
+        {"name": "off", **common, "auto_approve": True, "enabled": False},
+        {
+            "name": "typo",
+            **common,
+            "auto_approve": "false",
+            "enabled": "false",
+            "tls_skip_verify": "false",
+        },
+        {"name": "unset", **common, "enabled": None},
+        {"url": url, "auth_type": "static", "tls_skip_verify": True},
+        {"url": url, "auth_type": "static", "tls_skip_verify": "0"},
+    ]

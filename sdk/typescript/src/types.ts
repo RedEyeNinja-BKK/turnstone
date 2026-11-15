@@ -1,0 +1,1286 @@
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
+/** Sanitized operator-visible state of accepted conversation persistence. */
+export type ConversationPersistenceState =
+  | "healthy"
+  | "pending"
+  | "retrying"
+  | "conflict";
+
+export interface ErrorResponse {
+  error: string;
+}
+
+export interface StatusResponse {
+  status: string;
+}
+
+export interface DeleteSettingResponse {
+  status: string;
+  key: string;
+  default: unknown;
+}
+
+export interface AuthLoginRequest {
+  token: string;
+}
+
+/** How a page draws a person: one initial on a palette colour, or a picture. */
+export interface UserAvatar {
+  /** Palette index, 0-5. */
+  color: number;
+  /** The letter to draw; empty when the name has no letter or digit. */
+  initial: string;
+  /** Version of the uploaded picture, or null for none. */
+  picture: string | null;
+}
+
+export interface AuthLoginResponse {
+  can_refresh?: boolean;
+  status: string;
+  role: string;
+  scopes?: string;
+  jwt?: string;
+  user_id?: string;
+  /** Login name (user accounts). */
+  username?: string;
+  /** Display name, else the login name (user accounts). */
+  display_name?: string;
+  avatar?: UserAvatar;
+}
+
+export interface AuthStatusResponse {
+  auth_enabled: boolean;
+  has_users: boolean;
+  setup_required: boolean;
+}
+
+export interface AuthSetupResponse {
+  can_refresh?: boolean;
+  status: string;
+  user_id: string;
+  username: string;
+  display_name?: string;
+  avatar?: UserAvatar;
+  role: string;
+  scopes: string;
+  jwt?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Server API — Workstream management
+// ---------------------------------------------------------------------------
+
+export interface SendRequest {
+  message: string;
+  ws_id: string;
+  /**
+   * Explicit list of pending attachment ids to inject into this turn.
+   * When omitted, any pending attachments for the caller on the
+   * workstream are auto-consumed; an empty list disables auto-consume.
+   */
+  attachment_ids?: string[];
+  /**
+   * Opaque optimistic-send correlation echoed by user_turn/history.
+   * Reusing it does not collapse or deduplicate accepted turns.
+   */
+  client_send_id?: string;
+}
+
+export interface SendResponse {
+  /** "ok" | "busy" | "queued" | "queue_full". */
+  status: string;
+  /**
+   * Attachment ids actually reserved onto this turn. Subset of the
+   * request's `attachment_ids` (or the auto-consumed pending set).
+   */
+  attached_ids?: string[];
+  /**
+   * Attachment ids the caller requested that the server could not
+   * reserve (lost a race, already consumed, or cross-scope). The
+   * request still proceeds with whatever was reserved.
+   */
+  dropped_attachment_ids?: string[];
+  /** Set on "queued" responses: relative priority of the queued message. */
+  priority?: string | null;
+  /** Set on "queued" responses: id used to dequeue the message. */
+  msg_id?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Server API — Attachments
+// ---------------------------------------------------------------------------
+
+/** A file to upload as an attachment. */
+export interface AttachmentUpload {
+  filename: string;
+  /** Raw file bytes; use a `Blob` in browsers and a `Uint8Array` in Node. */
+  data: Blob | Uint8Array;
+  /** Optional advisory MIME type; the server applies its own validation. */
+  mimeType?: string;
+}
+
+export interface AttachmentInfo {
+  attachment_id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  kind: "image" | "text" | "pdf" | "audio";
+}
+
+export type UploadAttachmentResponse = AttachmentInfo;
+
+export interface ListAttachmentsResponse {
+  attachments: AttachmentInfo[];
+}
+
+/** Raw bytes returned from the attachment `/content` endpoint. */
+export interface AttachmentContent {
+  bytes: Uint8Array;
+  contentType: string;
+  filename: string;
+}
+
+export interface ApproveRequest {
+  approved: boolean;
+  feedback?: string | null;
+  always?: boolean;
+  /** Resolve exactly this approval cycle. */
+  cycle_id?: string | null;
+  /** Resolve the approval cycle containing this tool call. */
+  call_id?: string | null;
+}
+
+export interface ApproveResponse {
+  status: string;
+  /** The cycle resolved by the request, or null when none was pending. */
+  cycle_id: string | null;
+}
+
+export interface CancelRequest {
+  force?: boolean;
+}
+
+export interface CancelResponse {
+  status: string;
+  /** Credential-redacted snapshot of pending work affected by cancellation. */
+  dropped: Record<string, unknown>;
+}
+
+export interface CommandRequest {
+  command: string;
+  ws_id: string;
+}
+
+export interface CreateWorkstreamRequest {
+  name?: string;
+  model?: string;
+  auto_approve?: boolean;
+  /** Tool names accepted as a CSV string or array; blanks are removed server-side. */
+  auto_approve_tools?: string | string[];
+  /**
+   * Override judge model alias for this workstream; the output guard's LLM
+   * stage runs on it too unless judge.output_guard_model is set.
+   */
+  judge_model?: string;
+  /**
+   * Owner override for trusted service identities. Ordinary callers remain
+   * bound to their authenticated principal.
+   */
+  user_id?: string;
+  resume_ws?: string;
+  /** Require an exact source ID; disable alias and prefix resolution. */
+  resume_ws_exact?: boolean;
+  /** Durable execution requirement. Omission inherits the fork source requirement. */
+  required_node_id?: string | null;
+  /** Completion-notification targets as JSON text or structured target objects. */
+  notify_targets?: string | Array<Record<string, string>>;
+  /** Client surface label such as web, cli, chat, or scheduled. */
+  client_type?: string;
+  skill?: string;
+  /**
+   * Persona name (slug) to create the workstream with. Resolved and
+   * snapshotted at creation — later persona edits never affect this
+   * workstream. Empty selects the kind's default persona.
+   */
+  persona?: string;
+  /**
+   * Optional project to attach this workstream to. Drives the shared
+   * `project` memory scope; coordinator children inherit the parent's project.
+   */
+  project_id?: string;
+  /** First user message dispatched in a background worker after creation. */
+  initial_message?: string;
+  /**
+   * Caller-supplied workstream id (32-hex). Auto-generated when omitted.
+   * Required for cluster-routed multipart creates so the console can
+   * hash to the owning node before the body lands.
+   */
+  ws_id?: string;
+  /**
+   * Files to attach to the first turn. When non-empty the request is
+   * sent as multipart/form-data and (with `initial_message`) reserved
+   * onto that turn before the worker dispatches.
+   */
+  attachments?: AttachmentUpload[];
+}
+
+export interface CreateWorkstreamResponse {
+  ws_id: string;
+  name: string;
+  resumed?: boolean;
+  message_count?: number;
+  /** Ids of attachments saved by this request (multipart variant only). */
+  attachment_ids?: string[];
+  /**
+   * Present ONLY when the workstream was created but its initial_message
+   * could not be delivered: "queue_full" (raced live worker's interjection
+   * queue at capacity — resend via /send; uploads stay staged) or
+   * "refused_closed" (workstream closed mid-create).
+   */
+  initial_message_status?: "queue_full" | "refused_closed";
+}
+
+export interface CloseWorkstreamRequest {
+  /**
+   * Optional close reason persisted to `workstream_config` for
+   * postmortem. Capped at 512 UTF-8 bytes server-side; credential
+   * redaction is applied via the output guard.
+   */
+  reason?: string;
+}
+
+export interface WorkstreamInfo {
+  // Renamed `id` → `ws_id` and added kind/parent_ws_id/user_id in
+  // the Stage 2 list-verb lift. Pre-1.5 readers branching on
+  // `row.id` should swap to `row.ws_id`.
+  ws_id: string;
+  name: string;
+  state: string;
+  kind: string;
+  parent_ws_id: string | null;
+  user_id: string;
+  project_id: string | null;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
+}
+
+export interface ListWorkstreamsResponse {
+  workstreams: WorkstreamInfo[];
+}
+
+export interface WorkstreamDetailResponse {
+  // Lifted from coord-only into a shared verb in the Stage 2
+  // history/detail verb lift. Both kinds populate every field; SDK
+  // consumers don't branch on kind.
+  ws_id: string;
+  name: string;
+  state: string;
+  user_id: string;
+  kind: string;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
+}
+
+export interface WorkstreamHistoryResponse {
+  ws_id: string;
+  /**
+   * Requested limit-bounded tail of the authoritative total accepted
+   * conversation-row prefix.
+   * Roles include user, assistant, tool, and system; projected compaction and
+   * cancellation markers participate in the same prefix.
+   */
+  messages: Record<string, unknown>[];
+  /** Initial event-ring cursor returned by the history projection, if needed. */
+  cursor: number | null;
+  /**
+   * Opaque one-shot token naming the exact live prefix used for this render.
+   * Null for a workstream that is not currently loaded.
+   */
+  handoff_token: string | null;
+}
+
+export interface StreamEventsOptions {
+  /** Initial event-ring cursor, normally copied from `getHistory()`. */
+  lastEventId?: number;
+  /** One-shot live-prefix token, copied only from the history just rendered. */
+  historyToken?: string;
+}
+
+export interface DashboardWorkstream {
+  ws_id: string;
+  name: string;
+  state: string;
+  project_id: string | null;
+  title?: string;
+  tokens?: number;
+  context_ratio?: number;
+  activity?: string;
+  activity_state?: string;
+  tool_calls?: number;
+  node?: string;
+  model?: string;
+  model_alias?: string;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
+}
+
+export interface DashboardAggregate {
+  total_tokens: number;
+  total_tool_calls: number;
+  active_count: number;
+  total_count: number;
+  uptime_seconds?: number;
+  node?: string;
+}
+
+export interface DashboardResponse {
+  workstreams: DashboardWorkstream[];
+  aggregate: DashboardAggregate;
+}
+
+// ---------------------------------------------------------------------------
+// Server API — Saved workstreams
+// ---------------------------------------------------------------------------
+
+export interface SavedWorkstreamInfo {
+  ws_id: string;
+  alias?: string | null;
+  title?: string | null;
+  name?: string;
+  created: string;
+  updated: string;
+  message_count: number;
+  // Enriched fields — all optional (defaulted server-side, so an older
+  // server may omit them).
+  state?: string;
+  kind?: string;
+  node_id?: string;
+  model_alias?: string | null;
+  launch_skill?: string | null;
+  child_count?: number;
+  context_tokens?: number;
+  context_ratio?: number;
+  project_id?: string | null;
+  /** Persona slug the workstream was created with (empty/absent = pre-persona). */
+  persona?: string | null;
+}
+
+/** One page of saved workstreams; `total` counts every matching row. A server
+ *  older than paging sends only `workstreams`. */
+export interface ListSavedWorkstreamsResponse {
+  workstreams: SavedWorkstreamInfo[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+}
+
+/** Page, search and sort for `listSavedWorkstreams`; omitted fields take the
+ *  server defaults (its page size, newest first). `limit: 0` returns only
+ *  `total`. */
+export interface ListSavedWorkstreamsOptions {
+  limit?: number;
+  offset?: number;
+  /** Case-insensitive substring of the alias, title, name, project name or ws_id. */
+  search?: string;
+  sort?:
+    | "updated"
+    | "name"
+    | "kind"
+    | "persona"
+    | "project"
+    | "model"
+    | "message_count"
+    | "child_count"
+    | "context_ratio"
+    | "ws_id";
+  order?: "asc" | "desc";
+}
+
+// ---------------------------------------------------------------------------
+// Server API — Skills
+// ---------------------------------------------------------------------------
+
+export interface SkillSummary {
+  name: string;
+  category: string;
+  description: string;
+  tags: string[];
+  origin: string;
+  author: string;
+  version: string;
+}
+
+export interface SkillInfo {
+  template_id: string;
+  name: string;
+  category: string;
+  content: string;
+  description: string;
+  tags: string[];
+  variables: string;
+  org_id: string;
+  created_by: string;
+  origin: string;
+  mcp_server: string;
+  readonly: boolean;
+  source_url: string;
+  version: string;
+  author: string;
+  token_estimate: number;
+  auto_approve: boolean;
+  notify_on_complete: string;
+  enabled: boolean;
+  priority: number;
+  allowed_tools: string;
+  license: string;
+  compatibility: string;
+  resource_count: number;
+  created: string;
+  updated: string;
+}
+
+export interface CreateSkillRequest {
+  name: string;
+  content: string;
+  category?: string;
+  description?: string;
+  tags?: string;
+  variables?: string;
+  org_id?: string;
+  author?: string;
+  version?: string;
+  auto_approve?: boolean;
+  notify_on_complete?: string;
+  enabled?: boolean;
+  priority?: number;
+  allowed_tools?: string;
+  license?: string;
+  compatibility?: string;
+}
+
+export interface UpdateSkillRequest {
+  name?: string;
+  content?: string;
+  category?: string;
+  description?: string;
+  tags?: string;
+  variables?: string;
+  author?: string;
+  version?: string;
+  auto_approve?: boolean;
+  notify_on_complete?: string;
+  enabled?: boolean;
+  priority?: number;
+  allowed_tools?: string;
+  license?: string;
+  compatibility?: string;
+}
+
+export interface ListSkillsResponse {
+  skills: SkillInfo[];
+}
+
+export interface SkillResourceInfo {
+  resource_id: string;
+  skill_id: string;
+  path: string;
+  content?: string;
+  content_type: string;
+  size: number;
+  created: string;
+}
+
+export interface ListSkillResourcesResponse {
+  resources: SkillResourceInfo[];
+}
+
+export interface CreateSkillResourceRequest {
+  path: string;
+  content: string;
+  content_type?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Server API — Health
+// ---------------------------------------------------------------------------
+
+export interface BackendStatus {
+  status: string;
+}
+
+export interface WorkstreamCounts {
+  total: number;
+  idle?: number;
+  thinking?: number;
+  running?: number;
+  attention?: number;
+  evaluation?: number;
+  error?: number;
+}
+
+export interface McpStatus {
+  servers: number;
+  resources: number;
+  prompts: number;
+}
+
+export interface HealthResponse {
+  status: string;
+  version?: string;
+  uptime_seconds?: number;
+  model?: string;
+  workstreams?: WorkstreamCounts;
+  backend?: BackendStatus | null;
+  mcp?: McpStatus | null;
+}
+
+// ---------------------------------------------------------------------------
+// Console API
+// ---------------------------------------------------------------------------
+
+export interface StateCounts {
+  running?: number;
+  thinking?: number;
+  attention?: number;
+  evaluation?: number;
+  idle?: number;
+  error?: number;
+}
+
+export interface ClusterAggregate {
+  total_tokens: number;
+  total_tool_calls: number;
+}
+
+export interface ClusterOverviewResponse {
+  nodes: number;
+  workstreams: number;
+  states: StateCounts;
+  aggregate: ClusterAggregate;
+  version_drift: boolean;
+  versions: string[];
+}
+
+export interface ClusterNodeInfo {
+  node_id: string;
+  server_url: string;
+  ws_total: number;
+  ws_running: number;
+  ws_thinking: number;
+  ws_attention: number;
+  ws_evaluation: number;
+  ws_idle: number;
+  ws_error: number;
+  total_tokens: number;
+  started: number;
+  reachable: boolean;
+  health: Record<string, string>;
+  version: string;
+}
+
+export interface ClusterNodesResponse {
+  nodes: ClusterNodeInfo[];
+  total: number;
+}
+
+export interface ClusterWorkstreamInfo {
+  id: string;
+  name: string;
+  state: string;
+  node: string;
+  title?: string;
+  tokens?: number;
+  context_ratio?: number;
+  activity?: string;
+  activity_state?: string;
+  tool_calls?: number;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
+}
+
+export interface ClusterWorkstreamsResponse {
+  workstreams: ClusterWorkstreamInfo[];
+  total: number;
+  page: number;
+  per_page: number;
+  pages: number;
+}
+
+export interface NodeDetailResponse {
+  node_id: string;
+  server_url: string;
+  health: Record<string, string>;
+  workstreams: ClusterWorkstreamInfo[];
+  aggregate: ClusterAggregate;
+}
+
+export interface ClusterSnapshotNode {
+  node_id: string;
+  server_url: string;
+  max_ws: number;
+  reachable: boolean;
+  version: string;
+  health: Record<string, string>;
+  aggregate: Record<string, number>;
+  workstreams: ClusterWorkstreamInfo[];
+}
+
+export interface ClusterSnapshotResponse {
+  nodes: ClusterSnapshotNode[];
+  overview: ClusterOverviewResponse;
+  timestamp: number;
+}
+
+export interface ConsoleCreateWsRequest {
+  /** Specific IDs require that node; auto/pool choose initial placement only. */
+  node_id?: string;
+  name?: string;
+  model?: string;
+  initial_message?: string;
+  skill?: string;
+  /** Persona slug — resolved and snapshotted at creation. */
+  persona?: string;
+  /** Project to attach the workstream to. */
+  project_id?: string;
+  resume_ws?: string;
+  resume_ws_exact?: boolean;
+  required_node_id?: string | null;
+  /**
+   * Override judge model alias for this workstream; the output guard's LLM
+   * stage runs on it too unless judge.output_guard_model is set.
+   */
+  judge_model?: string;
+}
+
+export interface ConsoleCreateWsResponse {
+  status: string;
+  correlation_id: string;
+  target_node: string;
+}
+
+export interface RouteCreateRequest extends CreateWorkstreamRequest {
+  /** Require execution on this node, including when forking saved history. */
+  target_node?: string;
+}
+
+export interface RouteCreateResponse extends CreateWorkstreamResponse {
+  node_url: string;
+  node_id: string;
+  routing_strategy: "rendezvous" | "target_node" | "resume";
+}
+
+export interface RouteLiveResponse {
+  ws_id: string;
+  live: boolean;
+}
+
+export interface ConsoleHealthResponse {
+  status: string;
+  service: string;
+  nodes: number;
+  workstreams: number;
+  version_drift: boolean;
+  versions: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Schedules
+// ---------------------------------------------------------------------------
+
+export interface CreateScheduleRequest {
+  name: string;
+  schedule_type: string;
+  initial_message: string;
+  description?: string;
+  cron_expr?: string;
+  at_time?: string;
+  /** IANA zone the cron is evaluated in (e.g. America/New_York); default UTC. */
+  timezone?: string;
+  target_mode?: string;
+  model?: string;
+  auto_approve?: boolean;
+  auto_approve_tools?: string[];
+  enabled?: boolean;
+}
+
+export interface UpdateScheduleRequest {
+  name?: string;
+  description?: string;
+  schedule_type?: string;
+  cron_expr?: string;
+  at_time?: string;
+  timezone?: string;
+  target_mode?: string;
+  model?: string;
+  initial_message?: string;
+  auto_approve?: boolean;
+  auto_approve_tools?: string[];
+  enabled?: boolean;
+}
+
+export interface ScheduleInfo {
+  task_id: string;
+  name: string;
+  description: string;
+  schedule_type: string;
+  cron_expr: string;
+  at_time: string;
+  timezone: string;
+  target_mode: string;
+  model: string;
+  initial_message: string;
+  auto_approve: boolean;
+  auto_approve_tools: string[];
+  enabled: boolean;
+  created_by: string;
+  last_run: string | null;
+  next_run: string | null;
+  created: string;
+  updated: string;
+}
+
+export interface ListSchedulesResponse {
+  schedules: ScheduleInfo[];
+}
+
+export interface ScheduleRunInfo {
+  run_id: string;
+  task_id: string;
+  node_id: string;
+  ws_id: string;
+  correlation_id: string;
+  started: string;
+  status: string;
+  error: string;
+}
+
+export interface ListScheduleRunsResponse {
+  runs: ScheduleRunInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Roles
+// ---------------------------------------------------------------------------
+
+export interface RoleInfo {
+  role_id: string;
+  name: string;
+  display_name: string;
+  permissions: string;
+  builtin: boolean;
+  org_id: string;
+  created: string;
+  updated: string;
+}
+
+export interface CreateRoleOptions {
+  name: string;
+  display_name?: string;
+  permissions?: string;
+}
+
+export interface UpdateRoleOptions {
+  display_name?: string;
+  permissions?: string;
+}
+
+export interface UserRoleInfo extends RoleInfo {
+  assigned_by: string;
+  assignment_created: string;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Orgs
+// ---------------------------------------------------------------------------
+
+export interface OrgInfo {
+  org_id: string;
+  name: string;
+  display_name: string;
+  settings: string;
+  created: string;
+  updated: string;
+}
+
+export interface UpdateOrgOptions {
+  display_name?: string;
+  settings?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Tool Policies
+// ---------------------------------------------------------------------------
+
+export interface ToolPolicyInfo {
+  policy_id: string;
+  name: string;
+  tool_pattern: string;
+  action: string;
+  priority: number;
+  org_id: string;
+  enabled: boolean;
+  created_by: string;
+  created: string;
+  updated: string;
+}
+
+export interface CreatePolicyOptions {
+  name: string;
+  tool_pattern: string;
+  action: string;
+  priority?: number;
+  org_id?: string;
+  enabled?: boolean;
+}
+
+export interface UpdatePolicyOptions {
+  name?: string;
+  tool_pattern?: string;
+  action?: string;
+  priority?: number;
+  enabled?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Usage & Audit
+// ---------------------------------------------------------------------------
+
+export interface UsageBreakdownItem {
+  key?: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  tool_calls_count: number;
+}
+
+export interface UsageResponse {
+  summary: UsageBreakdownItem[];
+  breakdown: UsageBreakdownItem[];
+}
+
+export interface UsageQueryOptions {
+  since: string;
+  until?: string;
+  user_id?: string;
+  model?: string;
+  group_by?: string;
+}
+
+export interface AuditEventInfo {
+  event_id: string;
+  timestamp: string;
+  user_id: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  detail: string;
+  ip_address: string;
+  created: string;
+}
+
+export interface AuditQueryOptions {
+  action?: string;
+  user_id?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AuditResponse {
+  events: AuditEventInfo[];
+  total: number;
+}
+
+// ---------------------------------------------------------------------------
+// SDK-specific types
+// ---------------------------------------------------------------------------
+
+export interface TurnResult {
+  wsId: string;
+  contentParts: string[];
+  reasoningParts: string[];
+  toolResults: Array<{ name: string; output: string }>;
+  errors: string[];
+  timedOut: boolean;
+  content: string;
+  reasoning: string;
+  ok: boolean;
+}
+
+export interface SendAndWaitOptions {
+  /** Timeout in milliseconds (default: 600000 = 10 minutes). */
+  timeout?: number;
+  onEvent?: (event: import("./events.js").ServerEvent) => void;
+}
+
+export interface NodesOptions {
+  sort?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface WorkstreamsOptions {
+  state?: string;
+  node?: string;
+  search?: string;
+  sort?: string;
+  page?: number;
+  per_page?: number;
+}
+
+// -- Server API: Memories ---------------------------------------------------
+
+export interface SaveMemoryRequest {
+  name: string;
+  content: string;
+  description: string;
+  type?: "user" | "general" | "feedback" | "reference";
+  scope?: "global" | "workstream" | "user";
+  scope_id?: string;
+}
+
+export interface MemorySummary {
+  memory_id: string;
+  name: string;
+  description: string;
+  type: string;
+  scope: string;
+  scope_id: string;
+  created: string;
+  updated: string;
+  last_accessed: string;
+  access_count: number;
+}
+
+export interface MemoryInfo extends MemorySummary {
+  content: string;
+}
+
+export interface ListMemoriesResponse {
+  memories: MemorySummary[];
+  total: number;
+}
+
+export interface SearchMemoriesRequest {
+  query: string;
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface ListMemoriesOptions {
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface MemoryScopeOptions {
+  scope?: string;
+  scope_id?: string;
+}
+
+export type GetMemoryOptions = MemoryScopeOptions;
+export type DeleteMemoryOptions = MemoryScopeOptions;
+
+// -- Console API: Admin Memories --------------------------------------------
+
+export interface AdminMemorySummary {
+  memory_id: string;
+  name: string;
+  description: string;
+  type: string;
+  scope: string;
+  scope_id: string;
+  scope_label: string;
+  created: string;
+  updated: string;
+  last_accessed: string;
+  access_count: number;
+}
+
+export interface AdminMemoryInfo extends AdminMemorySummary {
+  content: string;
+}
+
+export interface ListAdminMemoriesResponse {
+  memories: AdminMemorySummary[];
+  total: number;
+}
+
+export interface AdminListMemoriesOptions {
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface AdminSearchMemoriesOptions {
+  q: string;
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface MemoryIndexHealthResponse {
+  budget_chars: number;
+  over_budget: boolean;
+  max_char_count: number;
+  max_entry_count: number;
+  over_by_chars: number;
+  invalid_description_count: number;
+  envelope_count: number;
+}
+
+// -- Console API: MCP Servers -----------------------------------------------
+
+/** A tool a server lists that its catalog leaves out: its input schema is not valid JSON Schema. */
+export interface McpSkippedTool {
+  name: string;
+  /** The field of the input schema that is wrong, and what is wrong with it. */
+  reason: string;
+}
+
+export interface McpServerStatus {
+  connected: boolean;
+  tools: number;
+  /** Absent from read-scoped status reads, as the error text is. */
+  skipped_tools?: McpSkippedTool[];
+  resources: number;
+  prompts: number;
+  error: string;
+  /** Present on status reads; absent from the refresh and reconnect results. */
+  has_error?: boolean;
+}
+
+export interface McpServerDetail {
+  server_id: string;
+  name: string;
+  transport: string;
+  command: string;
+  args: string;
+  url: string;
+  headers: string;
+  env: string;
+  auto_approve: boolean;
+  enabled: boolean;
+  /** Accepts any certificate the server presents (Streamable HTTP only). */
+  tls_skip_verify: boolean;
+  created_by: string;
+  registry_name: string | null;
+  registry_version: string;
+  registry_meta: string;
+  created: string;
+  updated: string;
+  status: Record<string, McpServerStatus>;
+}
+
+export interface ListMcpServersResponse {
+  servers: McpServerDetail[];
+}
+
+export interface CreateMcpServerRequest {
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  auto_approve?: boolean;
+  enabled?: boolean;
+  /** Streamable HTTP with auth "none" or "static" only: accept any certificate. */
+  tls_skip_verify?: boolean;
+}
+
+export interface UpdateMcpServerRequest {
+  name?: string;
+  transport?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  auto_approve?: boolean;
+  enabled?: boolean;
+  /** Streamable HTTP with auth "none" or "static" only: accept any certificate. */
+  tls_skip_verify?: boolean;
+}
+
+export interface ImportMcpConfigResponse {
+  imported: string[];
+  skipped: string[];
+  errors: string[];
+}
+
+/** Unsaved values for a connection test: Streamable HTTP, auth "none" or "static". */
+export interface McpConnectionTestRequest {
+  url: string;
+  headers?: Record<string, string>;
+  auth_type?: string;
+  transport?: string;
+  /** Labels the server in error messages; the URL's host stands in when empty. */
+  name?: string;
+  /** Accept any certificate the server presents, as a saved server with it does. */
+  tls_skip_verify?: boolean;
+}
+
+export interface McpConnectionTestResponse {
+  ok: boolean;
+  /** The names of the tools a save would publish, and how many resources and prompts it lists. */
+  tools: string[];
+  /** The tools a save would leave out. */
+  skipped_tools: McpSkippedTool[];
+  resources: number;
+  prompts: number;
+  error: string | null;
+  kind:
+    | "unreachable"
+    | "tls"
+    | "http"
+    | "timeout"
+    | "not_mcp"
+    | "protocol"
+    | "invalid_catalog"
+    | "error"
+    | null;
+  /** The HTTP status the server answered with, for kind "http". */
+  status: number | null;
+}
+
+// -- Console API: MCP Registry ----------------------------------------------
+
+export interface RegistryRemoteInfo {
+  type: string;
+  url: string;
+  headers: Record<string, unknown>[];
+  variables: Record<string, Record<string, unknown>>;
+}
+
+export interface RegistryPackageInfo {
+  registry_type: string;
+  identifier: string;
+  version: string;
+  transport_type: string;
+  environment_variables: Record<string, unknown>[];
+}
+
+export interface RegistryServerInfo {
+  name: string;
+  description: string;
+  title: string;
+  version: string;
+  website_url: string;
+  repository: Record<string, string>;
+  icons: Record<string, string>[];
+  remotes: RegistryRemoteInfo[];
+  packages: RegistryPackageInfo[];
+  meta: Record<string, unknown>;
+  installed: boolean;
+  installed_server_id: string;
+  installed_version: string;
+  update_available: boolean;
+}
+
+export interface RegistrySearchResponse {
+  servers: RegistryServerInfo[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface RegistryInstallRequest {
+  registry_name: string;
+  source: string;
+  index?: number;
+  name?: string;
+  variables?: Record<string, string>;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
+// -- Console API: Skill Discovery -------------------------------------------
+
+export interface SkillDiscoverListing {
+  id: string;
+  name: string;
+  description: string;
+  author: string;
+  source: string;
+  source_url: string;
+  install_count: number;
+  tags: string[];
+  installed: boolean;
+  risk_level?: string;
+  template_id?: string;
+}
+
+export interface SkillDiscoverResponse {
+  skills: SkillDiscoverListing[];
+}
+
+export interface SkillInstallRequest {
+  source: string;
+  skill_id?: string;
+  url?: string;
+}
+
+export interface SkillInstallSkipped {
+  name: string;
+  reason: string;
+}
+
+export interface SkillInstallResponse {
+  installed: SkillInfo[];
+  skipped: SkillInstallSkipped[];
+  total: number;
+}
+
+// -- Console API: System Settings -------------------------------------------
+
+export interface SettingInfo {
+  key: string;
+  value: unknown;
+  source: string;
+  type: string;
+  description: string;
+  section: string;
+  is_secret: boolean;
+  node_id: string;
+  changed_by: string;
+  updated: string;
+  restart_required: boolean;
+}
+
+export interface ListSettingsResponse {
+  settings: SettingInfo[];
+}
+
+export interface SettingSchemaInfo {
+  key: string;
+  type: string;
+  default: unknown;
+  description: string;
+  section: string;
+  is_secret: boolean;
+  min_value: number | null;
+  max_value: number | null;
+  choices: string[] | null;
+  restart_required: boolean;
+}
+
+export interface ListSettingSchemaResponse {
+  schema: SettingSchemaInfo[];
+}
+
+export interface UpdateSettingOptions {
+  value: unknown;
+  node_id?: string;
+}
+
+// Re-export event types for convenience
+export type { ServerEvent, ClusterEvent } from "./events.js";

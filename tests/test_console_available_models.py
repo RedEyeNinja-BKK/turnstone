@@ -1,0 +1,353 @@
+"""``GET /v1/api/models`` resolution-chain coverage.
+
+The console handler resolves four defaults from settings + the enabled
+model list:
+
+* ``default_alias`` ← ``model.default_alias``
+* ``channel_default_alias`` ← ``channels.default_model_alias``
+* ``coordinator_default_alias`` ← ``coordinator.model_alias``, else
+  ``model.default_alias``, else ``registry.default`` (the chain
+  :mod:`turnstone.console.session_factory` walks).
+
+The default, channel and coordinator aliases are reported as configured
+even when no enabled row matches: a create that relies on one fails with
+``model_not_loaded`` rather than moving to another model (#1359), and the
+pickers name it rather than hide it.
+* ``judge_default_alias`` ← ``judge.model`` as configured, loaded or not: a
+  judge naming an alias it can't use doesn't judge rather than moving to
+  another model (#1529).  Empty means the session's own model judges, which
+  on this launcher is the resolved coordinator alias.
+
+These tests pin each branch so the home composer's resolved-alias
+placeholder stays correct as the precedence rules evolve.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import pytest
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
+from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
+from turnstone.console.server import list_available_models
+from turnstone.core.model_registry import ModelRegistry
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+
+@pytest.fixture
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "available_models.db"))
+
+
+def _seed_model(
+    storage: SQLiteBackend,
+    *,
+    definition_id: str,
+    alias: str,
+    model: str = "model-x",
+    enabled: bool = True,
+) -> None:
+    storage.create_model_definition(
+        definition_id=definition_id,
+        alias=alias,
+        model=model,
+        provider="openai-compatible",
+        base_url="http://localhost:8000/v1",
+        api_key="sk-test",
+        context_window=8192,
+        capabilities="{}",
+        enabled=enabled,
+        created_by="admin",
+    )
+
+
+class _StubRegistry:
+    """Mimics the surface ``resolve_coordinator_alias`` reads from
+    ``coord_registry``: ``.default`` and ``.has_alias()``.
+
+    Production wires this through ``ModelRegistry``, which in turn
+    pulls aliases from both DB rows and config.toml.  The fixture
+    mirrors the storage's enabled-row set so ``has_alias()`` agrees
+    with what the placeholder's enabled-row filter would accept —
+    without that alignment the helper rejects every tier-2 candidate
+    and the placeholder goes blank in cases that production handles
+    fine."""
+
+    def __init__(self, *, default: str, known: set[str]) -> None:
+        self.default = default
+        self._known = known
+
+    def has_alias(self, alias: str) -> bool:
+        return alias in self._known
+
+    def effective_default(self, config_store: Any) -> str:
+        return ModelRegistry.effective_default(self, config_store)  # type: ignore[arg-type]
+
+
+def _make_client(
+    storage: SQLiteBackend,
+    *,
+    settings: dict[str, str] | None = None,
+    registry_default: str = "",
+    config_store: bool = True,
+) -> TestClient:
+    app = Starlette(
+        routes=[Route("/v1/api/models", list_available_models)],
+        middleware=[Middleware(_AuthMiddleware)],
+    )
+    app.state.auth_storage = storage
+    if config_store:
+        app.state.config_store = _FakeConfigStore(dict(settings or {}))
+    # ``coord_registry`` is always set in production after lifespan
+    # startup; mirror that here.  ``has_alias`` answers from the same
+    # enabled-rows set the handler filters against.
+    enabled = {r["alias"] for r in storage.list_model_definitions(enabled_only=True)}
+    app.state.coord_registry = _StubRegistry(default=registry_default, known=enabled)
+    client = TestClient(app)
+    client.headers.update({"X-Test-User": "admin", "X-Test-Perms": ""})
+    return client
+
+
+def _get_models(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/api/models")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Coordinator resolution
+# ---------------------------------------------------------------------------
+
+
+def test_no_settings_leaves_all_defaults_blank(storage: SQLiteBackend) -> None:
+    """No model.default_alias, no per-role overrides → every default
+    field is empty and ``models`` is an empty list."""
+    body = _get_models(_make_client(storage))
+    assert body == {
+        "models": [],
+        "default_alias": "",
+        "channel_default_alias": "",
+        "coordinator_default_alias": "",
+        "judge_default_alias": "",
+    }
+
+
+def test_coordinator_inherits_default_alias_when_unset(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(_make_client(storage, settings={"model.default_alias": "primary"}))
+    assert body["default_alias"] == "primary"
+    assert body["coordinator_default_alias"] == "primary"
+
+
+def test_coordinator_explicit_enabled_alias_passes_through(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model(storage, definition_id="m1", alias="primary")
+    _seed_model(storage, definition_id="m2", alias="fast")
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={
+                "model.default_alias": "primary",
+                "coordinator.model_alias": "fast",
+            },
+        )
+    )
+    assert body["coordinator_default_alias"] == "fast"
+
+
+def test_coordinator_set_to_disabled_alias_is_reported(
+    storage: SQLiteBackend,
+) -> None:
+    """Operator disabled the alias the coordinator was pinned to: a create
+    fails on it, so the placeholder names it rather than the default."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    _seed_model(storage, definition_id="m2", alias="legacy", enabled=False)
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={
+                "model.default_alias": "primary",
+                "coordinator.model_alias": "legacy",
+            },
+        )
+    )
+    assert body["coordinator_default_alias"] == "legacy"
+
+
+def test_coordinator_set_to_unknown_alias_is_reported(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={
+                "model.default_alias": "primary",
+                "coordinator.model_alias": "ghost",
+            },
+        )
+    )
+    assert body["coordinator_default_alias"] == "ghost"
+
+
+def test_coordinator_falls_back_to_registry_default_when_config_store_empty(
+    storage: SQLiteBackend,
+) -> None:
+    """Match ``console/session_factory.py:109-110``: when both
+    ``coordinator.model_alias`` and ``model.default_alias`` are unset, new
+    coordinator sessions run on ``registry.default`` (loaded from
+    config.toml ``[model].default``).  The placeholder must report the
+    same alias rather than going blank — otherwise the home composer
+    advertises "Default model" while sessions actually launch on a
+    concrete alias."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(_make_client(storage, registry_default="primary"))
+    assert body["default_alias"] == ""
+    assert body["coordinator_default_alias"] == "primary"
+    assert body["judge_default_alias"] == "primary"
+
+
+def test_coordinator_reports_a_disabled_registry_default(
+    storage: SQLiteBackend,
+) -> None:
+    """Registry default points at an alias that's been disabled in the DB:
+    a create fails on it, so the placeholder names it rather than going
+    blank."""
+    _seed_model(storage, definition_id="m1", alias="legacy", enabled=False)
+    body = _get_models(_make_client(storage, registry_default="legacy"))
+    assert body["coordinator_default_alias"] == "legacy"
+
+
+def test_coordinator_falls_back_to_registry_default_when_config_store_missing(
+    storage: SQLiteBackend,
+) -> None:
+    """Edge case from PR #500 review: lifespan can leave
+    ``app.state.config_store`` as None (e.g. a startup exception) while
+    ``coord_registry`` still binds successfully.  The placeholder must
+    still advertise ``registry.default`` (filtered against enabled rows)
+    rather than going blank — otherwise the home composer is uselessly
+    empty in a degraded-but-recoverable state."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(_make_client(storage, registry_default="primary", config_store=False))
+    assert body["default_alias"] == ""
+    assert body["coordinator_default_alias"] == "primary"
+    assert body["judge_default_alias"] == "primary"
+
+
+# ---------------------------------------------------------------------------
+# Judge resolution
+# ---------------------------------------------------------------------------
+
+
+def test_judge_empty_inherits_resolved_coordinator_alias(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model(storage, definition_id="m1", alias="primary")
+    _seed_model(storage, definition_id="m2", alias="fast")
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={
+                "model.default_alias": "primary",
+                "coordinator.model_alias": "fast",
+            },
+        )
+    )
+    assert body["coordinator_default_alias"] == "fast"
+    assert body["judge_default_alias"] == "fast"
+
+
+def test_judge_explicit_enabled_alias_passes_through(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model(storage, definition_id="m1", alias="primary")
+    _seed_model(storage, definition_id="m2", alias="judge-fast")
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={
+                "model.default_alias": "primary",
+                "judge.model": "judge-fast",
+            },
+        )
+    )
+    assert body["judge_default_alias"] == "judge-fast"
+
+
+def test_judge_set_to_unknown_value_is_reported_as_configured(
+    storage: SQLiteBackend,
+) -> None:
+    """The judge doesn't move to another model, so the placeholder doesn't
+    name one: it names what's configured, like the other model roles."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={
+                "model.default_alias": "primary",
+                "judge.model": "anthropic/claude-haiku-4-5",  # raw, not an alias
+            },
+        )
+    )
+    assert body["coordinator_default_alias"] == "primary"
+    assert body["judge_default_alias"] == "anthropic/claude-haiku-4-5"
+
+
+def test_judge_set_to_disabled_alias_is_reported_as_configured(
+    storage: SQLiteBackend,
+) -> None:
+    """Disabled-alias case is handled identically to the unknown-value case."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    _seed_model(storage, definition_id="m2", alias="judge-old", enabled=False)
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={
+                "model.default_alias": "primary",
+                "judge.model": "judge-old",
+            },
+        )
+    )
+    assert body["judge_default_alias"] == "judge-old"
+
+
+# ---------------------------------------------------------------------------
+# Pre-existing fields stay correct under the new resolution code
+# ---------------------------------------------------------------------------
+
+
+def test_channel_default_alias_reported_when_disabled(
+    storage: SQLiteBackend,
+) -> None:
+    """Slack and Discord create on the channel model; a disabled one fails
+    the conversation rather than moving it to the default (#1359)."""
+    _seed_model(storage, definition_id="m1", alias="primary", enabled=False)
+    body = _get_models(
+        _make_client(
+            storage,
+            settings={"channels.default_model_alias": "primary"},
+        )
+    )
+    assert body["channel_default_alias"] == "primary"
+
+
+def test_models_payload_strips_secret_fields(storage: SQLiteBackend) -> None:
+    """Regression guard: only alias/model/provider land in the response,
+    never api_key / base_url / context_window / raw capabilities."""
+    _seed_model(storage, definition_id="m1", alias="primary")
+    body = _get_models(_make_client(storage))
+    assert len(body["models"]) == 1
+    entry = body["models"][0]
+    assert set(entry) == {"alias", "model", "provider"}
+    assert entry["alias"] == "primary"
+    assert entry["model"] == "model-x"
+    assert entry["provider"] == "openai-compatible"

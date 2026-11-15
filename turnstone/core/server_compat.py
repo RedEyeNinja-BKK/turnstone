@@ -1,0 +1,238 @@
+"""Server compatibility profiles for OpenAI-compatible backends.
+
+Different local model servers (vLLM, llama.cpp, SGLang) need different
+request shaping.  This module separates three concerns:
+
+1. **Model capabilities** — ``thinking_mode`` and ``thinking_param`` are
+   properties of the *model* (Gemma thinks, Llama doesn't).  These go
+   into the ``capabilities`` dict and flow through ``ModelCapabilities``
+   so the provider can act on them (just like Anthropic's thinking mode).
+
+2. **API surface** — ``api_surface`` selects which OpenAI-compatible
+   API surface the provider talks to: ``"chat"`` (Chat Completions,
+   the default) or ``"responses"`` (Responses API, native reasoning).
+   Stored under ``server_compat`` because it's an endpoint property,
+   not a model property.
+
+3. **Server workarounds** — ``extra_body`` overrides like llama.cpp's
+   ``reasoning_format`` are properties of the *server*, not the model.
+   These stay in ``server_compat`` and get merged into the request's
+   ``extra_body`` at call time.  Reserve these for stable server config:
+   bug-workaround flags for fast-moving open models go stale the moment
+   the upstream bug is fixed, so we don't carry them speculatively.
+
+Profiles are *suggestions* only.  The admin UI auto-fills them on
+Detect; the operator has final say, and the stored DB config is what
+actually gets used at request time.
+"""
+
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Profile suggestions
+# ---------------------------------------------------------------------------
+
+# Each profile has two optional parts:
+#   "capabilities" — merged into the model's capabilities dict (thinking_mode etc.)
+#   "server_compat" — stored as server_compat (extra_body workarounds)
+
+_PROFILES: dict[str, dict[str, Any]] = {
+    "vllm-gemma-thinking": {
+        "capabilities": {
+            "thinking_mode": "manual",
+            "thinking_param": "enable_thinking",
+        },
+        "server_compat": {
+            "server_type": "vllm",
+        },
+    },
+    "vllm-qwen-thinking": {
+        "capabilities": {
+            "thinking_mode": "manual",
+            "thinking_param": "enable_thinking",
+        },
+        "server_compat": {
+            "server_type": "vllm",
+        },
+    },
+    "vllm-granite-thinking": {
+        "capabilities": {
+            "thinking_mode": "manual",
+            "thinking_param": "thinking",
+        },
+        "server_compat": {
+            "server_type": "vllm",
+        },
+    },
+    "vllm-deepseek-thinking": {
+        "capabilities": {
+            "thinking_mode": "manual",
+            "thinking_param": "thinking",
+        },
+        "server_compat": {
+            "server_type": "vllm",
+        },
+    },
+    "vllm-holo-thinking": {
+        "capabilities": {
+            "thinking_mode": "manual",
+            "thinking_param": "enable_thinking",
+        },
+        "server_compat": {
+            "server_type": "vllm",
+        },
+    },
+    "vllm-mistral-medium": {
+        # Mistral medium open-weights served by vLLM can deliver reasoning
+        # via either surface, but the trade-off is asymmetric:
+        #   * Chat Completions — tool calling works (``--tool-call-parser
+        #     mistral``); reasoning is enabled via the vLLM CLI
+        #     (``--reasoning-parser``) rather than per-request.
+        #   * Responses API   — reasoning effort is per-request and clean,
+        #     but as of vLLM 0.x the tool-call parser is not wired up on
+        #     this surface so tool calls leak as ``[TOOL_CALLS]`` text.
+        # We do **not** auto-suggest this profile from Detect; an operator
+        # who needs per-request effort and accepts the tool-calling
+        # limitation can pick "Responses API" manually in the admin UI.
+        "server_compat": {
+            "server_type": "vllm",
+            "api_surface": "responses",
+        },
+    },
+    "vllm": {
+        "server_compat": {
+            "server_type": "vllm",
+        },
+    },
+    "llama.cpp": {
+        "server_compat": {
+            "server_type": "llama.cpp",
+        },
+    },
+    "llama.cpp-thinking": {
+        "capabilities": {
+            "thinking_mode": "manual",
+            "thinking_param": "enable_thinking",
+        },
+        "server_compat": {
+            "server_type": "llama.cpp",
+            # llama.cpp uses reasoning_format (top-level request param) to
+            # extract thinking into the reasoning_content response field.
+            # "auto" lets the server decide based on the model's template;
+            # "deepseek" forces extraction for all thinking models.
+            "extra_body": {"reasoning_format": "auto"},
+        },
+    },
+    "sglang": {
+        "server_compat": {
+            "server_type": "sglang",
+        },
+    },
+}
+
+# Model-family → profile key mapping.  Checked in order; first match wins.
+_VLLM_MODEL_PROFILES: list[tuple[str, str]] = [
+    ("gemma-4", "vllm-gemma-thinking"),
+    ("gemma-3", "vllm-gemma-thinking"),
+    ("gemma4", "vllm-gemma-thinking"),
+    ("gemma3", "vllm-gemma-thinking"),
+    ("qwen3", "vllm-qwen-thinking"),
+    ("qwq", "vllm-qwen-thinking"),
+    ("granite-3", "vllm-granite-thinking"),
+    ("granite3", "vllm-granite-thinking"),
+    ("deepseek-r1", "vllm-deepseek-thinking"),
+    ("holo2", "vllm-holo-thinking"),
+    # Mistral medium intentionally omitted — see ``vllm-mistral-medium``
+    # profile docstring for the Chat-vs-Responses trade-off; operator
+    # picks manually rather than letting Detect auto-suggest Responses.
+]
+
+# llama.cpp model-family → profile key mapping.
+_LLAMA_CPP_MODEL_PROFILES: list[tuple[str, str]] = [
+    ("gemma-4", "llama.cpp-thinking"),
+    ("gemma-3", "llama.cpp-thinking"),
+    ("gemma4", "llama.cpp-thinking"),
+    ("gemma3", "llama.cpp-thinking"),
+    ("qwen3", "llama.cpp-thinking"),
+    ("qwq", "llama.cpp-thinking"),
+    ("deepseek-r1", "llama.cpp-thinking"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def suggest_profile(server_type: str, model_id: str) -> dict[str, Any]:
+    """Suggest capabilities and server compat based on server type and model.
+
+    Returns a dict with optional ``"capabilities"`` and ``"server_compat"``
+    keys.  Empty dict when no special settings are needed.
+    """
+    profile_key: str | None = None
+    model_lower = (model_id or "").lower()
+    if server_type == "vllm":
+        for substring, key in _VLLM_MODEL_PROFILES:
+            if substring in model_lower:
+                profile_key = key
+                break
+        if profile_key is None:
+            profile_key = "vllm"
+    elif server_type == "llama.cpp":
+        for substring, key in _LLAMA_CPP_MODEL_PROFILES:
+            if substring in model_lower:
+                profile_key = key
+                break
+        if profile_key is None:
+            profile_key = "llama.cpp"
+    elif server_type in _PROFILES:
+        profile_key = server_type
+
+    if profile_key is None:
+        return {}
+    return copy.deepcopy(_PROFILES[profile_key])
+
+
+def merge_server_compat(
+    base_chat_template_kwargs: dict[str, Any] | None,
+    server_compat: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the ``extra_body`` dict by merging server compat into base kwargs.
+
+    *base_chat_template_kwargs* is an explicit ``chat_template_kwargs`` dict
+    to seed the request with, or ``None``/empty to skip seeding.  Operator-
+    supplied entries in ``server_compat["extra_body"]["chat_template_kwargs"]``
+    are deep-merged on top.  Top-level ``extra_body`` keys (``skip_special_tokens``,
+    ``reasoning_format``, etc.) are forwarded as-is.
+
+    Note: thinking-mode params (``enable_thinking``, ``thinking``) are **not**
+    merged here — the provider handles those via ``ModelCapabilities``.
+    This function only merges what the operator stored in ``server_compat``.
+
+    Returns the complete dict to pass as ``extra_body`` to the OpenAI client.
+    May be empty when there is nothing to send.
+    """
+    extra: dict[str, Any] = {}
+    if base_chat_template_kwargs:
+        extra["chat_template_kwargs"] = dict(base_chat_template_kwargs)
+
+    # Merge top-level extra_body overrides (skip_special_tokens, etc.)
+    compat_eb = server_compat.get("extra_body")
+    if isinstance(compat_eb, dict):
+        for key, value in compat_eb.items():
+            if key == "chat_template_kwargs":
+                # Deep-merge with operator values winning so an operator
+                # can intentionally extend chat_template_kwargs (e.g. set
+                # ``reasoning_effort`` for gpt-oss-style local templates).
+                if isinstance(value, dict):
+                    if "chat_template_kwargs" not in extra:
+                        extra["chat_template_kwargs"] = {}
+                    extra["chat_template_kwargs"].update(value)
+                continue
+            extra[key] = value
+
+    return extra

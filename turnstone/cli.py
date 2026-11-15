@@ -1,0 +1,2285 @@
+"""Terminal CLI frontend for turnstone.
+
+Provides TerminalUI (implementing the SessionUI protocol), readline setup,
+model auto-detection, workstream management, and the main() REPL entry point.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import logging
+import os
+import readline
+import sys
+import textwrap
+import threading
+from typing import TYPE_CHECKING, Any, Literal
+
+from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
+from turnstone.core.judge import JudgeConfig
+from turnstone.core.oauth.context import OAuthContext
+from turnstone.core.session import ChatSession, SessionUI
+from turnstone.core.session_manager import (
+    PERSISTENCE_RECONCILE_INTERVAL_SECONDS,
+    CloseOutcome,
+    SessionManager,
+)
+from turnstone.core.session_ui_base import publish_gate_state
+from turnstone.core.workstream import (
+    Workstream,
+    WorkstreamKind,
+    WorkstreamState,
+)
+from turnstone.ui.colors import (
+    BOLD,
+    DIM,
+    GREEN,
+    RED,
+    RESET,
+    YELLOW,
+    bold,
+    cyan,
+    dim,
+    green,
+    red,
+    show_controls,
+    yellow,
+)
+from turnstone.ui.markdown import MarkdownRenderer
+from turnstone.ui.spinner import Spinner
+
+# ANSI colors for intent verdict risk levels
+_VERDICT_COLORS: dict[str, str] = {
+    "low": GREEN,
+    "medium": YELLOW,
+    "high": RED,
+    "critical": f"{BOLD}{RED}",
+}
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from turnstone.core.personas import PersonaSnapshot
+    from turnstone.core.workstream_lease import WorkstreamLease
+
+# ─── Readline ─────────────────────────────────────────────────────────────
+
+SLASH_COMMANDS = [
+    "/instructions",
+    "/clear",
+    "/new",
+    "/workstreams",
+    "/resume",
+    "/name",
+    "/delete",
+    "/history",
+    "/model",
+    "/raw",
+    "/reason",
+    "/compact",
+    "/debug",
+    "/mcp",
+    "/retry",
+    "/rewind",
+    "/help",
+    "/exit",
+    "/quit",
+    "/q",
+    "/ws",
+    "/cluster",
+]
+
+
+def _style_preview(preview: str) -> str:
+    """Colour an approval preview's lines as the session used to: removed lines
+    red, added lines green, edit separators, warnings and notes yellow, the rest
+    dim.  The session sends previews as plain text, so it no longer colours them
+    itself.
+
+    Takes the preview as the session sent it: each line's marker is read as
+    written, where a form feed or another whitespace control still counts as
+    indentation, and the line is printed with its control characters shown.
+    """
+    styled: list[str] = []
+    for line in preview.split("\n"):
+        text = line.strip()
+        shown = show_controls(line)
+        if text.startswith(("---", "Warning:", "(")):
+            styled.append(yellow(shown))
+        elif text.startswith("-"):
+            styled.append(red(shown))
+        elif text.startswith("+"):
+            styled.append(green(shown))
+        else:
+            styled.append(dim(shown))
+    return "\n".join(styled)
+
+
+def _shown(values: dict[str, Any]) -> dict[str, Any]:
+    """A copy of *values* to print from, each string in it, and each string in a
+    list in it, through ``show_controls``.
+
+    For the dicts the session hands the UI (an approval item, a verdict, an output
+    assessment, a sub-agent step), so a top-level field printed from one is shown
+    without anyone remembering to.  One level only: a nested dict (an item's
+    heuristic verdict) comes back as the same object, unshown, so a writer that
+    prints from one takes a copy of it too, and a tool's arguments, which a model
+    can nest deeper than Python recurses, are never walked.  The session reads
+    back what the UI writes into the original (a denial), and policy checks use
+    its labels, so only printing reads the copy.
+    """
+    copy: dict[str, Any] = {}
+    for key, value in values.items():
+        if isinstance(value, str):
+            value = show_controls(value)
+        elif isinstance(value, list):
+            value = [show_controls(v) if isinstance(v, str) else v for v in value]
+        copy[key] = value
+    return copy
+
+
+def _show_lines(text: str) -> str:
+    """*text* shown, a CR LF line ending as a plain line feed.
+
+    For reasoning and for error text from a provider, a server or a tool: a
+    carriage return just before a line feed rewrites nothing, and any other
+    still shows.  An approval card keeps every one, since in a command it
+    changes what runs (``cd /tmp`` followed by one fails).
+    """
+    return show_controls(text.replace("\r\n", "\n"))
+
+
+_SUMMARY_MAX = 400
+
+
+def _one_line(summary: object) -> str:
+    """A verdict's summary on one line of at most 400 characters, as the web and
+    channel cards show it, each run of whitespace as one space.
+
+    The heuristic summary quotes the call's arguments and the judge's has no
+    limit, so its line feeds could push the card and its RISK line off screen.
+    """
+    line = " ".join(str(summary).split())
+    return line if len(line) <= _SUMMARY_MAX else line[: _SUMMARY_MAX - 1] + "…"
+
+
+def _completer(text: str, state: int) -> str | None:
+    """Tab-complete slash commands."""
+    matches = [c for c in SLASH_COMMANDS if c.startswith(text)] if text.startswith("/") else []
+    if state < len(matches):
+        return matches[state] + " "
+    return None
+
+
+def setup_readline() -> None:
+    """Set up readline with tab completion."""
+    readline.set_history_length(1000)
+    readline.set_completer(_completer)
+    readline.set_completer_delims("")  # treat entire line as completion input
+    readline.parse_and_bind("tab: complete")
+
+
+# ─── TerminalUI ───────────────────────────────────────────────────────────
+
+
+class TerminalUI(SessionUI):
+    """Terminal-based UI using ANSI colors, MarkdownRenderer, and Spinner.
+
+    Text from a model or from outside (a tool, a server, the judge) goes through
+    ``show_controls`` before the UI colours and prints it, so it can't move the
+    cursor, rewrite a line, or leave the terminal in a mode (line wrap off,
+    hidden text) that changes how a later approval card reads.  ``on_info``
+    messages are composed by the session with its own colours and print as sent.
+    """
+
+    def __init__(self) -> None:
+        self.md = MarkdownRenderer()
+        self.spinner: Spinner | None = None
+        self._print_lock = threading.Lock()
+        self.auto_approve = False
+        self.auto_approve_tools: set[str] = set()
+        # A carriage return that ended a reasoning token, held until the next
+        # token shows whether a line feed follows it.
+        self._reasoning_cr = False
+
+    def _show(self, text: str, *, stderr: bool = False) -> None:
+        """Show *text*, on stdout, or on stderr when *stderr* is set.
+
+        Everything the UI writes goes through here, except the spinner, the
+        status line and what must reach the terminal now (``_write_terminal``),
+        so a workstream in the background can keep it for later
+        (``WorkstreamTerminalUI``).
+        """
+        self._write_terminal(text, stderr=stderr)
+
+    def _write_terminal(self, text: str, *, stderr: bool = False) -> None:
+        """Write *text* to the terminal now, whichever workstream is in front.
+
+        For text a person must see now, which no buffer may keep.
+        """
+        out = sys.stderr if stderr else sys.stdout
+        out.write(text)
+        out.flush()
+
+    def _wait_for_foreground(
+        self, items: list[dict[str, Any]], pending: list[dict[str, Any]]
+    ) -> bool:
+        """Wait until the person can answer the approval prompt for *pending*.
+
+        False when the batch was cancelled meanwhile.  A lone terminal is
+        always in front, so it never waits.
+        """
+        return True
+
+    def on_turn_start(self) -> None:
+        # Terminal UI has no inflight buffer to reset.
+        pass
+
+    def on_turn_committed(self) -> None:
+        # Terminal UI has no inflight buffer to reset.
+        pass
+
+    def on_stream_discarded(self) -> None:
+        # Printed text cannot be unprinted; the renderer reset rides the
+        # stream_end that precedes this call.
+        pass
+
+    def on_thinking_start(self) -> None:
+        # Idempotent: replacing a RUNNING spinner would orphan its render
+        # thread (painting frames over all later output for the process
+        # lifetime) — callers must not need a stop-first protocol.
+        if self.spinner:
+            self.spinner.stop()
+        self.spinner = Spinner("Thinking")
+        self.spinner.start()
+
+    def on_thinking_stop(self) -> None:
+        if self.spinner:
+            self.spinner.stop()
+            self.spinner = None
+
+    def on_reasoning_token(self, text: str) -> None:
+        # A CR LF is a line ending and prints as one, though a token may end
+        # between the two; any other carriage return shows.
+        if self._reasoning_cr:
+            text = "\r" + text
+            self._reasoning_cr = False
+        if text.endswith("\r"):
+            text = text[:-1]
+            self._reasoning_cr = True
+        if text:
+            self._show(f"{DIM}{_show_lines(text)}{RESET}")
+
+    def _end_reasoning(self) -> None:
+        """Show a carriage return the reasoning ended on: no line feed follows."""
+        if self._reasoning_cr:
+            self._reasoning_cr = False
+            self._show(f"{DIM}{show_controls(chr(13))}{RESET}")
+
+    def on_content_token(self, text: str) -> None:
+        self._end_reasoning()
+        # The renderer shows the reply's control characters line by line.
+        rendered = self.md.feed(text)
+        if rendered:
+            self._show(rendered)
+
+    def on_stream_end(self) -> None:
+        self._end_reasoning()
+        remainder = self.md.flush()
+        self.md.in_code_block = False
+        self._show(f"{remainder}\n")
+
+    @staticmethod
+    def _approval_was_cancelled(items: list[dict[str, Any]]) -> bool:
+        """Whether a close/Stop retired the operation owning this gate."""
+        return any(
+            bool(getattr(item.get("_approval_cancel_witness"), "aborted", False)) for item in items
+        )
+
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
+        """Display tool previews and prompt for batch approval.
+
+        Returns (approved: bool, feedback: str | None).
+        """
+        if self._approval_was_cancelled(items):
+            return False, "Cancelled by user"
+        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
+
+        # Evaluate admin tool policies (deny/allow/ask) before prompting.
+        if pending:
+            from turnstone.core.policy import (
+                POLICIES_UNREADABLE_DENIAL,
+                evaluate_loaded_tool_policies,
+            )
+
+            # ``None``: the policies could not be read, so every call needing
+            # approval is refused (no deny rule could be checked).
+            verdicts: dict[str, str | None] | None = {}
+            try:
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                _policy_names = [
+                    it.get("approval_label", "") or it.get("func_name", "")
+                    for it in pending
+                    if it.get("func_name")
+                ]
+                if storage is not None and _policy_names:
+                    verdicts = evaluate_loaded_tool_policies(storage, _policy_names)
+            except Exception:
+                logging.getLogger(__name__).warning("Policy evaluation failed", exc_info=True)
+                verdicts = None
+            for it in pending:
+                policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                if verdicts is None or verdicts.get(policy_name) == "deny":
+                    it["denied"] = True
+                    it["_refused_by"] = "policy"
+                    it["error"] = (
+                        POLICIES_UNREADABLE_DENIAL
+                        if verdicts is None
+                        else f"Blocked by tool policy ('{policy_name}')"
+                    )
+                    it["needs_approval"] = False
+                elif verdicts.get(policy_name) == "allow":
+                    it["needs_approval"] = False
+            pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
+
+        # Policy lookup can block before the prompt.  Recheck ownership so a
+        # close that landed during storage I/O cannot paint or solicit approval
+        # for a retired tool batch.
+        if self._approval_was_cancelled(items):
+            return False, "Cancelled by user"
+
+        def _settled() -> bool:
+            """No call here waits on a person: none needs approval, or blanket
+            or per-tool auto-approve covers every one."""
+            if not pending or self.auto_approve:
+                return True
+            pending_names = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending
+                if it.get("func_name")
+            }
+            return bool(pending_names) and pending_names.issubset(self.auto_approve_tools)
+
+        # The prompt below waits on a person, so the workstream says so first,
+        # then waits until the person can answer it.  Outside the print lock:
+        # the publish takes the session's generation and state locks.
+        needs_person = not _settled()
+        if needs_person:
+            publish_gate_state(items, "attention")
+            if not self._wait_for_foreground(items, pending):
+                return False, "Cancelled by user"
+
+        with self._print_lock:
+            # The publish and the wait above, and the wait for this lock, can
+            # block too: recheck before painting the batch.
+            if self._approval_was_cancelled(items):
+                return False, "Cancelled by user"
+            # All headers, previews, and heuristic verdicts
+            lines: list[str] = []
+            for raw in items:
+                item = _shown(raw)
+                header = item.get("header") or item.get("func_name", "")
+                if item.get("error"):
+                    lines.append(f"  {red(header)}\n")
+                    lines.append(f"  {red(item['error'])}\n")
+                else:
+                    lines.append(f"  {yellow(header)}\n")
+                if item.get("preview"):
+                    # _style_preview reads each line's marker as written, and
+                    # shows the line itself.
+                    styled = (
+                        red(item["preview"])
+                        if item.get("error")
+                        else _style_preview(raw["preview"])
+                    )
+                    lines.append(styled + "\n")
+                verdict = item.get("_heuristic_verdict")
+                if verdict:
+                    verdict = _shown(verdict)
+                    risk = verdict.get("risk_level", "medium")
+                    rec = verdict.get("recommendation", "review")
+                    conf = int(verdict.get("confidence", 0.5) * 100)
+                    summary = verdict.get("intent_summary", "")
+                    color = _VERDICT_COLORS.get(risk, "")
+                    lines.append(
+                        f"  {color}RISK: {risk} (confidence: {conf}%) \u2014 {rec}{RESET}\n"
+                    )
+                    if summary:
+                        lines.append(f"  Intent: {_one_line(summary)}\n")
+            if needs_person:
+                # The prompt below goes to the terminal whichever workstream is
+                # in front, so the card it asks about goes there too.
+                self._write_terminal("".join(lines))
+            else:
+                self._show("".join(lines))
+
+            # Rechecked: a concurrent prompt's "always" may have covered this
+            # batch since.
+            if _settled():
+                return True, None
+
+            # Prompt
+            no_input = False
+            asked = [_shown(it) for it in pending]
+            try:
+                if len(pending) == 1:
+                    label = asked[0].get("approval_label", asked[0]["func_name"])
+                    prompt_text = (
+                        f"    \001{BOLD}\002Allow {label}?\001{RESET}\002 "
+                        f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
+                    )
+                else:
+                    labels = ", ".join(it.get("approval_label", it["func_name"]) for it in asked)
+                    prompt_text = (
+                        f"    \001{BOLD}\002Allow {len(pending)} tools ({labels})?\001{RESET}\002 "
+                        f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
+                    )
+                resp = input(prompt_text).strip()
+            except (EOFError, KeyboardInterrupt) as exc:
+                self._write_terminal("\n")
+                resp = "n"
+                # End of input (stdin closed or exhausted, or Ctrl+D, which the banner offers as
+                # quit) answers nothing about the batch: it is refused as unanswered, not as the
+                # person's no. A Ctrl-C at the prompt stays the person's no.
+                no_input = isinstance(exc, EOFError)
+
+            # A Stop (Ctrl-C, a close) can retire the batch while its prompt
+            # waits, and the line typed next then lands here: use none of it.
+            if self._approval_was_cancelled(items):
+                self._write_terminal(
+                    f"  {DIM}The batch was stopped; that answer was not used.{RESET}\n"
+                )
+                return False, "Cancelled by user"
+
+            # Parse decision and optional feedback: "y, use absolute path"
+            decision = resp.lower()
+            feedback = None
+            for sep in (",", " "):
+                if sep in resp:
+                    decision = resp[: resp.index(sep)].strip().lower()
+                    feedback = resp[resp.index(sep) + 1 :].strip() or None
+                    break
+
+            if decision in ("a", "always"):
+                tool_names = {
+                    it.get("approval_label", "") or it.get("func_name", "")
+                    for it in pending
+                    if it.get("func_name") and not it.get("error")
+                }
+                tool_names.discard("")
+                self.auto_approve_tools.update(tool_names)
+                return True, feedback
+            elif decision in ("y", "yes"):
+                return True, feedback
+            else:
+                denial_msg = "Denied by user"
+                if feedback:
+                    denial_msg += f": {feedback}"
+                for item in pending:
+                    item["denied"] = True
+                    item["denial_msg"] = denial_msg
+                    if no_input:
+                        item["_refused_by"] = "no_input"
+                return False, None
+
+    def on_tool_result(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+        preview: dict[str, Any] | None = None,
+    ) -> None:
+        # ``preview`` renders nowhere in a terminal -- the result line already
+        # names what was shown, and the header carries the target for the
+        # operator to open themselves.
+        if is_error:
+            name, output = show_controls(name), _show_lines(output)
+            self._show(f"{RED}\u2717 {name}: {output}{RESET}\n", stderr=True)
+
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        pass  # Terminal shows spinner during tool execution
+
+    def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
+        # CLI keeps an inline "leg" per sub-agent step — the structured nesting
+        # card is web-only.
+        item = _shown(item)
+        hdr = item.get("header") or item.get("func_name") or "tool"
+        self._show(f"{DIM}  - {hdr}{RESET}\n")
+
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
+        total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
+        pct = total_tok / context_window * 100 if context_window > 0 else 0
+        parts = [f"{total_tok:,} / {context_window:,} tokens ({pct:.0f}%)"]
+        # Any resolved effort shows — "medium" is no longer a code default
+        # to hide, it only appears when someone explicitly chose it.
+        if effort:
+            parts.append(f"reasoning: {effort}")
+        sys.stdout.write(f"\n  {DIM}[{' · '.join(parts)}]{RESET}\n")
+        sys.stdout.flush()
+
+    def on_info(self, message: str) -> None:
+        self._show(f"{message}\n")
+
+    def on_error(self, message: str) -> None:
+        # Plain text from the session, often carrying a provider's, an MCP
+        # server's or a tool's own words.
+        self._show(f"{RED}{_show_lines(message)}{RESET}\n")
+
+    def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
+        """Render a first-class operator-context system turn as an
+        ``[operator · source] text`` line in the terminal — the CLI's
+        equivalent of the web UI's operator bubble.  Terminal output is
+        anchored by flow (the line lands directly after the turn it
+        relates to), so no DOM anchoring is needed.  ``meta`` (the structured
+        per-kind fields the web card uses) is unused here: the formatted body
+        in ``content`` already reads well in a terminal.
+        """
+        label = "operator" + (f" · {show_controls(source)}" if source else "")
+        self._show(f"{YELLOW}[{label}]{RESET} {show_controls(content)}\n")
+
+    # No on_compaction override: TerminalUI subclasses SessionUI
+    # explicitly, and the inherited protocol default body IS the
+    # terminal's classic rendering (render_compaction_event_as_info via
+    # on_info — see SessionUI.on_compaction).  A byte-identical override
+    # here silently forked the policy site: a future change to the
+    # default stopped applying to the CLI.
+
+    def on_state_change(self, state: str) -> None:
+        pass  # base TerminalUI ignores state changes
+
+    def on_intent_verdict(self, verdict: dict[str, Any], judge_event: object | None = None) -> None:
+        """Display LLM judge verdict — called from the judge's daemon thread.
+
+        The daemon finishes its batch after the approval resolves (unless
+        ``judge.cancel_on_approval``), so a verdict can land once the turn is
+        over and the user has switched to another workstream.
+
+        ``judge_event`` (the delivering judge generation) is a
+        cycle-registry concern — the terminal renders every verdict it
+        receives and ignores it.
+        """
+        # Printed under an approval card while its prompt waits, so the judge's
+        # words could otherwise move the cursor up and rewrite the card, or push
+        # it off screen.
+        verdict = _shown(verdict)
+        risk = verdict.get("risk_level", "medium")
+        rec = verdict.get("recommendation", "review")
+        summary = verdict.get("intent_summary", "")
+        conf = int(verdict.get("confidence", 0.5) * 100)
+        tier = verdict.get("tier", "llm")
+
+        color = _VERDICT_COLORS.get(risk, "")
+        text = f"\n  {color}\u25b8 {tier.upper()} VERDICT: {risk.upper()} ({conf}%) \u2014 {rec}{RESET}"
+        if summary:
+            text += f"\n    {_one_line(summary)}"
+        self._show(text + "\n")
+
+    def record_output_assessment(
+        self,
+        call_id: str,
+        assessment: dict[str, Any],
+        *,
+        tier: str = "heuristic",
+        reasoning: str = "",
+        judge_model: str = "",
+        latency_ms: int = 0,
+        confidence: float = 0.0,
+    ) -> None:
+        """Terminal UI doesn't persist; SessionUIBase subclasses do."""
+        return
+
+    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
+        """Display output guard warning when risk signals are detected."""
+        assessment = _shown(assessment)
+        risk = assessment.get("risk_level", "none")
+        if risk == "none":
+            return
+        flags = assessment.get("flags", [])
+        color = _VERDICT_COLORS.get(risk, YELLOW)
+        lines = [f"\n  {color}⚠ OUTPUT WARNING: {risk.upper()} — {', '.join(flags)}{RESET}\n"]
+        for ann in assessment.get("annotations", []):
+            lines.append(f"    {ann}\n")
+        if assessment.get("redacted"):
+            lines.append(f"    {DIM}(credentials redacted from output){RESET}\n")
+        self._show("".join(lines))
+
+    def on_rename(self, name: str) -> None:
+        pass  # base TerminalUI ignores renames
+
+
+# ─── WorkstreamTerminalUI ─────────────────────────────────────────────────
+
+
+# State display config: (symbol, color_fn, label), in the order the
+# cluster overview lists the states.
+_STATE_DISPLAY: dict[WorkstreamState, tuple[str, Callable[[str], str], str]] = {
+    WorkstreamState.RUNNING: ("▸", green, "running"),
+    WorkstreamState.THINKING: ("◌", cyan, "thinking"),
+    WorkstreamState.ATTENTION: ("◆", yellow, "attention"),
+    WorkstreamState.EVALUATION: ("⚖", cyan, "evaluation"),
+    WorkstreamState.IDLE: ("·", dim, "idle"),
+    WorkstreamState.ERROR: ("✖", red, "error"),
+}
+
+
+def _state_from_wire(value: str) -> WorkstreamState:
+    """A workstream state from a wire string; ``closed`` and unknown values read as idle."""
+    try:
+        return WorkstreamState(value)
+    except ValueError:
+        return WorkstreamState.IDLE
+
+
+class WorkstreamTerminalUI(TerminalUI):
+    """TerminalUI with workstream awareness: buffers output when in background,
+    and holds a tool batch that needs a person until brought forward."""
+
+    def __init__(self, ws_id: str, manager: SessionManager) -> None:
+        super().__init__()
+        self.ws_id = ws_id
+        self.manager = manager
+        self._output_buffer: list[tuple[bool, str]] = []  # (stderr, text)
+        # Held only to append or take the buffer, never across I/O: a write
+        # from a thread holding session locks never waits behind a prompt.
+        self._buffer_lock = threading.Lock()
+        self._fg_event = threading.Event()
+        self._fg_event.set()  # starts as foreground
+
+    @property
+    def is_foreground(self) -> bool:
+        return self.manager.active_id == self.ws_id
+
+    def set_foreground(self, fg: bool) -> None:
+        if fg:
+            self._fg_event.set()
+        else:
+            self._fg_event.clear()
+
+    def on_state_change(self, state: str) -> None:
+        try:
+            ws_state = WorkstreamState(state)
+        except ValueError:
+            return
+        self.manager.set_state(self.ws_id, ws_state)
+
+    def on_state_change_deferred(
+        self,
+        state: str,
+        *,
+        deferred_persistence: list[Callable[[], None]],
+        owner_valid: Callable[[], bool],
+    ) -> None:
+        """Keep CLI state storage outside ChatSession's generation lock."""
+        try:
+            ws_state = WorkstreamState(state)
+        except ValueError:
+            return
+        self.manager.set_state_deferred(
+            self.ws_id,
+            ws_state,
+            deferred_persistence=deferred_persistence,
+            owner_valid=owner_valid,
+        )
+
+    # -- output buffering when in background --------------------------------
+
+    def on_thinking_start(self) -> None:
+        if self.is_foreground:
+            super().on_thinking_start()
+
+    def on_thinking_stop(self) -> None:
+        if self.is_foreground:
+            super().on_thinking_stop()
+        elif self.spinner:
+            self.spinner.stop()
+            self.spinner = None
+
+    def _show(self, text: str, *, stderr: bool = False) -> None:
+        # Decided under the buffer lock: a switch moves the front before it
+        # takes the buffer to replay it, so a write lands in that replay or
+        # on the terminal, never in a buffer already taken.
+        with self._buffer_lock:
+            if not self.is_foreground:
+                self._output_buffer.append((stderr, text))
+                return
+        self._write_terminal(text, stderr=stderr)
+
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
+        if self.is_foreground:
+            super().on_status(usage, context_window, effort)
+        # silently drop status for background streams
+
+    def on_workstream_stopped(self, message: str) -> None:
+        """Another process took this workstream over: say so even from the background.
+
+        Kept in the buffer, the notice would show only in the replay printed when
+        the workstream leaves this CLI (``on_workstream_closed``), which after a
+        refused write waits for the next lease renewal: both branches write to
+        the terminal at once, whatever a switch does meanwhile, and neither waits
+        behind an open prompt.
+        """
+        message = show_controls(message)
+        if self.is_foreground:
+            self._write_terminal(f"{message}\n")
+            return
+        ws = self.manager.get(self.ws_id)
+        label = (
+            f"{self.manager.index_of(self.ws_id)}:{show_controls(ws.name)}"
+            if ws is not None
+            else self.ws_id
+        )
+        self._write_terminal(yellow(f"Workstream {label}: {message}") + "\n")
+
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        if self.is_foreground:
+            super().on_tool_output_chunk(call_id, chunk)
+
+    def _wait_for_foreground(
+        self, items: list[dict[str, Any]], pending: list[dict[str, Any]]
+    ) -> bool:
+        """In the background, hold the batch until the user brings the workstream forward.
+
+        The gate calls this only for a batch that still needs a person once
+        tool policies and auto-approve have run; a batch they settle runs at
+        once, and its lines wait in the buffer.
+        """
+        if self.is_foreground:
+            return True
+        tool_names = ", ".join(
+            it.get("approval_label", it.get("func_name", "?")) for it in map(_shown, pending)
+        )
+        self._show(f"{YELLOW}Waiting for approval: {tool_names}{RESET}\n")
+        # Foreground state is persistent, so close must not set this event
+        # merely to wake us: a later durability refusal would leave a live
+        # background workstream acting foregrounded. Poll the gate's
+        # monotonic cancellation witness instead; the bounded interval is
+        # comfortably inside soft-close's structural grace period.
+        while not self._fg_event.wait(timeout=0.05):
+            if self._approval_was_cancelled(items):
+                return False
+        # A close sets the event too, after stopping the batch.
+        return not self._approval_was_cancelled(items)
+
+    def flush_buffer(self) -> None:
+        """Replay buffered output when switching to foreground.
+
+        Under the print lock, so a gate the switch woke paints its card and
+        prompt before or after the replay, never in the middle of it.
+        """
+        with self._print_lock:
+            self._replay("buffered output")
+
+    def on_workstream_closed(self, name: str) -> None:
+        """The workstream is leaving this CLI: show what it kept in the background.
+
+        It will not come forward again, so what it buffered (a late judge
+        verdict, say) prints now, under its name.  Called once its session's
+        close has returned or raised, from whichever thread closed it (a lease
+        keeper's, for a lost lease), and never under the print lock: an open
+        prompt can hold it.
+        """
+        self._replay(f"{show_controls(name or self.ws_id)} closed; its buffered output")
+
+    def _replay(self, title: str) -> None:
+        """Take the buffer and write it to the terminal, under *title*.
+
+        The caller decides about the print lock: ``flush_buffer`` holds it, and
+        the replay as a workstream closes never takes it.
+        """
+        with self._buffer_lock:
+            buf, self._output_buffer = self._output_buffer, []
+        if not buf:
+            return
+        self._write_terminal(f"\n  {DIM}--- {title} ({len(buf)} events) ---{RESET}\n")
+        for stderr, text in buf:
+            # Each on the stream it was written to in front, in order.
+            self._write_terminal(text, stderr=stderr)
+        self._write_terminal(f"  {DIM}--- end buffered output ---{RESET}\n\n")
+
+
+# ─── Workstream commands ──────────────────────────────────────────────────
+
+
+def _print_ws_status_line(manager: SessionManager) -> None:
+    """Print a one-line status of background workstreams that are active."""
+    active_id = manager.active_id
+    parts = []
+    for ws in manager.list_all():
+        if ws.id == active_id:
+            continue
+        if ws.state in (WorkstreamState.IDLE,):
+            continue
+        sym, color_fn, label = _STATE_DISPLAY[ws.state]
+        idx = manager.index_of(ws.id)
+        parts.append(color_fn(f"{sym} {idx}:{ws.name} ({label})"))
+    if parts:
+        sys.stderr.write(f"  {'  '.join(parts)}\n")
+        sys.stderr.flush()
+
+
+def _default_model_not_loaded(alias: str, registry: Any = None) -> str:
+    """CLI wording for a default model that isn't loaded (#1359).
+
+    Nothing substitutes another model. The CLI reads only its own config.toml,
+    so the reason the loader recorded is the operator's and is shown.
+    """
+    if not alias:
+        return (
+            "no default chat model is configured: set [model] default in config.toml, "
+            "or add a chat model under [models.*]."
+        )
+    reason = ""
+    others = ""
+    if registry is not None:
+        from turnstone.core.model_registry import serves_chat
+
+        why = registry.skipped_aliases.get(alias)
+        if why:
+            reason = f" ({why})"
+        # Only models that can hold a chat, as every automatic pick takes.
+        loaded = [
+            a
+            for a in registry.list_aliases()
+            if serves_chat(registry.get_config(a).capabilities, registry.get_config(a).model)
+        ]
+        if loaded:
+            others = f", or set [model] default to one of: {', '.join(loaded)}"
+    from turnstone.core.model_registry import models_table
+
+    return (
+        f"the default model '{alias}' isn't loaded{reason}. "
+        f"Check {models_table(alias)} in config.toml{others}."
+    )
+
+
+def _handle_ws_command(
+    manager: SessionManager,
+    cmd_line: str,
+    skip_permissions: bool,
+) -> bool:
+    """Handle /ws subcommands.  Returns (switched: bool)."""
+    parts = cmd_line.strip().split()
+    sub = parts[1] if len(parts) > 1 else "list"
+
+    if sub == "list":
+        active_id = manager.active_id
+        all_ws = manager.list_all()
+        max_name = max((len(ws.name) for ws in all_ws), default=0)
+        for ws in all_ws:
+            idx = manager.index_of(ws.id)
+            sym, color_fn, label = _STATE_DISPLAY[ws.state]
+            marker = " *" if ws.id == active_id else "  "
+            padded = ws.name.ljust(max_name)
+            print(f"  {marker}{idx}. {color_fn(f'{sym} {padded}')}  {dim(label)}")
+        return False
+
+    elif sub == "new":
+        from turnstone.core.model_registry import UnknownModelAliasError
+
+        name = parts[2] if len(parts) > 2 else ""
+        try:
+            ws = manager.create(user_id="", name=name)
+        except RuntimeError as e:
+            print(red(str(e)))
+            return False
+        except UnknownModelAliasError as e:
+            print(red(f"Can't create a workstream: {_default_model_not_loaded(e.alias)}"))
+            return False
+        if skip_permissions and isinstance(ws.ui, TerminalUI):
+            ws.ui.auto_approve = True
+        _bring_to_front(manager, ws, previous=manager.get_active())
+        print(f"Created workstream {cyan(ws.name)} (#{manager.index_of(ws.id)})")
+        return True
+
+    elif sub.isdigit():
+        idx = int(sub)
+        old = manager.get_active()
+        ws: Workstream | None = manager.switch_by_index(idx)  # type: ignore[no-redef]
+        if ws:
+            _bring_to_front(manager, ws, previous=old)
+            print(f"Switched to {cyan(ws.name)}")
+            return True
+        else:
+            print(red(f"No workstream #{idx}"))
+            return False
+
+    elif sub == "close":
+        target_idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        ws_id: str | None = None
+        if target_idx is not None:
+            all_ws = manager.list_all()
+            if 1 <= target_idx <= len(all_ws):
+                ws_id = all_ws[target_idx - 1].id
+            else:
+                print(red(f"No workstream #{target_idx}"))
+                return False
+        else:
+            ws_id = manager.active_id
+            if ws_id is None:
+                return False
+
+        assert ws_id is not None
+        ws_obj = manager.get(ws_id)
+        ws_name = ws_obj.name if ws_obj else "?"
+        outcome = manager.close_with_outcome(ws_id)
+        if outcome in (CloseOutcome.CLOSED, CloseOutcome.OWNED_ELSEWHERE):
+            if outcome is CloseOutcome.CLOSED:
+                print(f"Closed workstream {ws_name}")
+            else:
+                print(
+                    f"Closed workstream {ws_name} here; this copy no longer owned it "
+                    "(another process took it over, or its lease ran out)."
+                )
+            # Ensure new active is foregrounded if any remain.
+            new_active = manager.get_active()
+            if new_active is not None:
+                _bring_to_front(manager, new_active)
+            return True
+        if outcome is CloseOutcome.UNRESOLVED_PERSISTENCE:
+            print(
+                yellow(
+                    f"Workstream {ws_name} stays open: its last messages are not saved yet. "
+                    "Try again shortly."
+                )
+            )
+        elif outcome is CloseOutcome.CLEANUP_PENDING:
+            print(yellow(f"Workstream {ws_name} is still cleaning up. Try again shortly."))
+        else:
+            print(red(f"Workstream {ws_name} not found or already closed"))
+        return False
+
+    elif sub == "rename":
+        new_name = " ".join(parts[2:]) if len(parts) > 2 else ""
+        if not new_name:
+            print(red("Usage: /ws rename <name>"))
+            return False
+        ws_active: Workstream | None = manager.get_active()
+        if ws_active:
+            old_name = ws_active.name
+            ws_active.name = new_name
+            print(f"Renamed {old_name} -> {cyan(new_name)}")
+        return False
+
+    else:
+        print(f"Unknown /ws subcommand: {sub}")
+        print("Usage: /ws [list|new [name]|<N>|close [N]|rename <name>]")
+        return False
+
+
+# ─── Cluster commands ─────────────────────────────────────────────────────
+
+
+def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
+    """Handle /cluster subcommands querying the turnstone-console API."""
+    import httpx2
+
+    if not console_url:
+        print(red("No console URL configured. Use --console-url or set [console] url in config."))
+        return
+
+    headers: dict[str, str] = {}
+    from turnstone.core.auth import jwt_secret_if_configured
+
+    jwt_secret = jwt_secret_if_configured() or ""
+    if jwt_secret:
+        from turnstone.core.auth import JWT_AUD_CONSOLE, ServiceTokenManager
+
+        _cluster_token_mgr = ServiceTokenManager(
+            user_id="cli",
+            scopes=frozenset({"read", "write", "approve", "service"}),
+            source="cli",
+            secret=jwt_secret,
+            audience=JWT_AUD_CONSOLE,
+        )
+        headers["Authorization"] = f"Bearer {_cluster_token_mgr.token}"
+
+    parts = cmd_line.strip().split()
+    sub = parts[1] if len(parts) > 1 else "status"
+
+    try:
+        if sub == "status":
+            resp = httpx2.get(f"{console_url}/v1/api/cluster/overview", timeout=5, headers=headers)
+            data = resp.json()
+            states = data.get("states", {})
+            agg = data.get("aggregate", {})
+            print(f"\n  {bold('Cluster Overview')}")
+            print(
+                f"  Nodes: {cyan(str(data.get('nodes', 0)))}  "
+                f"Workstreams: {cyan(str(data.get('workstreams', 0)))}"
+            )
+            print()
+            for ws_state, (sym, color_fn, label) in _STATE_DISPLAY.items():
+                count = states.get(ws_state.value, 0)
+                print(f"    {color_fn(f'{sym} {label}')}: {count}")
+            print()
+            tokens = agg.get("total_tokens", 0)
+            tools = agg.get("total_tool_calls", 0)
+            tok_str = f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+            print(f"  {dim(f'{tok_str} tokens · {tools} tool calls')}")
+            print()
+
+        elif sub == "nodes":
+            limit = 20
+            resp = httpx2.get(
+                f"{console_url}/v1/api/cluster/nodes?sort=activity&limit={limit}",
+                timeout=5,
+                headers=headers,
+            )
+            data = resp.json()
+            nodes = data.get("nodes", [])
+            total = data.get("total", len(nodes))
+            if not nodes:
+                print(dim("  No nodes discovered."))
+                return
+            # Column widths
+            max_name = max(len(n["node_id"]) for n in nodes)
+            print(
+                f"\n  {'NODE'.ljust(max_name)}  {'WS':>4}  {'RUN':>4}  {'ATTN':>4}  {'EVAL':>4}"
+                f"  {'TOKENS':>8}"
+            )
+            print(
+                f"  {'-' * max_name}  {'----':>4}  {'----':>4}  {'----':>4}  {'----':>4}"
+                f"  {'--------':>8}"
+            )
+            for n in nodes:
+                name = n["node_id"].ljust(max_name)
+                ws = str(n.get("ws_total", 0))
+                run = n.get("ws_running", 0)
+                attn = n.get("ws_attention", 0)
+                evaluation = n.get("ws_evaluation", 0)
+                tok = n.get("total_tokens", 0)
+                tok_str = f"{tok / 1000:.1f}k" if tok >= 1000 else str(tok)
+                run_str = green(str(run)) if run else dim("0")
+                attn_str = yellow(str(attn)) if attn else dim("0")
+                eval_str = cyan(str(evaluation)) if evaluation else dim("0")
+                print(
+                    f"  {cyan(name)}  {ws:>4}  {run_str:>4}  {attn_str:>4}  {eval_str:>4}"
+                    f"  {dim(tok_str):>8}"
+                )
+            if total > len(nodes):
+                print(dim(f"\n  Showing {len(nodes)} of {total} nodes"))
+            print()
+
+        elif sub == "workstreams" or sub == "ws":
+            params = "sort=state&per_page=20"
+            # Parse optional filters: /cluster ws running, /cluster ws node=X
+            for arg in parts[2:]:
+                if "=" in arg:
+                    key, val = arg.split("=", 1)
+                    if key in ("state", "node", "search"):
+                        params += f"&{key}={val}"
+                else:
+                    params += f"&state={arg}"
+            resp = httpx2.get(
+                f"{console_url}/v1/api/cluster/workstreams?{params}",
+                timeout=5,
+                headers=headers,
+            )
+            data = resp.json()
+            ws_list = data.get("workstreams", [])
+            total = data.get("total", len(ws_list))
+            if not ws_list:
+                print(dim("  No matching workstreams."))
+                return
+            max_name = max(len(w.get("name", "")[:20]) for w in ws_list)
+            max_node = max(len(w.get("node", "")[:16]) for w in ws_list)
+            print(
+                f"\n  {'STATE':<8}  {'NAME'.ljust(max_name)}  {'NODE'.ljust(max_node)}  {'TOKENS':>8}  {'CTX':>4}"
+            )
+            for w in ws_list:
+                ws_state = _state_from_wire(w.get("state", "idle"))
+                sym, color_fn, label = _STATE_DISPLAY[ws_state]
+                name = w.get("name", "")[:20].ljust(max_name)
+                node = w.get("node", "")[:16].ljust(max_node)
+                tok = w.get("tokens", 0)
+                tok_str = f"{tok / 1000:.1f}k" if tok >= 1000 else str(tok)
+                ctx = w.get("context_ratio", 0)
+                ctx_str = f"{int(ctx * 100)}%" if ctx > 0 else ""
+                print(
+                    f"  {color_fn(f'{sym} {label:<5}')}  {bold(name)}  {dim(node)}  {dim(tok_str):>8}  {ctx_str:>4}"
+                )
+            if total > len(ws_list):
+                print(dim(f"\n  Showing {len(ws_list)} of {total} workstreams"))
+            print()
+
+        elif sub == "node":
+            if len(parts) < 3:
+                print(red("Usage: /cluster node <node_id>"))
+                return
+            node_id = parts[2]
+            resp = httpx2.get(
+                f"{console_url}/v1/api/cluster/node/{node_id}", timeout=5, headers=headers
+            )
+            data = resp.json()
+            if "error" in data:
+                print(red(data["error"]))
+                return
+            ws_list = data.get("workstreams", [])
+            print(f"\n  {bold(node_id)}  ({data.get('server_url', '')})")
+            if not ws_list:
+                print(dim("  No workstreams."))
+                return
+            for w in ws_list:
+                ws_state = _state_from_wire(w.get("state", "idle"))
+                sym, color_fn, _ = _STATE_DISPLAY[ws_state]
+                name = w.get("name", "")
+                title = w.get("title", "")
+                activity = w.get("activity", "")
+                print(f"    {color_fn(sym)} {bold(name)}  {dim(title)}")
+                if activity:
+                    print(f"      {dim(activity)}")
+            print()
+
+        else:
+            print(f"Unknown /cluster subcommand: {sub}")
+            print("Usage: /cluster [status|nodes|workstreams [state|node=X]|node <id>]")
+
+    except httpx2.ConnectError:
+        print(red(f"Cannot connect to console at {console_url}"))
+    except Exception as e:
+        print(red(f"Cluster command failed: {e}"))
+
+
+# ─── Model auto-detection ─────────────────────────────────────────────────
+
+
+def detect_model(client: Any, provider: str = "openai") -> tuple[str, int | None]:
+    """Auto-detect model — delegates to :func:`turnstone.core.model_registry.detect_model`.
+
+    CLI always uses fatal=True, so model is never None.
+    """
+    from turnstone.core.model_registry import detect_model as _detect
+
+    model, ctx = _detect(client, provider=provider)
+    assert model is not None  # fatal=True guarantees non-None or SystemExit
+    return model, ctx
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────
+
+
+def resolve_cli_persona_kwargs(storage: Any, persona_arg: str | None) -> dict[str, Any]:
+    """Resolve the persona stamp for a new CLI session, pre-construction.
+
+    ``--persona`` (or the interactive default persona) resolves against the
+    shelf.  A database with no personas seeded yields ``{}`` — an unstamped
+    legacy session, byte-identical behavior.  (``--resume`` opens the saved
+    workstream, which runs from its own stamp.)
+
+    Unknown/disabled/kind-mismatched ``--persona`` names print a clear error
+    and ``sys.exit(1)`` — a startup misconfiguration must not silently start
+    an unrestricted session.
+    """
+    from turnstone.core.personas import resolve_persona_for_kind, snapshot_from_persona
+
+    if persona_arg:
+        row, err = resolve_persona_for_kind(storage, persona_arg, "interactive")
+        if row is None:
+            print(red(err))
+            sys.exit(1)
+        return {"persona": row["name"], "persona_snapshot": snapshot_from_persona(row)}
+    if storage is not None:
+        try:
+            default_row = storage.get_default_persona("interactive")
+        except Exception as exc:
+            # A failed lookup must not silently start an unrestricted
+            # session — the operator may have promoted a restricted
+            # persona to default.  (A clean None — no default configured —
+            # still yields the unstamped legacy session below.)
+            print(red(f"Default persona lookup failed: {exc}"))
+            sys.exit(1)
+        if default_row:
+            return {
+                "persona": default_row["name"],
+                "persona_snapshot": snapshot_from_persona(default_row),
+            }
+    return {}
+
+
+def _close_all_sessions(manager: SessionManager) -> None:
+    """Close EVERY loaded session at CLI exit — not just the active one.
+
+    ``ChatSession.close()`` removes MCP listeners AND reaps the workstream's
+    background shells (#817).  An active-only close would let a dev server
+    started in workstream 1 survive ``/new`` + ``/exit`` forever: its
+    detached process group outlives this process — the exact leaked-server
+    class #816 removed.
+
+    Two phases so total exit latency doesn't stack per workstream: the kill
+    signals land on EVERY session's shells first (microseconds each — after
+    which nothing can outlive us), then the per-session closes pay their
+    join budgets, which are near-zero once the kills have landed.  A Ctrl-C
+    during the close phase degrades gracefully instead of aborting the
+    sweep: the signals are already delivered, the remaining joins are
+    skipped, and the caller still runs MCP/registry shutdown.  Best-effort
+    per workstream either way — one bad teardown must not stop the rest.
+    """
+    loaded = [(ws, ws.session) for ws in manager.list_all() if ws.session is not None]
+    for _ws, session in loaded:
+        with contextlib.suppress(Exception):
+            session._background_shells.signal_all()
+    try:
+        try:
+            for ws, session in loaded:
+                try:
+                    session.close()
+                except Exception:
+                    print(dim(f"  (workstream {ws.id[:8]} teardown error, continuing)"))
+        finally:
+            # What a background workstream kept for the user shows now, as when it
+            # closes any other way (``cleanup_session_ui``), a Ctrl-C during the
+            # closes included: the replay is a few writes, not a join.
+            for ws, _session in loaded:
+                if isinstance(ws.ui, WorkstreamTerminalUI):
+                    with contextlib.suppress(Exception):
+                        ws.ui.on_workstream_closed(ws.name)
+    except KeyboardInterrupt:
+        # The kills above already landed; skipping the remaining joins
+        # leaks nothing — it only abandons wedged drain threads that die
+        # with this process anyway.
+        print(dim("  (interrupted — background shells already signalled)"))
+    # Hand the workstreams back so a server can open them at once instead of
+    # waiting out the lease TTL; release_leases first drains each session's
+    # admitted writes. A Ctrl-C here leaves the leases to expire.
+    try:
+        manager.release_leases()
+    except KeyboardInterrupt:
+        print(dim("  (interrupted — workstream leases expire on their own)"))
+    except Exception:
+        print(dim("  (could not release workstream leases; they expire on their own)"))
+
+
+def _judge_parallel_evaluations_arg(value: str) -> int:
+    """Argparse adapter for the registry's strict bounded integer contract."""
+    from turnstone.core.settings_registry import validate_value
+
+    try:
+        return int(validate_value("judge.parallel_evaluations", value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+# What a line typed at the prompt does (see _classify_repl_input).
+ReplInputKind = Literal[
+    "empty", "exit", "cluster", "stale", "ws", "tab", "no_workstream", "dispatch"
+]
+# Why a tab /resume or /new left is still open: unsaved messages, or running programs.
+ParkReason = Literal["unsaved", "programs"]
+
+
+def _classify_repl_input(
+    manager: SessionManager, user_input: str, prompt_active: str | None
+) -> tuple[ReplInputKind, Workstream | None]:
+    """What one line typed at the prompt does: ``(kind, target)``.
+
+    ``prompt_active`` is the workstream the prompt showed. Kinds: ``empty``,
+    ``exit`` (in any case, whether or not a workstream is open), ``cluster``,
+    ``stale`` (typed for a workstream that closed while the prompt was up:
+    never sent into another conversation, and ``/ws`` lines included, since
+    their implicit target and indices moved), ``ws``, ``tab`` (``/resume`` or
+    ``/new``, with the tab they leave as ``target``, if any), ``no_workstream``,
+    and ``dispatch`` with that same workstream as ``target``.
+    """
+    line = user_input.strip()
+    if not line:
+        return "empty", None
+    if line.split()[0].lower() in ("/exit", "/quit", "/q"):
+        return "exit", None
+    if line.startswith("/cluster"):
+        return "cluster", None
+    target = manager.get(prompt_active) if prompt_active is not None else None
+    if manager.active_id != prompt_active or (prompt_active is not None and target is None):
+        return "stale", None
+    if line.startswith("/ws"):
+        return "ws", None
+    if line.split()[0].lower() in ("/resume", "/new"):
+        return "tab", target
+    if target is None or target.session is None:
+        return "no_workstream", None
+    return "dispatch", target
+
+
+def _bring_to_front(
+    manager: SessionManager, ws: Workstream, previous: Workstream | None = None
+) -> None:
+    """Put ``ws`` in front: background ``previous``, switch, show ``ws``'s buffered output."""
+    if (
+        previous is not None
+        and previous is not ws
+        and isinstance(previous.ui, WorkstreamTerminalUI)
+    ):
+        previous.ui.set_foreground(False)
+    if manager.active_id != ws.id:
+        manager.switch(ws.id)
+    if isinstance(ws.ui, WorkstreamTerminalUI):
+        ws.ui.set_foreground(True)
+        ws.ui.flush_buffer()
+
+
+def _bring_forward_after_background_close(manager: SessionManager) -> None:
+    """Show the workstream now in front after the previous one closed in the background.
+
+    The closed workstream's own notice (another process took it over, or its
+    lease ran out) printed before it closed; this tells the user where their
+    next input goes.
+    """
+    active = manager.get_active()
+    if active is None:
+        print(yellow("No workstream is open here any more. Use /ws new to start one, or /exit."))
+        return
+    _bring_to_front(manager, active)
+    print(yellow(f"Now in workstream {manager.index_of(active.id)}:{active.name}."))
+
+
+# ─── /resume and /new: tab operations (#988) ──────────────────────────────
+
+
+def _carry_approvals(left: Workstream | None, new: Workstream, skip_permissions: bool) -> None:
+    """Give a tab ``/resume`` or ``/new`` opened the approval state of the tab left.
+
+    One terminal UI used to serve both conversations, so skip-permissions and
+    "Always" grants carried over; they still do.
+    """
+    new_ui = new.ui
+    if not isinstance(new_ui, TerminalUI):
+        return
+    old_ui = left.ui if left is not None else None
+    if skip_permissions or (isinstance(old_ui, TerminalUI) and old_ui.auto_approve):
+        new_ui.auto_approve = True
+    if isinstance(old_ui, TerminalUI):
+        new_ui.auto_approve_tools.update(old_ui.auto_approve_tools)
+
+
+def _create_tab_like(manager: SessionManager, left: Workstream | None) -> Workstream:
+    """``/new``: a new workstream with the current tab's persona and settings.
+
+    The persona is construction-time; the other settings go through the path
+    a reopened workstream takes (``ChatSession.adopt_settings``), plus the
+    reasoning-display and debug toggles. A failure leaves no tab and no row.
+    """
+    old = left.session if left is not None else None
+    if old is None:
+        return manager.create(user_id="")
+    persona_kwargs: dict[str, Any] = {}
+    snap = old._current_persona_snapshot()
+    if snap is not None:
+        persona_kwargs = {"persona": snap.name, "persona_snapshot": snap}
+    config = old._config_for_save()
+    # Built on the binding the tab runs on: a tab whose model isn't loaded is
+    # held on it over a stand-in (#1359), and ``adopt_settings`` then holds the
+    # new tab on that model too.
+    ws = manager.create(
+        user_id="",
+        model=old.bound_model_alias,
+        defer_emit_created=True,
+        **persona_kwargs,
+    )
+    try:
+        new_session = ws.session
+        if new_session is not None:
+            new_session.adopt_settings(config)
+            new_session.show_reasoning = old.show_reasoning
+            new_session.debug = old.debug
+        if not manager.commit_create(ws):
+            raise RuntimeError("the new workstream was retired while it was created")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            manager.rollback_create(ws)
+        raise
+    return ws
+
+
+# Close outcomes after which the tab is gone from this CLI.
+_TAB_GONE = (CloseOutcome.CLOSED, CloseOutcome.NOT_FOUND, CloseOutcome.OWNED_ELSEWHERE)
+
+# A saved workstream the manager will not open: a coordinator, or a row being
+# created or deleted.
+_NOT_OPENABLE = (
+    "Cannot resume {}: it is not an interactive workstream, or it is being created or deleted."
+)
+
+
+def _tab_is_clean(ws: Workstream) -> bool:
+    """Whether closing ``ws`` now loses nothing: every message saved, no turn half-done.
+
+    Never blocks: a session whose locks are busy counts as not clean.
+    """
+    session = ws.session
+    if session is None:
+        return True
+    return session.has_unresolved_conversation_persistence_nowait() is False
+
+
+def _runs_background_programs(ws: Workstream) -> bool:
+    return ws.session is not None and ws.session.has_running_background_shells()
+
+
+def _leave_tab(manager: SessionManager, left: Workstream, parked: dict[str, ParkReason]) -> None:
+    """Close the tab ``/resume`` or ``/new`` left, unless closing it would lose something.
+
+    A tab with unsaved messages stays open while they are retried and closes
+    by itself once they are saved; a tab whose background programs still run
+    stays open until the user closes it, so the programs keep running.
+    """
+    label = f"{manager.index_of(left.id)}:{left.name}"
+    if _runs_background_programs(left):
+        parked[left.id] = "programs"
+        print(
+            yellow(
+                f"Workstream {label} stays open: programs it started are still running. "
+                f"Close it with /ws close {manager.index_of(left.id)}."
+            )
+        )
+        return
+    if _tab_is_clean(left):
+        outcome = manager.close_with_outcome(left.id)
+        if outcome in _TAB_GONE:
+            return
+    parked[left.id] = "unsaved"
+    print(
+        yellow(
+            f"Workstream {label} stays open until its last messages are saved, "
+            "then closes by itself."
+        )
+    )
+
+
+def _close_parked_tabs(manager: SessionManager, parked: dict[str, ParkReason]) -> None:
+    """Close each tab left with unsaved messages once they are saved (run at each prompt)."""
+    for ws_id, reason in list(parked.items()):
+        ws = manager.get(ws_id)
+        if ws is None or ws_id == manager.active_id:
+            # Gone, or the user went back to it: no longer a tab left behind.
+            parked.pop(ws_id, None)
+            continue
+        if reason != "unsaved" or not _tab_is_clean(ws):
+            continue
+        label = f"{manager.index_of(ws_id)}:{ws.name}"
+        if manager.close_with_outcome(ws_id) in _TAB_GONE:
+            parked.pop(ws_id, None)
+            print(dim(f"Workstream {label} closed (its messages are saved)."))
+
+
+def _handle_tab_command(
+    manager: SessionManager,
+    line: str,
+    left: Workstream | None,
+    skip_permissions: bool,
+    parked: dict[str, ParkReason],
+) -> None:
+    """``/resume <id|alias>`` and ``/new``: open the workstream in a tab and leave this one.
+
+    No session changes its workstream in place (#988): ``/resume`` opens the
+    saved workstream through the manager, or switches to it when another tab
+    here has it; ``/new`` creates one with this tab's settings. Any refusal
+    prints one line and stays on the current tab, unless the current tab was a
+    stopped copy of the workstream ``/resume`` named: the open retires it first,
+    and the next tab comes forward.
+    """
+    from turnstone.core.memory import resolve_workstream
+
+    # Split as the classifier does (any whitespace), so a pasted tab or
+    # non-breaking space after the command still names its target.
+    word, *rest = line.split(None, 1)
+    word = word.lower()
+    arg = rest[0].strip() if rest else ""
+    if word == "/resume":
+        if not arg:
+            print("Usage: /resume <alias_or_ws_id>\nUse /workstreams to list saved workstreams.")
+            return
+        target_id = resolve_workstream(arg)
+        if not target_id:
+            print(yellow(f"Workstream not found: {arg}"))
+            return
+        # A tab whose lease moved has stopped and cannot write: it counts as
+        # gone, so resuming it opens it again (or names the process holding it).
+        if left is not None and target_id == left.id and manager.loaded(left.id) is not None:
+            print("Already in that workstream.")
+            return
+        new_ws = manager.loaded(target_id)
+        if new_ws is None:
+            try:
+                new_ws = manager.open(target_id)
+            except KeyboardInterrupt:
+                # The open may already have retired the stopped tab in front.
+                _front_after_a_retired_tab(manager, left)
+                raise
+            except Exception as exc:
+                # Open elsewhere (the message names the holder), a node
+                # requirement, a corrupt persona stamp, a storage error.
+                print(red(f"Cannot resume {target_id}: {exc}"))
+                _front_after_a_retired_tab(manager, left)
+                return
+            if new_ws is None:
+                print(yellow(_NOT_OPENABLE.format(arg)))
+                _front_after_a_retired_tab(manager, left)
+                return
+            _carry_approvals(left, new_ws, skip_permissions)
+        count = len(new_ws.session.messages) if new_ws.session is not None else 0
+        notice = f"Resumed {bold(target_id)} ({count} messages loaded)"
+    elif word == "/new":
+        try:
+            new_ws = _create_tab_like(manager, left)
+        except Exception as exc:
+            print(red(f"Cannot start a new workstream: {exc}"))
+            return
+        _carry_approvals(left, new_ws, skip_permissions)
+        notice = "New workstream started."
+    else:
+        return
+    _bring_to_front(manager, new_ws, previous=left)
+    print(notice)
+    if left is not None and manager.get(left.id) is left:
+        # Not when the tab left was a stopped copy of the one just reopened.
+        _leave_tab(manager, left, parked)
+
+
+def _front_after_a_retired_tab(manager: SessionManager, left: Workstream | None) -> None:
+    """After a failed ``/resume``: if its open retired the stopped tab left, show what is in front.
+
+    Resuming a tab whose lease moved opens it again, and the open retires the
+    stopped copy first; when it then fails, the workstream in front changed.
+    """
+    if left is not None and manager.get(left.id) is not left:
+        _bring_forward_after_background_close(manager)
+
+
+def _refuse_deleting_an_open_tab(manager: SessionManager, line: str) -> bool:
+    """``/delete`` of a workstream a tab here has open: say so, rather than the lease refusal.
+
+    That refusal reads as another process holding it. Returns whether the line
+    was handled.
+    """
+    from turnstone.core.memory import resolve_workstream
+
+    word, *rest = line.split(None, 1)
+    if word.lower() != "/delete" or not rest:
+        return False
+    target_id = resolve_workstream(rest[0].strip())
+    ws = manager.get(target_id) if target_id else None
+    if ws is None:
+        return False
+    idx = manager.index_of(ws.id)
+    print(yellow(f"Workstream {idx}:{ws.name} is open here; close it first with /ws close {idx}."))
+    return True
+
+
+def _open_for_cli_resume(manager: SessionManager, target_id: str, requested: str) -> Workstream:
+    """Open ``target_id`` for ``turnstone --resume``, or print one line and exit 1.
+
+    A node requirement or lease refusal, a corrupt persona stamp or a storage
+    error never ends the CLI with a traceback.
+    """
+    try:
+        opened = manager.open(target_id)
+    except Exception as exc:
+        logging.getLogger(__name__).debug("cli.startup_resume_failed", exc_info=True)
+        print(red(f"Cannot resume {target_id}: {exc}"))
+        sys.exit(1)
+    if opened is None:
+        print(red(_NOT_OPENABLE.format(requested)))
+        sys.exit(1)
+    return opened
+
+
+def _build_cli_manager(
+    session_factory: Callable[..., ChatSession],
+    has_alias: Callable[[str], bool],
+    default_alias: Callable[[], str],
+) -> SessionManager:
+    """The CLI's workstream manager: a terminal UI per workstream, sessions from *session_factory*.
+
+    Opening a workstream saved with an alias this CLI does not define (*has_alias* tells) builds
+    it on the default model as a stand-in and holds it on its own alias instead of failing.
+    *default_alias* reads that default, so a reopen whose default stays unloaded fails at once
+    instead of retrying as if it raced (#1359).
+    """
+    import queue
+
+    from turnstone.core.storage._registry import get_storage
+
+    # The adapter's ui_factory needs the manager, whose constructor takes the
+    # adapter: ``InteractiveAdapter.attach`` breaks the cycle.
+    adapter = InteractiveAdapter(
+        # The CLI consumes no SSE events: a tiny queue, and emit_* drops
+        # silently on Full (the adapter already suppresses).
+        global_queue=queue.Queue(maxsize=1),
+        ui_factory=lambda ws: WorkstreamTerminalUI(ws.id, adapter.manager),
+        session_factory=session_factory,
+    )
+    manager = SessionManager(
+        adapter,
+        storage=get_storage(),
+        max_active=50,
+        model_validator=has_alias,
+        default_alias_reader=default_alias,
+    )
+    adapter.attach(manager)
+    return manager
+
+
+# The servers' reconcile cadence (a module attribute, so tests can shorten it).
+_PERSISTENCE_RETRY_SECONDS = PERSISTENCE_RECONCILE_INTERVAL_SECONDS
+
+
+def _start_persistence_retries(manager: SessionManager) -> threading.Event:
+    """Retry unsaved conversation rows every second, as the server's maintenance loop does.
+
+    Returns the event that stops the thread.
+    """
+    stop = threading.Event()
+
+    def retry_loop() -> None:
+        while not stop.wait(_PERSISTENCE_RETRY_SECONDS):
+            try:
+                manager.reconcile_unresolved_persistence()
+            except Exception:
+                logging.getLogger(__name__).debug("cli.persistence_retry_failed", exc_info=True)
+
+    threading.Thread(target=retry_loop, name="cli-persistence-retry", daemon=True).start()
+    return stop
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Interactive CLI for OpenAI-compatible models with tool calling.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python3 chat.py                          # auto-detect model
+              python3 chat.py --model kappa_20b_131k    # explicit model
+              python3 chat.py --temperature 0.7         # lower temperature
+        """),
+    )
+    parser.add_argument(
+        "--base-url",
+        default="http://localhost:8000/v1",
+        help="OpenAI-compatible API base URL (default: http://localhost:8000/v1)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model name (default: auto-detect from server)",
+    )
+    parser.add_argument(
+        "--instructions",
+        default=None,
+        help="Developer instructions injected as developer message",
+    )
+    parser.add_argument(
+        "--skill",
+        default=None,
+        help=(
+            "Skill for each workstream this terminal starts from scratch (/new copies the "
+            "current tab's skill; a resumed workstream keeps its own)"
+        ),
+    )
+    parser.add_argument(
+        "--persona",
+        default=None,
+        help=(
+            "Persona name for this session (resolved and snapshotted at start; "
+            "default: the interactive default persona)"
+        ),
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help=(
+            "Sampling temperature (default: the model's configured value, "
+            "else the field is omitted and the serving default applies)"
+        ),
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=32768,
+        help="Max completion tokens (default: 32768)",
+    )
+    parser.add_argument(
+        "--tool-timeout",
+        type=int,
+        default=30,
+        help="Bash command timeout in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default="",
+        choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        help=(
+            "Reasoning effort level (default: the model's configured or "
+            "declared value, else the serving default)"
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        default="openai",
+        choices=["openai", "anthropic"],
+        help="LLM provider for the default model (default: openai)",
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=0,
+        help="Context window size in tokens (0 = auto-detect from model)",
+    )
+    parser.add_argument(
+        "--compact-max-tokens",
+        type=int,
+        default=32768,
+        help="Max tokens for compaction summary (default: 32768)",
+    )
+    parser.add_argument(
+        "--auto-compact-pct",
+        type=float,
+        default=0.8,
+        help="Auto-compact when prompt exceeds this fraction of context window (default: 0.8)",
+    )
+    parser.add_argument(
+        "--agent-max-turns",
+        type=int,
+        default=-1,
+        help="Max tool turns for agent sub-sessions, -1 for unlimited (default: -1)",
+    )
+    parser.add_argument(
+        "--tool-truncation",
+        type=int,
+        default=0,
+        help=(
+            "Tool output truncation limit in chars, 0 for auto "
+            "(20%% of the remaining input budget per result) (default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--tool-search",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Dynamic tool search: auto (enable when tool count exceeds threshold), on, off (default: auto)",
+    )
+    parser.add_argument(
+        "--tool-search-threshold",
+        type=int,
+        default=20,
+        help="Min tools before tool search activates (default: 20)",
+    )
+    parser.add_argument(
+        "--tool-search-max-results",
+        type=int,
+        default=5,
+        help="Max tools returned per tool search query (default: 5)",
+    )
+    parser.add_argument(
+        "--web-search-backend",
+        default="",
+        metavar="BACKEND",
+        help="Web search backend: '' (auto), 'searxng', or 'mcp:server:tool'",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="WS",
+        help="Resume a previous workstream by alias or ws_id",
+    )
+    parser.add_argument(
+        "--skip-permissions",
+        action="store_true",
+        help="Auto-approve all tool calls (no confirmation prompts)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key (default: $OPENAI_API_KEY, or 'dummy' for local servers)",
+    )
+    parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=90,
+        metavar="DAYS",
+        help="Delete unnamed workstreams older than DAYS days on startup, 0 to disable (default: 90)",
+    )
+    parser.add_argument(
+        "--console-url",
+        default=None,
+        help="Turnstone console URL for /cluster commands (e.g., http://localhost:8090)",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        default=None,
+        metavar="PATH",
+        help="Path to MCP server config file (standard mcpServers JSON format)",
+    )
+
+    judge_group = parser.add_argument_group("Judge options")
+    judge_group.add_argument(
+        "--judge",
+        dest="judge_enabled",
+        action="store_true",
+        default=True,
+        help="Enable intent validation judge for tool approvals (default)",
+    )
+    judge_group.add_argument(
+        "--no-judge",
+        dest="judge_enabled",
+        action="store_false",
+        help="Disable intent validation judge",
+    )
+    judge_group.add_argument(
+        "--judge-model",
+        dest="judge_model",
+        default="",
+        help=(
+            "Model alias for the judge (default: same as session model); a name that isn't "
+            "a usable alias stops the judge rather than using another model. The output "
+            "guard's LLM stage runs on it too unless judge.output_guard_model is set"
+        ),
+    )
+    judge_group.add_argument(
+        "--judge-timeout",
+        dest="judge_timeout",
+        type=float,
+        default=120.0,
+        help="LLM judge timeout in seconds (default: 120)",
+    )
+    judge_group.add_argument(
+        "--judge-parallel-evaluations",
+        dest="judge_parallel_evaluations",
+        type=_judge_parallel_evaluations_arg,
+        default=1,
+        metavar="N",
+        help="Concurrent LLM evaluations within one judge batch, 1-16 (default: 1)",
+    )
+    judge_group.add_argument(
+        "--judge-confidence",
+        dest="judge_confidence",
+        type=float,
+        default=0.95,
+        help="Judge verdict confidence threshold, 0-1 (default: 0.95)",
+    )
+    from turnstone.core.config import add_config_arg, apply_config
+
+    add_config_arg(parser)
+    apply_config(
+        parser,
+        ["api", "model", "session", "tools", "console", "auth", "mcp", "database", "judge"],
+    )
+    args = parser.parse_args()
+
+    from turnstone.core.log import configure_logging
+
+    configure_logging(level="WARNING", service="cli")
+
+    # Initialize storage backend
+    from turnstone.core.storage import init_storage
+
+    db_backend = getattr(args, "db_backend", None) or os.environ.get(
+        "TURNSTONE_DB_BACKEND", "sqlite"
+    )
+    db_url = getattr(args, "db_url", None) or os.environ.get("TURNSTONE_DB_URL", "")
+    db_path = getattr(args, "db_path", None) or os.environ.get("TURNSTONE_DB_PATH", "")
+    db_pool_size = int(
+        getattr(args, "db_pool_size", None) or os.environ.get("TURNSTONE_DB_POOL_SIZE", "2")
+    )
+    init_storage(db_backend, path=db_path, url=db_url, pool_size=db_pool_size)
+
+    # Prune stale / empty workstreams on startup
+    from turnstone.core.memory import prune_workstreams
+
+    prune_workstreams(retention_days=args.retention_days, log_fn=print)
+
+    # Set up readline
+    setup_readline()
+
+    # Create client and detect model
+    provider_name = args.provider
+    key_variable = "ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY"
+    api_key = args.api_key or os.environ.get(key_variable) or "dummy"
+    # Checked before its first use below, by the rule every model key follows.
+    from turnstone.core.http_headers import HeaderValueError, checked_header_value
+
+    try:
+        api_key = checked_header_value(
+            api_key, "--api-key (or [api] api_key)" if args.api_key else f"${key_variable}"
+        )
+    except HeaderValueError as exc:
+        print(f"turnstone: {exc}", file=sys.stderr)
+        sys.exit(1)
+    base_url = args.base_url
+    if provider_name == "anthropic" and base_url == "http://localhost:8000/v1":
+        # Override local default to Anthropic API
+        base_url = "https://api.anthropic.com"
+    from turnstone.core.providers import create_client
+
+    client = create_client(provider_name, base_url=base_url, api_key=api_key)
+    if args.model:
+        model = args.model
+        detected_ctx = None
+    else:
+        model, detected_ctx = detect_model(client, provider=provider_name)
+
+    # Use detected context window, fall back to CLI override or 32768
+    context_window = args.context_window
+    if detected_ctx and not context_window:  # 0 = auto-detect
+        context_window = detected_ctx
+    elif not context_window:
+        context_window = 32768
+
+    # A malformed [secrets] table is a startup failure, like a malformed keyring:
+    # [models.*] keys and MCP headers may hold secret:// references. Building
+    # the resolver touches no store.
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
+
+    try:
+        get_resolver()
+    except SecretConfigError as exc:
+        print(f"config.toml: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # The bootstrap secrets register first, so no model key or MCP header below
+    # may resolve to one of them.
+    from turnstone.core.bootstrap_secrets import register_bootstrap_values
+
+    register_bootstrap_values()
+
+    # Build model registry (reads [models.*] sections from config.toml)
+    from turnstone.core.model_registry import load_model_registry
+
+    try:
+        registry = load_model_registry(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            context_window=context_window,
+            provider=provider_name,
+        )
+    except ValueError as exc:  # a configuration problem, reported like the [secrets] check
+        print(f"turnstone: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Initialize MCP client (connects to configured MCP servers, if any)
+    from turnstone.core.mcp_client import create_mcp_client
+    from turnstone.core.storage._registry import get_storage as _get_storage
+
+    mcp_client = create_mcp_client(
+        getattr(args, "mcp_config", None),
+        storage=_get_storage(),
+        # Nodes maintain web users' grants; CLI sessions must not become a
+        # second background refresher against a shared SQLite database.
+        user_token_sweep=False,
+    )
+    from types import SimpleNamespace
+
+    from turnstone.core.mcp_crypto import close_mcp_crypto_state, initialize_mcp_crypto_state
+    from turnstone.core.model_oauth import OAuthModelTokenClient
+    from turnstone.core.oauth.oidc import close_oidc_state, initialize_oidc_state, load_oidc_config
+    from turnstone.core.oauth.runtime import shutdown_oauth_runtime
+
+    cli_auth_storage = _get_storage()
+    cli_auth_state = SimpleNamespace(
+        auth_storage=cli_auth_storage,
+        registry=registry,
+        oauth_context=OAuthContext(storage=cli_auth_storage),
+    )
+    model_token_client = OAuthModelTokenClient(cli_auth_state.oauth_context)
+    if registry.has_dynamic_auth():
+        cli_auth_state.oauth_context.oidc_config = load_oidc_config()
+
+        # CLI model authentication has its own runtime, including installations
+        # without MCP servers. Browser/JWKS clients have no CLI consumers.
+        async def _initialize_cli_auth_state() -> None:
+            await initialize_oidc_state(cli_auth_state)
+            await close_oidc_state(cli_auth_state)
+
+        asyncio.run(_initialize_cli_auth_state())
+        initialize_mcp_crypto_state(cli_auth_state, node_id="cli")
+    if mcp_client is not None:
+        mcp_client.set_storage(cli_auth_storage)
+        mcp_client.set_app_state(cli_auth_state)
+
+    # apply_config() merges [judge] config.toml values into args as
+    # Output_guard and redact_secrets default to True, enabling the heuristic
+    # guard even when the LLM judge is disabled via --no-judge.
+    judge_config = JudgeConfig(
+        enabled=args.judge_enabled,
+        model=args.judge_model,
+        confidence_threshold=args.judge_confidence,
+        timeout=args.judge_timeout,
+        parallel_evaluations=args.judge_parallel_evaluations,
+    )
+
+    # ChatSession factory — captures shared config for creating workstreams
+    def session_factory(
+        ui: SessionUI | None,
+        model_alias: str | None = None,
+        ws_id: str | None = None,
+        *,
+        skill: str | None = None,
+        client_type: str = "",
+        kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
+        parent_ws_id: str | None = None,
+        # ``project_id`` is accepted (and dropped) because the shared
+        # InteractiveAdapter passes it unconditionally — without the
+        # parameter every CLI create/rehydrate TypeErrors.  The CLI has
+        # no project surface, so the value is discarded.
+        project_id: str = "",
+        persona_snapshot: PersonaSnapshot | None = None,
+        fork_reservation_token: str = "",
+        workstream_lease: WorkstreamLease | None = None,
+    ) -> ChatSession:
+        assert ui is not None, "session_factory requires a non-None UI"
+        del project_id
+        from turnstone.core.model_turn import (
+            resolve_effort_setting,
+            resolve_model_binding,
+            resolve_temperature_setting,
+        )
+
+        # Resolve every stable model facet under one registry lock hold.  Passing
+        # the same immutable binding through to ChatSession prevents a reload in
+        # the construction window from pairing an old client/config with a new
+        # provider.
+        effective_alias = model_alias or registry.default
+        model_binding = resolve_model_binding(registry, effective_alias)
+        r_client = model_binding.lane.client
+        r_model = model_binding.lane.model
+        r_cfg = model_binding.config
+        if r_cfg is None:
+            raise RuntimeError(f"model binding for alias {effective_alias!r} has no config")
+        registry_generation = model_binding.registry_generation
+        # An explicit CLI flag is the user speaking; otherwise the knobs
+        # ride the shared assignment scheme (the CLI has no ConfigStore,
+        # so the rungs are the model config, then unset = wire omission).
+        eff_temperature = (
+            args.temperature
+            if args.temperature is not None
+            else resolve_temperature_setting(r_cfg, None)
+        )
+        eff_effort = args.reasoning_effort or resolve_effort_setting(r_cfg, None)
+        return ChatSession(
+            client=r_client,
+            model=r_model,
+            ui=ui,
+            instructions=args.instructions,
+            temperature=eff_temperature,
+            max_tokens=args.max_tokens,
+            tool_timeout=args.tool_timeout,
+            reasoning_effort=eff_effort,
+            context_window=r_cfg.context_window,
+            compact_max_tokens=args.compact_max_tokens,
+            auto_compact_pct=args.auto_compact_pct,
+            agent_max_turns=args.agent_max_turns,
+            tool_truncation=args.tool_truncation,
+            mcp_client=mcp_client,
+            model_token_client=model_token_client,
+            registry=registry,
+            registry_generation=registry_generation,
+            model_alias=effective_alias,
+            model_binding=model_binding,
+            ws_id=ws_id,
+            tool_search=args.tool_search,
+            tool_search_threshold=args.tool_search_threshold,
+            tool_search_max_results=args.tool_search_max_results,
+            web_search_backend=args.web_search_backend,
+            skill=skill or args.skill or None,
+            judge_config=judge_config,
+            kind=kind,
+            parent_ws_id=parent_ws_id,
+            persona_snapshot=persona_snapshot,
+            fork_reservation_token=fork_reservation_token,
+            workstream_lease=workstream_lease,
+        )
+
+    # The factory builds ``model_alias or registry.default``; the reader names the same.
+    manager = _build_cli_manager(session_factory, registry.has_alias, lambda: registry.default)
+    # Renew the owner leases of the workstreams this REPL has open (#988).
+    manager.start_lease_keeper()
+    # CLI has no background maintenance lifespan. Recover crash-abandoned
+    # hidden creates once per launch after the manager is fully wired and
+    # before a new caller-visible id can collide with durable residue.
+    manager.reap_stale_creating_reservations()
+
+    # Resolve the persona stamp BEFORE constructing the session — the four
+    # levers apply inside ``ChatSession.__init__``, so resolution can't wait.
+    cli_storage = _get_storage()
+    resume_target: str | None = None
+    if args.resume:
+        from turnstone.core.memory import resolve_workstream
+
+        resume_target = resolve_workstream(args.resume)
+        if not resume_target:
+            print(red(f"Workstream not found: {args.resume}"))
+            sys.exit(1)
+
+    if resume_target:
+        if args.persona:
+            print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
+        ws = _open_for_cli_resume(manager, resume_target, args.resume)
+    else:
+        from turnstone.core.model_registry import UnknownModelAliasError
+
+        try:
+            ws = manager.create(user_id="", **resolve_cli_persona_kwargs(cli_storage, args.persona))
+        except UnknownModelAliasError as exc:
+            print(f"turnstone: {_default_model_not_loaded(exc.alias, registry)}", file=sys.stderr)
+            sys.exit(1)
+    if args.skip_permissions and isinstance(ws.ui, TerminalUI):
+        ws.ui.auto_approve = True
+    if resume_target:
+        count = len(ws.session.messages) if ws.session is not None else 0
+        print(f"Resumed workstream {bold(resume_target)} ({count} messages)")
+
+    # Background attention notification — write to stderr while user types
+    def _bg_attention_notify(ws_id: str, state: WorkstreamState) -> None:
+        if state == WorkstreamState.ATTENTION and ws_id != manager.active_id:
+            bg_ws = manager.get(ws_id)
+            if bg_ws:
+                idx = manager.index_of(ws_id)
+                sys.stderr.write(
+                    f"\a\r\033[s\033[1A\033[K"
+                    f"  {YELLOW}\u25c6 {idx}:{bg_ws.name} needs attention{RESET}"
+                    f"\033[u"
+                )
+                sys.stderr.flush()
+
+    manager.subscribe_to_state(_bg_attention_notify)
+
+    # Print banner
+    print(f"\n{bold('Chat')} with {cyan(model)}")
+    if registry.count > 1:
+        others = [a for a in registry.list_aliases() if a != registry.default]
+        print(f"Models: {registry.default} (default), {', '.join(others)}")
+    if mcp_client:
+        mcp_tools = mcp_client.get_tools()
+        if mcp_tools:
+            print(f"MCP tools: {len(mcp_tools)} from {mcp_client.server_count} server(s)")
+        from turnstone.core.storage import get_storage as _cli_get_storage
+
+        mcp_client.set_storage(_cli_get_storage())
+    print("Type /help for commands, /ws for workstreams, /exit or Ctrl+D to quit.\n")
+
+    # Prompt string -- use a short display name
+    display_name = model.split("/")[-1]  # strip path prefixes if any
+    if len(display_name) > 30:
+        display_name = display_name[:27] + "..."
+
+    # Main loop. ``seen_active`` is the workstream the user last saw in front:
+    # a workstream can close in the background (another process took it
+    # over), which moves the manager's active id without a /ws command.
+    seen_active = manager.active_id
+    # Tabs /resume or /new left open: "unsaved" ones close once saved,
+    # "programs" ones stay until the user closes them.
+    parked: dict[str, ParkReason] = {}
+    stop_retries = _start_persistence_retries(manager)
+    try:
+        while True:
+            try:
+                _close_parked_tabs(manager, parked)
+                if manager.active_id != seen_active:
+                    _bring_forward_after_background_close(manager)
+                    seen_active = manager.active_id
+            except KeyboardInterrupt:
+                # As at the prompt just below: Ctrl-C ends the session.
+                print()
+                break
+            except Exception as exc:
+                # A parked tab that cannot close now stays parked; the next
+                # prompt tries again.
+                print(red(f"Error: {exc}"))
+            try:
+                # Show background workstream status if any need attention
+                if manager.count > 1:
+                    _print_ws_status_line(manager)
+
+                # Build prompt with workstream info. The active id is read once:
+                # the prompt and the dispatch below both use this workstream.
+                prompt_active = manager.active_id
+                active = manager.get(prompt_active) if prompt_active is not None else None
+                if manager.count > 1 and active is not None:
+                    idx = manager.index_of(active.id)
+                    prompt_str = f"\001{BOLD}\002{idx}:{active.name}\001{RESET}\002 > "
+                else:
+                    prompt_str = f"\001{BOLD}\002[{display_name}]\001{RESET}\002 > "
+                user_input = input(prompt_str)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            user_input = user_input.strip()
+            kind, target = _classify_repl_input(manager, user_input, prompt_active)
+            if kind == "empty":
+                continue
+            if kind == "exit":
+                break
+            if kind == "ws":
+                _handle_ws_command(manager, user_input, args.skip_permissions)
+                seen_active = manager.active_id
+                continue
+            if kind == "cluster":
+                _handle_cluster_command(user_input, args.console_url)
+                continue
+            if kind == "stale":
+                print(yellow("That workstream closed while you typed; your input was not sent."))
+                continue
+            if kind == "tab":
+                try:
+                    _handle_tab_command(manager, user_input, target, args.skip_permissions, parked)
+                except KeyboardInterrupt:
+                    print(f"\n{yellow('Interrupted.')}")
+                seen_active = manager.active_id
+                continue
+            if kind == "no_workstream" or target is None or target.session is None:
+                print(yellow("No workstream is open here. Use /ws new to start one, or /exit."))
+                continue
+            session = target.session
+            if user_input.startswith("/"):
+                if _refuse_deleting_an_open_tab(manager, user_input):
+                    continue
+                try:
+                    should_exit = session.handle_command(user_input)
+                except KeyboardInterrupt:
+                    print(f"\n{yellow('Interrupted.')}")
+                    continue
+                except Exception as e:
+                    print(f"\n{red(f'Error: {e}')}")
+                    continue
+                if should_exit:
+                    break
+                # Dispatch deferred retry (handle_command sets _pending_retry)
+                retry_msg = session._pending_retry
+                if retry_msg:
+                    session._pending_retry = None
+                    try:
+                        session.send(retry_msg)
+                    except KeyboardInterrupt:
+                        print(f"\n{yellow('Interrupted.')}")
+                    except Exception as e:
+                        print(f"\n{red(f'Error: {e}')}")
+            else:
+                try:
+                    session.send(user_input)
+                except KeyboardInterrupt:
+                    print(f"\n{yellow('Interrupted.')}")
+                except Exception as e:
+                    print(f"\n{red(f'Error: {e}')}")
+    finally:
+        # Every exit from the loop, an unexpected error included, lets go of
+        # the workstreams this REPL holds.
+        stop_retries.set()
+        _close_all_sessions(manager)
+        if mcp_client:
+            mcp_client.shutdown()
+        registry.shutdown()
+        shutdown_oauth_runtime(cli_auth_state)
+        close_mcp_crypto_state(cli_auth_state)
+
+    print("Goodbye.")
+
+
+if __name__ == "__main__":
+    main()

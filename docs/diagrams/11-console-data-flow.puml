@@ -1,0 +1,203 @@
+@startuml
+!theme plain
+title Turnstone — Console Dashboard Data Flow
+
+skinparam sequenceArrowThickness 1.5
+
+participant "Browser" as Browser
+participant "Console\nStarlette App" as Server
+participant "ClusterCollector" as CC
+participant "Node-A\n(server)" as NodeA
+participant "Node-B\n(server)" as NodeB
+
+== Thread 1: Node Discovery (every 60s) ==
+
+CC -> CC : list_services("server",\nmax_age_seconds=120)
+activate CC #C8E6C9
+
+CC -> CC : New node? → spawn SSE task\nLost node? → cancel SSE task
+CC -> CC : _fanout(node_joined)\n_fanout(node_lost)
+
+deactivate CC
+
+== Thread 2: SSE Manager (asyncio event loop) ==
+
+note over CC
+  Single asyncio event loop multiplexes
+  one persistent SSE connection per node.
+  Scales to 1000+ nodes.
+end note
+
+CC -> NodeA : GET /v1/api/events/global\n?expected_node_id=nodeA
+activate NodeA
+activate CC #BBDEFB
+
+NodeA --> CC : data: {"type":"node_snapshot",\n"node_id":"nodeA",\n"workstreams":[...],\n"health":{...},\n"aggregate":{...}}
+
+note right of CC
+  Snapshot populates NodeSnapshot
+  in-memory state. Reconciles
+  against stale data (emits
+  ws_created/ws_closed diffs).
+end note
+
+loop real-time delta events
+    NodeA --> CC : data: {"type":"ws_state",\n"ws_id":"ws1","state":"running"}
+    CC -> CC : Update NodeSnapshot\n_fanout(cluster_state)
+end
+
+alt health transition
+    NodeA --> CC : data: {"type":"health_changed",\n"circuit_state":"open"}
+    CC -> CC : Update node.health
+end
+
+alt periodic aggregate (every 10s)
+    NodeA --> CC : data: {"type":"aggregate",\n"total_tokens":50000}
+    CC -> CC : Update node.aggregate
+end
+
+deactivate CC
+deactivate NodeA
+
+alt SSE disconnect
+    CC -> CC : Mark node unreachable\nReconnect with backoff\n(1s → 30s cap)
+end
+
+alt identity mismatch (409 or snapshot node_id differs)
+    CC -> CC : Mark node unreachable\nStop reconnecting to this URL
+end
+
+== Browser SSE Stream ==
+
+Browser -> Server : GET /v1/api/cluster/events
+activate Server
+
+Server -> CC : get_snapshot_and_register(queue)
+note right : Atomic: snapshot + listener\nregistration under both locks\n→ no event gap
+CC --> Server : ClusterSnapshot\n(full current state)
+
+Server -> Browser : data: {"type":"snapshot",...}\n(full state as first SSE event)
+
+loop continuous (incremental updates)
+    CC -> Server : event via listener queue\n(from SSE manager thread)
+    Server -> Browser : data: {"type":"cluster_state",...}\n\n
+end
+
+alt keepalive (sse-starlette ping=5)
+    Server -> Browser : : ping\n\n
+end
+
+Browser -> Server : connection closed
+Server -> CC : unregister_listener(queue)
+deactivate Server
+
+== Browser REST: Snapshot ==
+
+Browser -> Server : GET /v1/api/cluster/snapshot
+Server -> CC : get_snapshot()
+CC --> Server : ClusterSnapshot\n(full current state)
+Server --> Browser : JSON response
+
+== Browser REST Requests ==
+
+Browser -> Server : GET /v1/api/cluster/overview
+Server -> CC : get_overview()
+CC --> Server : {nodes: 2, workstreams: 12,\nstates: {running:5, ...},\naggregate: {total_tokens: 50000},\nversion_drift: false, versions: ["0.9.7"]}
+Server --> Browser : JSON response
+
+Browser -> Server : GET /v1/api/cluster/nodes?sort=activity
+Server -> CC : get_nodes(sort_by="activity")
+CC --> Server : {nodes: [...], total: 2}
+Server --> Browser : JSON response
+
+Browser -> Server : GET /v1/api/cluster/workstreams\n?state=running&node=nodeA
+Server -> CC : get_workstreams(state="running",\nnode="nodeA")
+CC --> Server : {workstreams: [...], total: 5,\npage: 1, per_page: 50, pages: 1}
+Server --> Browser : JSON response
+
+== Workstream Creation (via Console proxy) ==
+
+Browser -> Server : POST /v1/api/cluster/workstreams/new\n{node_id:"nodeA", name:"new-task"}
+activate Server #FFECB3
+
+Server -> CC : _pick_best_node() or\nget_node_detail(node_id)
+CC --> Server : node validated
+
+Server -> NodeA : POST http://nodeA:8080/v1/api/workstreams/new\n{name:"new-task", user_id: from auth_result}
+activate NodeA
+NodeA --> Server : {ws_id:"ws789", name:"new-task",\nnode_url:"http://nodeA:8080"}
+deactivate NodeA
+
+Server --> Browser : {status:"ok", ws_id:"ws789",\nnode_url:"http://nodeA:8080"}
+deactivate Server
+
+note right of Server
+  Console proxies the create request
+  directly to the target node via HTTP.
+  The response includes node_url so the
+  client can establish a direct SSE
+  connection for the data plane.
+end note
+
+== Reverse Proxy (server UI through console port) ==
+
+Browser -> Server : GET /node/nodeA/
+activate Server #FFF9C4
+
+Server -> CC : get_node_detail("nodeA")\n→ server_url = "http://10.0.1.1:8080"
+
+Server -> NodeA : GET http://10.0.1.1:8080/\n(via httpx2.AsyncClient)
+activate NodeA
+NodeA --> Server : index.html
+deactivate NodeA
+
+Server -> Server : Rewrite static paths:\nhref="/static/" → "/node/nodeA/static/"\nInject console-return banner\nafter <body>
+
+Server --> Browser : Rewritten HTML
+deactivate Server
+
+Browser -> Server : GET /node/nodeA/static/app.js
+activate Server #FFF9C4
+
+Server -> NodeA : GET http://10.0.1.1:8080/static/app.js
+activate NodeA
+NodeA --> Server : app.js
+deactivate NodeA
+
+Server -> Server : Prepend JS proxy shim:\nOverride fetch() and EventSource()\nto prepend "/node/nodeA" prefix
+
+Server --> Browser : Shimmed app.js
+deactivate Server
+
+note right of Browser
+  All fetch("/v1/api/workstreams/{ws_id}/send") calls in the
+  server UI now become fetch("/node/nodeA/v1/api/workstreams/{ws_id}/send"),
+  routed through the console proxy.
+end note
+
+Browser -> Server : GET /node/nodeA/v1/api/workstreams/ws789/events
+activate Server #FFF9C4
+
+Server -> NodeA : GET http://10.0.1.1:8080/v1/api/workstreams/ws789/events\n(SSE stream via httpx2.AsyncClient, no read timeout)
+activate NodeA
+
+loop SSE streaming
+    NodeA --> Server : data: {"type":"content","text":"..."}\n\n
+    Server --> Browser : data: {"type":"content","text":"..."}\n\n
+end
+
+deactivate NodeA
+deactivate Server
+
+Browser -> Server : POST /node/nodeA/v1/api/workstreams/ws789/send\n{message:"hello"}
+activate Server #FFF9C4
+
+Server -> NodeA : POST http://10.0.1.1:8080/v1/api/workstreams/ws789/send\n(body forwarded)
+activate NodeA
+NodeA --> Server : {status:"ok"}
+deactivate NodeA
+
+Server --> Browser : {status:"ok"}
+deactivate Server
+
+@enduml

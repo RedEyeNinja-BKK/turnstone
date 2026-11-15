@@ -1,0 +1,182 @@
+"""Shared builders for the coordinator-endpoint test files.
+
+The four coordinator test modules each ship a copy of the same
+``_AuthMiddleware`` / ``_FakeConfigStore`` / ``_fake_registry`` /
+``_build_mgr`` helpers — this module is the single home for them so
+future edits land once.  Named with a leading underscore so pytest
+does not collect it.
+
+``_make_client`` stays local to each test module because the route
+list differs per file.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
+
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from turnstone.console.collector import ClusterCollector
+from turnstone.console.coordinator_adapter import CoordinatorAdapter
+from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from turnstone.core.auth import AuthResult
+from turnstone.core.model_registry import ModelConfig, ModelRegistry
+from turnstone.core.providers import ModelCapabilities
+from turnstone.core.session_manager import SessionManager
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+def _seed_children(
+    adapter: CoordinatorAdapter, coord_ws_id: str, child_ws_ids: Iterable[str]
+) -> None:
+    """Seed the coordinator adapter's children registry directly.
+
+    The production path populates the registry via the cluster-event
+    fan-out thread observing ``ws_created`` events. These tests just
+    need a known-children set for the endpoint handlers to iterate —
+    inject directly via the registry's bulk-merge surface rather than
+    spinning up the collector + fan-out plumbing.
+    """
+    adapter._registry.merge_children(coord_ws_id, child_ws_ids)
+
+
+class _AuthMiddleware(BaseHTTPMiddleware):
+    """Inject a configurable AuthResult from a header-based contract.
+
+    Tests set ``X-Test-Perms`` to a comma-separated permission list, and
+    ``X-Test-User`` to the user id.  Empty or missing → no auth.
+    """
+
+    async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
+        perms = request.headers.get("X-Test-Perms", "")
+        user_id = request.headers.get("X-Test-User", "")
+        if perms or user_id:
+            request.state.auth_result = AuthResult(
+                user_id=user_id,
+                scopes=frozenset({"read", "write", "approve"}),
+                token_source="test",
+                permissions=frozenset(p for p in perms.split(",") if p),
+            )
+        return await call_next(request)
+
+
+class _FakeConfigStore:
+    """Minimal ConfigStore stub — returns values from a dict."""
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        self._values = values
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._values.get(key, default)
+
+
+def _fake_registry() -> MagicMock:
+    """MagicMock whose legacy and atomic binding resolutions both succeed."""
+    client = MagicMock()
+    cfg = ModelConfig(
+        alias="default",
+        base_url="https://example.invalid/v1",
+        api_key="test",
+        model="gpt-4",
+    )
+    provider = MagicMock()
+    provider.provider_name = "openai"
+    provider.get_capabilities.return_value = ModelCapabilities()
+    reg = MagicMock()
+    reg.default = "default"
+    # The real resolution over the mock's ``default``, so the console's
+    # coordinator tiers resolve as they do against a ModelRegistry.
+    reg.effective_default.side_effect = lambda cs: ModelRegistry.effective_default(reg, cs)
+    reg.resolve.return_value = (client, cfg.model, cfg, 0)
+    reg.resolve_binding.return_value = (client, cfg.model, cfg, provider, 0)
+    return reg
+
+
+def _build_mgr_with_factory(storage: Any, session_factory: Any) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) with a caller-supplied factory.
+
+    Used by tests that need to capture or assert factory kwargs (e.g.
+    per-call ``model`` / ``judge_model`` overrides). Plain :func:`_build_mgr`
+    is the right entry point when the test doesn't care about the
+    factory.
+    """
+    adapter = CoordinatorAdapter(
+        collector=MagicMock(),
+        ui_factory=lambda ws: ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or ""),
+        session_factory=session_factory,
+    )
+    mgr = SessionManager(
+        adapter,
+        storage=storage,
+        max_active=3,
+        node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
+        event_emitter=adapter,
+    )
+    adapter.attach(mgr)
+    return mgr
+
+
+def _build_mgr(storage: Any) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) with stub factories (test default)."""
+
+    def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        s = MagicMock()
+        s.send.return_value = None
+        return s
+
+    return _build_mgr_with_factory(storage, _sf)
+
+
+def _rehydrate_with_children_down(
+    storage: Any, monkeypatch: Any, child_ws_ids: Iterable[str]
+) -> tuple[SessionManager, Any, str, dict[str, Any]]:
+    """Open a stored coordinator in a fresh manager while its children query fails.
+
+    The fresh manager stands in for a console restart, so its children
+    registry starts empty and the open seeds it from storage. The query for
+    the coordinator's children raises while ``down["on"]`` is true, and
+    ``down["calls"]`` counts how often it ran. Returns the manager, the opened
+    workstream, its id and ``down``.
+    """
+    original_mgr = _build_mgr(storage)
+    coord_id = original_mgr.create(user_id="user-1", name="coord-a").id
+    # Model shutdown before the replacement manager acquires the coordinator's lease.
+    original_mgr.release_leases()
+    for child_ws_id in child_ws_ids:
+        storage.register_workstream(
+            child_ws_id, kind="interactive", parent_ws_id=coord_id, user_id="user-1"
+        )
+    real = storage.list_workstreams
+    down: dict[str, Any] = {"on": True, "calls": 0}
+
+    def _flaky(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("parent_ws_id") == coord_id:
+            down["calls"] += 1
+            if down["on"]:
+                raise RuntimeError("statement timeout")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "list_workstreams", _flaky)
+    mgr = _build_mgr(storage)
+    ws = mgr.open(coord_id)
+    assert ws is not None
+    return mgr, ws, coord_id, down
+
+
+class MockStorage:
+    """Minimal storage mock that implements ``list_services``.
+
+    Used by the collector tests + the console route-walk tests. The
+    collector calls ``list_services("turnstone-server", ...)`` to
+    discover nodes; tests that don't care about discovery push an
+    empty list (the default).
+    """
+
+    def __init__(self) -> None:
+        self.services: list[dict[str, str]] = []
+
+    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
+        return list(self.services)

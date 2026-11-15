@@ -1,0 +1,513 @@
+"""Tests for conversation rewind and retry functionality."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from turnstone.core.memory import register_workstream
+from turnstone.core.session import ChatSession
+from turnstone.core.trajectory import turn_to_dict, turns_from_dicts
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class NullUI:
+    """UI adapter that discards all output."""
+
+    def on_turn_start(self):
+        pass
+
+    def on_turn_committed(self):
+        pass
+
+    def on_thinking_start(self):
+        pass
+
+    def on_thinking_stop(self):
+        pass
+
+    def on_reasoning_token(self, text):
+        pass
+
+    def on_content_token(self, text):
+        pass
+
+    def on_stream_end(self):
+        pass
+
+    def approve_tools(self, items):
+        return True, None
+
+    def on_tool_result(self, call_id, name, output, **kwargs):
+        pass
+
+    def on_tool_output_chunk(self, call_id, chunk):
+        pass
+
+    def on_status(self, usage, context_window, effort):
+        pass
+
+    def on_info(self, message):
+        pass
+
+    def on_error(self, message):
+        pass
+
+    def on_state_change(self, state):
+        pass
+
+    def on_rename(self, name):
+        pass
+
+    def on_output_warning(self, call_id, assessment):
+        pass
+
+    def record_output_assessment(
+        self,
+        call_id,
+        assessment,
+        *,
+        tier="heuristic",
+        reasoning="",
+        judge_model="",
+        latency_ms=0,
+        confidence=0.0,
+    ):
+        pass
+
+
+def _make_session(tmp_db, ws_id: str | None = None) -> ChatSession:
+    session = ChatSession(
+        client=MagicMock(),
+        model="test-model",
+        ui=NullUI(),
+        instructions="",
+        temperature=0.5,
+        max_tokens=4096,
+        tool_timeout=30,
+        ws_id=ws_id,
+    )
+    # Production creates the durable parent before exposing a live session.
+    # Strict tail truncation shares that parent boundary with keyed commits.
+    register_workstream(session.ws_id, user_id="test-user")
+    return session
+
+
+def _populate_simple(session: ChatSession) -> None:
+    """Populate with 2 simple turns (no tool calls)."""
+    session.messages = turns_from_dicts(
+        [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "How are you?"},
+            {"role": "assistant", "content": "I'm fine."},
+        ]
+    )
+    session._msg_tokens = [10, 20, 10, 20]
+
+
+def _populate_with_tools(session: ChatSession) -> None:
+    """Populate with 2 turns, first has tool calls."""
+    session.messages = turns_from_dicts(
+        [
+            {"role": "user", "content": "Write a test"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc1", "function": {"name": "bash", "arguments": '{"cmd":"echo hi"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "hi"},
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "Fix the import"},
+            {"role": "assistant", "content": "Fixed."},
+        ]
+    )
+    session._msg_tokens = [10, 20, 10, 20, 10, 20]
+
+
+# ---------------------------------------------------------------------------
+# _find_turn_boundaries
+# ---------------------------------------------------------------------------
+
+
+class TestFindTurnBoundaries:
+    def test_empty_messages(self, tmp_db):
+        session = _make_session(tmp_db)
+        assert session._find_turn_boundaries() == []
+
+    def test_single_turn(self, tmp_db):
+        session = _make_session(tmp_db)
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+            ]
+        )
+        assert session._find_turn_boundaries() == [0]
+
+    def test_multi_turn(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        assert session._find_turn_boundaries() == [0, 2]
+
+    def test_with_tool_calls(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_with_tools(session)
+        assert session._find_turn_boundaries() == [0, 4]
+
+
+# ---------------------------------------------------------------------------
+# rewind
+# ---------------------------------------------------------------------------
+
+
+class TestRewind:
+    def test_rewind_zero(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        assert session.rewind(0) == 0
+        assert len(session.messages) == 4
+
+    def test_rewind_one_turn(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        removed = session.rewind(1)
+        assert removed == 2  # user + assistant
+        assert len(session.messages) == 2
+        assert turn_to_dict(session.messages[0])["content"] == "Hello"
+        assert turn_to_dict(session.messages[1])["content"] == "Hi there!"
+        assert len(session._msg_tokens) == 2
+
+    def test_rewind_all_turns(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        removed = session.rewind(2)
+        assert removed == 4
+        assert len(session.messages) == 0
+        assert len(session._msg_tokens) == 0
+
+    def test_rewind_clamped(self, tmp_db):
+        """Rewinding more turns than exist should clamp to available."""
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        removed = session.rewind(999)
+        assert removed == 4
+        assert len(session.messages) == 0
+
+    def test_rewind_empty(self, tmp_db):
+        session = _make_session(tmp_db)
+        assert session.rewind(1) == 0
+
+    def test_rewind_with_tools(self, tmp_db):
+        """Rewinding 1 turn on a multi-sub-turn conversation."""
+        session = _make_session(tmp_db)
+        _populate_with_tools(session)
+        removed = session.rewind(1)
+        assert removed == 2  # user "Fix the import" + assistant "Fixed."
+        assert len(session.messages) == 4
+        assert turn_to_dict(session.messages[-1])["content"] == "Done."
+
+    def test_rewind_tokens_sync(self, tmp_db):
+        """_msg_tokens stays in sync with messages."""
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        session.rewind(1)
+        assert len(session._msg_tokens) == len(session.messages)
+
+
+# ---------------------------------------------------------------------------
+# retry
+# ---------------------------------------------------------------------------
+
+
+class TestRetry:
+    def test_retry_returns_user_message(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        msg = session.retry()
+        assert msg == "How are you?"
+        # Only Turn 1 remains, without the second user message
+        assert len(session.messages) == 2
+        assert turn_to_dict(session.messages[-1])["content"] == "Hi there!"
+
+    def test_retry_empty(self, tmp_db):
+        session = _make_session(tmp_db)
+        assert session.retry() is None
+
+    def test_retry_with_tools(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_with_tools(session)
+        msg = session.retry()
+        assert msg == "Fix the import"
+        # Only Turn 1 remains (user + assistant w/tools + tool result + assistant)
+        assert len(session.messages) == 4
+
+    def test_retry_sets_pending(self, tmp_db):
+        """handle_command for /retry should set _pending_retry."""
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        session.handle_command("/retry")
+        assert session._pending_retry == "How are you?"
+
+    def test_retry_tokens_sync(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        session.retry()
+        assert len(session._msg_tokens) == len(session.messages)
+
+    def test_retry_multipart_content_returns_none(self, tmp_db):
+        """retry() should refuse multipart (vision/image) messages."""
+        session = _make_session(tmp_db)
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        # Canonical non-text content is a by-reference placeholder;
+                        # the turn stays multipart, so retry refuses it.
+                        {"type": "image", "attachment_id": "sha256:abc"},
+                    ],
+                },
+                {"role": "assistant", "content": "It's an image."},
+            ]
+        )
+        session._msg_tokens = [10, 20]
+        assert session.retry() is None
+        # Messages should be unchanged
+        assert len(session.messages) == 2
+
+    def test_retry_none_content_returns_none(self, tmp_db):
+        """retry() should handle content=None gracefully."""
+        session = _make_session(tmp_db)
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": None},
+                {"role": "assistant", "content": "Ok."},
+            ]
+        )
+        session._msg_tokens = [10, 20]
+        assert session.retry() is None
+
+
+# ---------------------------------------------------------------------------
+# handle_command integration
+# ---------------------------------------------------------------------------
+
+
+class TestHandleCommand:
+    def test_rewind_command(self, tmp_db):
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        session.handle_command("/rewind 1")
+        assert len(session.messages) == 2
+
+    def test_rewind_no_arg(self, tmp_db):
+        session = _make_session(tmp_db)
+        ui = session.ui
+        ui.on_info = MagicMock()
+        session.handle_command("/rewind")
+        ui.on_info.assert_called_once()
+        assert "Usage" in ui.on_info.call_args[0][0]
+
+    def test_rewind_invalid_arg(self, tmp_db):
+        session = _make_session(tmp_db)
+        ui = session.ui
+        ui.on_info = MagicMock()
+        session.handle_command("/rewind abc")
+        ui.on_info.assert_called_once()
+        assert "integer" in ui.on_info.call_args[0][0]
+
+    def test_retry_nothing_to_retry(self, tmp_db):
+        session = _make_session(tmp_db)
+        ui = session.ui
+        ui.on_info = MagicMock()
+        session.handle_command("/retry")
+        ui.on_info.assert_called_once()
+        assert "Nothing" in ui.on_info.call_args[0][0]
+
+    def test_rewind_refusal_reports_instead_of_killing_the_repl(self, tmp_db):
+        """Round-4 review pin: rewind()'s raising contract (GenerationCancelled
+        on a refused admission, e.g. the workstream-gone latch) converts to an
+        on_error message in the CLI arm — the REPL dispatches commands
+        uncaught, so a raise here previously killed the whole process."""
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        ui = session.ui
+        ui.on_error = MagicMock()
+        session._workstream_gone = True
+        session.handle_command("/rewind 1")
+        ui.on_error.assert_called_once()
+        assert "refused" in ui.on_error.call_args[0][0].lower()
+
+    def test_retry_storage_failure_reports_instead_of_killing_the_repl(self, tmp_db):
+        """Round-4 review pin: a storage error escaping retry() (the durable
+        truncation batch is raising now) becomes an on_error message, never an
+        uncaught REPL death."""
+        from unittest.mock import patch
+
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        ui = session.ui
+        ui.on_error = MagicMock()
+        with patch.object(session, "retry", side_effect=RuntimeError("database is locked")):
+            session.handle_command("/retry")
+        ui.on_error.assert_called_once()
+        assert "Retry failed" in ui.on_error.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Storage integration — delete_messages_after
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteMessagesAfter:
+    def test_delete_truncates_db(self, tmp_db):
+        from turnstone.core.memory import (
+            load_messages,
+            register_workstream,
+            save_message,
+        )
+        from turnstone.core.storage import get_storage
+
+        ws_id = "test-ws-delete"
+        register_workstream(ws_id)
+        save_message(ws_id, "user", "Hello")
+        save_message(ws_id, "assistant", "Hi!")
+        save_message(ws_id, "user", "Bye")
+        save_message(ws_id, "assistant", "Goodbye!")
+
+        deleted = get_storage().delete_messages_after(ws_id, 2)
+        assert deleted == 2
+
+        msgs = load_messages(ws_id)
+        assert len(msgs) == 2
+        assert msgs[0]["content"] == "Hello"
+        assert msgs[1]["content"] == "Hi!"
+
+    def test_delete_nothing(self, tmp_db):
+        from turnstone.core.memory import (
+            register_workstream,
+            save_message,
+        )
+        from turnstone.core.storage import get_storage
+
+        ws_id = "test-ws-noop"
+        register_workstream(ws_id)
+        save_message(ws_id, "user", "Hello")
+
+        deleted = get_storage().delete_messages_after(ws_id, 10)
+        assert deleted == 0
+
+    def test_delete_all(self, tmp_db):
+        from turnstone.core.memory import (
+            load_messages,
+            register_workstream,
+            save_message,
+        )
+        from turnstone.core.storage import get_storage
+
+        ws_id = "test-ws-all"
+        register_workstream(ws_id)
+        save_message(ws_id, "user", "Hello")
+        save_message(ws_id, "assistant", "Hi!")
+
+        deleted = get_storage().delete_messages_after(ws_id, 0)
+        assert deleted == 2
+        assert load_messages(ws_id) == []
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: rewind + DB sync
+# ---------------------------------------------------------------------------
+
+
+class TestRewindDBSync:
+    def test_rewind_persists_to_db(self, tmp_db):
+        from turnstone.core.memory import load_messages, register_workstream, save_message
+
+        session = _make_session(tmp_db)
+        ws_id = session.ws_id
+        register_workstream(ws_id)
+
+        # Persist messages to DB and set in-memory state
+        save_message(ws_id, "user", "Hello")
+        save_message(ws_id, "assistant", "Hi!")
+        save_message(ws_id, "user", "Bye")
+        save_message(ws_id, "assistant", "Goodbye!")
+
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+                {"role": "user", "content": "Bye"},
+                {"role": "assistant", "content": "Goodbye!"},
+            ]
+        )
+        session._msg_tokens = [5, 5, 5, 5]
+
+        session.rewind(1)
+
+        # Verify DB matches in-memory state
+        db_msgs = load_messages(ws_id)
+        assert len(db_msgs) == 2
+        assert db_msgs[0]["content"] == "Hello"
+        assert db_msgs[1]["content"] == "Hi!"
+
+
+def test_truncation_bumps_history_generation(tmp_db) -> None:
+    """#894: the /history single-flight keys on _history_generation, so a
+    truncation that DELETED storage rows must bump it — and a truncation
+    that could not delete (storage count unavailable/empty — the
+    error-path early returns) must NOT, because flights rebuild from
+    storage and an unbumped generation on error is the safe direction (a
+    stale-keyed flight reading post-delete rows is spuriously fresh; a
+    new-keyed flight reading pre-delete rows would be wrongly joinable).
+    The endpoint-level flight test mocks the counter, so this is the
+    PRODUCER pin: delete the bump in _persist_truncation and the first
+    arm fails while everything else stays green."""
+    from turnstone.core.storage import get_storage
+
+    storage = get_storage()
+    storage.register_workstream("ws-gen-pin", kind="interactive", user_id="test-user")
+    session = _make_session(tmp_db, ws_id="ws-gen-pin")
+    _populate_simple(session)
+    for role, content in (
+        ("user", "Hello"),
+        ("assistant", "Hi there!"),
+        ("user", "How are you?"),
+        ("assistant", "I'm fine."),
+    ):
+        storage.save_message("ws-gen-pin", role, content)
+
+    g0 = session._history_generation
+    assert session.rewind(1) > 0
+    assert session._history_generation == g0 + 1, (
+        "a storage-deleting rewind must bump the history generation"
+    )
+
+    # retry: re-persist the tail the rewind removed, then drop the last
+    # assistant turn.
+    storage.save_message("ws-gen-pin", "user", "How are you?")
+    storage.save_message("ws-gen-pin", "assistant", "I'm fine.")
+    _populate_simple(session)
+    g1 = session._history_generation
+    assert session.retry() is not None
+    assert session._history_generation == g1 + 1, (
+        "a storage-deleting retry must bump the history generation"
+    )
+
+    # A registered workstream with no durable rows is still a successful
+    # atomic cut of the live trajectory, so its handoff revision advances.
+    bare = _make_session(tmp_db)
+    _populate_simple(bare)
+    g2 = bare._history_generation
+    assert bare.rewind(1) > 0
+    assert bare._history_generation == g2 + 1, (
+        "a successful live truncation must invalidate history even when the "
+        "durable tail is already empty"
+    )

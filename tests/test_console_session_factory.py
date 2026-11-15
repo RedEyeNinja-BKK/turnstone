@@ -1,0 +1,472 @@
+"""``console/session_factory.py`` alias-resolution coverage.
+
+The console session factory resolves the coordinator alias through a
+three-tier chain that must stay in lockstep with the placeholder logic
+in ``console/server.py:list_available_models`` — otherwise the home
+composer advertises one alias while sessions launch on another.
+
+Tier order (highest priority first):
+
+1. Per-call ``model_alias`` arg, or the ``coordinator.model_alias``
+   ConfigStore setting (admin-pinned coordinator-specific override).
+2. ``model.default_alias`` ConfigStore setting (admin-managed system
+   default surfaced in the Models tab).
+3. ``registry.default`` (config.toml ``[model].default``, else the model
+   named ``default``, else the first defined chat model).
+
+No tier is checked against what loaded (#1359): the first configured alias
+reaches ``registry.resolve_binding``, which raises for one that isn't loaded.
+
+These tests pin each branch by intercepting ``registry.resolve_binding`` —
+they short-circuit before ChatSession construction so the test never
+has to satisfy ChatSession's full kwarg contract.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from tests._coord_test_helpers import _FakeConfigStore
+from turnstone.console.session_factory import build_console_session_factory
+from turnstone.core.model_registry import ModelRegistry
+
+
+class _StopBeforeChatSessionError(Exception):
+    """Sentinel raised by the capturing registry to short-circuit
+    factory execution after alias resolution but before ChatSession is
+    built.  The factory's outer code path is irrelevant to alias
+    resolution and would force the test to satisfy a long kwarg
+    contract for no extra coverage."""
+
+
+class _CapturingRegistry:
+    """Records the alias passed to ``resolve_binding()`` and short-circuits.
+
+    ``has_alias`` answers from the configured known set so the
+    ``model.default_alias`` validation tier behaves realistically.
+    Mirrors the public surface ``ModelRegistry`` exposes to
+    session_factory: ``has_alias``, ``resolve_binding`` (which returns the
+    provider beside the other atomic binding facets), and ``default``.
+    """
+
+    def __init__(self, *, default: str, known: set[str]) -> None:
+        self.default = default
+        self._known = known
+        self.captured_alias: str | None = None
+
+    def has_alias(self, alias: str) -> bool:
+        return alias in self._known
+
+    def effective_default(self, config_store: Any) -> str:
+        return ModelRegistry.effective_default(self, config_store)  # type: ignore[arg-type]
+
+    def resolve_binding(self, alias: str) -> Any:
+        self.captured_alias = alias
+        raise _StopBeforeChatSessionError()
+
+
+def _build_factory(
+    *,
+    registry_default: str = "registry-default",
+    known_aliases: set[str] | None = None,
+    settings: dict[str, Any] | None = None,
+) -> tuple[Any, _CapturingRegistry]:
+    """Construct the factory with stub deps.  Returns ``(factory_callable,
+    registry)`` so tests can read back ``registry.captured_alias``."""
+
+    registry = _CapturingRegistry(
+        default=registry_default,
+        known=known_aliases if known_aliases is not None else {registry_default},
+    )
+    config_store = _FakeConfigStore(dict(settings or {}))
+    factory = build_console_session_factory(
+        registry=registry,  # type: ignore[arg-type]
+        config_store=config_store,  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    return factory, registry
+
+
+def _invoke(factory: Any, **factory_kwargs: Any) -> None:
+    """Call the factory with a stub UI and absorb the sentinel.
+
+    Forwards ``factory_kwargs`` to the factory so per-call overrides
+    (e.g. ``model_alias``) can flow through.  Raises if any other
+    exception comes out — the test should fail loudly when alias
+    resolution itself errors rather than swallowing it.
+    """
+    ui = MagicMock()
+    ui._user_id = ""  # skip storage-backed username lookup branch
+    with pytest.raises(_StopBeforeChatSessionError):
+        factory(ui, **factory_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 — explicit pin (per-call arg or coordinator.model_alias)
+# ---------------------------------------------------------------------------
+
+
+def test_per_call_model_alias_arg_wins_over_everything() -> None:
+    """The ``model_alias`` kwarg on the factory call (e.g. body field on
+    POST /workstreams/new) wins over both ConfigStore tiers and the
+    registry default."""
+    factory, registry = _build_factory(
+        known_aliases={"per-call", "coord-pin", "admin-default", "registry-default"},
+        settings={
+            "coordinator.model_alias": "coord-pin",
+            "model.default_alias": "admin-default",
+        },
+    )
+    _invoke(factory, model_alias="per-call")
+    assert registry.captured_alias == "per-call"
+
+
+def test_coordinator_model_alias_wins_when_no_per_call_override() -> None:
+    factory, registry = _build_factory(
+        known_aliases={"coord-pin", "admin-default", "registry-default"},
+        settings={
+            "coordinator.model_alias": "coord-pin",
+            "model.default_alias": "admin-default",
+        },
+    )
+    _invoke(factory)
+    assert registry.captured_alias == "coord-pin"
+
+
+def test_coordinator_model_alias_passed_through_unvalidated() -> None:
+    """Tier 1 is an *explicit* operator pin — when it's stale or typoed
+    we deliberately pass it through to ``registry.resolve_binding`` so the
+    request layer turns it into a 503 with the alias surfaced in the
+    error.  Falling through silently would mask the misconfiguration."""
+    factory, registry = _build_factory(
+        known_aliases={"admin-default", "registry-default"},
+        settings={
+            "coordinator.model_alias": "ghost",  # unknown
+            "model.default_alias": "admin-default",
+        },
+    )
+    _invoke(factory)
+    assert registry.captured_alias == "ghost"
+
+
+def test_per_call_model_alias_arg_passed_through_unvalidated() -> None:
+    """The per-call ``model_alias`` kwarg (POST body field — the more
+    common production trigger) is the same kind of explicit pin as the
+    ConfigStore setting, so a stale value passes through to
+    ``registry.resolve_binding`` rather than silently falling through to the
+    system default."""
+    factory, registry = _build_factory(
+        known_aliases={"registry-default"},
+        settings={"model.default_alias": "registry-default"},
+    )
+    _invoke(factory, model_alias="ghost")
+    assert registry.captured_alias == "ghost"
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — model.default_alias (admin-managed system default)
+# ---------------------------------------------------------------------------
+
+
+def test_model_default_alias_used_when_coordinator_unset() -> None:
+    """Regression for the historical drift: admin sets the system
+    default in the Models tab, the home composer advertises it, and new
+    coordinator sessions must launch on the same alias rather than
+    silently falling through to ``registry.default``."""
+    factory, registry = _build_factory(
+        known_aliases={"admin-default", "registry-default"},
+        settings={"model.default_alias": "admin-default"},
+    )
+    _invoke(factory)
+    assert registry.captured_alias == "admin-default"
+
+
+def test_unloaded_model_default_alias_passed_through() -> None:
+    """Tier 2 names the system default, loaded or not: a disabled or typo'd
+    alias reaches ``registry.resolve_binding`` and fails the create with
+    ``model_not_loaded`` rather than launching on ``registry.default``
+    (#1359)."""
+    factory, registry = _build_factory(
+        known_aliases={"registry-default"},  # admin-default got removed
+        settings={"model.default_alias": "admin-default"},
+    )
+    _invoke(factory)
+    assert registry.captured_alias == "admin-default"
+
+
+def test_blank_model_default_alias_falls_through_to_registry_default() -> None:
+    factory, registry = _build_factory(
+        settings={"model.default_alias": ""},
+    )
+    _invoke(factory)
+    assert registry.captured_alias == "registry-default"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — registry.default (config.toml [model].default)
+# ---------------------------------------------------------------------------
+
+
+def test_no_settings_uses_registry_default() -> None:
+    factory, registry = _build_factory()
+    _invoke(factory)
+    assert registry.captured_alias == "registry-default"
+
+
+def test_whitespace_only_coord_alias_falls_through() -> None:
+    """``"   "`` is not an explicit pin — ``.strip()`` reduces it to
+    "", which the chain should treat as unset."""
+    factory, registry = _build_factory(
+        settings={"coordinator.model_alias": "   "},
+    )
+    _invoke(factory)
+    assert registry.captured_alias == "registry-default"
+
+
+# ---------------------------------------------------------------------------
+# Atomic model binding construction
+# ---------------------------------------------------------------------------
+
+
+def test_factory_passes_one_atomic_model_binding_to_chat_session() -> None:
+    """Every constructor facet comes from the same resolve_binding snapshot."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    registry = _fake_registry()
+    config_store = _FakeConfigStore({"model.temperature": 0.25})
+    factory = build_console_session_factory(
+        registry=registry,
+        config_store=config_store,  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with patch("turnstone.console.session_factory.ChatSession") as chat_session:
+        factory(ui, ws_id="w1")
+
+    registry.resolve_binding.assert_called_once_with("default")
+    registry.resolve.assert_not_called()
+    client, model, cfg, provider, generation = registry.resolve_binding.return_value
+    kwargs = chat_session.call_args.kwargs
+    binding = kwargs["model_binding"]
+    assert binding.lane.client is client
+    assert binding.lane.provider is provider
+    assert binding.lane.model == model
+    assert binding.lane.alias == "default"
+    assert binding.lane.registry is registry
+    assert binding.lane.temperature == 0.25
+    assert binding.config is cfg
+    assert binding.registry_generation == generation
+    assert kwargs["client"] is binding.lane.client
+    assert kwargs["model"] == binding.lane.model
+    assert kwargs["registry_generation"] == binding.registry_generation
+
+
+def test_unknown_explicit_alias_preserves_registry_value_error() -> None:
+    registry = MagicMock()
+    registry.default = "default"
+    registry.resolve_binding.side_effect = ValueError("Unknown model alias: ghost")
+    factory = build_console_session_factory(
+        registry=registry,
+        config_store=_FakeConfigStore({}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with pytest.raises(ValueError, match=r"^Unknown model alias: ghost$"):
+        factory(ui, model_alias="ghost")
+
+    registry.resolve_binding.assert_called_once_with("ghost")
+
+
+def test_a_per_call_judge_model_reaches_the_session_apart_from_the_setting() -> None:
+    """It reaches ``ChatSession`` as ``workstream_judge_model``, unresolved and apart from
+    ``judge_config``: an alias the session can't use builds no judge, never one on the configured
+    model (#1529)."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore({"judge.enabled": True, "judge.model": "configured"}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with patch("turnstone.console.session_factory.ChatSession") as chat_session:
+        factory(ui, ws_id="w1", judge_model="ghost")
+
+    kwargs = chat_session.call_args.kwargs
+    assert kwargs["workstream_judge_model"] == "ghost"
+    assert kwargs["judge_config"].model == "configured"
+
+
+def test_no_per_call_judge_model_leaves_the_session_following_the_setting() -> None:
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore({"judge.enabled": True, "judge.model": "configured"}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with patch("turnstone.console.session_factory.ChatSession") as chat_session:
+        factory(ui, ws_id="w1")
+
+    assert chat_session.call_args.kwargs["workstream_judge_model"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Coordinator MCP gate (#725) — flag × getter matrix, resolved per construction
+# ---------------------------------------------------------------------------
+
+
+def _capture_chatsession_kwargs(
+    *,
+    settings: dict[str, Any],
+    mcp_client_getter: Any = None,
+    getter_passed: bool = True,
+) -> Any:
+    """Run the factory through to a (patched) ChatSession and return the
+    captured construction kwargs.  ChatSession's own contract is covered
+    elsewhere; the unit under test here is the factory's MCP gate."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    extra: dict[str, Any] = {}
+    if getter_passed:
+        extra["mcp_client_getter"] = mcp_client_getter
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore(dict(settings)),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+        **extra,
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+    with patch("turnstone.console.session_factory.ChatSession") as cs:
+        factory(ui, ws_id="w1")
+    assert cs.call_count == 1
+    return cs.call_args.kwargs
+
+
+def test_mcp_getter_passes_live_manager_unconditionally() -> None:
+    """Node parity: the factory passes the live console manager to every
+    coordinator session (the console counterpart of the node factory's
+    mcp_ref[0] read) — whether MCP tools surface is the persona's call,
+    exactly as for interactive sessions."""
+    manager = MagicMock()
+    got = _capture_chatsession_kwargs(settings={}, mcp_client_getter=lambda: manager)
+    assert got["mcp_client"] is manager
+
+
+def test_mcp_getter_none_manager_passes_none() -> None:
+    """Nothing configured (create_mcp_client returned None): the session
+    gets None, not a crash."""
+    got = _capture_chatsession_kwargs(settings={}, mcp_client_getter=lambda: None)
+    assert got["mcp_client"] is None
+
+
+def test_mcp_no_getter_is_backward_compatible() -> None:
+    got = _capture_chatsession_kwargs(settings={}, getter_passed=False)
+    assert got["mcp_client"] is None
+
+
+def test_judge_parallel_evaluations_reaches_coordinator_session() -> None:
+    got = _capture_chatsession_kwargs(
+        settings={"judge.parallel_evaluations": 7},
+        getter_passed=False,
+    )
+    assert got["judge_config"].parallel_evaluations == 7
+
+
+def test_mcp_getter_resolved_per_construction() -> None:
+    """The getter is consulted at EVERY construction — a manager
+    (re)constructed by the console ensure-helper after factory build must
+    reach the next session.  An instance captured at factory-build time
+    fails this row."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    holder: dict[str, Any] = {"mgr": None}
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore({}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+        mcp_client_getter=lambda: holder["mgr"],
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+    with patch("turnstone.console.session_factory.ChatSession") as cs:
+        factory(ui, ws_id="w1")
+        first = cs.call_args.kwargs["mcp_client"]
+        manager = MagicMock()
+        holder["mgr"] = manager  # the ensure-helper lazily constructed it
+        factory(ui, ws_id="w2")
+        second = cs.call_args.kwargs["mcp_client"]
+    assert first is None
+    assert second is manager
+
+
+def test_the_node_factory_hands_a_chosen_judge_to_the_session_as_is() -> None:
+    """The node builds its factory inside ``server.main``, so this reads that ``ChatSession`` call
+    with ast, which ignores comments and layout where a text match wouldn't (#1529)."""
+    import ast
+    import inspect
+    import textwrap
+
+    from turnstone import server
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(server.main)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "ChatSession"
+        and any(k.arg == "judge_config" for k in node.keywords)
+    ]
+    assert len(calls) == 1
+    keywords = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert keywords["workstream_judge_model"] == "judge_model or ''"
+    # Nothing checks the alias first and keeps ``judge.model`` when it doesn't resolve.
+    assert not any(
+        isinstance(node, ast.Call) and ast.unparse(node) == "registry.resolve(judge_model)"
+        for node in ast.walk(tree)
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("   ", None), ("", None), (["x"], None), (None, None), (" set ", "set")],
+)
+def test_the_node_create_api_drops_a_blank_judge_pick(raw: Any, expected: str | None) -> None:
+    """A blank pick would strip to "" in the session and judge with its own model, so the node's
+    create builder, which the console's create proxy also reaches, keeps it out (#1529)."""
+    from turnstone.server import _interactive_create_build_kwargs
+
+    body = {} if raw is None else {"judge_model": raw}
+    kwargs = _interactive_create_build_kwargs(MagicMock(), body, "u1", None, "", 0)
+
+    assert kwargs["judge_model"] == expected

@@ -1,0 +1,138 @@
+"""Storage CRUD tests for ``oidc_user_credentials`` (single-credential MCP minting, #551).
+
+Validates the storage-protocol additions for the captured per-(user, issuer)
+IdP refresh token:
+
+- ``upsert_oidc_user_credential`` (create-or-replace semantics)
+- ``get_oidc_user_credential``
+- ``update_oidc_user_credential_refresh`` (rotation write-back)
+- ``delete_user`` cascade
+
+A credential is removed only with its identity, through ``unlink_oidc_identity``.
+
+plus the ``MCPTokenStore`` encrypt/decrypt wrappers over the same rows.
+"""
+
+from __future__ import annotations
+
+from tests.conftest import make_mcp_token_cipher
+from turnstone.core.mcp_crypto import MCPTokenStore
+
+ISS = "https://login.example.test/tenant-1/v2.0"
+
+
+class TestUpsertAndGet:
+    def test_round_trip(self, backend) -> None:
+        backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-1")
+        row = backend.get_oidc_user_credential("u1", ISS)
+        assert row is not None
+        assert row["user_id"] == "u1"
+        assert row["issuer"] == ISS
+        assert row["refresh_token_ct"] == b"ct-1"
+        assert row["created"] == row["last_refreshed"]
+
+    def test_get_missing_returns_none(self, backend) -> None:
+        assert backend.get_oidc_user_credential("nobody", ISS) is None
+
+    def test_keyed_by_user_and_issuer(self, backend) -> None:
+        backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-1")
+        assert backend.get_oidc_user_credential("u1", "https://other.test") is None
+        assert backend.get_oidc_user_credential("u2", ISS) is None
+
+    def test_upsert_replaces_on_conflict(self, backend) -> None:
+        """A fresh login must overwrite a stale credential; ``created`` survives.
+
+        Plants a distinctly-past ``created`` via direct SQL so the assertion
+        actually detects a reset (comparing two upserts milliseconds apart would
+        pass at second granularity even if the on-conflict clause reset created).
+        """
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import oidc_user_credentials
+
+        backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-old")
+        planted = "2020-01-01T00:00:00"
+        with backend._engine.connect() as conn:
+            conn.execute(
+                sa.update(oidc_user_credentials)
+                .where(
+                    (oidc_user_credentials.c.user_id == "u1")
+                    & (oidc_user_credentials.c.issuer == ISS)
+                )
+                .values(created=planted)
+            )
+            conn.commit()
+
+        backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-new")
+        second = backend.get_oidc_user_credential("u1", ISS)
+        assert second is not None
+        assert second["refresh_token_ct"] == b"ct-new"
+        # created is PRESERVED across the replace (not reset to now).
+        assert second["created"] == planted
+        # last_refreshed, by contrast, advances off the planted-past value.
+        assert second["last_refreshed"] != planted
+
+
+class TestRotationWriteBack:
+    def test_update_rewrites_token(self, backend) -> None:
+        backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-1")
+        assert backend.update_oidc_user_credential_refresh("u1", ISS, refresh_token_ct=b"ct-2")
+        row = backend.get_oidc_user_credential("u1", ISS)
+        assert row is not None
+        assert row["refresh_token_ct"] == b"ct-2"
+
+    def test_update_missing_returns_false(self, backend) -> None:
+        assert not backend.update_oidc_user_credential_refresh(
+            "nobody", ISS, refresh_token_ct=b"ct"
+        )
+
+
+class TestDelete:
+    def test_delete_user_cascades_credential(self, backend) -> None:
+        backend.create_user("u-doomed", "doomed", "Doomed", "hash")
+        backend.upsert_oidc_user_credential("u-doomed", ISS, refresh_token_ct=b"ct-1")
+        assert backend.delete_user("u-doomed")
+        assert backend.get_oidc_user_credential("u-doomed", ISS) is None
+
+
+class TestTokenStoreWrappers:
+    def test_encrypt_decrypt_round_trip(self, backend) -> None:
+        store = MCPTokenStore(backend, make_mcp_token_cipher())
+        store.upsert_oidc_credential("u1", ISS, refresh_token="rt-plaintext")
+        plain = store.get_oidc_credential("u1", ISS)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-plaintext"
+        # Ciphertext at rest — the raw row must not contain the plaintext.
+        raw = backend.get_oidc_user_credential("u1", ISS)
+        assert raw is not None
+        assert b"rt-plaintext" not in raw["refresh_token_ct"]
+
+    def test_redeem_write_back_round_trip(self, backend) -> None:
+        store = MCPTokenStore(backend, make_mcp_token_cipher())
+        store.upsert_oidc_credential("u1", ISS, refresh_token="rt-first")
+        # CAS matches the stored value → write lands.
+        assert store.update_oidc_credential_after_redeem(
+            "u1", ISS, refresh_token="rt-rotated", expected_current="rt-first"
+        )
+        plain = store.get_oidc_credential("u1", ISS)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-rotated"
+
+    def test_redeem_write_back_cas_skips_when_credential_changed(self, backend) -> None:
+        """The rotation write is a no-op when the stored credential no longer
+        matches what the mint read (a concurrent login capture refreshed it) —
+        so a stale rotation can't clobber a fresh login token."""
+        store = MCPTokenStore(backend, make_mcp_token_cipher())
+        store.upsert_oidc_credential("u1", ISS, refresh_token="rt-login-fresh")
+        # Mint read "rt-old", but the stored value is now the fresh login token.
+        assert not store.update_oidc_credential_after_redeem(
+            "u1", ISS, refresh_token="rt-rotated-from-old", expected_current="rt-old"
+        )
+        # The fresh login token survived.
+        plain = store.get_oidc_credential("u1", ISS)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-login-fresh"
+
+    def test_get_missing_returns_none(self, backend) -> None:
+        store = MCPTokenStore(backend, make_mcp_token_cipher())
+        assert store.get_oidc_credential("nobody", ISS) is None

@@ -1,0 +1,53 @@
+{
+  "inn": {
+    "kind": "inn",
+    "name": "The Sleeping Drake",
+    "glyph": "⌂",
+    "color": "inn",
+    "actions": ["rest", "deposit", "withdraw", "gamble", "leave"],
+    "flavor": [
+      "Lamplight pools on worn oak tables.",
+      "The innkeeper nods toward the hearth.",
+      "A night's rest restores you fully.",
+      "An iron strongbox by the bar keeps coin safe from sleeping-robbers.",
+      "In the corner, a dice cup waits for a wager."
+    ]
+  },
+  "shop": {
+    "kind": "shop",
+    "name": "Gravel & Sons Outfitters",
+    "glyph": "$",
+    "color": "shop",
+    "actions": ["buy", "sell", "forge", "leave"],
+    "flavor": [
+      "Racks of steel and leather line the walls.",
+      "Buying a weapon or armour equips it at once.",
+      "Potions go into your satchel, to quaff when the need is dire.",
+      "The forge glows: bring coin to better your blade or your guard.",
+      "Old gear sells back for half its price."
+    ]
+  },
+  "healer": {
+    "kind": "healer",
+    "name": "The Quiet Shrine",
+    "glyph": "✚",
+    "color": "healer",
+    "actions": ["heal", "leave"],
+    "flavor": [
+      "Incense curls beneath a still blue flame.",
+      "The keeper mends wounds for coin, per point of vigour."
+    ]
+  },
+  "dungeon": {
+    "kind": "dungeon",
+    "name": "The Understone Deep",
+    "glyph": "∩",
+    "color": "dungeon",
+    "actions": ["descend", "challenge", "leave"],
+    "flavor": [
+      "A cold throat of stone descends into dark.",
+      "To descend is to face a troll, then something worse.",
+      "Deeper still, the old tales say, the Wyrm Below coils and waits."
+    ]
+  }
+}

@@ -1,0 +1,192 @@
+@startuml
+!theme plain
+title Turnstone — Watch Tool Architecture
+
+skinparam participant {
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<session>> #C8E6C9
+    BackgroundColor<<ui>> #E8EAF6
+}
+
+participant "ChatSession\n(session.py)" as Session <<session>>
+participant "WatchRunner\n(watch.py)" as Runner <<server>>
+participant "StorageBackend\n(SQLite / PostgreSQL)" as Storage <<storage>>
+participant "WebUI / SSE\n(server.py)" as UI <<ui>>
+participant "Model" as Model
+
+== Create Phase ==
+
+Session -> Session : _prepare_watch(action="create")
+note right
+  Validates:
+  - command via is_command_blocked()
+  - poll_every → parse_duration()
+  - stop_on → validate_condition()
+  - max watches limit (5)
+  - duplicate name check
+  needs_approval = True
+end note
+
+Session -> Storage : create_watch(watch_id, ws_id,\nnode_id, command, interval,\nstop_on, max_polls, next_poll)
+
+Session --> UI : tool_result:\n"Watch 'pr-review' created"
+
+== Poll Phase (WatchRunner daemon, every 15s) ==
+
+Runner -> Storage : list_due_watches(now)
+Storage --> Runner : due_watches[]
+note right
+  Filters:
+  active=1 AND
+  next_poll <= now AND
+  node_id matches
+end note
+
+loop for each due watch
+
+    Runner -> Runner : is_command_blocked()?
+    alt blocked
+        Runner -> Storage : update_watch(active=False)
+    else safe
+
+        Runner -> Runner : subprocess.run(command)
+        note right
+          timeout = tool_timeout
+          start_new_session = True
+          output truncated at 64KB
+        end note
+
+        Runner -> Runner : evaluate_condition(\nstop_on, output,\nexit_code, prev_output)
+        note right
+          **Variables:**
+          output, data, exit_code,
+          prev_output, changed
+
+          **Safe builtins only:**
+          len, str, int, sorted, ...
+          No import/open/exec/eval
+
+          **stop_on=None:**
+          fires on change (skip 1st poll)
+        end note
+
+        alt condition fired OR max_polls reached
+            Runner -> Runner : build_watch_reminder()
+            Runner -> Runner : _dispatch_result(ws_id, reminder)
+            Runner -> Storage : update_watch(\npoll_count++,\nlast_output, active=False)
+        else not fired
+            Runner -> Storage : update_watch(\npoll_count++,\nlast_output, next_poll)
+        end
+
+    end
+end
+
+== Dispatch Phase ==
+
+note over Runner, Session
+  **Three dispatch paths:**
+end note
+
+alt Path A: workstream active + idle
+    Runner -> Session : dispatch_fn(reminder)\n→ NudgeQueue.enqueue(channel="any")
+    Session -> Session : wake workstream\n→ send("")
+
+else Path B: workstream active + busy
+    Runner -> Session : dispatch_fn(reminder)\n→ NudgeQueue.enqueue(channel="any")
+    note right
+      In-flight worker drains the notice
+      at its next user or tool seam.
+    end note
+
+else Path C: workstream not loaded
+    Runner -> Runner : restore_fn(ws_id)
+    note right
+      1. persona and owner checks
+      2. mgr.open_with_outcome(ws_id) — may evict
+         another idle workstream; open in another
+         process → retry later; no turns → watch ends
+      3. opened here: unattended approval until
+         the first client, set_watch_runner()
+      4. already loaded: register its dispatch_fn
+    end note
+    Runner -> Session : restored dispatch_fn(reminder)\n→ NudgeQueue.enqueue(channel="any")
+end
+
+Session -> Session : drain notice into watch_triggered system turn
+Session -> UI : system_turn(content=notice, meta=output snapshot)
+note over Session, UI
+  The card renders output from structured metadata.
+  Metadata is invisible to the model.
+end note
+Session -> Model : metadata-only operator notice + read hint
+Model -> Session : watch(action="read", name="<full watch id>")
+Session -> Session : find delivered snapshot in active transcript
+alt no active snapshot
+    Session -> Storage : get_watch_snapshot(current ws_id, full watch id)
+    Storage --> Session : snapshot from this workstream's persisted history
+end
+alt no delivered snapshot
+    Session -> Storage : resolve own watch; read stored last_output
+    Storage --> Session : watch row (including completed watches)
+end
+note right
+  The snapshot is available before
+  the runner's final row commit.
+  Forks keep inherited snapshots.
+  Compacted-source forks copy retained
+  snapshots before the child's checkpoint.
+  Persisted snapshots survive compaction.
+  Condition exception details also
+  stay out of operator notice text.
+end note
+Session -> Session : output guard (when enabled)
+Session -> Model : tool result with command output
+
+== Cancel / List ==
+
+Session -> Storage : list_watches_for_ws(ws_id)
+note right : action="list" (auto-approve)
+
+Session -> Storage : update_watch(active=False)
+note right : action="cancel" (auto-approve)
+
+== Server Lifecycle ==
+
+note over Runner, Storage
+  **Startup:**
+  1. WatchRunner created in main() with storage + node_id
+  2. restore_fn = make_watch_restore_fn(manager)
+  3. Initial workstream: session.set_watch_runner(runner)
+  4. _lifespan(): runner.start() — daemon thread begins
+
+  **New workstream:**
+  session.set_watch_runner(runner) in create_workstream()
+  → registers dispatch_fn for ws_id
+
+  **Eviction / close:**
+  session.close() → runner.remove_dispatch_fn(ws_id)
+  Watches remain active in DB — WatchRunner uses restore_fn
+
+  **Restart recovery:**
+  Overdue watches fire ONE immediate poll
+  next_poll updated to now + interval
+  Normal cadence resumes
+
+  **Shutdown:**
+  _lifespan(): runner.stop() — joins thread
+end note
+
+== REST API ==
+
+note over UI, Storage
+  **GET /v1/api/watches[?ws_id=X]**
+  List active watches (for node or workstream)
+
+  **POST /v1/api/watches/{watch_id}/cancel**
+  Cancel a watch (sets active=False)
+
+  Both require write scope
+end note
+
+@enduml

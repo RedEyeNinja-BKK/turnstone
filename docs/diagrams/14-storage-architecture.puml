@@ -1,0 +1,211 @@
+@startuml
+!theme plain
+title Turnstone — Storage, Deferred Create, Fork, and Checkpoint Architecture
+
+skinparam class {
+    BackgroundColor<<protocol>> #E8EAF6
+    BackgroundColor<<sqlite>> #C8E6C9
+    BackgroundColor<<postgres>> #B3E5FC
+    BackgroundColor<<lifecycle>> #FFF9C4
+    BackgroundColor<<schema>> #F3E5F5
+    BackgroundColor<<helper>> #FFE0B2
+}
+
+interface "StorageBackend" as Storage <<protocol>> {
+    + load_message_turns(ws_id, checkpointed=True) → list[Turn]
+    + save_message(ws_id, role, content, metadata...)
+    + clone_workstream(source, destination, principal, expected_session) → ForkCloneSnapshot
+    + get_memory_index_snapshot(ws_id) → row | None
+    + acquire_memory_index_snapshot(ws_id, principal, commit_context) → row | None
+    --
+    + register_workstream(..., state, reservation_token) → bool
+    + ensure_workstream_incarnation_snapshot(ws_id) → row + token
+    + finalize_deferred_create(ws_id, token, config...) → bool
+    + publish_deferred_create(ws_id, token) → bool
+    + delete_workstream_if_fork_reserved(ws_id, token) → bool
+    + delete_stale_creating_reservations(...) → list[ws_id]
+    + update_workstream_state(ws_id, state)
+    + delete_workstream(ws_id) → bool
+    --
+    + attachment / project / memory / auth / governance APIs
+}
+
+class "SQLiteBackend" as SQLite <<sqlite>> {
+    - _engine: sa.Engine
+    - _fts5_available: bool
+    --
+    Fork clone: BEGIN IMMEDIATE
+    FTS5 refresh in same transaction
+}
+
+class "PostgreSQLBackend" as PG <<postgres>> {
+    - _engine: sa.Engine
+    --
+    Fork clone: SERIALIZABLE + row locks
+    Retry SQLSTATE 40001 / 40P01
+    DML success uses RETURNING rows
+}
+
+class "_utils.py" as Utils <<helper>> {
+    + reconstruct_turns(rows) → list[Turn]
+    + recover_trajectory(turns) → list[Turn]
+    + reconstruct_turns_checkpointed(...)
+    + retain_attachment_refs(conn, ids)
+    + release_attachment_refs(conn, ids)
+    + clone_workstream_transaction(...) → ForkCloneSnapshot
+}
+
+class "ForkCloneExpectation" as Expectation <<lifecycle>> {
+    + persona_config
+    + project_id / name / writable
+    + source_reservation_token
+    + destination_reservation_token
+}
+
+class "ForkCloneSnapshot" as Snapshot <<lifecycle>> {
+    + turns: tuple[Turn, ...]
+    + config: dict[str, str]
+    + project_id: str | None
+}
+
+class "workstreams" as Workstreams <<schema>> {
+    ws_id PK
+    state: creating | live state | closed
+    user_id, node_id, kind, parent_ws_id
+    project_id, persona, alias, title
+}
+
+class "conversations" as Conversations <<schema>> {
+    canonical persisted Turn rows
+    provider_data + tool_calls mirror
+    event_id, source, is_error, meta
+    attachment-id ref list
+    --
+    compaction marker:
+    source="compaction"
+    meta.watermark=<folded row id>
+}
+
+class "workstream_config" as WorkstreamConfig <<schema>> {
+    PK (ws_id, key)
+    stamped persona/session config
+    private durable incarnation fence:
+    __fork_destination_reservation
+}
+
+class "memory_index_snapshots" as MemoryIndexSnapshots <<schema>> {
+    ws_id PK: one binding per durable row
+    principal + project witnesses
+    visibility key + rendered content
+    format / entry / character counts
+    captured_at
+}
+
+class "workstream_attachments" as Attachments <<schema>> {
+    content-addressed blob
+    attachment_id, bytes, kind
+    refcount
+}
+
+class "projects + project_members" as Projects <<schema>> {
+    visibility / owner / membership
+    active project-memory envelope
+}
+
+class "SessionManager" as Manager <<lifecycle>> {
+    + create(..., defer_emit_created)
+    + commit_create(ws)
+    + discard(ws)
+    + reap_stale_creating_reservations(max_age=2h)
+    + open / close / delete
+}
+
+class "ChatSession" as Session <<lifecycle>> {
+    + append canonical Turns
+    + compact / resume checkpoint
+    + fork_from_storage(...)
+}
+
+SQLite ..|> Storage
+PG ..|> Storage
+SQLite --> Utils
+PG --> Utils
+
+Storage --> Workstreams
+Storage --> Conversations
+Storage --> WorkstreamConfig
+Storage --> MemoryIndexSnapshots
+Storage --> Attachments
+Storage --> Projects
+
+Manager --> Storage : lifecycle reservation + state
+Session --> Storage : turn durability + resume
+Session --> MemoryIndexSnapshots : first-admission prefix binding
+Session --> Expectation : construction witness
+Storage --> Snapshot : atomic clone result
+Expectation --> Utils : checked inside transaction
+Utils --> Snapshot : builds
+
+note right of Manager
+  **Deferred create publication**
+  1. INSERT workstream as state="creating" and store a fresh
+     private token in the same transaction.
+  2. Construct UI/session and run attachment/fork gates while
+     ordinary list/open/history reads exclude the row.
+  3. finalize_deferred_create atomically applies config/alias.
+  4. publish_deferred_create compare-and-swaps creating → idle.
+  5. Only then emit ws_created.
+
+  Any normal prepublication failure immediately calls exact token-checked
+  deletion. The workstreams primary key reserves the ID while its row exists;
+  rollback and hard deletion release it after removing owned state. The token
+  prevents stale provisional operations from deleting a same-ID replacement
+  reservation.
+  A legacy row acquires the same private token atomically when rehydrate,
+  delete, or fork preflight takes its authoritative snapshot. Loaded hard
+  delete drains admitted session durability before its token-checked delete.
+end note
+
+note left of Manager
+  **Crash-abandoned hidden-create recovery**
+  • Boot pass; long-lived processes repeat every 5 min,
+    even when ordinary idle eviction is disabled.
+  • Candidates remain state="creating", are >2h old,
+    and are absent from the manager loaded/pending set.
+  • A live owner lease protects a row; a crashed creator's
+    lease expires, whatever node ID the restart carries.
+  • A storage failure deletes nothing.
+  • One transaction rechecks state, age, lease and token, then
+    hard-deletes dependents and releases attachment refs.
+  • Tokenless legacy/corrupt rows use their locked durable
+    row as the incarnation fence and log a warning.
+  • Retention pruning excludes creating rows. Recovery never
+    closes or publishes them as live WorkstreamState values.
+end note
+
+note bottom of Utils
+  **Atomic fork clone**
+  • Reject a provisional source; compare the source incarnation captured
+    by canonical preflight; re-authorize project visibility and compare the
+    live session envelope inside the transaction.
+  • Require a same-owner, empty destination still in creating state
+    with the exact reservation token.
+  • Copy the checkpoint-bounded canonical trajectory and config;
+    retain every referenced attachment or roll everything back.
+  • Preserve/rebase a valid compaction checkpoint watermark and
+    return the exact snapshot installed into the live destination.
+end note
+
+note bottom of Conversations
+  Full transcript rows are never deleted by compaction. Normal resume
+  loads the latest valid [summary] + rows after its watermark; audit and
+  export can request the full marker-free history.
+end note
+
+note bottom of MemoryIndexSnapshots
+  Capture resolves project access and visible metadata in one transaction.
+  The caller validates the complete final system prefix before first commit.
+  Hard workstream deletion removes the snapshot in the same transaction.
+end note
+
+@enduml

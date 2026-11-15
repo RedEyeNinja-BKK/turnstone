@@ -1,0 +1,310 @@
+"""HTTP-200 error responses share product recovery without changing raw callers."""
+
+from __future__ import annotations
+
+import threading
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import httpx2
+import pytest
+from openai import InternalServerError
+
+from tests._session_helpers import NullUI, scripted_session
+from tests.test_sdk_stream_boundary import _BlockingJsonStream
+from turnstone.core.completion_recovery import (
+    CompletionRecoveryError,
+    ModelTurnLocalError,
+    completion_cause,
+)
+from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+from turnstone.core.judge import JudgeConfig
+from turnstone.core.model_turn import model_turn
+from turnstone.core.providers import IncompleteStreamError
+from turnstone.core.providers._openai_common import (
+    UpstreamRateLimitError,
+    UpstreamResponseError,
+    UpstreamTransientError,
+)
+from turnstone.core.session import ChatSession
+from turnstone.core.trajectory import Turn
+from turnstone.core.workstream import WorkstreamKind
+
+_ANSWER = "The work is complete."
+
+
+class _UI(NullUI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.aux_usage: list[dict[str, Any]] = []
+        self.task_results: list[tuple[str, bool]] = []
+
+    def on_state_change(self, state: str) -> None:
+        pass
+
+    def on_aux_usage(self, usage: dict[str, Any]) -> None:
+        self.aux_usage.append(dict(usage))
+        super().on_aux_usage(usage)
+
+    def on_tool_result(self, call_id, name, output, *, is_error=False, preview=None):
+        if name == "task_agent":
+            self.task_results.append((output, is_error))
+        super().on_tool_result(call_id, name, output, is_error=is_error, preview=preview)
+
+
+class _BrokenJsonBody(httpx2.SyncByteStream):
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __iter__(self):
+        yield b'{"error":{"message":"'
+        raise httpx2.ReadError("JSON body connection lost")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture(autouse=True)
+def no_recovery_wait(monkeypatch):
+    monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
+
+
+@contextmanager
+def _session(replies, *, surface="chat", native=False, sdk_retries=0):
+    with (
+        scripted_session(
+            WorkstreamKind.INTERACTIVE,
+            replies,
+            api_surface=surface,
+            server_parses=None,
+            sdk_retries=sdk_retries,
+            ui=_UI(),
+            user_id="response-recovery-user",
+            context_window=100_000,
+            max_tokens=256,
+            compact_max_tokens=256,
+            judge_config=JudgeConfig(enabled=False, output_guard=False),
+        ) as (session, ui, requests),
+        ExitStack() as stack,
+    ):
+        lane = session._primary_lane()
+        provider = lane.provider
+        session._agent_prompt_components = ()
+        session._task_tools = []
+        if native is True:
+            if surface == "chat":
+                lane = replace(lane, extra_params={"web_search_options": {}})
+            else:
+                # Responses ignores extra_params. Its main envelope advertises
+                # web_search, which this capability converts to native search.
+                lane = replace(
+                    lane, capabilities=replace(lane.capabilities, supports_web_search=True)
+                )
+            session._model_binding = replace(session._model_binding, lane=lane)
+        elif native is None:
+            # An older adapter can omit request metrics. Keep the real adapter,
+            # SDK, and wire path; omit only its posture report for this case.
+            create_streaming = provider.create_streaming
+
+            def without_metrics(**kwargs):
+                kwargs["request_metrics_ref"] = None
+                return create_streaming(**kwargs)
+
+            stack.enter_context(
+                patch.object(provider, "create_streaming", side_effect=without_metrics)
+            )
+        yield session, ui, requests
+
+
+def _invoke(session, caller):
+    if caller == "main":
+        session.send("Complete the work.")
+        return next(turn.text for turn in reversed(session.messages) if turn.role == "assistant")
+    if caller == "task":
+        _, result = session._exec_task({"call_id": "task-response", "prompt": "Complete the work."})
+        return result
+    if caller == "summary":
+        runtime = session._build_summary_runtime(
+            session._primary_lane(), continuation_overhead_tokens=0
+        )
+        return session._compaction_engine.summarize_batch(
+            "Summarize the conversation.", ["Earlier useful work."], 0, runtime
+        ).text
+    return session._utility_completion([Turn.user("Complete the work.")]).content
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize("caller,error", [("task", "overloaded"), ("summary", "rate-limit")])
+def test_product_callers_recover_json_errors_without_replaying_their_operation(
+    tmp_db, surface, caller, error
+):
+    with _session([error, "answer"], surface=surface, sdk_retries=2) as (session, ui, requests):
+        assert _invoke(session, caller) == _ANSWER
+        assert requests[0] == requests[1]
+        assert len(ui.aux_usage) == 1
+        assert ui.aux_usage[0]["completion_tokens"] == 43
+        if caller == "task":
+            assert ui.task_results == [(_ANSWER, False)]
+
+
+@pytest.mark.parametrize("caller", ["task", "summary"])
+@pytest.mark.parametrize(
+    "replies", [["overloaded", "empty", "death"], ["empty", "rate-limit", "overloaded"]]
+)
+def test_json_empty_and_drain_failures_share_one_allowance(tmp_db, caller, replies):
+    with _session(replies) as (session, ui, requests):
+        if caller == "task":
+            result = _invoke(session, caller)
+            assert result.startswith("Task error:")
+            assert ui.task_results == [(result, True)]
+        else:
+            with pytest.raises(CompletionRecoveryError):
+                _invoke(session, caller)
+        assert len(requests) == 3
+        assert requests[0] == requests[1] == requests[2]
+        # Only the completed empty attempt has usage. Error bodies and
+        # incomplete streams cannot create a fabricated completed charge.
+        assert len(ui.aux_usage) == 1
+        assert ui.aux_usage[0]["completion_tokens"] == 43
+
+
+@pytest.mark.parametrize(
+    "caller,surface,native",
+    [("utility", "chat", True), ("utility", "responses", None), ("task", "chat", True)],
+)
+def test_json_rejection_reissues_regardless_of_native_posture(tmp_db, caller, surface, native):
+    """A JSON error body arrives before any stream exists, so nothing ran and
+    the request's tool posture is no replay hazard: nonstreaming callers spend
+    their shared allowance on it like any transient failure."""
+    with _session(["overloaded", "answer"], surface=surface, native=native, sdk_retries=2) as (
+        session,
+        ui,
+        requests,
+    ):
+        assert _invoke(session, caller) == _ANSWER
+        assert requests[0] == requests[1]
+        assert len(ui.aux_usage) == 1
+        if native and surface == "chat":
+            assert requests[0]["web_search_options"] == {}
+        elif native:
+            assert {"type": "web_search"} in requests[0]["tools"]
+
+
+@pytest.mark.parametrize("native", [True, None, False])
+def test_main_json_rejection_is_a_creation_failure(tmp_db, native):
+    """The streaming owner keeps its creation ladder for a JSON error body at
+    any tool posture: the primary lane is retried, and its health failure is
+    recorded once before the error surfaces."""
+    replies = ["overloaded"] * (ChatSession._MAX_RETRIES + 1)
+    with _session(replies, native=native) as (session, ui, requests):
+        tracker = MagicMock()
+        with (
+            patch.object(session, "_get_health_tracker", return_value=tracker),
+            pytest.raises(UpstreamTransientError),
+        ):
+            _invoke(session, "main")
+        assert len(requests) == ChatSession._MAX_RETRIES + 1
+        tracker.record_failure.assert_called_once()
+        assert ui.aux_usage == []
+
+
+def test_main_json_overflow_rejection_compacts(tmp_db):
+    """A context rejection delivered as an HTTP-200 JSON body reaches the send
+    loop's compact-and-retry arm like any other request-time overflow."""
+    with _session(["overflow", "answer"]) as (session, ui, requests):
+        with patch.object(session, "_compact_messages") as compact:
+            assert _invoke(session, "main") == _ANSWER
+        compact.assert_called_once()
+        assert len(requests) == 2
+
+
+def test_main_json_rejection_health_fault_is_local(tmp_db):
+    replies = ["overloaded"] * (ChatSession._MAX_RETRIES + 1)
+    with _session(replies) as (session, ui, requests):
+        tracker = MagicMock()
+        tracker.record_failure.side_effect = ValueError("private health state")
+        with (
+            patch.object(session, "_get_health_tracker", return_value=tracker),
+            pytest.raises(ModelTurnLocalError),
+        ):
+            _invoke(session, "main")
+        tracker.record_failure.assert_called_once()
+        tracker.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize(
+    "reply,error_type",
+    [("overloaded", UpstreamTransientError), ("rate-limit", UpstreamRateLimitError)],
+)
+def test_raw_call_keeps_original_json_error_and_single_request(tmp_db, surface, reply, error_type):
+    with _session([reply], surface=surface, sdk_retries=2) as (session, _ui, requests):
+        with pytest.raises(error_type) as failure:
+            model_turn(session._primary_lane(), [Turn.user("Continue")], product_recovery=False)
+        assert not isinstance(failure.value, CompletionRecoveryError)
+        assert failure.value.status_code == 200
+
+
+def test_unclassified_json_error_remains_terminal(tmp_db):
+    with _session(["invalid"]) as (session, ui, requests):
+        with pytest.raises(CompletionRecoveryError) as failure:
+            _invoke(session, "utility")
+        assert type(completion_cause(failure.value)) is UpstreamResponseError
+        assert ui.aux_usage == []
+
+
+def test_http503_retains_sdk_retry_ownership(tmp_db):
+    with _session(["http503"] * 3, sdk_retries=2) as (session, ui, requests):
+        with pytest.raises(InternalServerError) as failure:
+            _invoke(session, "utility")
+        assert failure.value.status_code == 503
+        assert len(requests) == 3
+        assert ui.aux_usage == []
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+def test_json_body_read_failure_recovers_and_closes_the_response(tmp_db, surface):
+    body = _BrokenJsonBody()
+    with _session([body, "answer"], surface=surface, sdk_retries=2) as (session, ui, requests):
+        assert _invoke(session, "utility") == _ANSWER
+        assert body.closed
+        assert len(ui.aux_usage) == 1
+
+
+def test_raw_json_body_read_failure_is_not_retried(tmp_db):
+    body = _BrokenJsonBody()
+    with _session([body], sdk_retries=2) as (session, _ui, requests):
+        with pytest.raises(IncompleteStreamError) as failure:
+            model_turn(session._primary_lane(), [Turn.user("Continue")], product_recovery=False)
+        assert isinstance(failure.value.__cause__, httpx2.ReadError)
+        assert body.closed
+
+
+def test_cancelling_json_body_read_closes_response_without_reissue(tmp_db):
+    body = _BlockingJsonStream()
+    cancel_ref = StreamAbortRef()
+    errors: list[BaseException] = []
+    with _session([body]) as (session, ui, requests):
+
+        def invoke():
+            try:
+                session._utility_completion([Turn.user("Continue")], cancel_ref=cancel_ref)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=invoke)
+        worker.start()
+        try:
+            assert body.read_started.wait(2)
+            cancel_ref.abort()
+            worker.join(2)
+            assert not worker.is_alive()
+            assert len(errors) == 1
+            assert isinstance(errors[0], DeadlineCancelledError)
+            assert body.closed.is_set()
+            assert ui.aux_usage == []
+        finally:
+            cancel_ref.abort()
+            worker.join(2)

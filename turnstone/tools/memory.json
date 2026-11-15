@@ -1,0 +1,72 @@
+{
+  "name": "memory",
+  "description": "Persistent memory across sessions. The initial prompt contains a complete immutable body-free index for the acting principal, with the active project ID when present; later turns may contain live metadata pointers. Actions: 'save' stores a memory and always requires a one-line description of at most 512 characters, 'get' retrieves live full content by name, 'search' finds body-free metadata by query, 'delete' removes a memory, and 'list' shows body-free metadata. Only 'get' records an access. A successful save may append informational index-health prose; its over-budget notice is opt-in and off by default. Any stored project attachment pins unscoped save/get/delete to project: missing, archived, or unauthorized access fails closed without fallback; read-only access permits get but denies mutations, and authorized reactivation restores eligibility. Only no project attachment uses the session-kind default. Pass the displayed scope explicitly when following a search/list result from another scope.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["save", "get", "search", "delete", "list"],
+        "description": "Action to perform."
+      },
+      "name": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
+        "maxLength": 256,
+        "description": "Memory identifier (required for 'save', 'get', and 'delete'). Use a lowercase ASCII snake_case semantic key. Do not use punctuation or non-Latin scripts; keep native-language wording in the required description or content."
+      },
+      "content": {
+        "type": "string",
+        "description": "Memory content (required for 'save')."
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "description": "Required authored one-line index hook on every 'save' (create or update). Whitespace is normalized and the result must contain 1-512 characters."
+      },
+      "type": {
+        "type": "string",
+        "enum": ["user", "general", "feedback", "reference"],
+        "description": "Memory type. Default: 'general'."
+      },
+      "scope": {
+        "type": "string",
+        "enum": ["global", "workstream", "user", "coordinator", "project"],
+        "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the acting user across workstreams; 'project' = the shared bucket of the project attached to this session. Any stored project attachment pins unscoped save/get/delete to project. Missing, archived, revoked, or mutation-denied access fails closed without fallback; read-only access still permits get, and authorized reactivation restores eligibility. Only no project attachment uses the session-kind default. Search/list without scope use all visible scopes. A valid explicit scope selects exactly that scope."
+      },
+      "query": {
+        "type": "string",
+        "description": "Search query (for 'search' action)."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max results for 'search' or 'list'. Default: 20."
+      }
+    },
+    "required": ["action"]
+  },
+  "coordinator": true,
+  "interactive": true,
+  "kind_variants": {
+    "interactive": {
+      "description": "Persistent memory across sessions. The initial prompt contains a complete immutable body-free index for the acting principal, with the active project ID when present; later turns may contain live metadata pointers. Actions: 'save' requires a one-line description of at most 512 characters, 'get' retrieves live full content by name, 'search' and 'list' return body-free metadata, and 'delete' removes a memory. Only 'get' records an access. A successful save may append informational index-health prose; its over-budget notice is opt-in and off by default. Scopes are 'global' (shared everywhere), 'workstream' (this workstream only), 'user' (follows the acting user across workstreams), and 'project' (the shared bucket of an attached project). Any stored project attachment pins unscoped save/get/delete to project: missing, archived, or unauthorized access fails closed without fallback; read-only access permits get but denies mutations, and authorized reactivation restores eligibility. Only no project attachment defaults to global. Pass the displayed scope explicitly when following a search/list result from another scope.",
+      "parameter_overrides": {
+        "scope": {
+          "enum": ["global", "workstream", "user", "project"],
+          "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the acting user across workstreams; 'project' = the shared bucket of the project attached to this workstream. Any stored project attachment pins unscoped save/get/delete to project. Missing, archived, revoked, or mutation-denied access fails closed without fallback; read-only access still permits get, and authorized reactivation restores eligibility. Only no project attachment defaults to global. Search/list without scope use all visible scopes. A valid explicit scope selects exactly that scope."
+        }
+      }
+    },
+    "coordinator": {
+      "description": "Persistent orchestration memory for the acting user. The initial prompt contains a complete immutable body-free index, with the active project ID when present; later turns may contain live metadata pointers. Actions: 'save' requires a one-line description of at most 512 characters, 'get' retrieves live full content by name, 'search' and 'list' return body-free metadata, and 'delete' removes a memory. Only 'get' records an access. A successful save may append informational index-health prose; its over-budget notice is opt-in and off by default. Coordinator memories survive across that user's coordinator sessions and are NOT visible to child workstreams. Any stored project attachment pins unscoped save/get/delete to project: missing, archived, or unauthorized access fails closed without fallback; read-only access permits get but denies mutations, and authorized reactivation restores eligibility. Only no project attachment defaults to coordinator. Pass the displayed scope explicitly when following a search/list result from another scope.",
+      "parameter_overrides": {
+        "scope": {
+          "enum": ["coordinator", "project"],
+          "description": "'coordinator' = the acting user's private orchestration namespace, durable across their coordinator sessions; 'project' = the shared bucket of the project attached to this coordinator. Any stored project attachment pins unscoped save/get/delete to project. Missing, archived, revoked, or mutation-denied access fails closed without fallback; read-only access still permits get, and authorized reactivation restores eligibility. Only no project attachment defaults to coordinator. Search/list without scope use all visible scopes. A valid explicit scope selects exactly that scope."
+        }
+      }
+    }
+  },
+  "primary_key": "name"
+}

@@ -1,0 +1,58 @@
+@startuml
+!theme plain
+title Turnstone — System Context
+
+' Actors/Users
+actor "CLI User" as cli_user
+actor "Browser User" as browser_user
+actor "External Client\n(Python / CI)" as ext_client
+actor "Eval Harness" as eval_user
+
+' External Systems
+cloud "LLM Providers" as llm {
+    component [OpenAI-compatible API\n(OpenAI, vLLM, llama.cpp)] as llm_openai
+    component [Anthropic Messages API] as llm_anthropic
+}
+database "SQLite / PostgreSQL\n(durable state)" as storage
+
+' Turnstone System Boundary
+package "Turnstone Platform" {
+    component [turnstone\n(CLI)] as cli <<entry point>>
+    component [turnstone-server\n(HTTP + SSE)] as server <<entry point>>
+    component [turnstone-console\n(Dashboard + Router)] as console <<service>>
+    component [turnstone-eval\n(Headless)] as eval <<entry point>>
+    component [turnstone-channel\n(Channel Gateway)] as channel <<service>>
+}
+
+' User connections
+cli_user --> cli : stdin / stdout
+browser_user --> server : HTTP + SSE\n(port 8080)
+browser_user --> console : HTTP + SSE\n(port 8090)
+ext_client --> server : HTTP + SSE\n(SDK / API)
+eval_user --> eval : Python API
+
+' Internal connections
+cli --> llm : LLM Provider API\n(via provider adapters)
+cli --> storage : persistence
+
+server --> llm : LLM Provider API\n(via provider adapters)
+server --> storage : persistence
+
+eval --> llm : LLM Provider API\n(non-streaming)
+eval --> storage : persistence
+
+console --> server : HTTP routing/UI proxy + cluster SSE\n(FNV-1a rendezvous placement,\nproxy /node/{id}/* traffic)
+
+channel --> console : multi-node route/create/live/send/approve
+channel --> server : direct mode + owning-node SSE\n(POST /v1/api/workstreams/{ws_id}/send,\nGET /v1/api/workstreams/{ws_id}/events)
+
+' Notes
+note right of console
+  Multi-node router:
+  - FNV-1a rendezvous placement
+  - Proxies create/send/approve
+  - Collector aggregates node SSE
+  - Browser dashboard receives console SSE fanout
+  - /node/{id} proxies pane HTTP + SSE
+end note
+@enduml

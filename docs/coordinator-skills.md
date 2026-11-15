@@ -1,0 +1,398 @@
+# Writing a coordinator-specific skill
+
+A skill is prompt-level framing that steers a Turnstone session
+toward a narrow task.  Most skills target **interactive** sessions —
+the single-workstream "do this thing" surface where the model wields
+`bash`, `edit_file`, `web_fetch`, and the rest of the maker toolset.
+
+A **coordinator skill** is different.  It runs on a session whose job
+is to orchestrate other sessions.  The toolset is smaller and
+narrower, the role is an orchestrator instead of a maker, and the
+success metric is "did the plan resolve" instead of "did the code
+compile".  This doc covers the differences a skill author has to
+care about.
+
+---
+
+## `kind` — authored audience metadata
+
+A row in `prompt_templates` carries a `kind` column (see
+[`turnstone/core/skill_kind.py`](../turnstone/core/skill_kind.py);
+migration 044 added the column).  Three values:
+
+| `SkillKind` enum        | Stored as       | Meaning                                                                    |
+|-------------------------|-----------------|----------------------------------------------------------------------------|
+| `SkillKind.INTERACTIVE` | `"interactive"` | Authored for the interactive maker role (single-workstream "do this"). |
+| `SkillKind.COORDINATOR` | `"coordinator"` | Authored for the orchestrator role (delegate, monitor, synthesise).    |
+| `SkillKind.ANY`         | `"any"`         | Either surface (or audience-neutral).  Default on create.                 |
+
+The `kind` field is a `StrEnum` — drop-in `str` compatible — so DB
+rows, JSON payloads, and `==` comparisons all work without translation
+at the edge.
+
+**`kind` is metadata, not an enforcement boundary.**  The model can
+`skills(action='find')` across every kind from any session, `get` any
+row by name, and `load` any visible skill regardless of session kind.
+A skill with `allowed_tools` or `auto_approve`, or whose text scans as
+`high` or `critical` risk, is principal-load-only: the model cannot
+`load` it or `spawn_workstream(skill=...)` with it, and the operator
+loads it with `/skill`.  Every other `load` / `spawn_workstream(skill=...)`
+goes through the operator's approval card — `kind` doesn't add or remove
+any of that.  It's a sorting / grouping / search-narrowing hint.
+
+The opt-in filter is on `skills(action='find', kind='coordinator')`
+(or `'interactive'`) — pass it when you want to narrow a catalog
+browse to a specific authored audience.  Omitting it (or passing
+`kind='any'`) returns the full catalog.  When supplied, the storage
+filter widens to `[<kind>, 'any']` so audience-neutral rows remain
+visible inside the narrowed view.
+
+**Tagging a new skill as coordinator-targeted** — set `kind` to
+`SkillKind.COORDINATOR` (or the literal `"coordinator"`) when you
+`skills(action='create', kind='coordinator', ...)` or POST to
+`/v1/api/admin/skills`.  Use this to signal intent to other skill
+authors and to make the orchestrator-targeted catalog easy to
+browse — not to hide the skill from interactive sessions.  Existing
+rows default to `SkillKind.ANY`; bump them to `COORDINATOR` if
+you've rewritten the prompt around the orchestrator toolset and
+want the kind filter to surface them as such.
+
+---
+
+## Tool surface differences
+
+Coordinator sessions receive a **fixed** tool set, defined in
+`turnstone/core/tools.py` as `COORDINATOR_TOOLS`.  Nothing a skill
+or MCP config can do adds to it.  Current members:
+
+| Tool                      | Category        | Notes                                                               |
+|---------------------------|-----------------|---------------------------------------------------------------------|
+| `spawn_workstream`        | delegate        | Create one child.  Requires approval.                               |
+| `spawn_batch`              | delegate        | Create up to 10 children in one approval.  Partial-success shape.   |
+| `inspect_workstream`      | observe         | Read state + tail of one child.  Auto-approved (no mutation).       |
+| `list_workstreams`        | observe         | List the direct children (same shape as `/children` endpoint).      |
+| `wait_for_workstream`     | block           | Block until one/all listed children hit a terminal state.           |
+| `send_to_workstream`      | steer           | Queue a follow-up message to a running child.                        |
+| `close_workstream`        | wind-down       | Soft-close one child.  Requires approval.                           |
+| `close_all_children`      | wind-down       | Soft-close every direct child in one approval.  Partial-success shape. |
+| `cancel_workstream`       | wind-down       | Drop the in-flight generation; leaves child idle for a fresh send.  |
+| `delete_workstream`       | wind-down       | Hard-delete one child.  Requires approval.                          |
+| `list_nodes`              | discover        | Enumerate live cluster nodes + capabilities.                        |
+| `skills` (action=find)    | discover        | Browse the skill catalog; opt-in `kind` filter narrows by audience. |
+| `memory`                  | persist         | Durable acting-user orchestration memory (`coordinator`), plus shared memory when attached to a project. |
+| `notify`                  | broadcast       | Post a status update to a human channel at a narrative beat.        |
+| `tasks`                   | plan            | Orchestrator-only scratchpad.  Children don't see it.               |
+
+Explicitly **not** in the coordinator set:
+
+- `bash` / `edit_file` / `write_file` / `append_file` / `diff_file` — no local FS.
+- `read_file` / `search` — no local FS reads.
+- `web_fetch` / `web_search` — no direct web access.
+- `task_agent` — sub-agent tool is zeroed on coord sessions.
+- `recall` / `watch` / `read_resource` / `use_prompt` — UX / persistence tools that belong to interactive sessions.  The dual-kind `memory` / `skills` / `notify` tools are available on both kinds (see the table above).
+
+If your skill needs a coordinator to "run a command" or "read a
+file", write the delegate pattern instead: spawn a child with an
+appropriate skill and `wait_for_workstream`, whose results carry the
+child's answer.  The coordinator stays the orchestrator.
+
+---
+
+## Framing differences
+
+Interactive skills compose on top of `base_interactive.md` — a
+"maker" framing: get the work done, use the tools, edit the code,
+close the loop.
+
+Coordinator skills compose on top of
+[`personas/orchestrator.md`](../turnstone/prompts/personas/orchestrator.md) —
+an "orchestrator" framing: decompose, delegate, monitor, synthesise.
+The base text is short but sets the tone every coordinator skill
+inherits:
+
+> You are a coordinator.  Your role is to orchestrate work across
+> the cluster...  You do
+> not edit files, run shell commands, browse the web, or manipulate
+> the codebase directly.  Children do that.
+
+Write your skill's system prompt to *add* task-specific orchestration
+hints on top — don't re-explain the role, don't paste tool JSON,
+don't try to override the "no direct action" contract.  Keep the
+additions to: (a) the specific kind of work this skill delegates;
+(b) the preferred skill tags for children; (c) the synthesis shape
+the skill should end on.
+
+---
+
+## `tasks` integration
+
+`tasks` is the coordinator's scratchpad — a persisted, ordered
+list of rows with fields `{id, title, status, child_ws_id, created,
+updated}`, plus `note` on rows where one has been set (the key is
+absent otherwise), that only this coordinator sees.  Children don't
+see it; the user does via the sidebar.  Five actions: `add`,
+`update`, `remove`, `reorder`, `list` (only `list` is auto-approved;
+the mutators go through the approval flow).
+
+The input schema refers to rows by `task_id`; the persisted row
+object exposes the same id as `id`.  The `child_ws_id` field is a
+free-form label the skill sets to link a task to a spawned
+workstream — it is NOT validated against the workstreams table, so
+a skill can set it to a placeholder before `spawn_workstream`
+returns or keep it pointing at a closed child for later audit.
+
+A skill's initial prompt can seed the task list by calling
+`tasks(action="add", title=...)` as its very first tool calls —
+the user gets a visible plan before any child is spawned, and the
+coordinator's future self has something concrete to iterate on.
+Status transitions (`pending` → `in_progress` → `done` / `blocked` /
+`needs_user`) are the skill's main feedback loop: mutate the task
+when the child covering it finishes, not when the child starts.
+`blocked` and `needs_user` are not interchangeable — `blocked` is a
+dependency the coordinator may be able to clear itself, while
+`needs_user` marks a task that cannot move without a decision,
+approval, or grant only the user can give.  The distinction is
+load-bearing: a coordinator that goes idle holding open tasks gets
+nudged to pick them back up — even when children are still running, so
+keep the matrix honest rather than expecting the reminder to wait for
+an all-clear — and `needs_user` is what tells that nudge the stop was
+deliberate.  Pair it with `note` to record what is being asked for.
+Use `tasks(action="update", task_id=..., child_ws_id=<ws_id>)` to link
+a task to the child that owns it once spawn returns.
+
+A final gotcha: parallel tool dispatch does NOT serialise reads
+after writes in the same batch.  If a skill issues an `update` and
+a `list` in one parallel tool batch, the `list` response may reflect
+the pre-update state.  Dispatch mutate and list serially (one
+tool_use turn each) when the list must observe the mutation.
+
+Keep the tasks coarse-grained — one per child, roughly.  A 20-task
+list for a 3-child fan-out is noise; a 1-task list for a 5-child
+fan-out loses the plan.  The sidebar renders tasks as the operator's
+mental model of "what the coord thinks it's doing".
+
+---
+
+## Referencing children by `ws_id`
+
+Every ws_id returned by `spawn_workstream` / `spawn_batch` is a
+**full 32-char hex string**.  The skill's system prompt must not
+invent ws_ids — a model that hallucinates `"child-1"` or `"ws-abc"`
+hits the tenant guard in `CoordinatorClient._is_own_subtree`, which
+validates ws_id against `parent_ws_id=coord_ws_id` AND
+`user_id=owner` in storage.  The rejection shape is uniform and
+recovery-oriented:
+
+- **Mutating ops** (`send_to_workstream`, `close_workstream`,
+  `cancel_workstream`, `delete_workstream`) and
+  **`inspect_workstream`** return
+  `{"error": "no workstream matching '<ref>' among your children; …",
+  "status": 404, "ws_id": "<ref>", "did_you_mean": [...],
+  "children": [...], "children_truncated": bool}` — a did-you-mean
+  (edit distance ≤ 3 against the coord's own children, which catches
+  the garbled-hex incident class: a 32-char id whose `aaa` run
+  collapsed to `a`) plus a roster of the coord's children.  A ref
+  that matches a child's display NAME is called out explicitly with
+  the right id (names are mutable labels, not addresses).  Foreign
+  and nonexistent ids produce the same payload (no existence
+  oracle), every hint references only the coord's own children, and
+  near-miss ids are never auto-resolved — the skill should fix the
+  id and re-issue, not treat the child as dead.
+- **`wait_for_workstream`** validates ids before waiting: a
+  malformed id fails the whole call immediately (`invalid_ws_ids`
+  carries the per-id payloads above, `elapsed=0`); a well-formed id
+  that is foreign, nonexistent, or hard-deleted mid-wait surfaces as
+  `state="not_found"` and aborts the wait on that tick with
+  top-level `error` / `not_found` fields and, when it can be read,
+  the `children` roster. `complete=true` therefore means every
+  polled lane really finished — an unobservable id can neither burn
+  the timeout nor ride along to a "complete" result.
+
+Pattern: capture each spawn result in the next tool call's input. The
+JSON tool-result carries `{"child_ws_id": "...", "name": "...",
+"node_id": "...", "routing_strategy": "..."}`, plus
+`initial_message_status` and a `note` when the child was created
+without its initial message (the note says whether to send it with
+`send_to_workstream` or, for a child closed while it was being
+created, to spawn again); the model should extract the `child_ws_id`
+and pass it as `ws_id` (or in the `ws_ids` list) to
+`inspect_workstream` / `wait_for_workstream` / `send_to_workstream` /
+`close_workstream` verbatim.  The asymmetry — spawn returns
+`child_ws_id` but the other tools accept `ws_id` / `ws_ids` — is
+intentional: it defuses a coordinator-LLM recency bias where seeing
+`ws_id` in a spawn return primed re-spawn loops instead of progression
+to the wait phase.
+
+A UI that wants human-readable identifiers should render the `name`
+field and keep the workstream id as the click-through key — note
+that the id *value* is the same regardless of whether it arrived
+under the `child_ws_id` key (spawn return) or the `ws_id` key
+(every other tool's input/output); only the field name differs.
+
+---
+
+## `wait_for_workstream` vs `inspect_workstream`
+
+Two distinct semantics, different cost profiles:
+
+- **`wait_for_workstream(ws_ids=[...], timeout=60, mode="any")`** —
+  blocks inside a single tool call until one (or all, for `mode="all"`)
+  of the listed children reaches a terminal state (`idle`, `error`,
+  `closed`, `deleted`).  The worker thread blocks up to `timeout`
+  seconds; the assistant turn remains a single round-trip regardless
+  of how long the wait actually takes.  Prefer this for "the plan
+  needs child X to finish before the next step."  A message the user
+  sends meanwhile ends the wait early (`complete=false`,
+  `interrupted="user_message"`).  A wait that times out or is
+  interrupted returns states only; the wait that completes returns
+  the children's messages, so a skill that needs the children
+  finished re-issues the wait (after handling the user's message,
+  when one ended it).  A child that hasn't started a message the
+  coordinator just dispatched (a spawn's initial message, or a
+  `send_to_workstream` to an idle child) reads `starting`, which isn't
+  terminal: keep waiting rather than resending.  One whose message
+  still hasn't started after 120 s reads `stalled`, and the first wait
+  to see it returns early; inspect it before resending.  If the
+  message is in its history, the child has it (a long context can take
+  minutes to compact), so give it more time, because a resend
+  delivers it twice.  After 600 s the child reads its stored state
+  again.  Both carry `dispatch_age_s`.
+- **`inspect_workstream(ws_id=...)`** — single read of the child's
+  state + tail.  Costs a full assistant turn (judge, tokens, stream).
+  Prefer this for what led up to a child's answer (its earlier turns
+  and tool results).  The child's final message itself already rides
+  in the completing wait's `results`.  A message the wait marked
+  `truncated` carries `message_chars`, its whole length.  To read more
+  of it, wait on that child alone while it is still idle on that
+  answer: it then gets all of a result's room, which helps only a
+  message that shared its wait (a child that was alone in its wait
+  already had all the room).  `inspect_workstream` with
+  `message_limit=1` returns the message whole only when it fits
+  inspect's budget: at most 32,768 characters of JSON, less on a small
+  context, with a newline taking two characters and a non-ASCII
+  character six.  A longer message comes back as its first 600 and last
+  300 characters, or a 400-character preview on a small context.
+
+Rule of thumb: wait once for a fan-out and read each finished child's
+`message` from its results.  Inspecting a child the wait already
+answered for spends a turn and puts the same text in context twice.  A
+loop of inspect-every-few-seconds is a token-burning antipattern — on
+3+ children it rounds to a 10× efficiency hit over a single wait.
+
+---
+
+## Common coordinator patterns
+
+Three patterns cover most coordinator skills.  Pick the one that
+matches the task, or combine them deliberately.
+
+### Pattern 1 — delegate-and-summarise
+
+One specialist child, one focused brief, one synthesis message back
+to the user.  Appropriate when the user's request is "run the thing
+and tell me what happened" and the work fits in one workstream.
+
+```
+tasks(action='add', title='audit /auth for CSRF')
+spawn_workstream(skill='engineer', initial_message='audit /auth ...')
+wait_for_workstream(ws_ids=[<child>], timeout=300)
+→ synthesise the child's message (in the wait's results) into a user-facing response
+tasks(action='update', task_id='t_01', status='done')
+close_workstream(ws_id=<child>, reason='audit complete')
+```
+
+### Pattern 2 — fan-out-and-synthesise
+
+N children running in parallel, each with a distinct brief, all
+waited-on together, then synthesised.  Appropriate when the user's
+request naturally decomposes into independent subtasks.
+
+```
+tasks seeds:
+  t_01 benchmark Anthropic 4.7 latency on summarisation
+  t_02 benchmark OpenAI GPT-5.2 latency on summarisation
+  t_03 benchmark Gemini 2.5 latency on summarisation
+spawn_batch(children=[...3 briefs...])
+wait_for_workstream(ws_ids=[c1, c2, c3], mode='all', timeout=600)
+→ synthesise head-to-head comparison from the three messages in its results
+tasks → all done
+close_all_children(reason='benchmark complete')
+```
+
+Prefer `spawn_batch` over 3 individual `spawn_workstream` calls —
+one approval instead of three, one audit trail, results keyed by
+input index.  Pair with `wait_for_workstream(mode='all')` and
+`close_all_children(reason=...)` to wind the fan-out down in one
+approval each.
+
+### Pattern 3 — plan-then-delegate
+
+The coordinator first uses its own reasoning to carve the plan,
+records it in `tasks`, then spawns children that each own one
+task.  Appropriate when the user's request is "figure out how to X"
+and the coordinator's planning step is itself valuable.
+
+```
+→ coord reasons about the shape of the work
+tasks(action='add', title='...') × N   # the plan, visible in the sidebar
+for task in tasks:
+    spawn_workstream(skill=..., initial_message=task.brief)
+    tasks(action='update', task_id=task.id, note='ws=<child_ws_id>')
+wait_for_workstream(ws_ids=[...], mode='all', timeout=...)
+for child in children:
+    # its message is in the wait's results
+    tasks(action='update', task_id=..., status='done', note='result summary')
+→ synthesise
+```
+
+The key distinction from Pattern 2: the plan is an artifact the user
+can see and interact with (via the sidebar).  If the coordinator's
+reasoning-pass was wrong about the decomposition, the user can
+course-correct before any child runs.
+
+---
+
+## Testing a coordinator skill
+
+Coordinator sessions are hosted on the console, not on a node.
+Integration tests that drive a real coord session live under
+`tests/test_coordinator_end_to_end.py` — they spin a console with
+an in-memory SQLite backend and a fake upstream node, then drive
+the session through its HTTP surface.
+
+For a new coordinator skill:
+
+1. Write the skill prompt as a string and pass it to the
+   `coord_session` fixture's `skill=` kwarg (see
+   `tests/test_coordinator_tools.py` for the pattern).
+2. Build a small fake cluster: one node + two children via
+   the `_seed_children` helper in `tests/_coord_test_helpers.py`
+   (``_seed_children(mgr._adapter, coord.id, ["child-1", "child-2"])``).
+3. Drive the session with seeded tool_call dicts matching the
+   provider layer's shape.  The unit-level tests in
+   `tests/test_coordinator_tools.py` show the helper (`_tc(name,
+   args, call_id)`).
+4. Assert the skill's decision shape — which tools fire in what
+   order, what the tasks looks like at the end, which
+   `_error` reasons appear on the denied-path.
+
+A full end-to-end test isn't required for every skill; a
+prepare-step unit test that asserts "given this initial message, the
+first tool call is X with Y args" is usually sufficient to catch
+framing drift without a real LLM in the loop.
+
+---
+
+## Further reading
+
+- [coordinator-api-tour.md](coordinator-api-tour.md) — the HTTP
+  surface every coordinator skill indirectly drives.
+- [bulk-endpoints.md](bulk-endpoints.md) — the response shape
+  `spawn_batch` and `close_all_children` use, so your skill can
+  parse results / denied arrays correctly.
+- [governance.md](governance.md) — the broader governance surface
+  (`/trust`, `/restrict`, role-based permissions)
+  that wraps every coord session.
+- [settings.md](settings.md) — `coordinator.model_alias` and
+  `coordinator.reasoning_effort` settings that gate which LLM runs
+  the coordinator session at all.

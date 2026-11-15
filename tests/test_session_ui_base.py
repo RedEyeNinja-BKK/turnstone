@@ -1,0 +1,5010 @@
+"""Tests for ``SessionUIBase`` — the shared UI scaffolding.
+
+Covers listener fan-out, approval blocking gates, intent-judge
+verdict bookkeeping, and the approval-cycle reset invariant that
+prevents a late verdict from inheriting the previous round's
+``user_decision``.
+
+These are unit tests exercising the base class directly via a thin
+concrete subclass — subclass-specific behaviour (WebUI's per-UI
+metrics broadcast, ConsoleCoordinatorUI's collector fan-out) lives
+in its own test files.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import queue
+import threading
+import time
+from collections.abc import Callable, Iterator
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from tests.conftest import resolve_when_pending
+from turnstone.core.session_ui_base import SessionUIBase, _SmartApprovalConfig
+
+
+class _ConcreteUI(SessionUIBase):
+    """Minimal concrete subclass — no kind-specific overrides.
+
+    Exists only so we can instantiate the base (it's designed to be
+    subclassed). Inherits the full base behaviour verbatim.
+    """
+
+
+def _make_ui(ws_id: str = "ws-1", user_id: str = "u1") -> _ConcreteUI:
+    return _ConcreteUI(ws_id=ws_id, user_id=user_id)
+
+
+@pytest.fixture(autouse=True)
+def _per_token_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force per-token flushes (batch window 0) for this whole file.
+
+    These tests pin per-emit invariants — seq advance, mid-stream
+    inflight buffer state, snapshot atomicity — that predate emit-time
+    token batching and remain the contract AT each flush boundary;
+    window 0 makes every token its own flush, which is exactly the
+    emit shape they were written against.  Batching cadence itself
+    (window/size coalescing, pending-batch visibility, flush-before-
+    non-token ordering) is pinned in ``test_sse_token_batching.py``.
+    """
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Listener fan-out
+# ---------------------------------------------------------------------------
+
+
+def test_register_listener_returns_fresh_queue() -> None:
+    ui = _make_ui()
+    lq = ui._register_listener()
+    assert isinstance(lq, queue.Queue)
+    assert lq in ui._listeners
+
+
+def test_enqueue_fans_out_to_all_listeners() -> None:
+    ui = _make_ui()
+    lq1 = ui._register_listener()
+    lq2 = ui._register_listener()
+    ui._enqueue({"type": "hello"})
+    # ``_enqueue`` stamps ``_event_id`` on every event so the ring
+    # buffer can key replay against ``Last-Event-ID``; non-token
+    # events (``hello`` isn't ``content`` / ``reasoning``) skip
+    # ``_seq``.  Both listeners observe the SAME dict reference
+    # (covered by ``test_listeners_share_dict_reference_warning``).
+    assert lq1.get_nowait() == {"type": "hello", "ws_id": "ws-1", "_event_id": 1}
+    assert lq2.get_nowait() == {"type": "hello", "ws_id": "ws-1", "_event_id": 1}
+
+
+def test_enqueue_preserves_existing_ws_id() -> None:
+    """When payload already carries ws_id, don't overwrite it — this
+    supports the coord fan-out path where child events carry their own
+    ws_id and parent forwarding mutates in place."""
+    ui = _make_ui()
+    lq = ui._register_listener()
+    ui._enqueue({"type": "child_event", "ws_id": "child-9"})
+    assert lq.get_nowait()["ws_id"] == "child-9"
+
+
+def test_unregister_listener_removes_from_fanout() -> None:
+    ui = _make_ui()
+    lq = ui._register_listener()
+    ui._unregister_listener(lq)
+    ui._enqueue({"type": "hello"})
+    assert lq.empty()
+
+
+def test_enqueue_tolerates_full_listener_queue() -> None:
+    """A slow SSE consumer shouldn't break the session's fan-out."""
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=1)
+    lq.put_nowait({"type": "filler"})
+    ui._enqueue({"type": "hello"})  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Approval gates
+# ---------------------------------------------------------------------------
+
+
+def _register_cycle(
+    ui: SessionUIBase,
+    call_ids: list[str],
+    *,
+    judge_event: object | None = None,
+    cancel_witness: object | None = None,
+    cycle_id: str | None = None,
+    execution_principal_id: str = "",
+) -> Any:
+    """Register a live ApprovalCycle the way ``approve_tools`` does.
+
+    Builds the card from wire-shaped items so serializer tests see the
+    exact production shape, registers under the lock, and returns the
+    cycle for direct assertions.
+    """
+    from turnstone.core.session_ui_base import ApprovalCycle
+
+    items = [
+        {
+            "call_id": cid,
+            "func_name": "bash",
+            "approval_label": "bash",
+            "needs_approval": True,
+            "_principal_id": execution_principal_id,
+        }
+        for cid in call_ids
+    ]
+    if cancel_witness is not None:
+        for item in items:
+            item["_approval_cancel_witness"] = cancel_witness
+    card: dict[str, Any] = {
+        "type": "approve_request",
+        "cycle_id": cycle_id or f"cycle-{'-'.join(call_ids)}",
+        "items": ui._serialize_approval_items(items),
+        "judge_pending": False,
+    }
+    cycle = ApprovalCycle(items, card, judge_event)
+    ui._register_approval_cycle(cycle)
+    return cycle
+
+
+def test_resolve_approval_sets_result_and_unblocks_cycle_event() -> None:
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"])
+    resolved = ui.resolve_approval(True, "looks good")
+    assert resolved == cycle.cycle_id
+    assert cycle.result == (True, "looks good")
+    assert cycle.resolved is True
+    assert cycle.event.is_set()
+
+
+def test_resolve_approval_without_live_cycle_is_a_noop() -> None:
+    """No live cycle → nothing to resolve: returns None and broadcasts
+    nothing (the old singleton overwrote a shared result slot and
+    leaked a stale ``approval_resolved`` event on idle cancels)."""
+    ui = _make_ui()
+    lq = ui._register_listener()
+    assert ui.resolve_approval(True, "nobody asked") is None
+    assert lq.empty()
+
+
+def test_resolve_approval_broadcasts_approval_resolved() -> None:
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"])
+    lq = ui._register_listener()
+    ui.resolve_approval(False, "nope")
+    event = lq.get_nowait()
+    assert event["type"] == "approval_resolved"
+    assert event["approved"] is False
+    assert event["feedback"] == "nope"
+    # Cycle identity rides the event so clients dismiss the RIGHT card.
+    assert event["cycle_id"] == cycle.cycle_id
+    assert event["call_ids"] == ["c1"]
+
+
+def test_peer_can_make_binary_decision_but_cannot_add_feedback_or_always() -> None:
+    from turnstone.core.session_ui_base import CrossPrincipalApprovalError
+
+    storage = MagicMock()
+    ui = _make_ui()
+    feedback_cycle = _register_cycle(ui, ["feedback"], execution_principal_id="alice")
+    feedback_cycle.pending_verdicts = [{"verdict_id": "v-peer", "call_id": "feedback"}]
+    with pytest.raises(CrossPrincipalApprovalError, match="only the initiating principal"):
+        ui.resolve_approval(
+            False,
+            "please change this",
+            cycle_id=feedback_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+    assert not feedback_cycle.resolved
+
+    always_cycle = _register_cycle(ui, ["always"], execution_principal_id="alice")
+    with pytest.raises(CrossPrincipalApprovalError, match="only the initiating principal"):
+        ui.resolve_approval(
+            True,
+            always=True,
+            cycle_id=always_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+    assert not always_cycle.resolved
+
+    reject_cycle = _register_cycle(ui, ["reject"], execution_principal_id="alice")
+    assert (
+        ui.resolve_approval(
+            False,
+            cycle_id=reject_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+        == reject_cycle.cycle_id
+    )
+    assert reject_cycle.result == (False, None)
+
+    with _patch_get_storage(storage):
+        assert (
+            ui.resolve_approval(
+                True,
+                cycle_id=feedback_cycle.cycle_id,
+                resolver_principal_id="bob",
+            )
+            == feedback_cycle.cycle_id
+        )
+    assert feedback_cycle.resolver_principal_id == "bob"
+    assert feedback_cycle.execution_principal_id == "alice"
+    storage.update_intent_verdict.assert_called_once_with(
+        "v-peer",
+        user_decision="approved",
+        resolver_principal_id="bob",
+        execution_principal_id="alice",
+    )
+
+
+def test_approve_always_grants_nothing_for_a_call_a_policy_refused() -> None:
+    """The refused call is on the card, but the person chose to always approve only the rest."""
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1", "c2"], execution_principal_id="alice")
+    cycle.items[1].update(
+        func_name="write_file", approval_label="write_file", denied=True, _refused_by="policy"
+    )
+
+    with _patch_get_storage(MagicMock()):
+        ui.resolve_approval(
+            True, always=True, cycle_id=cycle.cycle_id, resolver_principal_id="alice"
+        )
+
+    assert ui._always_approve_tools_by_principal["alice"] == {"bash"}
+
+
+def test_a_prompt_nobody_answers_is_marked_as_no_rejection() -> None:
+    """The session then sends no "the user rejected it" nudge."""
+    ui = _make_ui()
+    ui._APPROVAL_WAIT_TIMEOUT = 0.05
+    item = _pending_item("t-1")
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        approved, _feedback = ui.approve_tools([item])
+
+    assert approved is False
+    assert (item["denied"], item["_refused_by"]) == (True, "timeout")
+
+
+def test_same_principal_feedback_and_always_are_preserved_and_attributed() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"], execution_principal_id="alice")
+    cycle.pending_verdicts = [{"verdict_id": "v1", "call_id": "c1"}]
+
+    with _patch_get_storage(storage):
+        resolved = ui.resolve_approval(
+            True,
+            "ship it",
+            always=True,
+            cycle_id=cycle.cycle_id,
+            resolver_principal_id="alice",
+        )
+
+    assert resolved == cycle.cycle_id
+    assert cycle.result == (True, "ship it")
+    assert ui._always_approve_tools_by_principal["alice"] == {"bash"}
+    storage.update_intent_verdict.assert_called_once_with(
+        "v1",
+        user_decision="approved",
+        resolver_principal_id="alice",
+        execution_principal_id="alice",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Intent-verdict bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def _mock_storage(storage: Any = None) -> Any:
+    storage = storage or MagicMock()
+    return storage
+
+
+def _patch_get_storage(storage: Any):  # type: ignore[no-untyped-def]
+    """Patch ``turnstone.core.storage._registry.get_storage`` to return
+    the supplied stub so the fire-and-forget persistence paths in
+    SessionUIBase are observable under test."""
+    return patch("turnstone.core.storage._registry.get_storage", return_value=storage)
+
+
+def test_on_intent_verdict_caches_for_sse_replay() -> None:
+    ui = _make_ui()
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1", "risk_level": "low"})
+    assert ui._llm_verdicts["c1"]["verdict_id"] == "v1"
+
+
+def test_on_intent_verdict_persists_verdict_row() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    verdict = {
+        "verdict_id": "v1",
+        "call_id": "c1",
+        "func_name": "bash",
+        "risk_level": "medium",
+        "confidence": 0.7,
+        "recommendation": "review",
+        "evidence": ["line-1"],
+    }
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(verdict)
+    storage.upsert_intent_verdict.assert_called_once()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
+    assert kwargs["verdict_id"] == "v1"
+    assert kwargs["ws_id"] == "ws-1"
+    assert kwargs["call_id"] == "c1"
+
+
+@pytest.mark.parametrize("resolve_first", [False, True], ids=["verdict-first", "decision-first"])
+def test_deferred_verdict_persistence_preserves_concurrent_approval_decision(
+    resolve_first: bool,
+) -> None:
+    """The deferred base UPSERT and approval decision commute.
+
+    ``ChatSession`` publishes the live verdict while holding its judge
+    lifecycle lock, then executes the returned storage action after releasing
+    that lock.  A human decision can land in that gap.  Whichever storage path
+    wins first, the durable row must finish with the operator's decision rather
+    than a late base UPSERT regressing it to ``pending``.
+    """
+
+    class _ConflictAwareStorage:
+        def __init__(self) -> None:
+            self.row: dict[str, Any] | None = None
+
+        def upsert_intent_verdict(self, **values: Any) -> None:
+            if self.row is None:
+                self.row = dict(values)
+                return
+            # Production's conflict update refreshes judge fields but does not
+            # overwrite the independently resolved user decision.
+            for key, value in values.items():
+                if key != "user_decision":
+                    self.row[key] = value
+
+        def update_intent_verdict(self, verdict_id: str, **values: Any) -> None:
+            if self.row is not None and self.row.get("verdict_id") == verdict_id:
+                self.row.update(values)
+
+    storage = _ConflictAwareStorage()
+    ui = _make_ui()
+    judge_event = threading.Event()
+    cycle = _register_cycle(ui, ["c-race"], judge_event=judge_event)
+    verdict = {
+        "verdict_id": "v-race",
+        "call_id": "c-race",
+        "func_name": "bash",
+        "tier": "llm",
+        "user_decision": "pending",
+    }
+
+    with _patch_get_storage(storage):
+        deferred = ui._publish_intent_verdict_live(verdict, judge_event)
+        assert cycle.pending_verdicts == [verdict]
+        if resolve_first:
+            ui.resolve_approval(True, cycle_id=cycle.cycle_id)
+        for persist in deferred:
+            persist()
+        if not resolve_first:
+            ui.resolve_approval(True, cycle_id=cycle.cycle_id)
+
+    assert storage.row is not None
+    assert storage.row["verdict_id"] == "v-race"
+    assert storage.row["user_decision"] == "approved"
+
+
+def test_raising_llm_metric_hook_does_not_drop_verdict_persistence() -> None:
+    """Metrics are auxiliary to the verdict's durable audit record."""
+
+    class _RaisingMetricUI(_ConcreteUI):
+        def _record_llm_judge_metric(self, verdict: dict[str, Any]) -> None:
+            del verdict
+            raise RuntimeError("metric collector unavailable")
+
+    storage = MagicMock()
+    ui = _RaisingMetricUI(ws_id="ws-metric", user_id="u1")
+    verdict = {"verdict_id": "v-metric", "call_id": "c-metric", "tier": "llm"}
+
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(verdict)
+
+    storage.upsert_intent_verdict.assert_called_once()
+    assert storage.upsert_intent_verdict.call_args.kwargs["verdict_id"] == "v-metric"
+
+
+def test_on_intent_verdict_parks_on_owning_cycle_when_undecided() -> None:
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"])
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+    assert cycle.pending_verdicts == [{"verdict_id": "v1", "call_id": "c1"}]
+
+
+def test_on_intent_verdict_without_owner_is_cache_only() -> None:
+    """No live cycle owns the call (pre-cycle Smart-Approvals arrival):
+    the verdict caches for the wait/replay but parks nowhere — the
+    gate's registration sweep adopts it when the cycle is created."""
+    ui = _make_ui()
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+    assert ui._llm_verdicts["c1"]["verdict_id"] == "v1"
+    assert ui._approval_cycles == {}
+
+
+def test_on_intent_verdict_stamps_immediately_when_decision_already_set() -> None:
+    """Late-arriving verdict (after its round resolved) gets
+    user_decision stamped from the per-call decision map instead of
+    parked — the run-to-completion daemon can deliver seconds after
+    the gate closed."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui._recent_decisions["c-late"] = ("approved", None)
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v-late", "call_id": "c-late"})
+    storage.update_intent_verdict.assert_called_once_with("v-late", user_decision="approved")
+
+
+def test_on_intent_verdict_late_stamp_is_per_call_not_global() -> None:
+    """Concurrent-cycles regression: sibling B's late verdict must NOT
+    inherit sibling A's decision — the old single ``_last_verdict_decision``
+    string stamped every late verdict with whichever round resolved last."""
+    storage = MagicMock()
+    ui = _make_ui()
+    _register_cycle(ui, ["a1"])
+    _register_cycle(ui, ["b1"])
+    with _patch_get_storage(storage):
+        ui.resolve_approval(True, None, call_id="a1")  # approve A only
+        ui.on_intent_verdict({"verdict_id": "v-b", "call_id": "b1"})
+    # B's verdict is parked on B's still-open cycle, unstamped.
+    for call in storage.update_intent_verdict.call_args_list:
+        assert call.args[0] != "v-b", "sibling A's decision leaked onto B's verdict"
+
+
+def test_on_superseded_intent_verdict_persists_without_live_surfaces() -> None:
+    """The persist-only audit hook for verdicts that landed after a newer
+    turn replaced their judge generation: the row reaches storage with
+    user_decision="superseded", but NONE of the live surfaces move — no
+    SSE event, no ``_llm_verdicts`` cache entry (Smart Approvals must
+    never see a stale call_id), no ``_pending_verdicts`` park (the next
+    ``resolve_approval`` must not stamp it with the wrong decision)."""
+    storage = MagicMock()
+    ui = _make_ui()
+    lq = ui._register_listener()
+    verdict = {
+        "verdict_id": "v-late",
+        "call_id": "c-late",
+        "func_name": "bash",
+        "risk_level": "low",
+        "tier": "llm",
+    }
+    with _patch_get_storage(storage):
+        ui.on_superseded_intent_verdict(verdict)
+    storage.upsert_intent_verdict.assert_called_once()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
+    assert kwargs["verdict_id"] == "v-late"
+    assert kwargs["user_decision"] == "superseded"
+    assert lq.empty()  # no SSE delivery
+    assert "c-late" not in ui._llm_verdicts  # no replay-cache write
+    assert "user_decision" not in verdict  # caller's dict not mutated
+
+
+def test_llm_verdict_cache_evicts_oldest_at_cap() -> None:
+    """FIFO eviction at ``_LLM_VERDICT_CACHE_MAX`` prevents unbounded
+    growth on a long-running session."""
+    ui = _make_ui()
+    cap = SessionUIBase._LLM_VERDICT_CACHE_MAX
+    with _patch_get_storage(MagicMock()):
+        for i in range(cap + 5):
+            ui.on_intent_verdict({"verdict_id": f"v{i}", "call_id": f"c{i}"})
+    assert len(ui._llm_verdicts) == cap
+    # Oldest five should have been evicted.
+    assert "c0" not in ui._llm_verdicts
+    assert "c4" not in ui._llm_verdicts
+    assert f"c{cap + 4}" in ui._llm_verdicts
+
+
+# ---------------------------------------------------------------------------
+# Per-round verdict purge — the bug-1 regression, scoped for concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_purge_round_verdicts_is_scoped_to_the_entering_batch() -> None:
+    """Successor of the whole-cache reset: entering a gate evicts stale
+    verdict state for ITS call_ids only — a concurrent sibling cycle's
+    cached verdicts must survive (the old full clear wiped them
+    mid-wait and sent qualifying batches to a human)."""
+    ui = _make_ui()
+    ui._recent_decisions["c-stale"] = ("approved", None)
+    ui._llm_verdicts["c-stale"] = {"verdict_id": "stale"}
+    ui._verdict_origins["c-stale"] = 123
+    ui._llm_verdicts["c-sibling"] = {"verdict_id": "sibling"}
+    ui._purge_round_verdicts({"c-stale"})
+    assert "c-stale" not in ui._llm_verdicts
+    assert "c-stale" not in ui._verdict_origins
+    assert "c-stale" not in ui._recent_decisions
+    # The concurrent sibling's verdict is untouched.
+    assert ui._llm_verdicts["c-sibling"]["verdict_id"] == "sibling"
+
+
+def test_late_verdict_in_new_round_not_stamped_with_prior_decision() -> None:
+    """Regression test for the ultrareview bug-1 finding, cycle-scoped.
+
+    Round 1 (call c1): approve → decision recorded for c1 only.
+    Round 2 (call c2, new cycle) begins.
+    A verdict fires mid-round 2: must NOT inherit "approved" from
+    round 1. Must park on round 2's cycle awaiting ITS resolution.
+    """
+    storage = MagicMock()
+    ui = _make_ui()
+    # Round 1 completion.
+    _register_cycle(ui, ["c1"])
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+        ui.resolve_approval(True, None)
+    assert ui._recent_decisions.get("c1") == ("approved", None)
+    # Round 2 begins — approve_tools purges the entering ids and
+    # registers a fresh cycle.
+    ui._purge_round_verdicts({"c2"})
+    cycle2 = _register_cycle(ui, ["c2"])
+    # Late judge fires during round 2 BEFORE the user decides.
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v2", "call_id": "c2"})
+    # The new verdict parks on round 2's cycle (awaiting its decision),
+    # NOT already stamped with round 1's "approved".
+    assert cycle2.pending_verdicts == [{"verdict_id": "v2", "call_id": "c2"}]
+    for call in storage.update_intent_verdict.call_args_list:
+        assert call.args[0] != "v2", "late verdict was stamped with prior round's decision"
+
+
+def test_both_subclasses_purge_round_state_from_approve_tools() -> None:
+    """Regression for bug-1, scoped: the real subclass ``approve_tools``
+    bodies must purge the ENTERING batch's stale verdict state at entry
+    — a provider that reuses call_ids across turns must not have round
+    1's cached ``approve`` pre-satisfy round 2's Smart-Approvals wait.
+    A concurrent sibling's cache entry survives.
+    """
+    import turnstone.server
+    from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+
+    webui = turnstone.server.WebUI
+
+    for cls in (webui, ConsoleCoordinatorUI):
+        ui = cls(ws_id="ws-x", user_id="u1")
+        # Stage state as if a prior round already finished on the SAME
+        # call_id this round reuses, plus an unrelated sibling entry.
+        ui._recent_decisions["c-reused"] = ("approved", None)
+        ui._llm_verdicts["c-reused"] = {"verdict_id": "stale"}
+        ui._llm_verdicts["c-sibling"] = {"verdict_id": "sibling"}
+        # Entering approve_tools for the new round — the scoped purge
+        # must fire for c-reused.  needs_approval=False so the gate
+        # returns without blocking on user input.
+        with _patch_get_storage(MagicMock()):
+            ui.approve_tools([{"call_id": "c-reused", "func_name": "ls", "needs_approval": False}])
+        assert "c-reused" not in ui._llm_verdicts, (
+            f"{cls.__name__}.approve_tools did not purge the entering batch's "
+            "stale cached verdict — round 2 could ride round 1's approve"
+        )
+        assert "c-reused" not in ui._recent_decisions, (
+            f"{cls.__name__}.approve_tools did not purge the entering batch's "
+            "stale decision — this round's verdicts would inherit it"
+        )
+        assert ui._llm_verdicts.get("c-sibling") == {"verdict_id": "sibling"}, (
+            f"{cls.__name__}.approve_tools wiped a concurrent sibling's verdict"
+        )
+
+
+def test_on_intent_verdict_decision_check_and_queue_are_atomic() -> None:
+    """Regression for the on_intent_verdict ↔ resolve_approval race.
+
+    The owner-check, the park, and the fallback decision-read must
+    happen under a SINGLE lock acquisition: ``resolve_approval`` marks
+    the cycle resolved and records the per-call decision atomically
+    under the same lock, so exactly one side wins — the verdict is
+    either parked pre-decision (resolve stamps it from the cycle's
+    ``pending_verdicts``) or stamped post-decision (from
+    ``_recent_decisions``).  A check-then-release-then-park pattern
+    reopens the window where a verdict lands unparked AND unstamped —
+    an audit row stuck at "pending" forever.
+
+    This test counts lock acquisitions during one ``on_intent_verdict``
+    and fails if the release-then-reacquire pattern returns.
+    """
+    ui = _make_ui()
+    _register_cycle(ui, ["c1"])
+    acquire_count = 0
+    original_lock = ui._ws_lock
+
+    class _CountingLock:
+        def __init__(self, inner: threading.Lock) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> None:
+            nonlocal acquire_count
+            acquire_count += 1
+            self._inner.acquire()
+
+        def __exit__(self, *a: Any) -> None:
+            self._inner.release()
+
+        def acquire(self, *a: Any, **kw: Any) -> bool:
+            return self._inner.acquire(*a, **kw)
+
+        def release(self) -> None:
+            self._inner.release()
+
+    ui._ws_lock = _CountingLock(original_lock)  # type: ignore[assignment]
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+    # Two acquisitions: one for the cache write (call_id is truthy),
+    # one for owner-check + park-or-stamp. A third acquisition means
+    # the release-then-reacquire window is back.
+    assert acquire_count == 2, (
+        f"on_intent_verdict acquired _ws_lock {acquire_count} times; "
+        "owner-check + park-or-stamp must happen under ONE acquisition "
+        "to avoid a race with resolve_approval"
+    )
+
+
+def test_resolve_approval_stamps_all_pending_verdicts() -> None:
+    """Normal path: multiple verdicts parked on the round's cycle, all
+    stamped with the user's decision on resolve."""
+    storage = MagicMock()
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1", "c2"])
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+        ui.on_intent_verdict({"verdict_id": "v2", "call_id": "c2"})
+    assert len(cycle.pending_verdicts) == 2
+    with _patch_get_storage(storage):
+        ui.resolve_approval(False, "too risky")
+    # Both verdicts get stamped.
+    stamped_ids = {c.args[0] for c in storage.update_intent_verdict.call_args_list}
+    assert stamped_ids == {"v1", "v2"}
+    # Cycle's park cleared after resolve; decisions recorded per call.
+    assert cycle.pending_verdicts == []
+    assert ui._recent_decisions.get("c1") == ("denied", None)
+    assert ui._recent_decisions.get("c2") == ("denied", None)
+
+
+# ---------------------------------------------------------------------------
+# user_decision value space — pending / approved / denied / timeout
+# / auto-approve reasons (policy / blanket / skill / always / auto_approve_tools).
+# Guards the "user_decision is never empty for new rows" invariant.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_approval_timeout_kwarg_writes_timeout_value() -> None:
+    """``resolve_approval(False, ..., timeout=True)`` writes
+    ``user_decision="timeout"`` so the audit trail can distinguish a
+    passive timeout expiry from an active user denial — the feedback
+    string used to carry this distinction but the column alone could not."""
+    storage = MagicMock()
+    ui = _make_ui()
+    _register_cycle(ui, ["c1"], execution_principal_id="alice")
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+    with _patch_get_storage(storage):
+        ui.resolve_approval(False, "expired", timeout=True)
+    storage.update_intent_verdict.assert_any_call(
+        "v1",
+        user_decision="timeout",
+        resolver_principal_id="",
+        execution_principal_id="alice",
+    )
+    assert ui._recent_decisions.get("c1") == ("timeout", None)
+
+
+def test_resolve_approval_timeout_with_approved_raises() -> None:
+    """``timeout=True`` is mutually exclusive with ``approved=True`` —
+    the combination would land a row whose audit column says
+    ``"timeout"`` while the SSE event reports ``approved=True``. Fail
+    loud so the inconsistency can't ship silently."""
+    import pytest
+
+    ui = _make_ui()
+    with pytest.raises(ValueError, match="timeout"):
+        ui.resolve_approval(True, timeout=True)
+
+
+def test_record_auto_approves_populates_reason_lookup() -> None:
+    """``_record_auto_approves`` must seed
+    ``_auto_approve_reasons[call_id]`` with the per-item reason so a
+    late-arriving LLM judge verdict can recover the auto-approve
+    reason via ``on_intent_verdict``."""
+    storage = MagicMock()
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c-policy",
+            "func_name": "bash",
+            "auto_approved": True,
+            "auto_approve_reason": "policy",
+        },
+        {
+            "call_id": "c-blanket",
+            "func_name": "list_workstreams",
+            "auto_approved": True,
+            "auto_approve_reason": "blanket",
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    assert "c-policy" in ui._auto_approve_reasons
+    assert "c-blanket" in ui._auto_approve_reasons
+    assert ui._auto_approve_reasons["c-policy"][0] == "policy"
+    assert ui._auto_approve_reasons["c-blanket"][0] == "blanket"
+
+
+def test_on_intent_verdict_consumes_auto_approve_reason() -> None:
+    """A late LLM verdict for a previously auto-approved call_id picks
+    up the reason from ``_auto_approve_reasons``, stamps it on the
+    verdict before persist, and pops the entry so re-use isn't
+    possible. Closes the misdiagnosis bug where auto-approved tools
+    landed verdict rows with ``user_decision=""``."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui._auto_approve_reasons["c-x"] = ("auto_approve_tools", 0.0)
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v-x", "call_id": "c-x"})
+    storage.upsert_intent_verdict.assert_called_once()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
+    assert kwargs["user_decision"] == "auto_approve_tools"
+    # Consumed on read so the same call_id can't double-stamp later.
+    assert "c-x" not in ui._auto_approve_reasons
+
+
+def test_on_intent_verdict_auto_reason_survives_resolve_cycle() -> None:
+    """Mixed-batch case: one tool was auto-approved (policy), another
+    needs manual approval. The LLM judge fires for the auto-approved
+    sibling DURING the manual-approval wait. The verdict must land
+    with ``user_decision="policy"`` and stay that way even after
+    ``resolve_approval`` fires for the pending sibling — the prior
+    bug was that the auto-stamped row got overwritten with
+    ``"approved"``/``"denied"`` by the resolve path."""
+    storage = MagicMock()
+    ui = _make_ui()
+    _register_cycle(ui, ["c-pending"])
+    ui._auto_approve_reasons["c-auto"] = ("policy", 0.0)
+    with _patch_get_storage(storage):
+        # LLM verdict fires for the auto-approved sibling.
+        ui.on_intent_verdict({"verdict_id": "v-auto", "call_id": "c-auto"})
+        # Now the pending sibling gets a verdict + manual resolve.
+        ui.on_intent_verdict({"verdict_id": "v-pending", "call_id": "c-pending"})
+        ui.resolve_approval(True, "looks good")
+    # Only the pending verdict should be UPDATEd to "approved" — the
+    # auto-stamped one stays "policy" via its INSERT.
+    update_calls = {
+        c.args[0]: c.kwargs.get("user_decision")
+        for c in storage.update_intent_verdict.call_args_list
+    }
+    assert update_calls == {"v-pending": "approved"}
+    # The auto verdict's INSERT carried the policy reason.
+    insert_calls: dict[str, list[str]] = {}
+    for call in storage.upsert_intent_verdict.call_args_list:
+        insert_calls.setdefault(call.kwargs["verdict_id"], []).append(call.kwargs["user_decision"])
+    assert insert_calls["v-auto"] == ["policy"]
+    # Resolution now UPSERTs the decided row before UPDATE so it is safe even
+    # when the deferred base verdict has not inserted yet.
+    assert insert_calls["v-pending"] == ["pending", "approved"]
+
+
+def test_persist_auto_approved_heuristic_verdicts_stamps_reason() -> None:
+    """The auto-approve early-return branches in ``approve_tools`` used
+    to drop heuristic verdicts on the floor — auditors couldn't tell
+    whether the judge ran or the call was simply silently auto-approved.
+    ``_persist_auto_approved_heuristic_verdicts`` closes that gap and
+    stamps each verdict with the item's reason."""
+    storage = MagicMock()
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c-1",
+            "auto_approved": True,
+            "auto_approve_reason": "blanket",
+            "_heuristic_verdict": {
+                "verdict_id": "v-1",
+                "call_id": "c-1",
+                "risk_level": "low",
+                "recommendation": "review",
+            },
+        },
+        # No _heuristic_verdict — skipped (judge didn't run for this item).
+        {"call_id": "c-2", "auto_approved": True, "auto_approve_reason": "blanket"},
+        # Not auto_approved — skipped (this helper only handles auto-approved).
+        {
+            "call_id": "c-3",
+            "_heuristic_verdict": {"verdict_id": "v-3", "call_id": "c-3"},
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui._persist_auto_approved_heuristic_verdicts(items)
+    storage.create_intent_verdicts_bulk.assert_called_once()
+    rows = storage.create_intent_verdicts_bulk.call_args.args[0]
+    assert len(rows) == 1
+    assert rows[0]["verdict_id"] == "v-1"
+    assert rows[0]["user_decision"] == "blanket"
+
+
+def test_auto_approve_reasons_ttl_prune_drops_stale_entries() -> None:
+    """Lazy TTL eviction at write time: entries older than
+    ``_AUTO_APPROVE_REASON_TTL`` are pruned on the next
+    ``_record_auto_approves`` call. Without this, a session with the
+    LLM judge disabled would accumulate entries that never get
+    consumed."""
+    import time as time_module
+
+    storage = MagicMock()
+    ui = _make_ui()
+    # Seed two stale entries (well past the TTL).
+    stale_ts = time_module.time() - ui._AUTO_APPROVE_REASON_TTL - 30.0
+    ui._auto_approve_reasons["c-stale-1"] = ("policy", stale_ts)
+    ui._auto_approve_reasons["c-stale-2"] = ("blanket", stale_ts)
+    items = [
+        {
+            "call_id": "c-fresh",
+            "auto_approved": True,
+            "auto_approve_reason": "skill",
+            "func_name": "bash",
+        }
+    ]
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    # Stale entries pruned; only the fresh one remains.
+    assert "c-stale-1" not in ui._auto_approve_reasons
+    assert "c-stale-2" not in ui._auto_approve_reasons
+    assert "c-fresh" in ui._auto_approve_reasons
+
+
+# ---------------------------------------------------------------------------
+# Output guard persistence
+# ---------------------------------------------------------------------------
+
+
+def test_on_output_warning_enqueues_only() -> None:
+    # Persistence was decoupled from on_output_warning when the LLM
+    # judge stage landed — the session now calls record_output_assessment
+    # directly per tier.  on_output_warning is UI-dispatch only.
+    storage = MagicMock()
+    ui = _make_ui()
+    lq = ui._register_listener()
+    assessment = {
+        "func_name": "bash",
+        "flags": ["secret_leak"],
+        "risk_level": "high",
+        "output_length": 200,
+    }
+    with _patch_get_storage(storage):
+        ui.on_output_warning("call-1", assessment)
+    event = lq.get_nowait()
+    assert event["type"] == "output_warning"
+    assert event["call_id"] == "call-1"
+    assert event["risk_level"] == "high"
+    storage.record_output_assessment.assert_not_called()
+
+
+def test_record_output_assessment_persists_with_tier() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    assessment = {
+        "func_name": "web_fetch",
+        "flags": ["camouflaged_injection"],
+        "risk_level": "medium",
+        "output_length": 4096,
+    }
+    with _patch_get_storage(storage):
+        ui.record_output_assessment(
+            "call-2",
+            assessment,
+            tier="llm",
+            reasoning="LLM saw a camouflaged directive",
+            judge_model="gpt-5-mini",
+            latency_ms=142,
+        )
+    storage.record_output_assessment.assert_called_once()
+    kwargs = storage.record_output_assessment.call_args.kwargs
+    assert kwargs["tier"] == "llm"
+    assert kwargs["reasoning"] == "LLM saw a camouflaged directive"
+    assert kwargs["judge_model"] == "gpt-5-mini"
+    assert kwargs["latency_ms"] == 142
+    assert kwargs["risk_level"] == "medium"
+
+
+def test_record_output_assessment_defaults_to_heuristic_tier() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    assessment = {
+        "func_name": "bash",
+        "flags": [],
+        "risk_level": "none",
+        "output_length": 0,
+    }
+    with _patch_get_storage(storage):
+        ui.record_output_assessment("call-3", assessment)
+    kwargs = storage.record_output_assessment.call_args.kwargs
+    assert kwargs["tier"] == "heuristic"
+    assert kwargs["reasoning"] == ""
+    assert kwargs["judge_model"] == ""
+    assert kwargs["latency_ms"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Concurrency smoke
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# serialize_pending_approval_details — dashboard projection (per cycle)
+# ---------------------------------------------------------------------------
+
+
+def _register_card_cycle(ui: SessionUIBase, card: dict[str, Any]) -> Any:
+    """Register a cycle from a raw approve_request card (shape-exact tests)."""
+    from turnstone.core.session_ui_base import ApprovalCycle
+
+    cycle = ApprovalCycle(list(card.get("items") or []), card, None)
+    ui._register_approval_cycle(cycle)
+    return cycle
+
+
+def test_serialize_pending_approval_details_empty_when_no_cycles() -> None:
+    ui = _make_ui()
+    assert ui.serialize_pending_approval_details() == []
+
+
+def test_serialize_pending_approval_details_skips_empty_items_card() -> None:
+    ui = _make_ui()
+    _register_card_cycle(
+        ui, {"type": "approve_request", "cycle_id": "cy-0", "items": [], "judge_pending": False}
+    )
+    assert ui.serialize_pending_approval_details() == []
+
+
+def test_serialize_pending_approval_details_merges_judge_verdict() -> None:
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "header": "bash",
+                    "preview": "$ ls",
+                    "func_name": "bash",
+                    "approval_label": "bash",
+                    "needs_approval": True,
+                    "error": None,
+                    "heuristic_verdict": {"recommendation": "review", "tier": "heuristic"},
+                }
+            ],
+            "judge_pending": True,
+        },
+    )
+    ui._llm_verdicts["c-1"] = {
+        "verdict_id": "v-1",
+        "call_id": "c-1",
+        "risk_level": "high",
+        "recommendation": "deny",
+        "tier": "llm",
+    }
+    details = ui.serialize_pending_approval_details()
+    assert len(details) == 1
+    detail = details[0]
+    assert detail["cycle_id"] == "cy-1"
+    assert detail["call_id"] == "c-1"
+    assert detail["judge_pending"] is True
+    assert len(detail["items"]) == 1
+    item = detail["items"][0]
+    assert item["call_id"] == "c-1"
+    assert item["header"] == "bash"
+    assert item["preview"] == "$ ls"
+    assert item["heuristic_verdict"] == {"recommendation": "review", "tier": "heuristic"}
+    assert item["judge_verdict"]["recommendation"] == "deny"
+    assert item["judge_verdict"]["risk_level"] == "high"
+
+
+def test_serialize_pending_approval_details_judge_verdict_none_when_missing() -> None:
+    """No cached verdict for the call_id → judge_verdict is None,
+    not absent or some sentinel."""
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [{"call_id": "c-1", "func_name": "ls", "needs_approval": True}],
+            "judge_pending": True,
+        },
+    )
+    details = ui.serialize_pending_approval_details()
+    assert details[0]["items"][0]["judge_verdict"] is None
+    assert details[0]["items"][0]["heuristic_verdict"] is None
+
+
+def test_serialize_pending_approval_details_multi_item() -> None:
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {"call_id": "c-1", "func_name": "bash", "needs_approval": True},
+                {"call_id": "c-2", "func_name": "mcp__sf__query", "needs_approval": True},
+            ],
+            "judge_pending": False,
+        },
+    )
+    ui._llm_verdicts["c-2"] = {"recommendation": "deny", "risk_level": "crit"}
+    details = ui.serialize_pending_approval_details()
+    detail = details[0]
+    assert detail["call_id"] == "c-1"  # primary = first item
+    assert len(detail["items"]) == 2
+    assert detail["items"][0]["judge_verdict"] is None
+    assert detail["items"][1]["judge_verdict"]["recommendation"] == "deny"
+
+
+def test_serialize_pending_approval_details_one_entry_per_live_cycle() -> None:
+    """Parallel task agents: every live cycle serializes, oldest first,
+    each addressable by its cycle_id — the single-slot serializer only
+    ever showed the one card the last writer left behind."""
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-old",
+            "items": [{"call_id": "a-1", "func_name": "bash", "needs_approval": True}],
+            "judge_pending": False,
+        },
+    )
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-new",
+            "items": [{"call_id": "b-1", "func_name": "write_file", "needs_approval": True}],
+            "judge_pending": False,
+        },
+    )
+    details = ui.serialize_pending_approval_details()
+    assert [d["cycle_id"] for d in details] == ["cy-old", "cy-new"]
+    assert [d["call_id"] for d in details] == ["a-1", "b-1"]
+
+
+def test_serialize_pending_approval_details_tool_policy_denied_passthrough() -> None:
+    """A tool-policy-denied item carries error + needs_approval=False
+    after WebUI.approve_tools mutates the items list. The serializer
+    must round-trip both fields so the JS can detect the
+    POLICY-BLOCKED matrix row and render the banner instead of
+    approve/deny buttons."""
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "func_name": "rm_rf",
+                    "approval_label": "rm_rf",
+                    "needs_approval": False,
+                    "error": "Blocked by tool policy (pattern match for 'rm_rf')",
+                }
+            ],
+            "judge_pending": False,
+        },
+    )
+    item = ui.serialize_pending_approval_details()[0]["items"][0]
+    # Both fields are the JS detection keys for the POLICY-BLOCKED
+    # branch in renderApprovalBlock — drift here silently regresses
+    # to a buttoned approve UI on a server-blocked call.
+    assert item["needs_approval"] is False
+    assert item["error"] == "Blocked by tool policy (pattern match for 'rm_rf')"
+
+
+def test_serialize_pending_approval_details_judge_unavailable_path() -> None:
+    """No judge_verdict + no heuristic_verdict + judge_pending=False
+    is the (judge unavailable) matrix row — the JS detects it via
+    !verdict && !judgePending && !policyBlocked. Verify the
+    serialized payload preserves the absence of all three signals."""
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "func_name": "bash",
+                    "approval_label": "bash",
+                    "needs_approval": True,
+                }
+            ],
+            "judge_pending": False,
+        },
+    )
+    detail = ui.serialize_pending_approval_details()[0]
+    assert detail["judge_pending"] is False
+    item = detail["items"][0]
+    assert item["judge_verdict"] is None
+    assert item["heuristic_verdict"] is None
+    assert item["needs_approval"] is True
+    assert item["error"] is None
+
+
+def test_serialize_pending_approval_details_returned_dict_is_decoupled() -> None:
+    """Mutating the returned dict must not corrupt the cached
+    verdict, which other consumers may still read."""
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [{"call_id": "c-1", "func_name": "bash", "needs_approval": True}],
+            "judge_pending": False,
+        },
+    )
+    ui._llm_verdicts["c-1"] = {"recommendation": "approve"}
+    detail = ui.serialize_pending_approval_details()[0]
+    detail["items"][0]["judge_verdict"]["recommendation"] = "MUTATED"
+    assert ui._llm_verdicts["c-1"]["recommendation"] == "approve"
+
+
+# ---------------------------------------------------------------------------
+# Auto-approve visibility — _serialize_approval_items + _record_auto_approves
+# + serialize_recent_auto_approvals
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_approval_items_forwards_auto_approve_fields() -> None:
+    """When the upstream pipeline tags an item with ``auto_approved`` +
+    ``auto_approve_reason``, the serialized payload must carry both
+    so the dashboard pill / per-ws SSE consumer can show *which*
+    path bypassed the operator gate."""
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "approval_label": "bash",
+            "needs_approval": False,
+            "auto_approved": True,
+            "auto_approve_reason": "skill",
+        },
+        {
+            "call_id": "c2",
+            "func_name": "read_file",
+            "needs_approval": False,
+            # No auto_approved tag — read-only tool that never needed approval.
+        },
+    ]
+    out = ui._serialize_approval_items(items)
+    assert out[0]["auto_approved"] is True
+    assert out[0]["auto_approve_reason"] == "skill"
+    # Items not flagged as auto-approved must NOT carry the fields —
+    # otherwise the dashboard would show pills for read-only tools too.
+    assert "auto_approved" not in out[1]
+    assert "auto_approve_reason" not in out[1]
+
+
+def test_serialize_approval_items_forwards_denial_msg_as_error() -> None:
+    """Denied items surface their ``denial_msg`` as ``error`` so the
+    /dashboard / SSE consumer renders the policy-block reason
+    without exposing the raw item shape."""
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "denied": True,
+            "denial_msg": "Blocked by tool policy (pattern match for 'bash')",
+        }
+    ]
+    out = ui._serialize_approval_items(items)
+    assert out[0]["error"] == "Blocked by tool policy (pattern match for 'bash')"
+
+
+def test_file_targets_survive_live_and_pending_card_projection() -> None:
+    ui = _make_ui()
+    path = "reports/" + "long-" * 40 + "report.html"
+    items = ui._serialize_approval_items(
+        [
+            {
+                "call_id": "write",
+                "func_name": "write_file",
+                "path": path,
+                "content": "private body",
+            },
+            {"call_id": "edit", "func_name": "edit_file", "path": "/tmp/code.js"},
+            {"call_id": "read", "func_name": "read_file", "path": path},
+        ]
+    )
+    assert items[0]["file_path"] == path
+    assert "content" not in items[0]
+    assert items[1]["file_path"] == "/tmp/code.js"
+    assert "file_path" not in items[2]
+    _register_card_cycle(ui, {"cycle_id": "files", "items": items})
+    pending = ui.serialize_pending_approval_details()[0]["items"]
+    assert pending[0]["file_path"] == path
+    assert pending[1]["file_path"] == "/tmp/code.js"
+
+
+def test_serialize_approval_items_carries_the_arguments_as_written() -> None:
+    """The full text goes out unchanged, empty included; an item the session never stamped
+    (no ``_raw_arguments``) carries no field rather than an invented one."""
+    raw = '{"query": "' + "q" * 500 + '", "note": "line one\\nline two"}'
+    out = _make_ui()._serialize_approval_items(
+        [
+            {"call_id": "c1", "func_name": "mcp__docs__search", "_raw_arguments": raw},
+            {"call_id": "c2", "func_name": "bash", "_raw_arguments": ""},
+            {"call_id": "c3", "func_name": "bash"},
+        ]
+    )
+    assert out[0]["arguments"] == raw
+    assert out[1]["arguments"] == ""
+    assert "arguments" not in out[2]
+
+
+def test_full_arguments_stay_on_the_workstream_stream() -> None:
+    """The prompt's own stream carries each call's full arguments; the copy for the console's
+    cluster-wide channel and the cross-tenant dashboard keep only the header and preview."""
+    broadcast: list[dict[str, Any]] = []
+
+    class _BroadcastUI(_ConcreteUI):
+        def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+            broadcast.append(detail)
+
+    ui = _BroadcastUI(ws_id="ws-1", user_id="u1")
+    ui._APPROVAL_WAIT_TIMEOUT = 0.05
+    lq = ui._register_listener()
+    raw = '{"command": "curl https://example.com/' + "p" * 300 + '"}'
+    item = {**_pending_item("t-1"), "_raw_arguments": raw}
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        ui.approve_tools([item])
+
+    events = _drain(lq)
+    early = [e for e in events if e.get("type") == "tool_pending"]
+    prompts = [e for e in events if e.get("type") == "approve_request"]
+    assert [e["items"][0]["arguments"] for e in early] == [raw]
+    assert [e["items"][0]["arguments"] for e in prompts] == [raw]
+    assert len(broadcast) == 1
+    assert broadcast[0]["cycle_id"] == prompts[0]["cycle_id"]
+    assert broadcast[0]["items"][0]["header"] == "Tool: bash"
+    assert "arguments" not in broadcast[0]["items"][0]
+
+    _register_card_cycle(ui, prompts[0])
+    pending = ui.serialize_pending_approval_details()[0]["items"]
+    assert "arguments" not in pending[0]
+
+
+def test_record_auto_approves_appends_only_tagged_items() -> None:
+    """Items without ``auto_approved=True`` are skipped — the ring
+    buffer is meant to surface bypassed-the-gate calls, not a
+    record of every tool invocation."""
+    storage = MagicMock()
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "approval_label": "bash",
+            "auto_approved": True,
+            "auto_approve_reason": "skill",
+        },
+        {
+            "call_id": "c2",
+            "func_name": "read_file",
+            # No auto_approved tag — read-only tool, gets skipped.
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == 1
+    assert snapshot[0]["func_name"] == "bash"
+    assert snapshot[0]["auto_approve_reason"] == "skill"
+    # Audit row recorded — one row per call (not per item) so
+    # tool-heavy turns don't blow up the audit table.
+    storage.record_audit_event.assert_called_once()
+    call_kwargs = storage.record_audit_event.call_args.kwargs
+    assert call_kwargs["action"] == "tool.auto_approved"
+
+
+def test_record_auto_approves_caps_buffer_at_max() -> None:
+    """Bounded ring buffer — a long-running skill workstream can't
+    fill the /dashboard payload with stale rows.  The cap is the
+    class-level constant, exercised here to lock the contract."""
+    ui = _make_ui()
+    cap = ui._RECENT_AUTO_APPROVALS_MAX
+    # Push (cap + 5) items; only the most recent ``cap`` survive.
+    for i in range(cap + 5):
+        with _patch_get_storage(MagicMock()):
+            ui._record_auto_approves(
+                [
+                    {
+                        "call_id": f"c{i}",
+                        "func_name": f"tool_{i}",
+                        "auto_approved": True,
+                        "auto_approve_reason": "blanket",
+                    }
+                ]
+            )
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == cap
+    # Tail preserved — oldest entries roll off the head.
+    assert snapshot[-1]["func_name"] == f"tool_{cap + 5 - 1}"
+    assert snapshot[0]["func_name"] == f"tool_{5}"
+
+
+def test_record_auto_approves_noop_when_no_tagged_items() -> None:
+    """No tagged items → no buffer write, no audit — matters for
+    the every-tool-call-was-read-only case where ``items`` is
+    non-empty but nothing was an auto-approve."""
+    storage = MagicMock()
+    ui = _make_ui()
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(
+            [{"call_id": "c1", "func_name": "read_file"}]  # no auto_approved tag
+        )
+    assert ui.serialize_recent_auto_approvals() == []
+    storage.record_audit_event.assert_not_called()
+
+
+def test_record_auto_approves_swallows_audit_failure() -> None:
+    """An audit-write exception must not break the tool-execution
+    path — visibility is best-effort, the SSE event + ring buffer
+    already shipped to operators by the time this fires."""
+    storage = MagicMock()
+    storage.record_audit_event.side_effect = RuntimeError("audit table down")
+    ui = _make_ui()
+    items = [
+        {
+            "call_id": "c1",
+            "func_name": "bash",
+            "auto_approved": True,
+            "auto_approve_reason": "policy",
+        }
+    ]
+    # Must not raise — the docstring explicitly promises best-effort.
+    with _patch_get_storage(storage):
+        ui._record_auto_approves(items)
+    # Buffer write still happened (it's first, before the audit).
+    assert len(ui.serialize_recent_auto_approvals()) == 1
+
+
+def test_replay_recent_auto_approvals_from_audit_seeds_buffer() -> None:
+    """Audit-replay seeds the ring buffer on UI construction so the
+    dashboard pill survives UI rebuilds (saved-workstream rehydrate /
+    coord→node click-through / process restart all create a fresh UI
+    whose buffer would otherwise be empty even though the audit row
+    is still on disk)."""
+    storage = MagicMock()
+    storage.list_audit_events.return_value = [
+        # DESC order — newest first.
+        {
+            "timestamp": "2026-04-27T18:00:00",
+            "detail": (
+                '{"tools": [{"call_id": "c2", "func_name": "edit_file",'
+                ' "approval_label": "edit_file", "reason": "policy"}],'
+                ' "count": 1}'
+            ),
+        },
+        {
+            "timestamp": "2026-04-27T17:00:00",
+            "detail": (
+                '{"tools": [{"call_id": "c1", "func_name": "bash",'
+                ' "approval_label": "bash", "reason": "skill"}],'
+                ' "count": 1}'
+            ),
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    # Buffer holds the replayed entries in chronological order
+    # (oldest first), matching what live appends produce.
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == 2
+    assert snapshot[0]["func_name"] == "bash"
+    assert snapshot[0]["auto_approve_reason"] == "skill"
+    assert snapshot[1]["func_name"] == "edit_file"
+    assert snapshot[1]["auto_approve_reason"] == "policy"
+    # And the audit query was scoped to this ws + tool.auto_approved.
+    storage.list_audit_events.assert_called_once()
+    call_kwargs = storage.list_audit_events.call_args.kwargs
+    assert call_kwargs["action"] == "tool.auto_approved"
+    assert call_kwargs["resource_id"] == "ws-replay"
+
+
+def test_replay_swallows_audit_storage_failure() -> None:
+    """A storage outage at construction time must not break UI
+    instantiation — the buffer simply stays empty until the next
+    live auto-approve populates it."""
+    storage = MagicMock()
+    storage.list_audit_events.side_effect = RuntimeError("audit table down")
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    assert ui.serialize_recent_auto_approvals() == []
+
+
+def test_replay_skips_when_ws_id_missing() -> None:
+    """No ws_id → no audit query.  Test fixtures sometimes
+    construct a UI with the default empty ws_id; the replay must
+    not fire a wildcard query that returns rows from other ws's."""
+    storage = MagicMock()
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="")
+    storage.list_audit_events.assert_not_called()
+    assert ui.serialize_recent_auto_approvals() == []
+
+
+def test_replay_tolerates_malformed_audit_detail() -> None:
+    """Unparseable / wrong-shape audit detail rows are skipped, not
+    propagated.  A historic audit row with a different schema (e.g.
+    pre-fix migration leftover) must not crash UI construction."""
+    storage = MagicMock()
+    storage.list_audit_events.return_value = [
+        {"timestamp": "2026-04-27T18:00:00", "detail": "not-json"},
+        {"timestamp": "2026-04-27T17:30:00", "detail": '{"tools": "wrong-shape"}'},
+        {
+            "timestamp": "2026-04-27T17:00:00",
+            "detail": '{"tools": [{"func_name": "bash", "reason": "skill"}], "count": 1}',
+        },
+    ]
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    # Only the well-shaped row contributes.
+    snapshot = ui.serialize_recent_auto_approvals()
+    assert len(snapshot) == 1
+    assert snapshot[0]["func_name"] == "bash"
+
+
+def test_parse_audit_timestamp_treats_naive_strings_as_utc() -> None:
+    """Audit rows are stored as naive UTC strings (e.g.
+    ``2026-04-27T18:00:00`` with no timezone marker); a server in
+    a non-UTC timezone would mis-stamp pill entries by hours
+    without explicit UTC.replace at parse time."""
+    from datetime import UTC, datetime
+
+    from turnstone.core.session_ui_base import SessionUIBase
+
+    expected = datetime(2026, 4, 27, 18, 0, 0, tzinfo=UTC).timestamp()
+    assert SessionUIBase._parse_audit_timestamp("2026-04-27T18:00:00") == expected
+    # Explicit-offset strings parse correctly too — the UTC stamp
+    # only applies when tzinfo is None.
+    assert SessionUIBase._parse_audit_timestamp("2026-04-27T18:00:00+00:00") == expected
+
+
+def test_replay_caps_at_buffer_max() -> None:
+    """Replay output is bounded by the same cap as live appends.
+    A long-lived workstream with hundreds of audit rows must not
+    blow past the 10-entry limit during replay."""
+    storage = MagicMock()
+    # Generate many fake rows.
+    storage.list_audit_events.return_value = [
+        {
+            "timestamp": f"2026-04-27T{i:02d}:00:00",
+            "detail": (
+                f'{{"tools": [{{"func_name": "tool_{i}", "reason": "skill"}}], "count": 1}}'
+            ),
+        }
+        for i in range(20)
+    ]
+    with _patch_get_storage(storage):
+        ui = _make_ui(ws_id="ws-replay")
+    snapshot = ui.serialize_recent_auto_approvals()
+    # Cap holds even when audit-replay fans in past it.
+    assert len(snapshot) == ui._RECENT_AUTO_APPROVALS_MAX
+
+
+def test_serialize_recent_auto_approvals_returns_a_copy() -> None:
+    """Mutating the returned list must not corrupt the buffer —
+    HTTP handler should not be able to drain or reorder it."""
+    ui = _make_ui()
+    with _patch_get_storage(MagicMock()):
+        ui._record_auto_approves(
+            [
+                {
+                    "call_id": "c1",
+                    "func_name": "bash",
+                    "auto_approved": True,
+                    "auto_approve_reason": "skill",
+                }
+            ]
+        )
+    snapshot = ui.serialize_recent_auto_approvals()
+    snapshot.clear()
+    snapshot.append({"poisoned": True})
+    # Buffer state survives the caller's mutation.
+    fresh = ui.serialize_recent_auto_approvals()
+    assert len(fresh) == 1
+    assert fresh[0]["func_name"] == "bash"
+
+
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_enqueue_and_listener_registration() -> None:
+    """Fan-out under concurrent enqueue + register/unregister shouldn't
+    drop events or crash on the lock. Sanity-level stress."""
+    ui = _make_ui()
+
+    def _producer() -> None:
+        for i in range(100):
+            ui._enqueue({"type": "tick", "n": i})
+
+    def _subscriber() -> None:
+        for _ in range(20):
+            lq = ui._register_listener()
+            ui._unregister_listener(lq)
+
+    producer = threading.Thread(target=_producer)
+    subscribers = [threading.Thread(target=_subscriber) for _ in range(4)]
+    producer.start()
+    for s in subscribers:
+        s.start()
+    producer.join()
+    for s in subscribers:
+        s.join()
+    # Test's job is to surface any RuntimeError / lock inversion
+    # during concurrent enqueue + register/unregister. If we got
+    # here every thread completed cleanly — assert explicitly so the
+    # intent survives optimization-mode assertion stripping.
+    assert not producer.is_alive()
+    assert all(not s.is_alive() for s in subscribers)
+
+
+# ---------------------------------------------------------------------------
+# Per-turn inflight buffers — SSE refresh-resume snapshot path
+# ---------------------------------------------------------------------------
+
+
+def test_on_content_token_writes_to_both_buffers() -> None:
+    """``on_content_token`` writes to the multi-turn buffer (IDLE
+    piggyback) AND the per-turn inflight buffer (SSE snapshot)."""
+    ui = _make_ui()
+    ui.on_content_token("hello")
+    assert ui._ws_turn_content == ["hello"]
+    assert ui._ws_inflight_content == ["hello"]
+    assert ui._event_id == 1
+
+
+def test_on_reasoning_token_writes_to_inflight_buffer_only() -> None:
+    """Reasoning has no multi-turn IDLE piggyback — only the inflight
+    buffer + the seq counter."""
+    ui = _make_ui()
+    ui.on_reasoning_token("thinking...")
+    assert ui._ws_inflight_reasoning == ["thinking..."]
+    assert ui._event_id == 1
+    # Multi-turn buffer is content-only and untouched by reasoning.
+    assert ui._ws_turn_content == []
+
+
+def test_inflight_seq_advances_on_every_emit_even_at_cap() -> None:
+    """Cap-hit content tokens MUST advance ``_event_id``,
+    even though the buffer rejected the append. If seq stalled at
+    high-water-pre-cap, a subscriber registering AFTER the cap is
+    hit would capture ``snap_seq == stalled_seq`` and every
+    subsequent live token (also tagged with the stalled seq) would
+    be filter-dropped by the events handler — silently losing the
+    rest of the stream. The cap is a buffer-size limit, not a
+    "stop streaming" signal."""
+    from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
+
+    ui = _make_ui()
+    chunk = "x" * 1024
+    while ui._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
+        ui.on_content_token(chunk)
+    seq_at_cap = ui._event_id
+
+    # Cap-hit token: seq MUST advance (no buffer append, but the
+    # event still gets a fresh seq for the dedup filter).
+    ui.on_content_token(chunk)
+    assert ui._event_id == seq_at_cap + 1
+    # Buffer remains bounded — the cap-hit token is NOT in inflight.
+    assert ui._ws_inflight_content_size <= _MAX_TURN_CONTENT_CHARS + len(chunk)
+
+
+def test_subscriber_after_cap_hit_receives_subsequent_tokens() -> None:
+    """Regression for Copilot's cap+seq finding: a subscriber that
+    connects AFTER the inflight buffer is at cap must still receive
+    live tokens past the cap. Past-cap tokens are absent from
+    ``snap.content`` (the snapshot text was truncated at cap) but
+    the live stream past them must NOT be filter-dropped."""
+    from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
+
+    ui = _make_ui()
+    chunk = "x" * 1024
+    while ui._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
+        ui.on_content_token(chunk)
+    # Stream a few tokens PAST the cap before subscribing.
+    for _ in range(3):
+        ui.on_content_token(chunk)
+
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    snap_seq = snap["seq"]
+
+    # Live token past cap.
+    ui.on_content_token(chunk)
+    ev = lq.get_nowait()
+    assert ev["type"] == "content"
+    # The critical invariant: seq advances per-emit, so the new
+    # event's _seq is strictly greater than the snap_seq the
+    # subscriber captured. Without this, the events handler's
+    # ``seq <= snap_seq`` filter would drop every token past the
+    # cap (silent token loss for refresh-past-cap).
+    assert ev["_seq"] > snap_seq, (
+        f"Token past cap has _seq={ev['_seq']} which is <= "
+        f"snap_seq={snap_seq} — would be silently dropped after a "
+        f"refresh past the cap."
+    )
+
+
+def test_subscriber_after_reasoning_cap_hit_receives_subsequent_tokens() -> None:
+    """Same invariant as content cap: reasoning subscribers past
+    cap must keep receiving live reasoning tokens."""
+    from turnstone.core.session_ui_base import _MAX_TURN_CONTENT_CHARS
+
+    ui = _make_ui()
+    chunk = "x" * 1024
+    while ui._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
+        ui.on_reasoning_token(chunk)
+    for _ in range(3):
+        ui.on_reasoning_token(chunk)
+
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    snap_seq = snap["seq"]
+
+    ui.on_reasoning_token(chunk)
+    ev = lq.get_nowait()
+    assert ev["type"] == "reasoning"
+    assert ev["_seq"] > snap_seq
+
+
+def test_on_turn_committed_resets_inflight_after_commit() -> None:
+    """``on_turn_committed`` fires immediately after each
+    ``messages.append(assistant_msg)`` in the send loop. Without it,
+    the inflight buffer keeps the just-committed turn's content
+    during the post-commit tool-execution window — and a refresh in
+    that window would show the assistant turn TWICE (history list
+    + in_progress_snapshot)."""
+    ui = _make_ui()
+    ui.on_content_token("Just-finished turn ")
+    ui.on_reasoning_token("Reasoning for the turn ")
+    # Sanity: buffer is populated pre-commit.
+    assert ui._ws_inflight_content == ["Just-finished turn "]
+    assert ui._ws_inflight_reasoning == ["Reasoning for the turn "]
+
+    ui.on_turn_committed()
+
+    # Inflight content + reasoning reset; seq stays monotonic.
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_reasoning == []
+    # Multi-turn buffer is NOT reset by commit (it drains at idle).
+    assert ui._ws_turn_content == ["Just-finished turn "]
+
+
+def test_inflight_snapshot_empty_during_post_commit_tool_window() -> None:
+    """Models the user-reported bug: refresh during a tool-execution
+    window between commit and the next stream. Pre-fix: snapshot has
+    the just-committed turn's text → double-renders against history.
+    Post-fix: snapshot is empty → no double-render. Seq stays
+    monotonic (carries the high-water mark across turn boundaries)."""
+    ui = _make_ui()
+    ui.on_content_token("Calling tool with these args: ")
+    seq_pre_commit = ui._event_id
+    ui.on_turn_committed()  # session.py fires this after messages.append
+    # We're now in the tool-execution window. A reconnecting client
+    # would call register_listener_with_in_progress_snapshot.
+    _, snap = ui.register_listener_with_in_progress_snapshot()
+    assert snap["content"] == ""
+    assert snap["reasoning"] == ""
+    # Seq did NOT reset — must remain monotonic across turns.
+    assert snap["seq"] == seq_pre_commit
+
+
+def test_on_turn_start_resets_inflight_content_and_reasoning() -> None:
+    """``on_turn_start`` clears the per-turn content + reasoning
+    buffers but does NOT touch the multi-turn ``_ws_turn_content``
+    (which the dashboard's IDLE-piggyback payload depends on) and
+    does NOT reset the seq counter (must remain monotonic across
+    turn boundaries — see ``test_inflight_seq_monotonic_across_turn_boundaries``)."""
+    ui = _make_ui()
+    ui.on_content_token("turn-1 ")
+    ui.on_reasoning_token("reasoning-1 ")
+    multi_pre = list(ui._ws_turn_content)
+    multi_pre_size = ui._ws_turn_content_size
+
+    ui.on_turn_start()
+
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_content_size == 0
+    assert ui._ws_inflight_reasoning == []
+    assert ui._ws_inflight_reasoning_size == 0
+    # Multi-turn untouched.
+    assert ui._ws_turn_content == multi_pre
+    assert ui._ws_turn_content_size == multi_pre_size
+
+
+def test_register_listener_with_in_progress_snapshot_empty() -> None:
+    ui = _make_ui()
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    assert isinstance(lq, queue.Queue)
+    assert lq in ui._listeners
+    assert snap == {
+        "content": "",
+        "reasoning": "",
+        "seq": 0,
+        "agent_contexts": [],
+        "agent_compactions": [],
+    }
+
+
+def test_register_listener_with_in_progress_snapshot_populated() -> None:
+    ui = _make_ui()
+    ui.on_content_token("Hello, ")
+    ui.on_content_token("world!")
+    ui.on_reasoning_token("planning a greeting")
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    assert snap["content"] == "Hello, world!"
+    assert snap["reasoning"] == "planning a greeting"
+    # seq counts every successful append across BOTH buffers.
+    assert snap["seq"] == 3
+    # Listener is registered — later live tokens land in lq.
+    ui.on_content_token(" Goodbye.")
+    ev = lq.get_nowait()
+    assert ev["type"] == "content"
+    assert ev["text"] == " Goodbye."
+    assert ev["_seq"] == 4
+
+
+def test_register_listener_with_in_progress_snapshot_only_inflight_not_multi_turn() -> None:
+    """The snapshot reflects the in-progress turn only — anything
+    cleared by ``on_turn_start`` (a prior committed turn within the
+    same send) must NOT appear in the snapshot, even though the
+    multi-turn buffer still has it."""
+    ui = _make_ui()
+    ui.on_content_token("PRIOR_TURN ")
+    ui.on_turn_start()  # commit boundary — inflight reset
+    ui.on_content_token("CURRENT")
+    _, snap = ui.register_listener_with_in_progress_snapshot()
+    assert snap["content"] == "CURRENT"
+    # Multi-turn buffer still has both turns (drives the IDLE piggyback).
+    assert "".join(ui._ws_turn_content) == "PRIOR_TURN CURRENT"
+
+
+def test_seq_filter_dedup_round_trip() -> None:
+    """End-to-end dedup invariant: every token appears exactly once
+    when reconstructing from snapshot + listener queue under live
+    writes that race the registration. Models the events handler."""
+    ui = _make_ui()
+    for ch in "abcde":
+        ui.on_content_token(ch)
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    for ch in "fgh":
+        ui.on_content_token(ch)
+
+    reconstructed = snap["content"]
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("_seq", 0) <= snap["seq"]:
+            continue
+        reconstructed += ev["text"]
+    assert reconstructed == "abcdefgh"
+
+
+def test_seq_filter_drops_overlap_when_register_lands_after_writer() -> None:
+    """Race: writer appends + emits while a second register snapshots
+    after the writer. The live event has _seq <= snap.seq → must be
+    dropped to avoid double-render."""
+    ui = _make_ui()
+    # Register a first listener so the writer's enqueue lands somewhere.
+    lq1, _ = ui.register_listener_with_in_progress_snapshot()
+    ui.on_content_token("X")
+    # Second register snapshots AFTER the write — snap has "X" AND
+    # the writer's enqueue is in lq1.
+    _, snap2 = ui.register_listener_with_in_progress_snapshot()
+    assert snap2["content"] == "X"
+    # Drain lq1 with the filter against snap2.seq — duplicate dropped.
+    duped: list[str] = []
+    while True:
+        try:
+            ev = lq1.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("_seq", 0) <= snap2["seq"]:
+            continue
+        duped.append(ev["text"])
+    assert duped == []
+
+
+def test_inflight_seq_monotonic_across_turn_boundaries() -> None:
+    """Regression: a subscriber registered mid-turn-N must still
+    receive turn N+1's tokens. The seq counter is monotonic across
+    turn boundaries — resetting it at on_turn_committed/on_turn_start
+    would silently drop turn N+1's first M tokens (M = the snap_seq
+    captured mid-turn-N) via the events handler's `seq <= snap_seq`
+    filter."""
+    ui = _make_ui()
+    # Turn N: stream tokens, register a listener mid-turn.
+    ui.on_content_token("turn-N tok1 ")
+    ui.on_content_token("turn-N tok2 ")
+    lq, snap = ui.register_listener_with_in_progress_snapshot()
+    snap_seq = snap["seq"]
+    assert snap_seq == 2
+    # Turn N completes, turn N+1 begins.
+    ui.on_turn_committed()
+    ui.on_turn_start()
+    # Turn N+1's first content token. With the q-1 fix, seq is
+    # monotonic (3), not reset to 1. The events handler's
+    # `seq <= snap_seq` filter must NOT swallow it.
+    ui.on_content_token("turn-N+1 tok1 ")
+    ev = lq.get_nowait()
+    assert ev["type"] == "content"
+    assert ev["text"] == "turn-N+1 tok1 "
+    assert ev["_seq"] > snap_seq, (
+        f"Token from turn N+1 has _seq={ev['_seq']} which is <= "
+        f"snap_seq={snap_seq} — the events handler's dedup filter "
+        f"would silently drop it on a long-lived SSE subscription."
+    )
+
+
+def test_snapshot_and_consume_drains_inflight_at_idle() -> None:
+    """Regression for the cancel/error path: ``on_turn_committed`` is
+    NOT called from cancel handlers, but every exit path eventually
+    fires ``_emit_state("idle")`` (cancel) or ``_emit_state("error")``
+    (exception). The IDLE/ERROR branches of
+    ``snapshot_and_consume_state_payload`` must drain the inflight
+    buffers so a refresh post-cancel doesn't double-render the
+    cancelled fragment against history's marker'd version."""
+    ui = _make_ui()
+    ui.on_content_token("partial cancelled text ")
+    ui.on_reasoning_token("partial reasoning ")
+    assert ui._ws_inflight_content_size > 0
+    assert ui._ws_inflight_reasoning_size > 0
+
+    ui.snapshot_and_consume_state_payload("idle")
+
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_content_size == 0
+    assert ui._ws_inflight_reasoning == []
+    assert ui._ws_inflight_reasoning_size == 0
+
+
+def test_snapshot_and_consume_drains_inflight_at_error() -> None:
+    """Regression for the exception path: ERROR-branch must drain
+    inflight too (parallel to the IDLE branch)."""
+    ui = _make_ui()
+    ui.on_content_token("partial errored text ")
+    ui.on_reasoning_token("partial errored reasoning ")
+
+    ui.snapshot_and_consume_state_payload("error")
+
+    assert ui._ws_inflight_content == []
+    assert ui._ws_inflight_reasoning == []
+
+
+def test_snapshot_and_consume_does_not_reset_seq_at_idle_or_error() -> None:
+    """The IDLE/ERROR drain clears content + reasoning but must NOT
+    reset the seq counter — long-lived subscribers' snap_seq must
+    stay valid across turn boundaries (see the q-1 invariant test)."""
+    ui = _make_ui()
+    ui.on_content_token("a")
+    ui.on_content_token("b")
+    assert ui._event_id == 2
+
+    ui.snapshot_and_consume_state_payload("idle")
+    assert ui._event_id == 2
+
+    ui.snapshot_and_consume_state_payload("error")
+    assert ui._event_id == 2
+
+
+def test_listeners_share_dict_reference_warning() -> None:
+    """Pinning the shape that necessitated the events-handler shallow
+    copy: ``_enqueue`` puts ONE dict reference into every listener
+    queue. If multiple SSE coroutines mutate (e.g. ``del event[\"_seq\"]``)
+    without copying first, they corrupt each other's view. The fix
+    in make_events_handler is ``event = dict(event)`` immediately
+    after ``client_queue.get`` — verify the underlying invariant
+    here so a future refactor of ``_enqueue`` can't silently break
+    the assumption the events handler relies on."""
+    ui = _make_ui()
+    lq1, _ = ui.register_listener_with_in_progress_snapshot()
+    lq2, _ = ui.register_listener_with_in_progress_snapshot()
+    ui.on_content_token("X")
+    ev1 = lq1.get_nowait()
+    ev2 = lq2.get_nowait()
+    # Same reference today — consumers MUST shallow-copy before any
+    # mutation. If a future _enqueue change makes this no longer
+    # true, the events handler's defensive copy becomes redundant
+    # but harmless; if this assertion suddenly fails the underlying
+    # invariant has shifted and the handler comment should be updated.
+    assert ev1 is ev2
+
+
+def test_concurrent_writer_and_register_with_snapshot_no_loss_no_dup() -> None:
+    """Stress: many tokens streaming + a register_with_snapshot landing
+    at a random point. End state: snapshot ∪ filtered_live == every
+    token written, exactly once."""
+    ui = _make_ui()
+    n_tokens = 500
+    snap_box: dict[str, Any] = {}
+    lq_box: dict[str, queue.Queue[Any]] = {}
+
+    def _writer() -> None:
+        for i in range(n_tokens):
+            ui.on_content_token(f"{i},")
+
+    def _registrar() -> None:
+        # Tiny sleep so the writer is mid-flight.
+        threading.Event().wait(0.001)
+        lq, snap = ui.register_listener_with_in_progress_snapshot()
+        snap_box["snap"] = snap
+        lq_box["lq"] = lq
+
+    w = threading.Thread(target=_writer)
+    r = threading.Thread(target=_registrar)
+    w.start()
+    r.start()
+    w.join()
+    r.join()
+
+    snap = snap_box["snap"]
+    lq = lq_box["lq"]
+    reconstructed = snap["content"]
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("_seq", 0) <= snap["seq"]:
+            continue
+        reconstructed += ev["text"]
+    expected = "".join(f"{i}," for i in range(n_tokens))
+    assert reconstructed == expected, (
+        f"reconstruction mismatch: len(rec)={len(reconstructed)}, len(exp)={len(expected)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Smart Approvals (judge.smart_approvals)
+# ---------------------------------------------------------------------------
+
+
+class _ObservedVerdictCondition(threading.Condition):
+    """Expose the instant a Smart Approval gate enters its real wait."""
+
+    def __init__(self, lock: threading.Lock, waiting: threading.Event) -> None:
+        super().__init__(lock)
+        self._waiting = waiting
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._waiting.set()
+        return super().wait(timeout)
+
+
+class _SeedingUI(_ConcreteUI):
+    """Delivers ``seed_verdicts`` through ``on_intent_verdict`` at one of two
+    points.  By default, right after the per-round purge evicts the entering
+    batch's ids: the judge answered before the Smart wait starts, or, with
+    ``seed_judge_event`` naming another generation, a STALE arrival in the
+    purge-to-registration window.  With ``seed_during_wait``, from a separate
+    thread once the gate is parked in the wait, so the verdict must wake it."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.seed_verdicts: list[dict[str, Any]] = []
+        self.seed_judge_event: threading.Event | None = None
+        self.seed_during_wait = False
+        self._parked = threading.Event()
+        self._verdict_cond = _ObservedVerdictCondition(self._ws_lock, self._parked)
+
+    def _deliver_seeds(self) -> None:
+        for verdict in self.seed_verdicts:
+            self.on_intent_verdict(dict(verdict), judge_event=self.seed_judge_event)
+
+    def _purge_round_verdicts(
+        self,
+        call_ids: set[str],
+        keep_origin: threading.Event | None = None,
+    ) -> None:
+        super()._purge_round_verdicts(call_ids, keep_origin=keep_origin)
+        if not self.seed_during_wait:
+            self._deliver_seeds()
+
+    def _await_llm_verdicts(
+        self,
+        needed: set[str],
+        budget_seconds: float,
+        *,
+        stop: Callable[[], bool] | None = None,
+        before_wait: Callable[[], None] | None = None,
+        delivered: Callable[[], bool] | None = None,
+    ) -> None:
+        if not self.seed_during_wait:
+            super()._await_llm_verdicts(
+                needed, budget_seconds, stop=stop, before_wait=before_wait, delivered=delivered
+            )
+            return
+        self._parked.clear()
+
+        def _deliver_once_parked() -> None:
+            if self._parked.wait(timeout=budget_seconds):
+                self._deliver_seeds()
+
+        judge = threading.Thread(target=_deliver_once_parked, name="seeding-judge")
+
+        def _publish_then_seed() -> None:
+            if before_wait is not None:
+                before_wait()
+            judge.start()
+
+        try:
+            super()._await_llm_verdicts(
+                needed,
+                budget_seconds,
+                stop=stop,
+                before_wait=_publish_then_seed,
+                delivered=delivered,
+            )
+        finally:
+            if judge.is_alive():
+                judge.join()
+
+
+def _patch_policies(verdicts: dict[str, str]):  # type: ignore[no-untyped-def]
+    """Neutralise the admin tool-policy stage so approve_tools tests
+    isolate the Smart Approvals gate."""
+    return patch(
+        "turnstone.core.policy.evaluate_loaded_tool_policies",
+        return_value=verdicts,
+    )
+
+
+def _drain(lq: queue.Queue[Any]) -> list[dict[str, Any]]:
+    """Drain all currently-queued events off a listener queue."""
+    out: list[dict[str, Any]] = []
+    while True:
+        try:
+            out.append(lq.get_nowait())
+        except queue.Empty:
+            return out
+
+
+def _smart_ui() -> _ConcreteUI:
+    ui = _make_ui()
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    return ui
+
+
+def _pending_item(call_id: str, func_name: str = "bash") -> dict[str, Any]:
+    """A still-pending tool call carrying a heuristic verdict, matching
+    what ``ChatSession._evaluate_intent`` attaches before the gate."""
+    return {
+        "call_id": call_id,
+        "func_name": func_name,
+        "approval_label": func_name,
+        "header": f"Tool: {func_name}",
+        "preview": "",
+        "needs_approval": True,
+        "_heuristic_verdict": {
+            "verdict_id": f"h-{call_id}",
+            "call_id": call_id,
+            "func_name": func_name,
+            "risk_level": "medium",
+            "confidence": 0.5,
+            "recommendation": "review",
+        },
+    }
+
+
+def _llm_verdict(
+    call_id: str,
+    *,
+    recommendation: str = "approve",
+    confidence: float = 0.99,
+    tier: str = "llm",
+) -> dict[str, Any]:
+    return {
+        "verdict_id": f"v-{call_id}",
+        "call_id": call_id,
+        "func_name": "bash",
+        "risk_level": "low",
+        "confidence": confidence,
+        "recommendation": recommendation,
+        "tier": tier,
+        "intent_summary": "",
+        "reasoning": "",
+        "evidence": [],
+    }
+
+
+def test_smart_approval_clears_high_confidence_llm_approve() -> None:
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == []  # nothing left for a human
+    assert item["needs_approval"] is False
+    assert item["auto_approved"] is True
+    assert item["auto_approve_reason"] == "smart_approval"
+
+
+def test_smart_approval_with_no_judge_hands_the_batch_to_a_person_at_once() -> None:
+    """A judge alias that can't run builds no judge, so the batch carries no verdict and no
+    judge generation: nothing will rule on it.  Smart Approvals passes it to a person without
+    waiting out its window (#1529)."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 5.0
+    item = _pending_item("c1")
+    del item["_heuristic_verdict"]
+    started = time.monotonic()
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item["needs_approval"] is True
+    assert "auto_approved" not in item
+    assert time.monotonic() - started < 1.0
+
+
+def test_smart_approval_clears_at_exact_threshold() -> None:
+    """``confidence >= threshold`` — the boundary value auto-approves."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.95)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == []
+    assert item["auto_approved"] is True
+
+
+def test_smart_approval_holds_just_below_threshold() -> None:
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.94)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+    assert item["needs_approval"] is True
+
+
+def test_smart_approval_holds_review_and_deny() -> None:
+    """Only ``approve`` auto-approves; ``review`` / ``deny`` reach a human
+    no matter how confident the judge is."""
+    ui = _smart_ui()
+    for rec in ("review", "deny"):
+        item = _pending_item("c1")
+        ui._llm_verdicts = {"c1": _llm_verdict("c1", recommendation=rec, confidence=1.0)}
+        with _patch_get_storage(MagicMock()):
+            remaining = ui._apply_smart_approvals([item])
+        assert remaining == [item], rec
+        assert item.get("auto_approved") is not True, rec
+
+
+def test_smart_approval_holds_llm_fallback_even_if_approve() -> None:
+    """A ``llm_fallback`` verdict means the LLM stage timed out / errored
+    and the row is the heuristic carry-over.  Even if it reads ``approve``
+    at full confidence it must reach a human — errors require attention."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict(
+        "c1", recommendation="approve", confidence=1.0, tier="llm_fallback"
+    )
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+
+
+def test_smart_approval_holds_when_no_verdict_arrives() -> None:
+    """Wait budget elapses with no verdict cached → fail closed to the
+    human gate."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 0.05  # nothing will be delivered
+    item = _pending_item("c1")
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item["needs_approval"] is True
+
+
+def test_smart_approval_batch_atomic_holds_whole_batch_on_one_failure() -> None:
+    """Batch-atomic: a single non-qualifying call (here a review) in a
+    parallel batch holds the ENTIRE batch for a human — including the call
+    that individually qualified.  Parallel calls are one unit of intent."""
+    ui = _smart_ui()
+    a = _pending_item("c1")
+    b = _pending_item("c2")
+    ui._llm_verdicts = {
+        "c1": _llm_verdict("c1", recommendation="approve", confidence=0.99),
+        "c2": _llm_verdict("c2", recommendation="review", confidence=0.99),
+    }
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == [a, b]  # NONE auto-approved
+    assert a.get("auto_approved") is not True
+    assert b.get("auto_approved") is not True
+
+
+def test_smart_approval_approves_full_batch_when_all_qualify() -> None:
+    """When every call in a parallel batch qualifies, the whole batch is
+    auto-approved and nothing is left for a human."""
+    ui = _smart_ui()
+    a = _pending_item("c1")
+    b = _pending_item("c2")
+    ui._llm_verdicts = {
+        "c1": _llm_verdict("c1", recommendation="approve", confidence=0.99),
+        "c2": _llm_verdict("c2", recommendation="approve", confidence=0.96),
+    }
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == []
+    assert a["auto_approved"] is True and b["auto_approved"] is True
+    assert a["needs_approval"] is False and b["needs_approval"] is False
+
+
+def test_smart_approved_item_serializes_llm_verdict_not_heuristic() -> None:
+    """The auto-approved tool row must carry the driving LLM verdict
+    (llm/approve) as judge_verdict so the UI doesn't render a contradictory
+    heuristic 'review/medium' chip beside the SMART_APPROVAL pill."""
+    ui = _smart_ui()
+    item = _pending_item("c1")  # heuristic verdict is review / medium
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    with _patch_get_storage(MagicMock()):
+        ui._apply_smart_approvals([item])
+    serialized = _ConcreteUI._serialize_approval_items([item])[0]
+    assert serialized["auto_approved"] is True
+    assert serialized["auto_approve_reason"] == "smart_approval"
+    judge_verdict = serialized["judge_verdict"]
+    assert judge_verdict["tier"] == "llm"
+    assert judge_verdict["recommendation"] == "approve"
+    # Heuristic still carried, but judge_verdict is what the row renders.
+    assert serialized["heuristic_verdict"]["recommendation"] == "review"
+
+
+def test_smart_approval_holds_batch_when_one_call_has_no_verdict() -> None:
+    """A parallel batch where one call never gets a verdict (timeout) holds
+    the whole batch, even though its sibling qualified."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 0.05
+    a = _pending_item("c1")
+    b = _pending_item("c2")
+    ui._llm_verdicts = {"c1": _llm_verdict("c1", recommendation="approve", confidence=0.99)}
+    # c2 has no verdict — the wait times out and the batch is held.
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == [a, b]
+    assert a.get("auto_approved") is not True
+
+
+def test_smart_approval_stamps_verdict_user_decision() -> None:
+    """The LLM verdict arrived during the wait (cache-only — no cycle
+    exists yet at that point); the smart stage stamps ``smart_approval``
+    on both the cached dict and the persisted row, and the non-"pending"
+    stamp keeps every later cycle-registration sweep away from it."""
+    storage = MagicMock()
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    verdict = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    ui._llm_verdicts["c1"] = verdict
+    with _patch_get_storage(storage):
+        ui._apply_smart_approvals([item])
+    assert ui._llm_verdicts["c1"]["user_decision"] == "smart_approval"
+    storage.update_intent_verdict.assert_called_once_with("v-c1", user_decision="smart_approval")
+
+
+def test_smart_approval_finalizes_exact_qualified_verdict_after_call_id_reuse() -> None:
+    """A sibling gate replacing the cache cannot inherit this decision."""
+    storage = MagicMock()
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    qualified = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    qualified["verdict_id"] = "v-qualified"
+    ui._llm_verdicts["c1"] = qualified
+    commits: list[Callable[[], None]] = []
+    persistence: list[Callable[[], None]] = []
+
+    with _patch_get_storage(storage):
+        remaining = ui._apply_smart_approvals(
+            [item],
+            commit_actions=commits,
+            persistence_actions=persistence,
+        )
+        assert remaining == []
+        assert len(commits) == 1
+
+        sibling = _llm_verdict("c1", recommendation="deny", confidence=0.99)
+        sibling["verdict_id"] = "v-sibling"
+        ui._llm_verdicts["c1"] = sibling
+        commits[0]()
+        for persist in persistence:
+            persist()
+
+    assert qualified["user_decision"] == "smart_approval"
+    assert "user_decision" not in sibling
+    assert ui._llm_verdicts["c1"] is sibling
+    storage.update_intent_verdict.assert_called_once_with(
+        "v-qualified", user_decision="smart_approval"
+    )
+
+
+def test_approve_tools_smart_approves_whole_batch_without_prompt() -> None:
+    """End-to-end through approve_tools: the verdict is delivered after
+    the cache reset (via _SeedingUI), the gate auto-approves, and the
+    function returns approved without ever emitting an approval prompt."""
+    storage = MagicMock()
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    item = _pending_item("c1")
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+    lq = ui._register_listener()
+    with _patch_get_storage(storage), _patch_policies({}):
+        approved, feedback = ui.approve_tools([item])
+    assert approved is True
+    assert feedback is None
+    assert item["auto_approved"] is True
+    assert item["auto_approve_reason"] == "smart_approval"
+    assert item["needs_approval"] is False
+    assert ui._pending_approval is None  # operator was never prompted
+    assert ui._approval_cycles == {}  # no cycle was ever registered
+    # No approval prompt was fanned out to listeners.
+    events = []
+    while True:
+        try:
+            events.append(lq.get_nowait()["type"])
+        except queue.Empty:
+            break
+    assert "approve_request" not in events
+
+
+def _unattended_smart_ui() -> _SeedingUI:
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    assert ui.grant_unattended() is True
+    return ui
+
+
+def test_unattended_grant_lets_the_judge_clear_an_ask_matched_batch() -> None:
+    """The judge counts as the normal flow for an "ask" call nobody is there for."""
+    ui = _unattended_smart_ui()
+    asked, other = _pending_item("c1", "bash"), _pending_item("c2", "read_file")
+    ui.seed_verdicts = [_llm_verdict("c1"), _llm_verdict("c2")]
+    with _patch_get_storage(MagicMock()), _patch_policies({"bash": "ask"}):
+        approved, _feedback = ui.approve_tools([asked, other])
+
+    assert approved is True
+    # It judged the whole batch, all or nothing, as in an attended session.
+    assert [asked["auto_approve_reason"], other["auto_approve_reason"]] == [
+        "smart_approval",
+        "smart_approval",
+    ]
+    assert ui._approval_cycles == {}
+
+
+def test_unattended_grant_leaves_what_the_judge_holds_to_a_person() -> None:
+    ui = _unattended_smart_ui()
+    asked, other = _pending_item("c1", "bash"), _pending_item("c2", "read_file")
+    # One call the judge will not clear holds the whole batch.
+    ui.seed_verdicts = [_llm_verdict("c1"), _llm_verdict("c2", recommendation="review")]
+    timer = resolve_when_pending(ui, False)
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies({"bash": "ask"}):
+            approved, _feedback = ui.approve_tools([asked, other])
+    finally:
+        timer.cancel()
+
+    assert approved is False  # the person refused the asked call
+    assert not asked.get("auto_approved")
+    assert other["auto_approve_reason"] == "unattended_watch"
+
+
+def test_approve_tools_skips_smart_stage_when_disabled() -> None:
+    """With Smart Approvals off (the default), a confident approve verdict
+    does NOT bypass the human — approve_tools blocks on the prompt as
+    before."""
+    storage = MagicMock()
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = False
+    ui.smart_approval_wait_seconds = 1.0
+    item = _pending_item("c1")
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+    timer = resolve_when_pending(ui, True, "ok")
+    timer.start()
+    try:
+        with _patch_get_storage(storage), _patch_policies({}):
+            approved, _feedback = ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    assert approved is True  # the human approved, not the judge
+    assert item.get("auto_approve_reason") != "smart_approval"
+    assert item.get("auto_approved") is not True
+
+
+def test_await_llm_verdicts_returns_when_verdict_delivered() -> None:
+    """The wait wakes as soon as the last needed verdict lands, well
+    before the budget elapses."""
+    ui = _smart_ui()
+
+    def _deliver() -> None:
+        with _patch_get_storage(MagicMock()):
+            ui.on_intent_verdict(_llm_verdict("c1"))
+
+    timer = threading.Timer(0.02, _deliver)
+    started = time.monotonic()
+    timer.start()
+    try:
+        # Generous budget; should return on the notify, not the timeout.
+        ui._await_llm_verdicts({"c1"}, 5.0)
+    finally:
+        timer.cancel()
+        timer.join()
+    assert "c1" in ui._llm_verdicts
+    assert time.monotonic() - started < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Where the gate moves the workstream: ``evaluation`` and ``attention``
+# ---------------------------------------------------------------------------
+
+
+def _smart_seeding_ui(*, smart: bool = True, seed_during_wait: bool = False) -> _SeedingUI:
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.seed_during_wait = seed_during_wait
+    ui.smart_approvals_enabled = smart
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    return ui
+
+
+def _stamp_publisher(ui: SessionUIBase, items: list[dict[str, Any]]) -> list[tuple[str, bool]]:
+    """Stamp a recording ``_publish_gate_state`` the way the session does.
+
+    Each publication records the state and whether a card for a person
+    already existed at that moment."""
+    published: list[tuple[str, bool]] = []
+
+    def _publish(state: str) -> None:
+        published.append((state, ui._pending_approval is not None))
+
+    for item in items:
+        item["_publish_gate_state"] = _publish
+    return published
+
+
+def _run_gate(  # type: ignore[no-untyped-def]
+    ui: SessionUIBase,
+    items: list[dict[str, Any]],
+    policies: dict[str, str],
+    *,
+    deadline: float = 3.0,
+):
+    """Drive ``approve_tools``; a person approves if a card appears within *deadline*."""
+    timer = resolve_when_pending(ui, True, "ok", deadline=deadline)
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies(policies):
+            return ui.approve_tools(items)
+    finally:
+        timer.cancel()
+
+
+def test_judge_wait_publishes_evaluation_then_attention_before_the_card() -> None:
+    """Under Smart Approvals the workstream waits on the judge first; when a
+    person is needed it moves to ``attention`` before the card goes out."""
+    ui = _smart_seeding_ui(seed_during_wait=True)
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True
+    assert published == [("evaluation", False), ("attention", False)]
+
+
+def test_smart_auto_approval_publishes_only_evaluation() -> None:
+    """An approved batch never needed a person: ``evaluation``, then the
+    ``running`` the session emits after the gate."""
+    ui = _smart_seeding_ui(seed_during_wait=True)
+    ui.smart_approval_wait_seconds = 5.0
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+
+    started = time.monotonic()
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5  # the verdict woke the wait
+    assert item["auto_approve_reason"] == "smart_approval"
+    assert published == [("evaluation", False)]
+
+
+def test_without_smart_approvals_the_gate_goes_straight_to_attention() -> None:
+    ui = _smart_seeding_ui(smart=False)
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True
+    assert published == [("attention", False)]
+
+
+def test_batch_the_judge_cannot_clear_alone_goes_straight_to_attention() -> None:
+    """An unjudged sibling makes the batch ineligible for Smart Approvals:
+    no wait, so no ``evaluation``."""
+    ui = _smart_seeding_ui()
+    judged, unjudged = _pending_item("c1"), _pending_item("c2")
+    del unjudged["_heuristic_verdict"]
+    published = _stamp_publisher(ui, [judged, unjudged])
+
+    approved, _feedback = _run_gate(ui, [judged, unjudged], {})
+
+    assert approved is True
+    assert published == [("attention", False)]
+
+
+@pytest.mark.parametrize(
+    "settled_by",
+    ["policy_allow", "policy_deny", "always_grant", "configured_auto_approve", "blanket"],
+)
+def test_batches_settled_without_anyone_stay_running(settled_by: str) -> None:
+    """Policies, "Always" grants, configured auto-approve and blanket
+    auto-approve decide before anyone could: the gate publishes no state, so
+    no flash and no "Approval required" announcement."""
+    ui = _smart_seeding_ui()
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+    policies: dict[str, str] = {}
+    if settled_by == "policy_allow":
+        policies = {"bash": "allow"}
+    elif settled_by == "policy_deny":
+        policies = {"bash": "deny"}
+    elif settled_by == "always_grant":
+        ui._always_approve_tools_by_principal[""] = {"bash"}
+    elif settled_by == "configured_auto_approve":
+        ui.auto_approve_tools = {"bash"}
+    else:
+        ui.auto_approve = True
+
+    approved, _feedback = _run_gate(ui, [item], policies)
+
+    assert approved is (settled_by != "policy_deny")
+    assert published == []
+    assert ui._approval_cycles == {}
+
+
+@pytest.mark.parametrize("flag", ["deny", "critical"])
+def test_heuristic_danger_skips_the_judge_wait(flag: str) -> None:
+    """A call the pattern rules flag deny/critical can never be cleared by the
+    LLM: no wait, no ``evaluation``, straight to ``attention`` and the card."""
+    ui = _smart_seeding_ui()
+    item = _pending_item("c1")
+    if flag == "deny":
+        item["_heuristic_verdict"]["recommendation"] = "deny"
+    else:
+        item["_heuristic_verdict"]["risk_level"] = "critical"
+    published = _stamp_publisher(ui, [item])
+    waited: list[bool] = []
+    ui._await_llm_verdicts = lambda *_a, **_kw: waited.append(True)  # type: ignore[method-assign]
+
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True  # the person approved
+    assert waited == []
+    assert published == [("attention", False)]
+
+
+def test_the_wait_ends_at_the_first_verdict_that_rules_the_batch_out() -> None:
+    """One ``review`` verdict already sends the batch to a person: the gate
+    stops waiting for the sibling's verdict instead of sitting in
+    ``evaluation`` until the budget runs out."""
+    ui = _smart_seeding_ui(seed_during_wait=True)
+    ui.smart_approval_wait_seconds = 5.0
+    first, second = _pending_item("c1"), _pending_item("c2")
+    published = _stamp_publisher(ui, [first, second])
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]  # c2 never arrives
+
+    started = time.monotonic()
+    # The person outlasts the 5 s wait, so a missing early stop fails the
+    # timing below instead of parking the gate on its hour-long human wait.
+    approved, _feedback = _run_gate(ui, [first, second], {}, deadline=10.0)
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5  # well inside the 5 s wait
+    assert published == [("evaluation", False), ("attention", False)]
+
+
+@pytest.mark.parametrize("outcome", ["already_approved", "already_ruled_out"])
+def test_a_batch_already_decided_never_enters_evaluation(outcome: str) -> None:
+    """Verdicts that are in before the wait starts (a fast or failing judge)
+    leave nothing to wait for: no ``evaluation`` flash, straight to the
+    outcome."""
+    ui = _smart_seeding_ui()  # verdicts land right after the purge, pre-wait
+    ui.smart_approval_wait_seconds = 5.0
+    if outcome == "already_approved":
+        items = [_pending_item("c1")]
+        ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+    else:
+        items = [_pending_item("c1"), _pending_item("c2")]  # c2 never arrives
+        ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+    published = _stamp_publisher(ui, items)
+
+    started = time.monotonic()
+    approved, _feedback = _run_gate(ui, items, {}, deadline=10.0)
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5
+    if outcome == "already_approved":
+        assert published == []
+        assert items[0]["auto_approve_reason"] == "smart_approval"
+    else:
+        assert published == [("attention", False)]
+
+
+@pytest.mark.parametrize("call_ids", [("c1",), ("c1", "c2")])
+def test_a_stale_generation_verdict_does_not_end_the_wait(call_ids: tuple[str, ...]) -> None:
+    """A verdict left by an earlier judge generation (a provider reusing
+    call_ids) is not this batch's: it must neither stop the wait early nor
+    count as delivered, since this generation's verdict for that call could
+    still approve.  (No verdict of this generation ever arrives, so only a
+    stale verdict could end the wait before the budget.)"""
+    ui = _smart_seeding_ui()
+    ui.smart_approval_wait_seconds = 0.3
+    generation = threading.Event()
+    items = [_pending_item(cid) for cid in call_ids]
+    for item in items:
+        item["_judge_event"] = generation
+    ui.seed_judge_event = threading.Event()  # an earlier generation
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+    published = _stamp_publisher(ui, items)
+
+    started = time.monotonic()
+    approved, _feedback = _run_gate(ui, items, {})
+
+    assert approved is True
+    assert time.monotonic() - started >= 0.3  # waited the full budget
+    assert published == [("evaluation", False), ("attention", False)]
+
+
+def test_this_generation_s_verdict_replaces_a_stale_one_and_approves() -> None:
+    """A stale verdict for a reused call_id holds the wait open; this
+    generation's verdict then lands, replaces it, and approves the batch with
+    no person."""
+    ui = _smart_seeding_ui()
+    ui.smart_approval_wait_seconds = 5.0
+    generation = threading.Event()
+    item = _pending_item("c1")
+    item["_judge_event"] = generation
+    ui.seed_judge_event = threading.Event()  # an earlier generation, pre-wait
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+    published = _stamp_publisher(ui, [item])
+
+    def _own_verdict_once_parked() -> None:
+        if ui._parked.wait(timeout=5.0):
+            ui.on_intent_verdict(
+                _llm_verdict("c1", recommendation="approve", confidence=0.99),
+                judge_event=generation,
+            )
+
+    judge = threading.Thread(target=_own_verdict_once_parked, name="own-judge")
+    judge.start()
+    started = time.monotonic()
+    try:
+        approved, _feedback = _run_gate(ui, [item], {})
+    finally:
+        judge.join()
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5
+    assert item["auto_approve_reason"] == "smart_approval"
+    assert published == [("evaluation", False)]
+
+
+def test_refused_state_publication_stops_the_gate() -> None:
+    """The session's publisher raises when the batch's generation moved on:
+    the gate stops there, before the judge wait blocks and with no card."""
+    from turnstone.core.session import GenerationCancelled
+
+    ui = _smart_seeding_ui()
+    ui.smart_approval_wait_seconds = 5.0
+    item = _pending_item("c1")  # no verdict ever arrives: the wait would block
+
+    def _refuse(_state: str) -> None:
+        raise GenerationCancelled()
+
+    item["_publish_gate_state"] = _refuse
+    started = time.monotonic()
+    with (
+        _patch_get_storage(MagicMock()),
+        _patch_policies({}),
+        pytest.raises(GenerationCancelled),
+    ):
+        ui.approve_tools([item])
+
+    assert time.monotonic() - started < 2.5  # it never parked in the wait
+    assert ui._approval_cycles == {}
+
+
+def test_smart_approval_respects_heuristic_deny_floor() -> None:
+    """A high-confidence LLM ``approve`` must NOT override a deterministic
+    heuristic ``deny`` — the LLM may escalate the heuristic but never lower
+    it.  The call reaches a human."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    item["_heuristic_verdict"]["recommendation"] = "deny"
+    item["_heuristic_verdict"]["risk_level"] = "critical"
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=1.0)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+    assert item["needs_approval"] is True
+
+
+def test_smart_approval_respects_heuristic_critical_floor() -> None:
+    """A heuristic ``critical`` risk_level blocks smart approval even when
+    the heuristic recommendation itself isn't ``deny``."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    item["_heuristic_verdict"]["recommendation"] = "review"
+    item["_heuristic_verdict"]["risk_level"] = "critical"
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=1.0)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+
+
+def test_smart_approval_skips_oversized_batch() -> None:
+    """A batch with more calls than the FIFO verdict-cache cap can't be
+    reliably awaited (older verdicts evict before the wait sees them all),
+    so the whole batch reaches a human rather than stalling on the wait."""
+    ui = _smart_ui()
+    n = ui._LLM_VERDICT_CACHE_MAX + 1
+    items = [_pending_item(f"c{i}") for i in range(n)]
+    for i in range(n):
+        ui._llm_verdicts[f"c{i}"] = _llm_verdict(f"c{i}", recommendation="approve", confidence=1.0)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals(items)
+    assert remaining == items  # none auto-approved
+    assert all(it.get("auto_approved") is not True for it in items)
+
+
+def test_replay_pending_verdicts_reemits_cached_verdicts() -> None:
+    """The streaming-fix helper re-fans-out each pending call's cached LLM
+    verdict as an intent_verdict event."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="review", confidence=0.9)
+    lq = ui._register_listener()
+    ui._replay_pending_verdicts([item])
+    intent_events = []
+    while True:
+        try:
+            ev = lq.get_nowait()
+        except queue.Empty:
+            break
+        if ev.get("type") == "intent_verdict":
+            intent_events.append(ev)
+    assert len(intent_events) == 1
+    assert intent_events[0]["call_id"] == "c1"
+    assert intent_events[0]["recommendation"] == "review"
+
+
+def test_approve_tools_reemits_verdict_after_card_on_held_batch() -> None:
+    """Streaming regression fix: when Smart Approvals holds a batch (e.g. a
+    review verdict), the approve_request card is FOLLOWED by a re-emitted
+    intent_verdict so the live chip updates without a browser reload."""
+    storage = MagicMock()
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    item = _pending_item("c1")
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review", confidence=0.99)]
+    lq = ui._register_listener()
+    timer = resolve_when_pending(ui, False, "no")
+    timer.start()
+    try:
+        with _patch_get_storage(storage), _patch_policies({}):
+            ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    events = []
+    while True:
+        try:
+            events.append(lq.get_nowait())
+        except queue.Empty:
+            break
+    types = [e.get("type") for e in events]
+    assert "approve_request" in types
+    # An intent_verdict is re-emitted AFTER the card (the live chip update).
+    ar = types.index("approve_request")
+    assert "intent_verdict" in types[ar + 1 :]
+    # The wait already collected the verdict, so the card must not claim the
+    # judge is still working — no spurious "judge pending" spinner / poll.
+    assert events[ar].get("judge_pending") is False
+
+
+def test_judge_pending_true_when_llm_verdict_not_yet_cached() -> None:
+    """Normal async flow (Smart Approvals off): a judged call whose LLM
+    verdict hasn't arrived yet → approve_request reports judge_pending=True."""
+    ui = _make_ui()  # smart_approvals_enabled defaults False
+    item = _pending_item("c1")  # carries _heuristic_verdict, no cached LLM verdict
+    lq = ui._register_listener()
+    timer = resolve_when_pending(ui, True, "ok")
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies({}):
+            ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    reqs = [e for e in _drain(lq) if e.get("type") == "approve_request"]
+    assert reqs and reqs[0]["judge_pending"] is True
+
+
+def test_auto_approve_reason_vocabulary_matches_js() -> None:
+    """AutoApproveReason.ALL must stay in lockstep with the JS
+    KNOWN_AUTO_APPROVE_REASONS set — a server-sent reason missing from the JS
+    set degrades to the 'unknown' pill on the coordinator tree."""
+    import re
+    from pathlib import Path
+
+    from turnstone.core.session_ui_base import AutoApproveReason
+
+    js = Path(__file__).resolve().parents[1] / "turnstone/console/static/coordinator/coordinator.js"
+    m = re.search(
+        r"KNOWN_AUTO_APPROVE_REASONS\s*=\s*new Set\(\s*\[(.*?)\]",
+        js.read_text(),
+        re.S,
+    )
+    assert m, "KNOWN_AUTO_APPROVE_REASONS set not found in coordinator.js"
+    js_reasons = set(re.findall(r'"([^"]+)"', m.group(1)))
+    assert js_reasons == AutoApproveReason.ALL
+    # ...and ALL names every reason the class defines.
+    defined = {
+        value
+        for name, value in vars(AutoApproveReason).items()
+        if name.isupper() and isinstance(value, str)
+    }
+    assert defined == AutoApproveReason.ALL
+
+
+def test_verdict_confidence_rejects_non_finite() -> None:
+    """NaN/inf confidence is treated as malformed (0.0), not clamped to 1.0."""
+    assert _ConcreteUI._verdict_confidence({"confidence": float("nan")}) == 0.0
+    assert _ConcreteUI._verdict_confidence({"confidence": float("inf")}) == 0.0
+    assert _ConcreteUI._verdict_confidence({"confidence": 0.97}) == 0.97
+
+
+def test_smart_approval_holds_nan_confidence() -> None:
+    """A NaN confidence (json.loads accepts NaN) must NOT clear the
+    auto-approve bar even with recommendation=approve."""
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=float("nan"))
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+
+
+def test_smart_approval_holds_batch_with_duplicate_call_ids() -> None:
+    """Two pending calls sharing a call_id (some local models emit duplicate
+    non-empty ids) must not both be cleared by the single shared verdict —
+    hold the whole batch."""
+    ui = _smart_ui()
+    a = _pending_item("dup")
+    b = _pending_item("dup")  # same call_id, distinct call
+    ui._llm_verdicts["dup"] = _llm_verdict("dup", recommendation="approve", confidence=0.99)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([a, b])
+    assert remaining == [a, b]
+    assert a.get("auto_approved") is not True
+
+
+def test_on_intent_verdict_skips_park_for_already_finalized_verdict() -> None:
+    """Guards the audit-corruption race: a verdict already stamped with a
+    final user_decision (e.g. ``_finalize_smart_verdicts`` ran between this
+    verdict's notify and its park) is NOT parked on its owning cycle,
+    so that cycle's resolve_approval can't overwrite the audit row."""
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"])
+    verdict = {"verdict_id": "v1", "call_id": "c1", "user_decision": "smart_approval"}
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict(verdict)
+    assert cycle.pending_verdicts == []
+    assert ui._llm_verdicts["c1"]["user_decision"] == "smart_approval"
+
+
+# ---------------------------------------------------------------------------
+# Early-paint (tool_pending) — render the batch before the judge / gate
+# ---------------------------------------------------------------------------
+
+
+def test_tool_pending_is_first_event_and_precedes_tool_info() -> None:
+    """``approve_tools`` emits ``tool_pending`` as its very first event,
+    before the auto-approve fall-through emits ``tool_info`` — so the UI
+    paints the pending call the instant it lands, not only once the gate
+    resolves.  The payload carries the serialised items (keyed by call_id)
+    that the later ``tool_info`` / ``approve_request`` upgrades in place."""
+    ui = _make_ui()
+    lq = ui._register_listener()
+    with _patch_get_storage(MagicMock()):
+        # needs_approval=False → auto fall-through, no human block.
+        ui.approve_tools([{"call_id": "c1", "func_name": "ls", "needs_approval": False}])
+    events = _drain(lq)
+    types = [e["type"] for e in events]
+    assert types[0] == "tool_pending", types
+    assert "tool_info" in types
+    assert types.index("tool_pending") < types.index("tool_info")
+    assert events[0]["items"][0]["call_id"] == "c1"
+
+
+def test_tool_pending_precedes_smart_approval_gate() -> None:
+    """Regression for the #621 block: pre-fix the Smart Approvals verdict
+    wait sat AHEAD of the card emit, so nothing painted until the judge
+    ruled.  The announce now fires at the top of ``approve_tools`` — already
+    on the wire by the time the gate runs — and carries the heuristic
+    verdict attached before the gate."""
+    ui = _smart_ui()
+    lq = ui._register_listener()
+    captured: list[str] = []
+
+    def _spy(
+        pending: list[dict[str, Any]],
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        # Snapshot what the UI has already been told at gate-entry.
+        captured.extend(e["type"] for e in _drain(lq))
+        return []  # simulate the gate clearing the whole batch (no human, no wait)
+
+    with patch.object(ui, "_apply_smart_approvals", side_effect=_spy), _patch_get_storage(None):
+        approved, _feedback = ui.approve_tools([_pending_item("c1")])
+
+    assert approved is True
+    assert captured and captured[0] == "tool_pending", captured
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent step tagging (task_agent child events nest under the parent card)
+# ---------------------------------------------------------------------------
+
+
+class TestAgentChildTagging:
+    """``note_agent_child`` makes ``_enqueue`` stamp ``parent_call_id`` on a
+    sub-tool's events so the UI can nest a task agent's steps under its card.
+    Keyed on the immutable child call_id (correct under the parent's parallel
+    tool pool); cleared when the task agent finishes."""
+
+    def test_registered_child_event_is_stamped(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "child-1", "name": "bash", "output": "ok"})
+        assert lq.get_nowait()["parent_call_id"] == "task-A"
+
+    def test_unregistered_call_id_is_not_stamped(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "other", "name": "x", "output": "y"})
+        assert "parent_call_id" not in lq.get_nowait()
+
+    def test_no_registry_no_stamp(self) -> None:
+        """Empty registry short-circuits — events pass through untouched."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui._enqueue({"type": "tool_result", "call_id": "child-1", "name": "x", "output": "y"})
+        assert "parent_call_id" not in lq.get_nowait()
+
+    def test_items_payload_is_stamped_per_entry(self) -> None:
+        """approve_request / tool_pending carry an ``items`` list; each child
+        entry is tagged independently, leaving non-child entries alone."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui._enqueue(
+            {
+                "type": "tool_pending",
+                "items": [
+                    {"call_id": "child-1", "func_name": "bash"},
+                    {"call_id": "top-level", "func_name": "search"},
+                ],
+            }
+        )
+        items = lq.get_nowait()["items"]
+        assert items[0]["parent_call_id"] == "task-A"
+        assert "parent_call_id" not in items[1]
+
+    def test_clear_agent_children_stops_stamping(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui.clear_agent_children("task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "child-1", "name": "x", "output": "y"})
+        assert "parent_call_id" not in lq.get_nowait()
+
+    def test_clear_is_scoped_to_one_parent(self) -> None:
+        """Two task agents in flight: clearing one leaves the other's children
+        tagged — the parallel-pool invariant."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-A", "task-A")
+        ui.note_agent_child("child-B", "task-B")
+        ui.clear_agent_children("task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "child-B", "name": "x", "output": "y"})
+        assert lq.get_nowait()["parent_call_id"] == "task-B"
+
+
+class TestAgentContextSnapshots:
+    """Running task-agent usage is live fan-out plus a reconnect snapshot."""
+
+    def test_live_event_and_fresh_snapshot_share_one_shape(self) -> None:
+        ui = _make_ui()
+        listener = ui._register_listener()
+
+        ui.on_agent_context("task-A", 41_000, 128_000, generation=7)
+
+        event = listener.get_nowait()
+        assert event == {
+            "type": "agent_context",
+            "ws_id": "ws-1",
+            "parent_call_id": "task-A",
+            "prompt_tokens": 41_000,
+            "context_window": 128_000,
+            "_event_id": 1,
+        }
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        assert snapshot["agent_contexts"] == [
+            {
+                "type": "agent_context",
+                "ws_id": "ws-1",
+                "parent_call_id": "task-A",
+                "prompt_tokens": 41_000,
+                "context_window": 128_000,
+            }
+        ]
+
+    def test_parallel_agents_keep_independent_latest_readings(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("task-A", 10, 100, generation=3)
+        ui.on_agent_context("task-B", 70, 200, generation=3)
+        ui.on_agent_context("task-A", 80, 100, generation=3)
+
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        readings = {event["parent_call_id"]: event for event in snapshot["agent_contexts"]}
+        assert readings["task-A"]["prompt_tokens"] == 80
+        assert readings["task-B"]["prompt_tokens"] == 70
+
+    def test_clear_and_overwrite_are_generation_scoped(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("reused", 10, 100, generation=4)
+        ui.on_agent_context("reused", 20, 100, generation=5)
+
+        # The retiring predecessor can neither overwrite nor clear generation 5.
+        ui.on_agent_context("reused", 99, 100, generation=4)
+        ui.clear_agent_transients("reused", generation=4)
+        assert ui._snapshot_agent_contexts()[0]["prompt_tokens"] == 20
+
+        ui.clear_agent_transients("reused", generation=5)
+        assert ui._snapshot_agent_contexts() == []
+
+    def test_force_cutoff_clears_only_retired_generations(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("old-A", 10, 100, generation=4)
+        ui.on_agent_context("old-B", 20, 100, generation=4)
+        ui.on_agent_context("successor", 30, 100, generation=5)
+
+        ui.clear_agent_transients_before_generation(5)
+
+        readings = ui._snapshot_agent_contexts()
+        assert [event["parent_call_id"] for event in readings] == ["successor"]
+
+    def test_replay_registration_captures_active_contexts(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("task-A", 10, 100, generation=1)
+
+        _, _events, status, _lost, _earliest, snapshot = ui.register_listener_with_replay(-1)
+
+        assert status == "truncated"
+        assert snapshot["agent_contexts"][0]["parent_call_id"] == "task-A"
+
+    def test_store_before_enqueue_closes_registration_loss_window(self) -> None:
+        """A subscriber in the store/enqueue gap gets snapshot and live copies.
+
+        Duplicate delivery is intentional and harmless because ``agent_context``
+        is a keyed replacement event. Missing both copies would strand a
+        refreshed badge until the task agent made another model call.
+        """
+        ui = _make_ui()
+        stored = threading.Event()
+        release = threading.Event()
+        original_enqueue = ui._enqueue
+
+        def blocked_enqueue(event: dict[str, Any]) -> int:
+            stored.set()
+            assert release.wait(timeout=2)
+            return original_enqueue(event)
+
+        with patch.object(ui, "_enqueue", side_effect=blocked_enqueue):
+            writer = threading.Thread(
+                target=ui.on_agent_context,
+                args=("task-A", 50, 100),
+                kwargs={"generation": 2},
+            )
+            writer.start()
+            try:
+                assert stored.wait(timeout=2)
+                listener, snapshot = ui.register_listener_with_in_progress_snapshot()
+                assert snapshot["agent_contexts"][0]["prompt_tokens"] == 50
+            finally:
+                release.set()
+                writer.join(timeout=2)
+
+        assert not writer.is_alive()
+        assert listener.get_nowait()["type"] == "agent_context"
+
+
+class TestAgentCompactionSnapshots:
+    """Task compaction is nested transient state, never foreground activity."""
+
+    def test_live_progress_snapshots_and_end_clears_without_activity_latch(self) -> None:
+        ui = _make_ui()
+        listener = ui._register_listener()
+        ui._ws_current_activity = "Running tool: task_agent"
+        ui._ws_activity_state = "tool"
+
+        ui.on_compaction(
+            {
+                "phase": "start",
+                "trigger": "auto",
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "_generation": 7,
+            }
+        )
+        start = listener.get_nowait()
+        assert start["target"] == "task_agent"
+        assert start["parent_call_id"] == "task-A"
+        assert "_generation" not in start
+        assert ui._ws_current_activity == "Running tool: task_agent"
+        assert ui._ws_activity_state == "tool"
+        assert ui._compaction_activity_live is False
+
+        ui.on_compaction(
+            {
+                "phase": "progress",
+                "part": 2,
+                "total": 3,
+                "depth": 0,
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "_generation": 7,
+            }
+        )
+        listener.get_nowait()
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        assert snapshot["agent_compactions"] == [
+            {
+                "type": "compaction",
+                "phase": "progress",
+                "part": 2,
+                "total": 3,
+                "depth": 0,
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "ws_id": "ws-1",
+            }
+        ]
+
+        ui.on_compaction(
+            {
+                "phase": "end",
+                "ok": True,
+                "trigger": "auto",
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "_generation": 7,
+            }
+        )
+        end = listener.get_nowait()
+        assert end["superseded"] is False
+        assert ui._snapshot_agent_compactions() == []
+
+    def test_agent_scope_allows_targeted_event_but_still_drops_workstream_event(self) -> None:
+        ui = _make_ui()
+        listener = ui._register_listener()
+        ui.begin_agent_scope()
+        try:
+            ui.on_compaction(
+                {
+                    "phase": "start",
+                    "trigger": "auto",
+                    "target": "task_agent",
+                    "parent_call_id": "task-A",
+                    "compaction_id": 1,
+                    "_generation": 2,
+                }
+            )
+            ui.on_compaction(
+                {
+                    "phase": "start",
+                    "trigger": "auto",
+                    "target": "workstream",
+                    "compaction_id": 2,
+                }
+            )
+        finally:
+            ui.end_agent_scope()
+
+        assert listener.get_nowait()["target"] == "task_agent"
+        assert listener.empty()
+
+    def test_generation_cleanup_cannot_remove_successor_snapshot(self) -> None:
+        ui = _make_ui()
+        for generation, compaction_id in ((4, 1), (5, 2)):
+            ui.on_compaction(
+                {
+                    "phase": "start",
+                    "trigger": "auto",
+                    "target": "task_agent",
+                    "parent_call_id": "reused",
+                    "compaction_id": compaction_id,
+                    "_generation": generation,
+                }
+            )
+
+        ui.clear_agent_transients("reused", generation=4)
+        assert ui._snapshot_agent_compactions()[0]["compaction_id"] == 2
+        ui.clear_agent_transients_before_generation(5)
+        assert ui._snapshot_agent_compactions()[0]["compaction_id"] == 2
+        ui.clear_agent_transients("reused", generation=5)
+        assert ui._snapshot_agent_compactions() == []
+
+
+class TestAgentScopeInfoSuppression:
+    """While a task agent runs, its ``on_info`` progress chatter ("[task done] N
+    chars", a tool's "fetched N chars") carries no call_id, so it can't nest
+    under the task card.  The web pane drops it for the duration rather than let
+    it escape to the top level; the per-thread contextvar keeps it correct under
+    the parent's parallel task pool (siblings in other threads aren't suppressed)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_scope(self):
+        # The scope depth is a module-level contextvar that persists across tests
+        # in the same thread; reset it around each so an unbalanced test (or a
+        # leak from elsewhere) can't bleed suppression into another test.
+        from turnstone.core.session_ui_base import _agent_scope_var
+
+        token = _agent_scope_var.set(0)
+        yield
+        _agent_scope_var.reset(token)
+
+    def test_on_info_suppressed_within_scope(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.begin_agent_scope()
+        ui.on_info("fetched 5663 chars, extracting...")
+        ui.end_agent_scope()
+        assert lq.empty()
+
+    def test_on_info_passes_through_outside_scope(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.on_info("top-level status")
+        assert lq.get_nowait() == {
+            "type": "info",
+            "message": "top-level status",
+            "ws_id": "ws-1",
+            "_event_id": 1,
+        }
+
+    def test_nested_scopes_need_matching_exits(self) -> None:
+        """Parallel task agents: info stays suppressed until the LAST one
+        leaves (the depth returns to zero)."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.begin_agent_scope()
+        ui.begin_agent_scope()
+        ui.end_agent_scope()
+        ui.on_info("still inside a sibling task agent")
+        assert lq.empty()
+        ui.end_agent_scope()
+        ui.on_info("now top-level again")
+        assert lq.get_nowait()["message"] == "now top-level again"
+
+    def test_end_scope_floored_at_zero(self) -> None:
+        """An unmatched ``end_agent_scope`` can't drive the depth negative and
+        wedge suppression off."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.end_agent_scope()
+        ui.begin_agent_scope()
+        ui.on_info("suppressed")
+        assert lq.empty()
+
+
+class TestAgentTrajectoryStash:
+    """The recall store retains a finished task agent's projected sub-trajectory
+    keyed by call_id, LRU-bounded.  A miss is the honest "not retained" signal —
+    /history then renders the flat parent record, never a fabricated 0-step card."""
+
+    def test_stash_and_get_roundtrip(self) -> None:
+        ui = _make_ui()
+        steps = [
+            {"id": "t1::c1", "name": "search", "arguments": "{}", "output": "ok", "is_error": False}
+        ]
+        ui.stash_agent_trajectory("t1", steps)
+        assert ui.get_agent_trajectory("t1") == steps
+
+    def test_missing_returns_none(self) -> None:
+        assert _make_ui().get_agent_trajectory("nope") is None
+
+    def test_empty_call_id_ignored(self) -> None:
+        ui = _make_ui()
+        ui.stash_agent_trajectory("", [{"id": "x"}])
+        assert ui.get_agent_trajectory("") is None
+
+    def test_restash_updates_value(self) -> None:
+        ui = _make_ui()
+        ui.stash_agent_trajectory("k", [{"id": "v1"}])
+        ui.stash_agent_trajectory("k", [{"id": "v2"}])
+        assert ui.get_agent_trajectory("k") == [{"id": "v2"}]
+
+    def test_lru_evicts_oldest(self) -> None:
+        from turnstone.core.session_ui_base import _AGENT_TRAJECTORY_CAP
+
+        ui = _make_ui()
+        for i in range(_AGENT_TRAJECTORY_CAP + 3):
+            ui.stash_agent_trajectory(f"t{i}", [{"id": f"t{i}"}])
+        # The three oldest fell out → honest None; the newest is retained.
+        assert ui.get_agent_trajectory("t0") is None
+        assert ui.get_agent_trajectory("t2") is None
+        assert ui.get_agent_trajectory(f"t{_AGENT_TRAJECTORY_CAP + 2}") is not None
+
+    @staticmethod
+    def _steps(arguments: str) -> list[dict[str, Any]]:
+        return [{"id": "c", "name": "write_file", "arguments": arguments, "output": "ok"}]
+
+    def test_size_budget_evicts_the_oldest_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Steps keep whole arguments, so the store is bounded by its total UTF-8 text."""
+        monkeypatch.setattr("turnstone.core.session_ui_base._AGENT_TRAJECTORY_BUDGET_BYTES", 100)
+        ui = _make_ui()
+        # 40 bytes each: "c" + "write_file" + 27 bytes of arguments + "ok".
+        for call_id in ("a", "b", "c"):
+            ui.stash_agent_trajectory(call_id, self._steps("x" * 27))
+        assert ui.get_agent_trajectory("a") is None
+        assert ui.get_agent_trajectory("b") is not None
+        assert ui.get_agent_trajectory("c") is not None
+        assert ui._agent_trajectory_bytes == 80
+
+    def test_size_counts_utf8_bytes_and_restash_replaces_its_share(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("turnstone.core.session_ui_base._AGENT_TRAJECTORY_BUDGET_BYTES", 100)
+        ui = _make_ui()
+        ui.stash_agent_trajectory("a", self._steps("é" * 30))  # 60 bytes of arguments
+        assert ui._agent_trajectory_bytes == 13 + 60
+        ui.stash_agent_trajectory("a", self._steps("x"))
+        assert ui._agent_trajectory_bytes == 14
+        ui.stash_agent_trajectory("b", self._steps("x" * 70))
+        assert ui.get_agent_trajectory("a") is not None, "a smaller restash freed its old share"
+
+    def test_one_larger_than_the_budget_is_not_retained(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("turnstone.core.session_ui_base._AGENT_TRAJECTORY_BUDGET_BYTES", 100)
+        ui = _make_ui()
+        ui.stash_agent_trajectory("small", self._steps("x"))
+        ui.stash_agent_trajectory("small", self._steps("x" * 200))
+        ui.stash_agent_trajectory("huge", self._steps("x" * 200))
+        # Not retained is the honest unknown: the card renders the flat parent row.
+        assert ui.get_agent_trajectory("small") is None
+        assert ui.get_agent_trajectory("huge") is None
+        assert ui._agent_trajectory_bytes == 0
+
+    def test_the_budget_is_sixteen_mebibytes(self) -> None:
+        from turnstone.core.session_ui_base import _AGENT_TRAJECTORY_BUDGET_BYTES
+
+        assert _AGENT_TRAJECTORY_BUDGET_BYTES == 16 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Concurrent approval cycles — parallel task agents each run their own gate.
+# Regression matrix for the two 1.7 release blockers: cross-approval (one
+# click resolving every parked gate) and the lost-wakeup hang (a sibling's
+# gate entry eating a just-fired resolution).
+# ---------------------------------------------------------------------------
+
+
+_Spawn = Callable[[dict[str, Any]], tuple[threading.Thread, dict[str, Any]]]
+
+
+@contextlib.contextmanager
+def _gate_harness(ui: SessionUIBase) -> Iterator[_Spawn]:
+    """ONE storage/policy patch pair + spawn + guaranteed teardown for
+    concurrent ``approve_tools`` gates.
+
+    The patches are applied ONCE, on the calling thread, and cover every
+    spawned gate thread: ``mock.patch`` start/stop of the SAME target
+    from concurrent threads corrupts the patcher's restore stack — the
+    second stop can reinstall the first thread's mock as the "original",
+    leaking it into every later test in the process.
+
+    Teardown keeps sweeping ``resolve_all_approvals`` until every gate
+    thread has exited — a gate that registers its cycle after a single
+    sweep would otherwise park for the full approval timeout and trip
+    the conftest thread-leak guard.
+    """
+    threads: list[threading.Thread] = []
+
+    def spawn(item: dict[str, Any]) -> tuple[threading.Thread, dict[str, Any]]:
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            approved, feedback = ui.approve_tools([item])
+            box["approved"] = approved
+            box["feedback"] = feedback
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        threads.append(t)
+        return t, box
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        try:
+            yield spawn
+        finally:
+            stop = time.monotonic() + 5.0
+            while any(t.is_alive() for t in threads) and time.monotonic() < stop:
+                ui.resolve_all_approvals(False, "test teardown")
+                time.sleep(0.01)
+            for t in threads:
+                t.join(timeout=1.0)
+
+
+def _wait_for_cycles(ui: SessionUIBase, count: int, deadline: float = 5.0) -> None:
+    stop = time.monotonic() + deadline
+    while time.monotonic() < stop:
+        with ui._ws_lock:
+            if len(ui._approval_cycles) >= count:
+                return
+        time.sleep(0.005)
+    raise AssertionError(f"never saw {count} live cycles")
+
+
+def test_zero_approval_timeout_waits_until_explicit_resolution() -> None:
+    """The registry's zero sentinel reaches ``Event.wait`` as ``None``."""
+    ui = _make_ui()
+    item = _pending_item("no-timeout")
+    item["_approval_wait_seconds"] = None
+
+    with _gate_harness(ui) as spawn:
+        gate, outcome = spawn(item)
+        _wait_for_cycles(ui, 1)
+        assert gate.is_alive(), "zero was passed through as an immediate timeout"
+        assert ui.resolve_approval(True, "approved later", call_id="no-timeout") is not None
+        gate.join(timeout=2.0)
+
+    assert not gate.is_alive()
+    assert outcome == {"approved": True, "feedback": "approved later"}
+
+
+def test_hard_delete_terminal_barrier_wakes_unbounded_approval() -> None:
+    """The hard-delete barrier signals gates after advancing their witness."""
+    from tests._session_helpers import make_session
+    from turnstone.core.session import _ApprovalCancelWitness
+
+    session = make_session(ws_id="hard-delete-approval")
+    ui = session.ui
+    item = _pending_item("hard-delete-call")
+    item["_approval_cancel_witness"] = _ApprovalCancelWitness(session)
+    item["_approval_wait_seconds"] = None
+
+    with _gate_harness(ui) as spawn:
+        gate, outcome = spawn(item)
+        _wait_for_cycles(ui, 1)
+        session.shutdown_publication_and_drain_durability()
+        gate.join(timeout=2.0)
+
+    assert not gate.is_alive()
+    assert outcome == {"approved": False, "feedback": "Workstream closed"}
+    assert ui._approval_cycles == {}
+
+
+def test_finite_approval_timeout_uses_captured_batch_value() -> None:
+    """A positive setting retains passive denial and its exact audit text."""
+    ui = _make_ui()
+    item = _pending_item("finite-timeout")
+    item["_approval_wait_seconds"] = 0.01
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        approved, feedback = ui.approve_tools([item])
+
+    assert approved is False
+    assert feedback == "Approval timed out after 0.01s"
+    assert item["denied"] is True
+    assert item["denial_msg"] == "Denied by user: Approval timed out after 0.01s"
+    assert ui._recent_decisions["finite-timeout"] == ("timeout", None)
+
+
+def test_concurrent_gates_resolve_independently() -> None:
+    """THE cross-approval regression: two parallel gates, two separate
+    decisions.  Approving A's cycle must not wake B, and B's later
+    denial must reach B's thread — one click can no longer resolve
+    every parked batch with the same verdict."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        tb, box_b = spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        assert ui.resolve_approval(True, "run it", call_id="a-1") is not None
+        ta.join(timeout=5.0)
+        assert not ta.is_alive(), "A's gate did not wake on its own resolution"
+        # B is still parked — A's approval must NOT have leaked to it.
+        assert tb.is_alive(), "resolving A also unblocked B (cross-approval)"
+        assert box_a == {"approved": True, "feedback": "run it"}
+        assert ui.resolve_approval(False, "not this one", call_id="b-1") is not None
+        tb.join(timeout=5.0)
+        assert not tb.is_alive()
+        assert box_b["approved"] is False
+        assert box_b["feedback"] == "not this one"
+
+
+def test_always_grant_is_isolated_by_execution_principal() -> None:
+    ui = _make_ui()
+    seed = _register_cycle(ui, ["seed"], execution_principal_id="alice")
+    assert (
+        ui.resolve_approval(
+            True,
+            always=True,
+            cycle_id=seed.cycle_id,
+            resolver_principal_id="alice",
+        )
+        == seed.cycle_id
+    )
+
+    alice_item = _pending_item("alice-next")
+    alice_item["_principal_id"] = "alice"
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        assert ui.approve_tools([alice_item]) == (True, None)
+    assert alice_item["auto_approve_reason"] == "always"
+
+    bob_item = _pending_item("bob-next")
+    bob_item["_principal_id"] = "bob"
+    with _gate_harness(ui) as spawn:
+        bob_thread, bob_result = spawn(bob_item)
+        _wait_for_cycles(ui, 2)  # seed remains registered + Bob's live gate
+        assert bob_thread.is_alive()
+        assert ui.resolve_approval(False, call_id="bob-next") is not None
+        bob_thread.join(timeout=5.0)
+        assert bob_result["approved"] is False
+
+
+def test_sibling_gate_entry_cannot_eat_a_resolution() -> None:
+    """THE lost-wakeup regression: under the singleton event, sibling B
+    entering the gate ran ``event.clear()`` and could erase A's
+    just-fired resolution — A then parked for the full 3600s timeout
+    ("approval dialog stuck").  Per-cycle events make the interleaving
+    structurally impossible: A's resolution lands on A's OWN event, so
+    B's registration can't touch it."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        # Resolve A and IMMEDIATELY register sibling B — the old code's
+        # clear() window.  A must still return promptly.
+        ui.resolve_approval(True, None, call_id="a-1")
+        spawn(_pending_item("b-1"))
+        ta.join(timeout=5.0)
+        assert not ta.is_alive(), (
+            "A's gate lost its wakeup when sibling B entered — the singleton-event race is back"
+        )
+        assert box_a["approved"] is True
+
+
+def test_selectorless_resolve_hits_oldest_cycle() -> None:
+    """Legacy clients (CLI wrappers, channel adapters, old tabs) send no
+    selector — the decision lands on the OLDEST live cycle, matching
+    the order the prompts were issued."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        tb, _box_b = spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        ui.resolve_approval(True, "first in, first out")
+        ta.join(timeout=5.0)
+        assert not ta.is_alive(), "selector-less resolve missed the oldest cycle"
+        assert box_a["approved"] is True
+        assert tb.is_alive(), "selector-less resolve hit more than one cycle"
+
+
+def test_resolve_all_approvals_wakes_every_gate() -> None:
+    """The cancel/close sweep: every parked gate wakes with its own
+    denied result."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        tb, box_b = spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        assert ui.resolve_all_approvals(False, "Cancelled by user") == 2
+        ta.join(timeout=5.0)
+        tb.join(timeout=5.0)
+        assert box_a["approved"] is False
+        assert box_b["approved"] is False
+        assert "Cancelled by user" in (box_a["feedback"] or "")
+
+
+def test_resolve_all_approvals_stamps_authenticated_resolver() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    first = _register_cycle(ui, ["a-1"], execution_principal_id="alice")
+    second = _register_cycle(ui, ["b-1"], execution_principal_id="bob")
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v-a", "call_id": "a-1"})
+
+    with _patch_get_storage(storage):
+        assert (
+            ui.resolve_all_approvals(
+                False,
+                "Cancelled by user",
+                resolver_principal_id="operator",
+            )
+            == 2
+        )
+
+    assert first.resolver_principal_id == "operator"
+    assert second.resolver_principal_id == "operator"
+    storage.update_intent_verdict.assert_any_call(
+        "v-a",
+        user_decision="denied",
+        resolver_principal_id="operator",
+        execution_principal_id="alice",
+    )
+
+
+def test_resolve_all_continues_after_first_resolution_transport_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One broken transport mirror cannot strand sibling approval gates."""
+
+    ui = _make_ui()
+    first = _register_cycle(ui, ["transport-failure-first"])
+    second = _register_cycle(ui, ["transport-failure-second"])
+    broadcast = MagicMock(side_effect=[RuntimeError("transport unavailable"), None])
+    caplog.set_level("WARNING", logger="turnstone.core.session_ui_base")
+
+    with patch.object(ui, "_broadcast_approval_resolved", broadcast):
+        count = ui.resolve_all_approvals(False, "Cancelled by user")
+
+    assert count == 2
+    assert broadcast.call_count == 2
+    for cycle in (first, second):
+        assert cycle.resolved is True
+        assert cycle.result == (False, "Cancelled by user")
+        assert cycle.decision == "denied"
+        assert cycle.event.is_set()
+    assert ui.pending_approval_cards() == []
+    assert ui._pending_approval is None
+    assert any("approval.resolve_all.publish_failed" in record.message for record in caplog.records)
+
+
+def test_targeted_resolution_returns_claim_after_transport_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A claimed targeted decision survives its dismissal callback failing."""
+
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["targeted-transport-failure"])
+    caplog.set_level("WARNING", logger="turnstone.core.session_ui_base")
+
+    with patch.object(
+        ui,
+        "_broadcast_approval_resolved",
+        side_effect=RuntimeError("transport unavailable"),
+    ):
+        resolved = ui.resolve_approval(True, "approved", cycle_id=cycle.cycle_id)
+
+    assert resolved == cycle.cycle_id
+    assert cycle.resolved is True
+    assert cycle.result == (True, "approved")
+    assert cycle.decision == "approved"
+    assert cycle.event.is_set()
+    assert ui.pending_approval_cards() == []
+    assert ui._pending_approval is None
+    assert any("approval.resolve.publish_failed" in record.message for record in caplog.records)
+
+
+class _TestApprovalCancelWitness:
+    """Event-backed stand-in for a generation's private cancel witness."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+
+    @property
+    def aborted(self) -> bool:
+        return self.event.is_set()
+
+
+class _ApprovalSurfaceProbeUI(_ConcreteUI):
+    """Record cross-stream approval surfaces that the base leaves abstract."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.activity_updates: list[tuple[str, str]] = []
+        self.approval_requests: list[dict[str, Any]] = []
+        super().__init__(*args, **kwargs)
+
+    def _broadcast_activity(self) -> None:
+        self.activity_updates.append((self._ws_current_activity, self._ws_activity_state))
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+        self.approval_requests.append(dict(detail))
+
+
+class _BlockingApprovalPublicationUI(_ApprovalSurfaceProbeUI):
+    """Hold cross-stream prompt publication at a deterministic seam."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.prompt_broadcast_entered = threading.Event()
+        self.release_prompt_broadcast = threading.Event()
+        self.prompt_hook_took_ws_lock = False
+        self.cross_approval_events: list[tuple[str, str]] = []
+        super().__init__(*args, **kwargs)
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+        # Transport hooks may need a UI-state snapshot of their own.  A
+        # timeout keeps a lock-order regression from stranding the test
+        # process while still proving the hook runs outside ``_ws_lock``.
+        self.prompt_hook_took_ws_lock = self._ws_lock.acquire(timeout=1)
+        self.prompt_broadcast_entered.set()
+        if not self.prompt_hook_took_ws_lock:
+            return
+        self._ws_lock.release()
+        if not self.release_prompt_broadcast.wait(2):
+            raise RuntimeError("test did not release approval broadcast")
+        self.cross_approval_events.append(("approve_request", detail["cycle_id"]))
+        super()._broadcast_approve_request(detail)
+
+    def _broadcast_approval_resolved(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        always: bool = False,
+        cycle_id: str = "",
+        call_ids: tuple[str, ...] = (),
+    ) -> None:
+        del approved, feedback, always, call_ids
+        self.cross_approval_events.append(("approval_resolved", cycle_id))
+
+
+class _ObservedApprovalCondition(threading.Condition):
+    """Expose the instant a cancellation sweep waits for a live lease."""
+
+    def __init__(self) -> None:
+        super().__init__(threading.Lock())
+        self.sweep_waiting = threading.Event()
+
+    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+        self.sweep_waiting.set()
+        return super().wait_for(predicate, timeout)
+
+
+def test_cancel_sweep_resolves_aborted_predecessor_but_not_fresh_successor() -> None:
+    """A workstream sweep targets only cycles owned by the stopped run.
+
+    Force replacement can publish a successor cycle before the predecessor's
+    route-level approval sweep runs.  The predecessor's monotonic witness is
+    aborted; the successor's is fresh.  Resolving the former must not consume
+    the latter's prompt.
+    """
+
+    ui = _make_ui()
+    listener = ui._register_listener()
+    predecessor_witness = _TestApprovalCancelWitness()
+    successor_witness = _TestApprovalCancelWitness()
+    predecessor_witness.event.set()
+    predecessor = _register_cycle(
+        ui,
+        ["predecessor"],
+        cancel_witness=predecessor_witness,
+    )
+    successor = _register_cycle(
+        ui,
+        ["successor"],
+        cancel_witness=successor_witness,
+    )
+
+    assert ui.resolve_all_approvals(False, "Cancelled by user") == 1
+
+    assert predecessor.resolved is True
+    assert predecessor.result == (False, "Cancelled by user")
+    assert predecessor.event.is_set()
+    assert successor.resolved is False
+    assert successor.event.is_set() is False
+    assert ui.pending_approval_cards() == [successor.card]
+    assert ui._pending_approval == successor.card
+    assert _drain(listener) == [
+        {
+            "type": "approval_resolved",
+            "approved": False,
+            "feedback": "Cancelled by user",
+            "always": False,
+            "cycle_id": predecessor.cycle_id,
+            "call_ids": ["predecessor"],
+            "ws_id": "ws-1",
+            "_event_id": 1,
+        }
+    ]
+
+
+def test_fresh_successor_admission_waits_for_active_cancel_sweep() -> None:
+    """A successor waits behind Stop, then acquires a real admission lease.
+
+    The sweep is held draining one predecessor lease while the fresh successor
+    enters admission.  Its witness remains live, so it must wait for the sweep
+    to retire and proceed—not inherit the predecessor's cancellation result.
+    """
+
+    ui = _make_ui()
+    admission_cond = _ObservedApprovalCondition()
+    ui._approval_admission_cond = admission_cond
+    predecessor_witness = _TestApprovalCancelWitness()
+    successor_witness = _TestApprovalCancelWitness()
+    assert ui._begin_approval_admission(lambda: predecessor_witness.aborted)
+    predecessor_lease_held = True
+    predecessor_witness.event.set()
+
+    sweep: dict[str, Any] = {}
+    successor: dict[str, Any] = {}
+    successor_checked_witness = threading.Event()
+    successor_finished = threading.Event()
+
+    def _run_sweep() -> None:
+        try:
+            sweep["count"] = ui.resolve_all_approvals(False, "Cancelled by user")
+        except Exception as exc:  # pragma: no cover - surfaced below
+            sweep["error"] = exc
+
+    def _successor_cancelled() -> bool:
+        successor_checked_witness.set()
+        return successor_witness.aborted
+
+    def _run_successor() -> None:
+        admitted = False
+        try:
+            admitted = ui._begin_approval_admission(_successor_cancelled)
+            successor["admitted"] = admitted
+        except Exception as exc:  # pragma: no cover - surfaced below
+            successor["error"] = exc
+        finally:
+            if admitted:
+                ui._end_approval_admission()
+            successor_finished.set()
+
+    resolver = threading.Thread(target=_run_sweep, daemon=True)
+    successor_gate = threading.Thread(target=_run_successor, daemon=True)
+    successor_started = False
+    resolver.start()
+    try:
+        assert admission_cond.sweep_waiting.wait(2), "approval sweep did not begin draining"
+        successor_gate.start()
+        successor_started = True
+        assert successor_checked_witness.wait(2), "successor never reached admission"
+        assert not successor_finished.is_set(), "successor bypassed the active approval sweep"
+
+        ui._end_approval_admission()
+        predecessor_lease_held = False
+        resolver.join(2)
+        successor_gate.join(2)
+    finally:
+        if predecessor_lease_held:
+            ui._end_approval_admission()
+        resolver.join(2)
+        if successor_started:
+            successor_gate.join(2)
+
+    assert not resolver.is_alive()
+    assert not successor_gate.is_alive()
+    assert "error" not in sweep
+    assert "error" not in successor
+    assert sweep["count"] == 0
+    assert successor["admitted"] is True
+    assert ui._approval_sweeps == 0
+    assert ui._active_approval_admissions == 0
+
+
+def test_cancel_wakes_smart_approval_verdict_wait_without_publishing() -> None:
+    """One zero-cycle cancel sweep wakes a gate parked before registration.
+
+    Smart Approvals can spend the full judge timeout waiting for a verdict,
+    before any ``ApprovalCycle`` exists for ``resolve_all_approvals`` to see.
+    The sweep must still wake that real condition-variable wait once the
+    generation witness is aborted.  The retired gate then denies promptly and
+    publishes no approval, execution, activity, persistence, or auto-approval
+    state after cancellation.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = float(ui._APPROVAL_WAIT_TIMEOUT)
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("cancel-smart-wait")
+    item["_approval_cancel_witness"] = witness
+    waiting = threading.Event()
+    ui._verdict_cond = _ObservedVerdictCondition(ui._ws_lock, waiting)
+    storage = MagicMock()
+    outcome: dict[str, tuple[bool, str | None]] = {}
+    finished = threading.Event()
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        finally:
+            finished.set()
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    with _patch_get_storage(storage), _patch_policies({}):
+        gate.start()
+        try:
+            assert waiting.wait(2), "Smart Approval gate never entered its verdict wait"
+            # The early paint happened before cancellation.  Everything after
+            # this drain is attributable to the cancel race under test.
+            assert [event["type"] for event in _drain(listener)] == ["tool_pending"]
+            witness.event.set()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            assert finished.wait(2), "cancel did not wake the Smart Approval verdict wait"
+        finally:
+            if gate.is_alive():
+                # A broken implementation would otherwise retain this daemon
+                # in its production 3600-second wait for the rest of the run.
+                with ui._verdict_cond:
+                    ui._llm_verdicts[item["call_id"]] = _llm_verdict(item["call_id"])
+                    ui._verdict_cond.notify_all()
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert _drain(listener) == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    assert item.get("auto_approved") is not True
+    storage.create_intent_verdicts_bulk.assert_not_called()
+    storage.record_audit_event.assert_not_called()
+
+
+def test_cancelled_gate_cannot_cross_first_approval_publication() -> None:
+    """A retired gate blocked before its first publication stays invisible.
+
+    This pins the earliest practical entry seam: the old generation begins
+    approval work, blocks in the round purge before ``tool_pending``, then its
+    witness loses ownership.  The cancellation sweep must wait for that
+    admitted bundle to finish, then see zero cycles.  Releasing the old gate
+    must not let it paint a pending/info card, set activity, persist audit
+    state, or consume the blanket auto-approval configured below.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    admission_cond = _ObservedApprovalCondition()
+    ui._approval_admission_cond = admission_cond
+    ui.auto_approve = True
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("cancel-before-publish")
+    item["_approval_cancel_witness"] = witness
+    before_publish = threading.Event()
+    release_publish = threading.Event()
+    storage = MagicMock()
+    outcome: dict[str, tuple[bool, str | None]] = {}
+    sweep: dict[str, Any] = {}
+    sweep_started = threading.Event()
+    sweep_finished = threading.Event()
+
+    def _hold_before_publish(*_args: Any, **_kwargs: Any) -> None:
+        before_publish.set()
+        if not release_publish.wait(2):
+            raise RuntimeError("test did not release approval publication")
+
+    def _run_gate() -> None:
+        outcome["result"] = ui.approve_tools([item])
+
+    def _run_sweep() -> None:
+        sweep_started.set()
+        try:
+            sweep["count"] = ui.resolve_all_approvals(False, "Cancelled by user")
+        except Exception as exc:  # pragma: no cover - surfaced below
+            sweep["error"] = exc
+        finally:
+            sweep_finished.set()
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    resolver: threading.Thread | None = None
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({}),
+        patch.object(ui, "_purge_round_verdicts", side_effect=_hold_before_publish),
+    ):
+        gate.start()
+        try:
+            assert before_publish.wait(2), "approval gate never reached its entry seam"
+            witness.event.set()
+            resolver = threading.Thread(target=_run_sweep, daemon=True)
+            resolver.start()
+            assert sweep_started.wait(2)
+            assert admission_cond.sweep_waiting.wait(2), (
+                "approval sweep did not wait for the admitted purge"
+            )
+            assert not sweep_finished.is_set()
+            assert _drain(listener) == []
+
+            release_publish.set()
+            resolver.join(2)
+            gate.join(2)
+        finally:
+            release_publish.set()
+            if resolver is not None:
+                resolver.join(2)
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert resolver is not None and not resolver.is_alive()
+    assert "error" not in sweep
+    assert sweep["count"] == 0
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert _drain(listener) == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    assert item.get("auto_approved") is not True
+    assert item["needs_approval"] is True
+    storage.create_intent_verdicts_bulk.assert_not_called()
+    storage.record_audit_event.assert_not_called()
+
+
+def test_cancel_before_cycle_registration_cannot_lose_its_wakeup() -> None:
+    """A cancel sweep that wins the pre-registration window is witnessed.
+
+    The final-admission seam pins the gate at the last pre-registration boundary.
+    This is the precise route ordering that used to hang: mark the operation
+    cancelled, sweep zero live cycles, then let the gate continue.  The
+    witness must make it self-deny without a timeout or a second resolver
+    sweep; an early cancellation fence may now prevent registration entirely.
+    """
+
+    class _Witness:
+        def __init__(self) -> None:
+            self.event = threading.Event()
+
+        @property
+        def aborted(self) -> bool:
+            return self.event.is_set()
+
+    ui = _make_ui()
+    listener = ui._register_listener()
+    witness = _Witness()
+    item = _pending_item("cancel-gap")
+    item["_approval_cancel_witness"] = witness
+    before_register = threading.Event()
+    release_register = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    real_begin = ui._begin_approval_admission
+    begin_count = 0
+
+    def _hold_before_register(cancelled: Callable[[], bool]) -> bool:
+        nonlocal begin_count
+        begin_count += 1
+        # Entry purge, early tool paint, then the final manual transaction.
+        if begin_count == 3:
+            before_register.set()
+            if not release_register.wait(2):
+                raise RuntimeError("test did not release approval registration")
+        return real_begin(cancelled)
+
+    def _run_gate() -> None:
+        outcome["result"] = ui.approve_tools([item])
+
+    gate = threading.Thread(target=_run_gate)
+    with (
+        _patch_get_storage(MagicMock()),
+        _patch_policies({}),
+        patch.object(ui, "_begin_approval_admission", side_effect=_hold_before_register),
+    ):
+        gate.start()
+        try:
+            assert before_register.wait(2)
+            witness.event.set()
+            # This is the one route sweep.  It intentionally sees no cycle.
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            release_register.set()
+            gate.join(2)
+        finally:
+            release_register.set()
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert ui._approval_cycles == {}
+    events = _drain(listener)
+    assert "approve_request" not in [event["type"] for event in events]
+    assert "approval_resolved" not in [event["type"] for event in events]
+    # Private synchronization state never enters either wire projection.
+    assert all(
+        "_approval_cancel_witness" not in serialized
+        for event in events
+        for serialized in event.get("items", [])
+    )
+
+
+def test_cancel_after_smart_qualification_aborts_terminal_auto_commit() -> None:
+    """Smart qualification alone authorizes no mutation or side effect.
+
+    Hold the gate at its third admission (after the verdict qualified, before
+    the terminal auto-approval bundle), then let Stop win.  The prepared
+    commit closure must be discarded wholesale: the tool remains pending, the
+    cached verdict remains undecided, and no visible or durable auto-approval
+    surface advances.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    judge_event = threading.Event()
+    item = _pending_item("cancel-after-smart-qualification")
+    item["_approval_cancel_witness"] = witness
+    item["_judge_event"] = judge_event
+    verdict = _llm_verdict(item["call_id"], recommendation="approve", confidence=0.99)
+    ui._llm_verdicts[item["call_id"]] = verdict
+    ui._verdict_origins[item["call_id"]] = id(judge_event)
+
+    before_terminal_admission = threading.Event()
+    release_terminal_admission = threading.Event()
+    outcome: dict[str, Any] = {}
+    storage = MagicMock()
+    metric = MagicMock()
+    real_begin = ui._begin_approval_admission
+    begin_count = 0
+
+    def _hold_terminal_admission(cancelled: Callable[[], bool]) -> bool:
+        nonlocal begin_count
+        begin_count += 1
+        # Entry purge, early tool paint, then the terminal auto commit.
+        if begin_count == 3:
+            before_terminal_admission.set()
+            if not release_terminal_admission.wait(2):
+                raise RuntimeError("test did not release Smart Approval admission")
+        return real_begin(cancelled)
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({}),
+        patch.object(ui, "_begin_approval_admission", side_effect=_hold_terminal_admission),
+        patch.object(ui, "_record_judge_metric", metric),
+    ):
+        gate.start()
+        try:
+            assert before_terminal_admission.wait(2), (
+                "Smart Approval never reached its terminal admission"
+            )
+            assert [event["type"] for event in _drain(listener)] == ["tool_pending"]
+            witness.event.set()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            release_terminal_admission.set()
+            gate.join(2)
+        finally:
+            release_terminal_admission.set()
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert begin_count == 3
+    assert item["needs_approval"] is True
+    assert item.get("auto_approved") is not True
+    assert "auto_approve_reason" not in item
+    assert "_llm_verdict" not in item
+    assert "user_decision" not in verdict
+    assert _drain(listener) == []
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    metric.assert_not_called()
+    assert storage.method_calls == []
+
+
+def test_cancel_after_manual_preparation_aborts_terminal_prompt_commit() -> None:
+    """A prepared mixed manual batch stays invisible if Stop wins admission.
+
+    The policy-cleared sibling makes this the mixed-auto path.  Holding the
+    third admission occurs after local heuristic rows and the cycle/card have
+    been prepared, but before any shared state or UI is committed.  Stop must
+    leave no activity, live cycle, prompt, verdict persistence, metric, ring
+    entry, reason lookup, or mixed-auto audit behind.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    policy_item = _pending_item("cancel-mixed-policy", func_name="safe_tool")
+    manual_item = _pending_item("cancel-mixed-manual", func_name="bash")
+    for item in (policy_item, manual_item):
+        item["_approval_cancel_witness"] = witness
+
+    before_terminal_admission = threading.Event()
+    release_terminal_admission = threading.Event()
+    outcome: dict[str, Any] = {}
+    storage = MagicMock()
+    metric = MagicMock()
+    real_begin = ui._begin_approval_admission
+    begin_count = 0
+
+    def _hold_terminal_admission(cancelled: Callable[[], bool]) -> bool:
+        nonlocal begin_count
+        begin_count += 1
+        # Entry purge, early tool paint, then the terminal manual commit.
+        if begin_count == 3:
+            before_terminal_admission.set()
+            if not release_terminal_admission.wait(2):
+                raise RuntimeError("test did not release manual approval admission")
+        return real_begin(cancelled)
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([policy_item, manual_item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({"safe_tool": "allow"}),
+        patch.object(ui, "_begin_approval_admission", side_effect=_hold_terminal_admission),
+        patch.object(ui, "_record_judge_metric", metric),
+    ):
+        gate.start()
+        try:
+            assert before_terminal_admission.wait(2), (
+                "manual gate never reached its terminal admission"
+            )
+            assert [event["type"] for event in _drain(listener)] == ["tool_pending"]
+            witness.event.set()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            release_terminal_admission.set()
+            gate.join(2)
+        finally:
+            release_terminal_admission.set()
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert begin_count == 3
+    assert policy_item["auto_approved"] is True
+    assert policy_item["auto_approve_reason"] == "policy"
+    assert manual_item["needs_approval"] is True
+    assert "user_decision" not in policy_item["_heuristic_verdict"]
+    assert "user_decision" not in manual_item["_heuristic_verdict"]
+    assert _drain(listener) == []
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    metric.assert_not_called()
+    assert storage.method_calls == []
+
+
+def test_aborted_cycle_rejects_targeted_approve_then_sweep_denies() -> None:
+    """A stale targeted click cannot beat Stop after ownership is lost.
+
+    Publish one real cycle, abort its monotonic witness, and attempt the
+    targeted approval before the workstream sweep.  The click cannot claim
+    the cycle; the sweep is its sole resolver and both the UI event and durable
+    intent-verdict decision record denial.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("aborted-targeted-approve")
+    item["_approval_cancel_witness"] = witness
+    outcome: dict[str, Any] = {}
+    storage = MagicMock()
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    request: dict[str, Any] | None = None
+    with _patch_get_storage(storage), _patch_policies({}):
+        gate.start()
+        try:
+            while request is None:
+                try:
+                    event = listener.get(timeout=2)
+                except queue.Empty:
+                    pytest.fail("manual gate did not publish its approval request")
+                if event["type"] == "approve_request":
+                    request = event
+
+            witness.event.set()
+            assert ui.resolve_approval(True, cycle_id=request["cycle_id"]) is None
+            storage.update_intent_verdict.assert_not_called()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 1
+            gate.join(2)
+        finally:
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert item["denied"] is True
+    assert item["denial_msg"] == "Denied by user: Cancelled by user"
+    assert ui._recent_decisions[item["call_id"]][0] == "denied"
+    resolution = _drain(listener)
+    assert [event["type"] for event in resolution] == ["approval_resolved"]
+    assert resolution[0]["cycle_id"] == request["cycle_id"]
+    assert resolution[0]["approved"] is False
+    storage.upsert_intent_verdict.assert_called_once()
+    assert storage.upsert_intent_verdict.call_args.kwargs["user_decision"] == "denied"
+    storage.update_intent_verdict.assert_called_once_with(
+        item["_heuristic_verdict"]["verdict_id"],
+        user_decision="denied",
+    )
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+
+
+def test_cancel_resolution_waits_for_complete_prompt_publication() -> None:
+    """Stop cannot publish a resolution ahead of either prompt surface."""
+
+    ui = _BlockingApprovalPublicationUI(ws_id="ws-1", user_id="u1")
+    admission_cond = _ObservedApprovalCondition()
+    ui._approval_admission_cond = admission_cond
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("cancel-during-publish")
+    item["_approval_cancel_witness"] = witness
+    outcome: dict[str, Any] = {}
+    sweep: dict[str, Any] = {}
+    sweep_started = threading.Event()
+    sweep_finished = threading.Event()
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    def _run_sweep() -> None:
+        sweep_started.set()
+        try:
+            sweep["count"] = ui.resolve_all_approvals(False, "Cancelled by user")
+        except Exception as exc:  # pragma: no cover - surfaced below
+            sweep["error"] = exc
+        finally:
+            sweep_finished.set()
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    resolver: threading.Thread | None = None
+    with (
+        _patch_get_storage(MagicMock()),
+        _patch_policies({}),
+    ):
+        gate.start()
+        try:
+            assert ui.prompt_broadcast_entered.wait(2), "prompt broadcast was not reached"
+            assert ui.prompt_hook_took_ws_lock, "prompt hook ran while _ws_lock was held"
+
+            # The local prompt is already visible; hold the cross-stream hook
+            # open, mark this operation cancelled, and run the route's one
+            # workstream-wide approval sweep.
+            local_before_resolution = _drain(listener)
+            assert [event["type"] for event in local_before_resolution] == [
+                "tool_pending",
+                "approve_request",
+            ]
+            request = local_before_resolution[-1]
+            witness.event.set()
+            resolver = threading.Thread(target=_run_sweep, daemon=True)
+            resolver.start()
+
+            assert sweep_started.wait(2)
+            assert admission_cond.sweep_waiting.wait(2), (
+                "approval sweep did not wait for prompt admission"
+            )
+            assert not sweep_finished.is_set()
+            assert [card["cycle_id"] for card in ui.pending_approval_cards()] == [
+                request["cycle_id"]
+            ]
+
+            ui.release_prompt_broadcast.set()
+            resolver.join(2)
+            gate.join(2)
+        finally:
+            ui.release_prompt_broadcast.set()
+            if resolver is not None:
+                resolver.join(2)
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert resolver is not None and not resolver.is_alive()
+    assert "error" not in outcome
+    assert "error" not in sweep
+    assert sweep["count"] == 1
+    assert outcome["result"] == (False, "Cancelled by user")
+
+    local_resolution = _drain(listener)
+    assert [event["type"] for event in local_resolution] == ["approval_resolved"]
+    assert local_resolution[0]["cycle_id"] == request["cycle_id"]
+    assert ui.cross_approval_events == [
+        ("approve_request", request["cycle_id"]),
+        ("approval_resolved", request["cycle_id"]),
+    ]
+    assert ui.pending_approval_cards() == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+
+
+def test_resolve_all_approvals_noop_when_idle() -> None:
+    """Idle cancels stay silent — no stale approval_resolved broadcast."""
+    ui = _make_ui()
+    lq = ui._register_listener()
+    assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+    assert lq.empty()
+
+
+def test_double_resolution_is_a_guarded_noop() -> None:
+    """A second decision racing the first (two tabs, or timeout racing a
+    click) must not re-resolve, re-broadcast, or clobber the recorded
+    result."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        first = ui.resolve_approval(True, "yes", call_id="a-1")
+        second = ui.resolve_approval(False, "no", call_id="a-1")
+        assert first is not None
+        assert second is None
+        ta.join(timeout=5.0)
+        assert box_a == {"approved": True, "feedback": "yes"}
+
+
+def test_pending_cards_and_legacy_view_track_cycles() -> None:
+    """``pending_approval_cards`` lists every live cycle's card (SSE
+    replay repaints them all); the legacy ``_pending_approval`` view
+    tracks the OLDEST for boolean-ish consumers and rolls forward as
+    cycles resolve."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, _box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        cards = ui.pending_approval_cards()
+        assert [c["items"][0]["call_id"] for c in cards] == ["a-1", "b-1"]
+        assert ui._pending_approval is not None
+        assert ui._pending_approval["items"][0]["call_id"] == "a-1"
+        ui.resolve_approval(True, None, call_id="a-1")
+        ta.join(timeout=5.0)
+        # View rolls forward to the surviving cycle.
+        assert ui._pending_approval is not None
+        assert ui._pending_approval["items"][0]["call_id"] == "b-1"
+
+
+def test_stale_generation_verdict_cannot_touch_live_cycle() -> None:
+    """A prior turn's run-to-completion daemon delivering a reused
+    call_id must not satisfy the NEW cycle's wait: the delivery's
+    generation (its cancel event) is identity-checked against the
+    owning cycle's — mismatch persists for audit only, with no cache
+    write, no SSE, no park."""
+    storage = MagicMock()
+    ui = _make_ui()
+    fresh_gen = threading.Event()
+    stale_gen = threading.Event()
+    cycle = _register_cycle(ui, ["c-reused"], judge_event=fresh_gen)
+    lq = ui._register_listener()
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-stale", "call_id": "c-reused", "tier": "llm"},
+            judge_event=stale_gen,
+        )
+    assert "c-reused" not in ui._llm_verdicts
+    assert cycle.pending_verdicts == []
+    assert lq.empty()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
+    assert kwargs["user_decision"] == "superseded"
+    # The cycle's OWN generation delivers normally.
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-fresh", "call_id": "c-reused", "tier": "llm"},
+            judge_event=fresh_gen,
+        )
+    assert ui._llm_verdicts["c-reused"]["verdict_id"] == "v-fresh"
+    assert cycle.pending_verdicts and cycle.pending_verdicts[0]["verdict_id"] == "v-fresh"
+
+
+def test_resolved_reused_id_cycle_cannot_capture_successor_verdict() -> None:
+    """A resolved predecessor still awaiting unregister is not an owner.
+
+    Resolution wakes the gate before its thread unregisters the cycle.  A
+    parallel successor can register the same provider call id in that window;
+    its exact judge generation must bypass the older resolved entry and park
+    on the successor instead of being persisted as a stale verdict.
+    """
+    storage = MagicMock()
+    ui = _make_ui()
+    gen_a = threading.Event()
+    gen_b = threading.Event()
+    predecessor = _register_cycle(
+        ui,
+        ["c-reused"],
+        judge_event=gen_a,
+        cycle_id="cycle-predecessor",
+    )
+    with _patch_get_storage(storage):
+        assert ui.resolve_approval(True, cycle_id=predecessor.cycle_id) == predecessor.cycle_id
+    assert predecessor.resolved is True
+    # Deliberately leave the resolved cycle registered, matching the real
+    # resolve -> gate-thread-unregister scheduling window.
+    successor = _register_cycle(
+        ui,
+        ["c-reused"],
+        judge_event=gen_b,
+        cycle_id="cycle-successor",
+    )
+    verdict = {
+        "verdict_id": "v-successor",
+        "call_id": "c-reused",
+        "tier": "llm",
+    }
+
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(verdict, judge_event=gen_b)
+
+    assert ui._llm_verdicts["c-reused"] is verdict
+    assert predecessor.pending_verdicts == []
+    assert successor.pending_verdicts == [verdict]
+    assert storage.upsert_intent_verdict.call_args.kwargs["user_decision"] == "pending"
+
+
+def test_late_predecessor_verdict_cannot_park_on_reused_id_successor() -> None:
+    """Owner identity is revalidated after live verdict publication.
+
+    The predecessor owns the call at initial classification, then resolves and
+    a successor registers the same id while the verdict is between its cache
+    commit and final park.  The late predecessor verdict must take its own
+    recorded decision, never enter the successor's pending-verdict list.
+    """
+    storage = MagicMock()
+    ui = _make_ui()
+    gen_a = threading.Event()
+    gen_b = threading.Event()
+    predecessor = _register_cycle(
+        ui,
+        ["c-reused"],
+        judge_event=gen_a,
+        cycle_id="cycle-predecessor",
+    )
+    successor_box: list[Any] = []
+
+    def replace_owner(_verdict: dict[str, Any]) -> None:
+        assert ui.resolve_approval(True, cycle_id=predecessor.cycle_id) == predecessor.cycle_id
+        successor_box.append(
+            _register_cycle(
+                ui,
+                ["c-reused"],
+                judge_event=gen_b,
+                cycle_id="cycle-successor",
+            )
+        )
+
+    verdict = {
+        "verdict_id": "v-predecessor-late",
+        "call_id": "c-reused",
+        "tier": "llm",
+    }
+    with (
+        _patch_get_storage(storage),
+        patch.object(ui, "_broadcast_intent_verdict", side_effect=replace_owner),
+    ):
+        ui.on_intent_verdict(verdict, judge_event=gen_a)
+
+    successor = successor_box[0]
+    assert predecessor.resolved is True
+    assert successor.resolved is False
+    assert successor.pending_verdicts == []
+    storage.update_intent_verdict.assert_called_once_with(
+        "v-predecessor-late",
+        user_decision="approved",
+    )
+
+
+def test_smart_approval_rejects_stale_origin_verdict() -> None:
+    """Smart-Approvals qualification requires the cached verdict to have
+    been delivered by THIS batch's judge generation — a cached approve
+    of unknown/stale origin sends the batch to a human."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 0.05
+    fresh_gen = threading.Event()
+    item = _pending_item("c1")
+    item["_judge_event"] = fresh_gen
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    ui._verdict_origins["c1"] = id(object())  # a different generation delivered it
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+    # Same verdict with the RIGHT origin qualifies.
+    ui._verdict_origins["c1"] = id(fresh_gen)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == []
+    assert item["auto_approved"] is True
+
+
+def test_concurrent_smart_gate_and_human_gate() -> None:
+    """A smart-qualifying batch auto-approves while a sibling batch is
+    parked on a human — the sibling's cycle survives untouched (the old
+    whole-cache reset at gate entry wiped its verdicts mid-wait)."""
+    ui = _make_ui()
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    # Regression guard: if the smart batch ever falls through to the
+    # human gate (it runs on THIS thread), fail in seconds instead of
+    # hanging the suite for the full approval timeout.
+    ui._APPROVAL_WAIT_TIMEOUT = 10.0
+    with _gate_harness(ui) as spawn:
+        # Human-gated sibling parks first.
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        # Smart-qualifying batch flows straight through on this thread —
+        # its verdict was delivered by its OWN generation before the
+        # gate was entered, so the entry purge must spare it.
+        gen = threading.Event()
+        item = _pending_item("s-1")
+        item["_judge_event"] = gen
+        ui._llm_verdicts["s-1"] = _llm_verdict("s-1", recommendation="approve", confidence=0.99)
+        ui._verdict_origins["s-1"] = id(gen)
+        approved, _ = ui.approve_tools([item])
+        assert approved is True
+        assert item["auto_approved"] is True
+        # Sibling still parked, its cycle + verdict path intact.
+        assert ta.is_alive()
+        ui.resolve_approval(True, "ok", call_id="a-1")
+        ta.join(timeout=5.0)
+        assert box_a["approved"] is True
+
+
+def test_chat_session_stamps_live_approval_config_without_mutating_ui() -> None:
+    """Each batch captures Smart settings plus the current human deadline."""
+    from turnstone.core.judge import JudgeConfig
+    from turnstone.core.session import ChatSession
+
+    ui = _make_ui()
+    ui.smart_approvals_enabled = False
+    ui.smart_approval_threshold = 0.42
+    ui.smart_approval_wait_seconds = 7.0
+    session = MagicMock()
+    session.ui = ui
+    session._judge_cfg = JudgeConfig(
+        enabled=True,
+        smart_approvals=True,
+        confidence_threshold=0.87,
+        timeout=4.5,
+    )
+    session._config_store = MagicMock()
+    session._config_store.get.return_value = 0
+    session._approval_wait_seconds.side_effect = lambda: ChatSession._approval_wait_seconds(session)
+    items = [_pending_item("snapshot-a"), _pending_item("snapshot-b")]
+
+    ChatSession._push_smart_approval_config(session, items)
+
+    snapshot = items[0]["_smart_approval_config"]
+    assert snapshot == _SmartApprovalConfig(
+        enabled=True,
+        threshold=0.87,
+        wait_seconds=4.5,
+    )
+    assert items[1]["_smart_approval_config"] is snapshot
+    assert items[0]["_approval_wait_seconds"] is None
+    assert items[1]["_approval_wait_seconds"] is None
+
+    # A hot reload affects the next gate but cannot mutate this batch's
+    # already-captured immutable deadline.
+    session._config_store.get.return_value = 90_000
+    next_items = [_pending_item("snapshot-next")]
+    ChatSession._push_smart_approval_config(session, next_items)
+    assert next_items[0]["_approval_wait_seconds"] == 90_000.0
+    assert items[0]["_approval_wait_seconds"] is None
+    assert (
+        ui.smart_approvals_enabled,
+        ui.smart_approval_threshold,
+        ui.smart_approval_wait_seconds,
+    ) == (False, 0.42, 7.0)
+
+
+def test_concurrent_smart_gates_use_their_own_coherent_config_snapshots() -> None:
+    """Parallel gates cannot assemble a permissive config from two reloads.
+
+    Neither coherent configuration clears a 0.75 verdict: the old snapshot
+    disables Smart Approvals, while the new snapshot raises the threshold to
+    0.99.  Their torn combination (new enabled + old 0.50 threshold) would
+    auto-approve, so leave exactly that combination on the shared legacy UI
+    attributes while both gates run.  Each item must instead keep the snapshot
+    attached by its own preparation path and reach a human independently.
+    """
+    ui = _make_ui()
+    old_item = _pending_item("old-config")
+    new_item = _pending_item("new-config")
+    old_item["_smart_approval_config"] = _SmartApprovalConfig(
+        enabled=False,
+        threshold=0.50,
+        wait_seconds=0.0,
+    )
+    new_item["_smart_approval_config"] = _SmartApprovalConfig(
+        enabled=True,
+        threshold=0.99,
+        wait_seconds=0.0,
+    )
+
+    # Same-generation cached verdicts survive each gate's entry purge.  They
+    # qualify only under the impossible torn hybrid left on the shared UI.
+    for item in (old_item, new_item):
+        call_id = item["call_id"]
+        judge_event = threading.Event()
+        item["_judge_event"] = judge_event
+        ui._llm_verdicts[call_id] = _llm_verdict(call_id, confidence=0.75)
+        ui._verdict_origins[call_id] = id(judge_event)
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.50
+    ui.smart_approval_wait_seconds = 0.0
+
+    start = threading.Barrier(3)
+    outcomes: dict[str, tuple[bool, str | None]] = {}
+    listener = ui._register_listener()
+
+    def run_gate(item: dict[str, Any]) -> None:
+        start.wait()
+        outcomes[item["call_id"]] = ui.approve_tools([item])
+
+    threads = [
+        threading.Thread(target=run_gate, args=(item,), daemon=True)
+        for item in (old_item, new_item)
+    ]
+    storage = MagicMock()
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({}),
+    ):
+        for thread in threads:
+            thread.start()
+        start.wait()
+        try:
+            approval_cards: list[dict[str, Any]] = []
+            while len(approval_cards) < 2:
+                try:
+                    event = listener.get(timeout=2.0)
+                except queue.Empty:
+                    pytest.fail(
+                        "a gate auto-approved by combining enabled from the new config "
+                        "with threshold from the old config"
+                    )
+                if event["type"] == "approve_request":
+                    approval_cards.append(event)
+            assert {card["items"][0]["call_id"] for card in approval_cards} == {
+                "old-config",
+                "new-config",
+            }
+            assert old_item.get("auto_approved") is not True
+            assert new_item.get("auto_approved") is not True
+            assert old_item["needs_approval"] is True
+            assert new_item["needs_approval"] is True
+            assert ui.resolve_approval(False, "hold", call_id="old-config") is not None
+            assert ui.resolve_approval(False, "hold", call_id="new-config") is not None
+        finally:
+            ui.resolve_all_approvals(False, "test teardown")
+            for thread in threads:
+                thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes == {
+        "old-config": (False, "hold"),
+        "new-config": (False, "hold"),
+    }
+
+
+def test_purge_round_verdicts_keeps_entry_from_the_entering_generation() -> None:
+    """``keep_origin``: a verdict the entering batch's OWN judge spawn
+    already delivered survives the entry purge.  The judge daemon is
+    spawned before the gate is entered, so a fast judge can beat the
+    gate to the cache — evicting its verdict as if it were a prior
+    round's leftover stalled the Smart-Approvals wait to its full
+    budget and sent an already-cleared batch to a human.  Foreign
+    generations and prior-round decisions still purge."""
+    ui = _make_ui()
+    gen = threading.Event()
+    other_gen = threading.Event()
+    ui._llm_verdicts["c-own"] = {"verdict_id": "own"}
+    ui._verdict_origins["c-own"] = id(gen)
+    ui._llm_verdicts["c-foreign"] = {"verdict_id": "foreign"}
+    ui._verdict_origins["c-foreign"] = id(other_gen)
+    ui._recent_decisions["c-own"] = ("approved", None)
+    ui._purge_round_verdicts({"c-own", "c-foreign"}, keep_origin=gen)
+    assert ui._llm_verdicts.get("c-own") == {"verdict_id": "own"}
+    assert ui._verdict_origins.get("c-own") == id(gen)
+    assert "c-foreign" not in ui._llm_verdicts
+    assert "c-foreign" not in ui._verdict_origins
+    # Decisions never survive: this round has not been decided yet.
+    assert "c-own" not in ui._recent_decisions
+
+
+def test_smart_gate_uses_verdict_delivered_before_gate_entry() -> None:
+    """Production shape of the generation-aware purge: judge spawned
+    before the gate, verdict delivered before ``approve_tools`` runs.
+    The entry purge spares the same-generation verdict, so the smart
+    wait sees it immediately and the batch auto-approves without a
+    human prompt or a full-budget stall."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 3.0
+    # Regression guard: a purged verdict sends this batch to the human
+    # gate on THIS thread — bound the park so the test fails instead of
+    # hanging the suite.
+    ui._APPROVAL_WAIT_TIMEOUT = 1.0
+    gen = threading.Event()
+    item = _pending_item("s-1")
+    item["_judge_event"] = gen
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        # The "fast judge": delivery lands before the gate is entered.
+        ui.on_intent_verdict(_llm_verdict("s-1"), judge_event=gen)
+        approved, _feedback = ui.approve_tools([item])
+    assert approved is True, "entry purge evicted this batch's own pre-delivered verdict"
+    assert item["auto_approved"] is True
+
+
+def test_registration_evicts_stale_generation_window_arrival() -> None:
+    """A STALE generation delivering into the purge→register window
+    (the entry purge can't see arrivals that land during the policy
+    round-trip or the smart wait) must not blank the card's "judge
+    analysing" cue, be adopted into ``pending_verdicts`` for
+    decision-stamping, or linger in the replay cache once the cycle
+    registers."""
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    stale_gen = threading.Event()
+    fresh_gen = threading.Event()
+    # _SeedingUI re-delivers right after the entry purge — inside the
+    # purge→register window — tagged with the STALE generation.
+    ui.seed_verdicts = [_llm_verdict("w-1")]
+    ui.seed_judge_event = stale_gen
+    item = _pending_item("w-1")
+    item["_judge_event"] = fresh_gen
+    with _gate_harness(ui) as spawn:
+        _t, box = spawn(item)
+        _wait_for_cycles(ui, 1)
+        with ui._ws_lock:
+            cycle = next(iter(ui._approval_cycles.values()))
+        assert "w-1" not in ui._llm_verdicts, "stale window arrival survived registration"
+        assert "w-1" not in ui._verdict_origins
+        assert cycle.card["judge_pending"] is True, "stale verdict blanked the judge cue"
+        assert [v["verdict_id"] for v in cycle.pending_verdicts] == ["h-w-1"], (
+            "stale window arrival was adopted for decision-stamping"
+        )
+        ui.resolve_approval(True, None, call_id="w-1")
+    assert box["approved"] is True
+
+
+def test_late_stale_generation_verdict_stamps_superseded() -> None:
+    """A late verdict from generation A delivering AFTER its round
+    resolved — and after a reused call_id's round from generation B
+    also resolved — must not steal B's recorded decision.  Recorded
+    decisions are generation-tagged: a mismatched late delivery stamps
+    ``superseded`` (same vocabulary as the superseded persist path); a
+    same-generation late delivery still stamps the real decision."""
+    storage = MagicMock()
+    ui = _make_ui()
+    gen_a = threading.Event()
+    gen_b = threading.Event()
+    # Round B (reusing the call_id generation A once judged) resolves
+    # and its gate unregisters the cycle — the decision survives only
+    # in ``_recent_decisions``, tagged with B's generation.
+    cycle_b = _register_cycle(ui, ["c-reuse"], judge_event=gen_b)
+    with _patch_get_storage(storage):
+        ui.resolve_approval(True, None, call_id="c-reuse")
+    ui._unregister_approval_cycle(cycle_b)
+    assert ui._recent_decisions["c-reuse"] == ("approved", gen_b)
+    # Generation A's run-to-completion daemon delivers late — no live
+    # owner, and the decision on file belongs to B.
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-stale-late", "call_id": "c-reuse", "tier": "llm"},
+            judge_event=gen_a,
+        )
+    storage.update_intent_verdict.assert_any_call("v-stale-late", user_decision="superseded")
+    # B's own late delivery still stamps B's real decision.
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-b-late", "call_id": "c-reuse", "tier": "llm"},
+            judge_event=gen_b,
+        )
+    storage.update_intent_verdict.assert_any_call("v-b-late", user_decision="approved")

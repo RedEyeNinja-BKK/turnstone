@@ -1,0 +1,1322 @@
+# Tools Reference
+
+Turnstone exposes a role-specific built-in tool surface plus any configured MCP
+tools through provider-native or OpenAI-compatible function calling. Built-in
+schemas live under `turnstone/tools/` and are loaded by
+`turnstone/core/tools.py`; metadata selects the interactive, coordinator, and
+task-agent subsets. MCP tools are discovered from configured servers by
+`turnstone/core/mcp_client.py`.
+
+---
+
+## Tool Schema Format
+
+Each JSON file in `turnstone/tools/` contains a standard OpenAI function-calling
+schema plus turnstone-specific metadata keys:
+
+```json
+{
+  "name": "tool_name",
+  "description": "What the tool does.",
+  "parameters": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["param1"]
+  },
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "param1"
+}
+```
+
+**Metadata keys** (stripped before sending the schema to the model; the full
+set lives in `_META_KEYS` in `turnstone/core/tools.py`):
+
+| Key              | Type | Meaning |
+|------------------|------|---------|
+| `task_agent`     | bool | Tool is available to task sub-agents. |
+| `coordinator`    | bool | Tool is available to coordinator sessions. Without `interactive: true` alongside it, this reads as coord-only and the tool is stripped from interactive sessions. |
+| `interactive`    | bool | Opt a `coordinator: true` tool back into interactive sessions (dual-kind tools like `memory`). |
+| `auto_approve`   | bool | Tool runs without user confirmation (read-only, safe operations). |
+| `primary_key`    | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
+| `kind_variants`  | dict | Per-kind description / parameter-schema overlays so each session kind sees only the surface it can use (see `memory.json`). |
+| `cwd_note`       | str  | Sentence appended to the description at session build time with `{working_dir}` substituted — declare on tools whose semantics depend on the process working directory (see `bash.json`, `apply_cwd_context`). |
+| `workspace_note` | str  | Companion sentence naming the operator-configured workspace directory, `{workspace_dir}` substituted; dropped when no workspace is configured. |
+
+---
+
+## Derived Tool Sets
+
+`turnstone/core/tools.py` loads all JSON files and derives these collections:
+
+| Name                | Description |
+|---------------------|-------------|
+| `TOOLS`             | The complete loaded built-in union. Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
+| `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
+| `TASK_AUTO_TOOLS`   | Set of all tool names with `auto_approve: true` -- used by task-agent sub-sessions to skip confirmation for matching available tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of the built-in union. Used by tool search to distinguish built-ins from deferrable MCP tools. |
+| `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
+
+---
+
+## Execution Pipeline
+
+> See also: [Tool Pipeline diagram](diagrams/png/05-tool-pipeline.png)
+
+Tool handling spans a four-phase pipeline. `ChatSession._execute_tools()` owns
+prepare, approval, and execution (phases 1–3); after it returns, the owning
+conversation loop guards the observed results and folds them into the
+trajectory (phase 4).
+
+### Phase 1: Prepare
+
+`_prepare_tool(tc)` is called for each tool call returned by the model.
+
+- Parses the JSON arguments (with fallback for malformed JSON).
+- If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
+  to the correct parameter.
+- Dispatches to the matching `_prepare_{func_name}()` handler, the synthetic
+  `tool_search` fallback, or the generic `_prepare_mcp_tool()` handler.
+- Validates arguments and builds a preview dict containing:
+  - `call_id`, `func_name`, `header`, `preview` (for display)
+  - `needs_approval` (bool)
+  - `execute` (callable to run the tool)
+  - `error` (set if validation fails; tool will not execute)
+
+### Phase 2: Approve
+
+Prepared items are sent to the UI via `ui.approve_tools(items)`. Several
+parallel task agents may leave independent `ApprovalCycle` objects pending on
+one workstream; each round owns a `cycle_id`, event, result, and verdict set.
+Remote clients resolve the exact round by `cycle_id` (or a member `call_id`).
+
+- The UI displays each tool's header and preview to the user.
+- Items where `needs_approval` is `False` (auto-approved tools) are shown
+  but do not block execution.
+- Items where `needs_approval` is `True` require the user to accept or deny.
+- The user can provide feedback alongside their approval (e.g. "y, use full path").
+- Choosing "always" (key `a`) adds the pending tool names to `auto_approve_tools`,
+  so that specific tool type is auto-approved going forward (other tool types still
+  prompt). This is per-tool, not blanket.
+- If `auto_approve` is `True` on the session (via `--skip-permissions` or workstream
+  template), all tools are approved automatically.
+- When Smart Approvals are enabled, one immutable judge/settings snapshot is
+  stamped onto the whole batch. The batch auto-approves only when every gated
+  item has a qualifying verdict; partial or mixed qualification fails closed to
+  the human prompt. Stop is linearized against that terminal decision.
+
+### Phase 3: Execute
+
+Each item's `execute` callable is invoked:
+
+- Single tool calls run directly on the current thread.
+- Multiple tool calls run in parallel via `ThreadPoolExecutor(max_workers=4)`.
+- Errored or denied items return their error/denial message without executing.
+- The `bash` tool streams stdout incrementally: each line calls
+  `ui.on_tool_output_chunk(call_id, line)` as it is produced, then the final
+  combined output (stdout + stderr) is delivered via
+  `ui.on_tool_result(call_id, name, output, is_error=...)`.
+  The `call_id` links `tool_info`/`approve_request` items to their streaming chunks and
+  final result, enabling correct routing when multiple bash tools run in parallel.
+  The `is_error` flag is `True` when the tool execution failed (e.g. bash exit code >= 2
+  or signal, file not found, timeout). Exit code 1 is ambiguous and not flagged; user
+  denials are tracked separately. This removes the need for text-prefix heuristics.
+  Other tools deliver results atomically via
+  `ui.on_tool_result(call_id, name, output, is_error=...)` only.
+
+Stop propagates to child model scopes, judges, tracked subprocess groups, and
+the approval cycles owned by the cancelled operation. Calls that definitely
+never started receive `EffectStatus.none`; an interrupted call whose external
+outcome was not observed receives `unknown`, `partial`, or `rolled_back` as
+appropriate. These typed receipts preserve effect truth across storage/replay
+without exposing unreviewed model output as a tool result.
+
+### Phase 4: Guard and atomic fold
+
+After `_execute_tools()` returns, the main `send()` loop compacts/truncates
+completed results to the remaining shared budget and then runs the heuristic
+and optional LLM output guard. The task-agent loop deliberately guards the
+observed raw output before applying its size cap, so truncation cannot hide a
+sensitive result from that check. Both loops guard each text part a tool wrote
+into a list result; the only list result today, `read_file` on an image, holds
+just the framework's header, which is not guarded. Both follow a flagged
+result with the same `output_guard` advisory, appended after the step's
+complete tool-result block. The advisory is checked against the result as the
+model receives it: a result cut after the guard read it (the task agent's cap,
+which the guard reads past, or the main loop's re-cut of a result redaction
+made longer than its share) says the finding may concern the part that was
+cut, and keeps only the cited lines the cut left in place.
+
+After guard work, the owning loop rechecks generation ownership. On the main
+conversation path, one generation-fenced commit appends the complete
+tool-result block, advisories, feedback, and queued user turns; its durable
+records run in FIFO order outside the lifecycle lock. A force-cancelled
+predecessor can therefore finish external cleanup, but cannot fold late results
+into its successor's trajectory.
+---
+
+## Tool Approval Flow
+
+**Auto-approved** (no user confirmation needed at runtime):
+- `read_file` -- reads files, no side effects
+- `search` -- grep-style search, no side effects
+- `memory` -- structured persistent memory (save/get/search/delete/list)
+- `recall` -- searches conversation history
+- `notify` -- sends notifications to linked channels (time-sensitive, auto-approved for urgency)
+
+**Requires user confirmation** (write operations, network access, side effects):
+- `bash` -- arbitrary command execution
+- `write_file` -- creates or overwrites files
+- `edit_file` -- modifies file content
+- `web_fetch` -- fetches a URL (SSRF-protected, but makes network requests)
+- `web_search` -- web search via self-hosted SearxNG (makes network requests)
+- `task_agent` -- spawns an autonomous sub-agent
+- `open_preview` -- **URL targets only** (network access, gated like `web_fetch`);
+  file-path and `attachment:` targets are local reads and run unprompted like
+  `read_file`
+
+Note: The JSON schema metadata key `auto_approve` controls membership in
+`TASK_AUTO_TOOLS` (used for task agent sub-sessions). The actual runtime
+approval behavior is determined by the `needs_approval` field set in each
+`_prepare_*` method on `ChatSession`. These two mechanisms can differ.
+
+---
+
+## Primary Key Fallback
+
+When the model sends a bare string instead of a JSON object as tool arguments
+(common with smaller models), the `primary_key` mapping rescues the call:
+
+```
+Model sends:  bash("ls -la")
+              raw_args = "ls -la"   (not valid JSON)
+
+PRIMARY_KEY_MAP["bash"] = "command"
+Result:       args = {"command": "ls -la"}
+```
+
+Every tool defines a `primary_key`. The mapping is:
+
+| Tool         | primary_key |
+|--------------|-------------|
+| `bash`       | `command`   |
+| `read_file`  | `path`      |
+| `write_file` | `content`   |
+| `edit_file`  | `old_string`|
+| `search`     | `query`     |
+| `web_fetch`  | `url`       |
+| `web_search` | `query`     |
+| `open_preview` | `target`  |
+| `task_agent` | `prompt`    |
+| `memory`     | `name`      |
+| `recall`     | `query`     |
+| `notify`     | `message`   |
+| `read_resource` | `uri`    |
+| `use_prompt` | `name`     |
+
+---
+
+## File Operations
+
+### bash
+
+Execute a bash command and return stdout + stderr.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `command` | string | yes      | The bash command to execute. |
+| `timeout` | integer | no      | Timeout in seconds (1-600). Omit to use the global `tools.timeout` setting (typically 120s). |
+| `stop_on_error` | boolean | no | Enable `set -e` so the script exits on the first command failure. Default false. |
+| `run_in_background` | boolean | no | Start the command as a detached background shell and return its shell id (e.g. `bash_1`) at once. Read its new output with `bash_output`, stop it with `kill_shell`; `timeout` does not apply. Default false. |
+
+- **What it does**: Runs the command in a subprocess with a configurable timeout. Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.). Stdin never takes input from the CLI's terminal: a command gets `/dev/null`, so one that reads it gets end-of-file at once. A background shell (`run_in_background`) gets `/dev/null` too, unless the process's own stdin is a terminal (the CLI): then it gets a pseudo-terminal of its own that nothing is typed into, so a long-running program keeps running, and one that waits for input waits until `kill_shell` stops it.
+- **Output format**: Stdout is returned directly. Stderr lines are prefixed with `[stderr]` so the model can distinguish them. When the command itself redirects stderr to stdout (`2>&1`), no prefix is added. Output exceeding 256KB is truncated (head + tail preserved, middle replaced with a truncation notice).
+- **Auto-approve**: No -- requires user confirmation.
+- **Agent availability**: `task_agent` only.
+
+---
+
+### read_file
+
+Read the contents of a file, returning numbered lines for text files or
+base64-encoded image data for supported image formats.
+
+| Parameter | Type    | Required | Description |
+|-----------|---------|----------|-------------|
+| `path`    | string  | yes      | Absolute or relative file path. |
+| `offset`  | integer | no       | Line number to start from (1-based, default: 1). Text files only. |
+| `limit`   | integer | no       | Maximum number of lines to read. Omit for full file. Text files only. |
+
+- **What it does**: For text files, reads and returns content with line numbers. For PNG, JPEG and WebP images, returns image data as multi-part content when the model supports vision, or a text description when it does not. The image type comes from the file's content, not its extension, and only those three formats are sent, since vision providers do not all accept others: a GIF, BMP, TIFF or ICO file, or any other content under an image extension, returns an error. SVG files are read as text. Images larger than 4 MB are rejected, as are paths that are not regular files. An image with transparent areas is sent, and stored with the result, as an uploaded image is: with them filled with white, black or mid grey, whichever the content's edges stand out on most, since providers otherwise remove transparency each their own way. Must be called before `edit_file` on the same path (the session tracks which files have been read).
+- **Vision support**: Controlled by `ModelCapabilities.supports_vision`. All commercial OpenAI and Anthropic models have vision enabled. Local models (vLLM, llama.cpp, NIM) default to off — enable via `[models.*.capabilities] supports_vision = true` in config.toml.
+- **Auto-approve**: Yes.
+- **Agent availability**: `task_agent`.
+
+---
+
+### write_file
+
+Write content to a file, creating it if needed.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `path`    | string | yes      | Absolute or relative file path. |
+| `content` | string | yes      | The full file content to write. |
+| `mode`    | string | no       | `"overwrite"` (default) replaces the file. `"append"` adds content to the end. |
+
+- **What it does**: Creates or overwrites (or appends to) the file at the given path. Parent directories are created as needed.
+- **Auto-approve**: No -- requires user confirmation.
+- **Agent availability**: `task_agent` only.
+
+---
+
+### edit_file
+
+Replace exact strings in a file, or apply multiple replacements atomically.
+
+| Parameter    | Type    | Required | Description |
+|--------------|---------|----------|-------------|
+| `path`       | string  | yes      | Absolute or relative file path. |
+| `old_string` | string  | no*      | The exact text to find and replace. |
+| `new_string` | string  | no*      | The replacement text. |
+| `near_line`  | integer | no       | Disambiguate when `old_string` matches multiple locations. |
+| `edits`       | array   | no*      | Multiple replacements to apply atomically (see below). |
+| `replace_all` | boolean | no       | Replace ALL occurrences of `old_string`. Cannot combine with `near_line` or `edits`. |
+
+\* Provide either `old_string`+`new_string` (single edit) or `edits` array (batch), not both.
+
+- **What it does**: Finds `old_string` in the file and replaces it with `new_string`. Fails if the string is not found or matches multiple locations (unless `near_line` or `replace_all` is provided). Requires a prior `read_file` or `diff_file` call on the same path.
+- **Batch mode**: The `edits` array accepts multiple `{old_string, new_string, near_line?}` entries applied atomically. All edits are validated before any are applied. Overlapping edits (two entries targeting the same text region) are rejected. Edits are applied in reverse file-position order so character offsets stay stable.
+- **Replace-all mode**: When `replace_all` is true, all occurrences are replaced via `str.replace()`. The approval preview shows the occurrence count.
+- **Auto-approve**: No -- requires user confirmation.
+- **Agent availability**: `task_agent` only.
+
+---
+
+### diff_file
+
+Show a unified diff between two files, or between a file and a provided string.
+
+| Parameter       | Type    | Required | Description |
+|-----------------|---------|----------|-------------|
+| `path_a`        | string  | yes      | Path to the first file. |
+| `path_b`        | string  | no       | Path to the second file. Mutually exclusive with `content_b`. |
+| `content_b`     | string  | no       | String content to compare against `path_a`. Mutually exclusive with `path_b`. |
+| `context_lines` | integer | no       | Number of context lines around changes (default 3, max 20). |
+
+- **What it does**: Returns unified diff output using Python's `difflib`. Binary files (containing null bytes) are rejected with a clear error. Files read through `diff_file` satisfy `edit_file`'s read guard — you can diff then edit without a separate `read_file` call. Large diffs are streamed with early cutoff at the tool truncation limit.
+- **Auto-approve**: Yes (read-only).
+- **Agent availability**: `task_agent`.
+
+---
+
+### search
+
+Search file contents for a regex pattern.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `query`   | string | yes      | Regex pattern (extended regex). |
+| `path`    | string | no       | File or directory to search in (default: current directory). |
+
+- **What it does**: Recursively searches for the pattern using `grep -rn`. Returns matching lines with file paths and line numbers.
+- **Auto-approve**: Yes.
+- **Agent availability**: `task_agent`.
+
+---
+
+## Information
+
+### web_fetch
+
+Fetch a web page or PDF and extract specific information from it.
+
+| Parameter  | Type   | Required | Description |
+|------------|--------|----------|-------------|
+| `url`      | string | yes      | The URL to fetch (must start with `http://` or `https://`). |
+| `question` | string | yes      | What to extract or answer from the page or PDF. |
+
+- **What it does**: Fetches the URL and has a model answer the question from
+  the fetched content. HTML becomes plain text that keeps each link as
+  `[text](url)`, its target resolved to an absolute URL against the address the
+  page was served from (after any redirects, without credentials) or against its
+  `<base href>`; a link to a named place in the page reads `[text](#fragment)`.
+  A link keeps only its text when its target could mislead: when it leads to the
+  page itself, to anything but an http, https or mailto URL, or to a target over
+  2,048 characters; when a browser would refuse or resolve its href differently
+  (a backslash, three slashes, an empty host, a bad port); and, after a note
+  saying so, once the page's links have used up the resolution work one fetch
+  allows, unless the same href was resolved earlier. Title and textarea content
+  is text, and the conversion stops once its text passes 10,485,760 characters,
+  saying where it stopped. Both the page and the PDF extraction model are told
+  to treat the source as untrusted, to give each URL exactly as the content has
+  it, resolving a relative one against the page URL (the address after
+  redirects, with the requested fragment), and never to invent one. A PNG, JPEG,
+  GIF or WebP image, or other binary content that isn't a PDF (a NUL character
+  among the first 8,192 characters of its decoded text), is refused with an
+  error giving its size and, if known, its type; nothing is extracted. A
+  response whose bytes begin with PDF magic uses the attachment PDF ladder:
+  native document input when the reading model supports it, ordered page images
+  for a vision model, configured perception, then local text extraction. If none
+  can read the PDF, the tool returns an explicit error instead of asking the
+  model to infer from an empty document. Local PDF rendering and text extraction
+  run in a one-shot child under memory, CPU, wall-time, and output limits;
+  exceeding that shared attachment safety envelope fails the fetch explicitly,
+  and so does a host that can't run that child. Decoded HTML/plain text and
+  locally extracted PDF text use at most half the reading model's calibrated
+  context after prompt, response, and safety reserves; the final request is
+  checked again before provider I/O. If no document allowance remains, the tool
+  returns an error instead of invoking extraction without source content. The
+  fixed worker output envelope is an additional PDF-only host-safety ceiling.
+  Rasterization supplies at most ten pages and explicitly tells the model when
+  later pages were omitted; that notice survives the perception cache. Fetched
+  PDFs are request-local and are not added to conversation history or attachment
+  storage. Every hop, the URL itself included, is SSRF-screened before it is
+  requested, and a hostname is looked up only once its call is approved, so a
+  denied call makes no DNS query. Private/internal addresses are refused by
+  default; enable `tools.allow_private_network` (console Settings → Tools) to
+  make them approvable for self-hosted setups whose services live on the local
+  network. The approval prompt marks such requests. A private IP address is
+  marked from the first request; a hostname is marked after an executed request
+  has found it private, which refuses that request and asks the model to repeat
+  the call, so the repeat is approved as a private-network request. Task agents
+  also send these tagged requests through the approval gate, including its
+  configured approval policies. If a remembered hostname no longer resolves
+  wholly private, that request is refused and its private tag is forgotten; a
+  now-public hostname can be retried as an ordinary request. A public site
+  redirecting into private space is refused regardless. Cloud metadata endpoints
+  and link-local, multicast and reserved addresses are refused even with the
+  opt-in enabled, including as a redirect target from a private address you
+  approved. An address is judged by what it actually reaches, so an IPv6
+  transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated
+  as an internal destination. A local-use NAT64 wrapper in `64:ff9b:1::/48` is
+  refused when any valid layout decodes into a refused range, even if its actual
+  IPv4 destination is public; the private-network opt-in cannot restore access.
+  The standard `64:ff9b::/96` DNS64 prefix still admits public IPv4
+  destinations. Each hop connects only to the addresses returned by its screen,
+  without another hostname lookup. The original hostname is kept for HTTP
+  routing, TLS SNI, and certificate verification. Certificates are verified
+  against the operating system's trust store; `SSL_CERT_FILE` or `SSL_CERT_DIR`
+  replaces it with a custom CA bundle for the whole process, so that bundle must
+  also hold any public roots other connections need. A redirect gets a fresh
+  screen and connection. Requests routed through `HTTP_PROXY`, `HTTPS_PROXY`, or
+  `ALL_PROXY` are refused because a proxy could resolve the destination
+  independently. Hosts excluded by `NO_PROXY` can connect directly.
+- **Which model reads the page**: The alias set in `tools.web_fetch_alias`
+  (console **Models → Roles → Web fetch**), in conversations and task agents
+  alike. When it's empty, the model that called web_fetch reads: the session's
+  model, or the task agent's model at the effort its own turns use. A set alias
+  reads with its own settings, even when it is the session's alias. While it
+  can't be used (it isn't loaded, or its client can't be built), web_fetch
+  refuses the call before asking for approval, and it never reads with another
+  model instead. The reading model sees the raw, untrusted page and only its
+  answer reaches the conversation, so it is the one that has to ignore
+  instructions planted in a page; smaller models do that less reliably. The
+  output guard checks that answer by pattern, and with its LLM stage only when
+  `judge.output_guard_llm` is on (off by default). The page and the question go
+  to the reading model whatever model the conversation runs on: with the setting
+  pointing at a hosted model, a conversation on a local model sends its fetches
+  there, and with the setting empty, so does a task agent running on a hosted
+  model.
+- **Request headers**: Every request, redirects included, identifies as
+  `User-Agent: turnstone/1.0` and prefers HTML and English (`Accept`,
+  `Accept-Language`). As in browsers, requests to https URLs and loopback hosts
+  also carry top-level navigation metadata (`Sec-Fetch-Dest: document`,
+  `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Site: none`), judged per hop, so a
+  redirect to plain http sends none. Other content types remain acceptable, but
+  an endpoint that negotiates content may return HTML rather than JSON or CSV,
+  and some image hosts redirect a direct image link to their HTML page. URL
+  targets of `open_preview` send the same headers.
+- **Deployment requirements for local PDF processing**: The bounded PDF worker
+  needs a writable temporary directory (`/tmp`, or the directory selected by
+  `TMPDIR`) and permission to create one child process and lower its own resource
+  limits. A hardened container with `readOnlyRootFilesystem: true` should mount
+  a writable `emptyDir` at `/tmp`; a custom seccomp policy must permit the
+  process/limit syscalls used for fork/exec, `setsid`, `setrlimit`, and
+  `prlimit64`. The worker intentionally ignores Python environment variables,
+  so venv, system-site, and ordinary default user-site dependencies work, but
+  dependencies reachable only through a custom `PYTHONUSERBASE` do not. Install
+  Turnstone and its PDF dependencies into the same venv or a standard site
+  directory instead. A host that can't create the temporary directory, start the
+  child process or apply its resource limits, such as macOS, which refuses a
+  finite address-space limit, cannot run the worker; there, models without
+  native PDF input are told that local PDF processing isn't available. Models
+  receiving PDFs natively do not start this worker.
+- **Auto-approve**: No -- requires user confirmation (makes network requests).
+- **Agent availability**: `task_agent`.
+
+---
+
+### web_search
+
+Search the web using a text query.
+
+| Parameter     | Type    | Required | Description |
+|---------------|---------|----------|-------------|
+| `query`       | string  | yes      | The search query. |
+| `max_results` | integer | no       | Max results to return (default 5, max 20). |
+| `category`    | string  | no       | Search category: `general` (default), `news`, `it` (code/tech), or `science`. Maps to SearxNG categories; the model picks per query. |
+
+- **What it does**: Searches the web and returns ranked results with titles, URLs, and content snippets. Uses provider-native search when available:
+  - **Anthropic**: Replaced at the API boundary with Anthropic's `web_search_20250305` server-side tool. Claude decides when to search; the API executes it and returns results with citations inline. No backend needed.
+  - **OpenAI search models** (`gpt-5-search-api`): Replaced with `web_search_options` parameter. The model always searches and returns `url_citation` annotations.
+  - **Local/vLLM models**: Falls back to a self-hosted [SearxNG](https://searxng.org) instance. Set `searxng_url` in `config.toml` `[tools]` or `$TURNSTONE_SEARXNG_URL` (the docker-compose stack bundles a `searxng` service and points at it by default). Operators with a custom MCP search server can instead set `web_search_backend = "mcp:server:tool"`.
+- **Auto-approve**: Yes (auto-approved for all tool dispatch paths).
+- **Agent availability**: `task_agent`.
+
+---
+
+### Reranking (optional)
+
+`web_search` can use an external **reranker** to re-order the backend's result pool by relevance to the query before returning the top hits. Turnstone runs no reranker model itself; it POSTs to a Cohere/Jina-compatible `/rerank` endpoint (self-hosted [vLLM](https://docs.vllm.ai) / [TEI](https://github.com/huggingface/text-embeddings-inference) / llama.cpp, or hosted Cohere/Jina/Voyage).
+
+**Disabled by default.** In the console **Models** tab, add a model definition whose `base_url` is a Cohere/Jina-compatible `/rerank` endpoint and whose capabilities include `{"supports_rerank": true}`, then select it under **Models → Roles → Reranker**. It's managed like every other model (write-only key, enable/disable, calibration). The reranker is purely this per-model definition — there is no global `rerank_url`-style endpoint setting.
+
+The `rerank_web_search` toggle defaults on once a reranker is selected. If the endpoint is unreachable or errors, web_search falls back silently to the backend's native result order — reranking never makes a search fail.
+
+The selected alias's `max_concurrency` limit applies to reranking. Turnstone
+keeps one process-owned HTTP connection pool for the active endpoint, shares it
+across sessions, and rotates it when relevant model or Reranker-role settings
+change. Three consecutive endpoint failures open a 30-second circuit so later
+retrievals preserve native order immediately instead of repeatedly waiting for
+the network timeout; one probe is allowed after cooldown. Queued work observes
+generation cancellation. A synchronous HTTP request already dispatched cannot
+be interrupted safely, but its per-call timeout still bounds eventual drain
+and fallback latency.
+
+When `rerank_bm25` is enabled, Turnstone also sends the current query and BM25 candidate metadata to the rerank endpoint. Live memory-pointer candidates contain only the memory name and authored description—never the body. Tool and skill candidates contain their names and descriptive metadata. A self-hosted endpoint (vLLM/TEI/llama.cpp) keeps this on your infrastructure; a hosted provider (Cohere/Jina/Voyage) sends it off-box.
+
+**Serving a Qwen3-Reranker with vLLM.** The model is instruction-aware, so vLLM **must** apply its chat template — pass `--chat-template` explicitly. Without it the bare query produces near-random scores and reranking actively *hurts* retrieval (verified: an irrelevant passage outscored the correct one):
+
+```bash
+vllm serve /models/Qwen3-Reranker-0.6B \
+  --runner pooling \
+  --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
+  --chat-template /models/Qwen3-Reranker-0.6B/chat_template.jinja \
+  --served-model-name qwen3-reranker --port 8000
+```
+
+Then add a reranker model in the **Models** tab with `base_url` `http://vllm:8000/rerank` (model name `qwen3-reranker`) and select it under **Models → Roles → Reranker**.
+
+For an endpoint that does *not* apply the model's template, set `rerank_instruction` instead — Turnstone then wraps each query as `<Instruct>: {instruction}` / `<Query>: {query}` (Qwen3's own default is `Given a web search query, retrieve relevant passages that answer the query`). Use the chat template **or** the instruction, not both (they double-wrap).
+
+**Picking `rerank_bm25_threshold`.** The relevance floor that filters live memory pointers is a probability in `[0, 1]`, but the right value differs per model (a sharp 0.6B reranker may want ~0.95; a broader 4B ~0.33). Calibrate it against your endpoint:
+
+```bash
+turnstone-admin rerank-calibrate           # probe the endpoint, recommend a floor
+turnstone-admin rerank-calibrate --apply   # ...and write tools.rerank_bm25_threshold
+```
+
+It reports the score scale, whether the endpoint cleanly separates relevant from irrelevant probes (a **"no clean separation"** result flags a mis-served or weak reranker), and the suggested floor. Leave the threshold at `0` to rerank-without-filtering.
+
+---
+
+### open_preview
+
+Show the user rich content in a preview pane beside the conversation.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `target`  | string | yes      | An http(s) URL, a file path, or `attachment:<id>` for a file attached to the conversation. |
+| `kind`    | string | no       | Rendering override: `web`, `pdf`, `image`, `table`, `text`, or `markdown`. Detected from the content when omitted. |
+| `title`   | string | no       | Pane header title. Defaults to the page title, filename, or URL. |
+
+- **What it does**: Resolves the target to bytes (URLs fetch through the same SSRF-guarded path as
+  `web_fetch`, screened per redirect hop, honoring the same `tools.allow_private_network` opt-in),
+  classifies the content, stores it content-addressed against the workstream, and opens the frontend
+  preview pane beside the conversation: web pages render in a fully sandboxed iframe (no scripts,
+  opaque origin), PDFs in the browser viewer, images inline, CSV/TSV/JSON as a sortable table,
+  text/markdown rendered. A previewed web page loads none of its remote images or styles by default,
+  so opening it never reveals the viewer to the page's site; a toggle in the pane header turns
+  remote content back on for that preview. **Download** saves the stored preview file, including the
+  complete CSV/TSV/JSON when the table display is capped or sorted. Text downloads use the preview's
+  UTF-8 encoding; fetched HTML includes its base URL for relative links and assets. Newly stored
+  previews derive their filename from the source where available, independently of the pane title.
+  Downloads reuse that stored name with an ASCII-safe fallback. The model receives only a one-line
+  confirmation — to reason about content, use `web_fetch` / `read_file` instead. Preview content is
+  size-capped per kind (pages 4 MB, PDFs 32 MB, images 4 MB, tables 2 MB, text 512 KB) and GC'd with
+  the workstream.
+- **Auto-approve**: URL targets require confirmation (network access); file
+  paths and `attachment:` targets run unprompted (local reads).
+- **Agent availability**: interactive sessions only (not `task_agent`, not
+  coordinators).
+- **Surfaces**: the pane renders in the web UI (standalone and console). The
+  CLI prints the confirmation line only — there is no terminal pane.
+
+---
+
+## Agent
+
+The tool name uses the `_agent` suffix — bare `task` collides with
+chat-template channel names on some local models.
+
+### task_agent
+
+Delegate a general-purpose task to an autonomous sub-agent.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `prompt`  | string | yes      | Complete task description for the sub-agent. |
+
+- **What it does**: Spawns a sub-agent that inherits the production
+  `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The
+  sub-agent runs autonomously to completion. A selected persona can narrow
+  that final lane but cannot add memory: task agents are memory-disabled in
+  1.8 regardless of the child persona's memory flag. Use for work that requires
+  file modifications or command execution.
+- **Auto-approve**: No -- requires user confirmation.
+- **Agent availability**: Top-level only.
+
+---
+
+## Memory
+
+### memory
+
+Structured persistent memory across sessions with typed, scoped entries.
+
+| Parameter     | Type    | Required | Description |
+|---------------|---------|----------|-------------|
+| `action`      | string  | yes      | `save`, `get`, `search`, `delete`, or `list`. |
+| `name`        | string  | save/get/delete | Short snake_case identifier for the memory. |
+| `content`     | string  | save     | Memory content to store. |
+| `description` | string  | save     | Authored one-line index hook (1-512 characters); required on every create or update. |
+| `type`        | string  | no       | Memory type: `user`, `general`, `feedback`, or `reference`. Default: `general`. |
+| `scope`       | string  | no       | Memory scope: `global`, `workstream`, `user`, `coordinator`, or `project`. See defaults below. |
+| `query`       | string  | search   | Search query for finding memories. |
+| `limit`       | integer | no       | Max results for `search` or `list`. Default: 20. |
+
+- **What it does**: Manages structured persistent memories in the database.
+  Memories persist across sessions, have a type classification, and live in a
+  role-specific visible scope. Unscoped `save`/`get`/`delete` resolve to one
+  target. Any stored project attachment pins that target to `project`; a
+  missing or archived project, or revoked access, fails closed without falling
+  back. Authorized read-only access permits `get` but makes `save`/`delete`
+  fail. Authorized reactivation restores eligibility. Only a workstream with
+  no stored project attachment defaults to `global` (interactive) or
+  `coordinator`. A valid explicit scope selects exactly that scope. Unscoped
+  `search`/`list` cover all visible scopes; use the displayed scope when
+  following a result with `get` or `delete`. The initial system prefix contains
+  an immutable, complete, body-free metadata index for the acting principal.
+  It records an explicit project ID only when the attached project is active
+  and readable at first admission. Later user turns may add live body-free
+  `(scope, name)` pointers. Setting `memory.nudges=false` suppresses those live
+  pointers and memory-directed nudges, but not the immutable index or the
+  memory tool. `get` is the sole full-body read and the sole action that updates
+  access counters.
+  The model-facing over-budget notice is opt-in, defaults off, and can appear
+  only on a successful memory-tool save; REST/SDK saves are unchanged and
+  console health remains unconditional.
+- **Auto-approve**: Yes.
+- **Agent availability**: Not available to task agents.
+
+---
+
+### recall
+
+Search conversation history for past messages and tool results.
+
+| Parameter | Type    | Required | Description |
+|-----------|---------|----------|-------------|
+| `query`   | string  | yes      | Search term or phrase to find in conversation history. |
+| `limit`   | integer | no       | Max results to return (default 20). |
+
+- **What it does**: Searches conversation history across sessions using FTS5 full-text search. Returns matching messages, tool calls, and tool results with timestamps and workstream context.
+- **Auto-approve**: Yes.
+- **Agent availability**: Not available to task agents.
+
+---
+
+## Notifications
+
+### notify
+
+Send a notification to a user or channel on an external platform.
+
+| Parameter      | Type   | Required | Description |
+|----------------|--------|----------|-------------|
+| `message`      | string | yes      | Notification content (max 2000 chars; Discord mentions supported). |
+| `username`     | string | no       | Turnstone username — sends to all linked channels. |
+| `channel_type` | string | no       | Platform for direct targeting (`discord`). |
+| `channel_id`   | string | no       | Platform-specific channel or user ID for direct targeting. |
+| `title`        | string | no       | Optional short title (rendered as bold prefix). |
+
+Provide either `username` for user-based targeting or `channel_type` +
+`channel_id` for direct targeting. Do not combine both.
+
+Discord notifications support `<@USER_ID>`, `<@&ROLE_ID>`, `@everyone`, and `@here`, subject to Discord's
+permissions and the recipient's notification settings. For a DM, pass the user's Discord ID as
+`channel_id`; a separate server channel ID is not required.
+
+- **What it does**: Sends a notification via the channel gateway's HTTP endpoint (`POST /v1/api/notify`). The server queries the `services` table for healthy channel gateways, authenticates with a service JWT (`aud: turnstone-channel`), and delivers to the first healthy gateway. On failure, retries up to 2 additional times with backoff (1s, 3s). Rate-limited to 5 notifications per turn (counter only increments on success).
+- **Auto-approve**: Yes — notifications are time-sensitive and auto-approved so the model can alert users urgently.
+- **Agent availability**: `task_agent`.
+
+> See [Channel Integrations: Notifications](channels.md#notifications)
+> for the full delivery flow, service registry details, and security
+> measures.
+
+---
+
+### watch
+
+Set up periodic polling of a shell command within the current workstream.
+When a watch fires, an operator-context notice identifies the watch and its trigger.
+The model reads command output with `watch(action="read", name="<watch id>")`, so external
+text arrives as tool data and passes through the configured output guard. Use for monitoring
+CI/CD pipelines, PR reviews, deployments, file changes, etc.
+
+| Parameter   | Type    | Required | Description |
+|-------------|---------|----------|-------------|
+| `action`    | string  | yes      | `create`, `list`, `cancel`, or `read`. |
+| `command`   | string  | create   | Shell command to poll periodically. |
+| `poll_every`| string  | no       | Poll interval as duration (`30s`, `5m`, `1h`). Default: `5m`. |
+| `stop_on`   | string  | no       | Python expression for stop condition (see below). Omit for change detection. |
+| `name`      | string  | create, cancel, read | Human-readable name for create; name or watch ID prefix for cancel/read. |
+| `max_polls` | integer | no       | Max poll cycles before auto-cancel. Default: 100. |
+
+**Actions:**
+
+- `create` — Start a new watch. Requires approval (same as bash — runs shell
+  commands). Persists to the `watches` table; the server-level `WatchRunner`
+  daemon polls every 15 seconds for due watches.
+- `list` — Show all active watches in this workstream. Auto-approved.
+- `cancel` — Stop a watch by name or ID prefix. Auto-approved.
+- `read` — Read the latest poll output and exit code of an active or completed watch in this
+  workstream. Auto-approved. Use the full ID from a notice to distinguish a completed watch
+  from a later watch with the same name. Reads use the delivered notice's snapshot from
+  active context or this workstream's persisted history, then fall back to its stored poll
+  result. Forks can read inherited snapshots using the full ID, including after compaction
+  or restart. Forking a compacted workstream copies retained snapshots behind the child
+  checkpoint, preserving access to results without adding old notices to active context.
+
+**Stop condition DSL** — The `stop_on` parameter accepts a Python expression
+evaluated after each poll. Available variables:
+
+| Variable      | Type       | Description |
+|---------------|------------|-------------|
+| `output`      | `str`      | stdout (+stderr) of the command. |
+| `data`        | `Any`      | `json.loads(output)`, or `None` if not valid JSON. |
+| `exit_code`   | `int`      | Process exit code. |
+| `prev_output` | `str|None` | Previous poll's stdout (`None` on first poll). |
+| `changed`     | `bool`     | `True` if output differs from previous poll. |
+
+Safe builtins: `len`, `str`, `int`, `float`, `bool`, `abs`, `min`, `max`,
+`any`, `all`, `isinstance`, `sorted`. No `import`, `open`, `exec`, or
+`eval`. Security model: equivalent to `bash` — the model already has shell
+access.
+
+**Examples:**
+```
+data["state"] == "MERGED"
+"error" in output
+exit_code != 0
+changed and "ready" in output.lower()
+data.get("mergedAt") is not None
+```
+
+**Lifecycle:**
+
+1. Model calls `watch(action="create", ...)` — persisted to storage.
+2. `WatchRunner` daemon polls for due watches every 15s.
+3. Each poll runs the command, evaluates the condition.
+4. When the condition fires (or max polls reached), a metadata-only operator notice is queued
+   and the watch auto-cancels. Condition errors use a fixed failure label; exception details
+   are available through `read` with the delivered snapshot.
+5. An idle workstream wakes to handle the notice. One that is not loaded is opened first, and
+   while nobody else is in it, it approves its own tool calls (audited as `unattended_watch`)
+   until the first client opens it, views it, sends to it, approves in it, stops it or attaches
+   to its stream. A workstream open in another process is retried for a few minutes, within the
+   watch's budget, so a fire can lapse while it stays open there; one with no stored turns ends
+   the watch. The watch-result card renders command output from display metadata. The model
+   pulls it through `read` as a normal tool result.
+6. Watches survive server restart (overdue watches fire once on recovery).
+
+**Constraints:**
+
+- Max 5 active watches per workstream.
+- Poll interval: 10s–24h.
+- Stored output capped at 65,536 characters, with a truncation marker when capped.
+- Max 50 queued watch notices per session; saturation drops the oldest notice.
+- Duplicate names rejected among active watches in the same workstream.
+
+- **Auto-approve**: `create` requires approval; `list`, `cancel`, and `read` are auto-approved.
+- **Agent availability**: Main session only — not available to task sub-agents.
+
+> See [Watch Architecture](diagrams/png/18-watch-architecture.png) for the
+> full poll → evaluate → dispatch flow.
+
+---
+
+### skills
+
+Browse the skill catalog, load a skill into the current session and, with
+permission, write skills. One tool with an `action` argument; each action has
+its own approval rule.
+
+| Parameter   | Type    | Required      | Description |
+|-------------|---------|---------------|-------------|
+| `action`    | string  | yes           | `find`, `get`, `load`, `create`, `update`, `enable` or `disable`. |
+| `name`      | string  | all but find  | Skill name. |
+| `query`     | string  | no            | For `find`: BM25 query over name, description, tags and category. |
+| `limit`     | integer | no            | For `find`: rows to return, 1-500 (default 100, or 50 with a `query`). |
+| `arguments` | string  | no            | For `load`: invocation arguments for `$ARGUMENTS`, `$N` and `$<name>`. |
+
+`find` also filters by `category`, `tag`, `risk_level`, `kind` and
+`enabled_only`. `create` and `update` take the skill's fields: `content`,
+`description`, `category`, `tags`, `kind`, `auto_approve`, `allowed_tools` and
+`notify_on_complete`.
+
+**Actions:**
+
+- `find` — List skills that match the filters, by priority then name. With a
+  `query`, it ranks up to 500 filtered skills by BM25 relevance (the same
+  `BM25Index` memory recall and tool search use) and returns up to `limit` of
+  them. Rows carry the name, description, category, tags, version, kind,
+  enabled flag, risk level and allowed tools, never the skill text.
+- `get` — Fetch one skill: the row `find` returns (allowed tools capped at 20)
+  plus its text, scan report and read-only flag.
+- `load` — Activate a skill by name, replacing the current one. Calls
+  `set_skill()`, which renders the text with `{{model}}`/`{{ws_id}}`/`{{node_id}}`
+  variables, rebuilds the system messages and saves the config. Returns the
+  skill's name, description and risk level. A disabled skill is refused, and so
+  is one whose text scans as high or critical risk, or that grants tool approvals
+  (`auto_approve` or `allowed_tools`): only the operator can load that, with
+  `/skill`. A batch that runs a write action (below) together with `load`, or
+  with a `spawn_workstream` / `spawn_batch` that names a skill, is refused: the
+  model splits them across turns.
+- `create`, `update`, `enable`, `disable` — Write the catalog. `enable` and
+  `disable` flip the `enabled` flag; there is no delete action (hard delete stays
+  in the admin UI).
+
+- **Auto-approve**: `find` and `get` are auto-approved (read-only). `load`
+  requires approval (it changes session behavior). The write actions require
+  approval and the `model.skills.write` permission, which no role has by default.
+- **Agent availability**: Interactive and coordinator sessions; not available to
+  task sub-agents.
+
+---
+
+## Interactive Tool Summary
+
+This table describes the ordinary interactive surface. Coordinator sessions
+receive their delegation/lifecycle tools instead, and task agents receive the
+metadata-selected `TASK_AGENT_TOOLS` subset.
+
+| Tool         | Category   | Auto-approve | task_agent | primary_key |
+|--------------|------------|--------------|------------|-------------|
+| `bash`       | File Ops   | No           | Yes        | `command`   |
+| `read_file`  | File Ops   | Yes          | Yes        | `path`      |
+| `write_file` | File Ops   | No           | Yes        | `content`   |
+| `edit_file`  | File Ops   | No           | Yes        | `old_string`|
+| `search`     | File Ops   | Yes          | Yes        | `query`     |
+| `web_fetch`  | Info       | No           | Yes        | `url`       |
+| `web_search` | Info       | No           | Yes        | `query`     |
+| `open_preview`| Info      | URL: no; path/attachment: yes | No | `target` |
+| `task_agent` | Agent      | No           | No         | `prompt`    |
+| `memory`     | Memory     | Yes          | No         | `name`      |
+| `recall`     | Memory     | Yes          | No         | `query`     |
+| `notify`     | Notify     | Yes          | Yes        | `message`   |
+| `watch`      | Monitor    | No (create)  | No         | `command`   |
+| `read_resource`| MCP      | No           | Yes        | `uri`       |
+| `use_prompt` | MCP        | No           | Yes        | `name`      |
+| `skills`     | Skills     | find, get    | No         | `action`    |
+| `tool_search`| Search     | Yes          | No         | `query`     |
+
+---
+
+## Dynamic Tool Search
+
+When many MCP tools are connected, the total tool count can grow large enough to
+consume significant context window tokens and reduce model accuracy. Dynamic tool
+search addresses this by deferring tools the model is unlikely to need on the
+current turn and letting it search for them on demand.
+
+### Three-tier approach
+
+Tool search uses the best available mechanism for each provider:
+
+1. **Anthropic (native)** -- Models that support it receive `defer_loading: true`
+   on deferred tool definitions plus the `tool_search_tool_bm25` server-side
+   search tool. Anthropic's API handles search and expansion transparently.
+
+2. **OpenAI GPT-5.4+ (native)** -- Models with hosted tool search receive
+   `defer_loading: true` on deferred definitions. The API handles search internally.
+
+3. **vLLM / llama.cpp / NIM (client-side BM25)** -- A synthetic `tool_search`
+   function tool is injected into the tool list. When the model calls it,
+   `_exec_tool_search()` runs a pure-Python BM25 index over tool names and
+   descriptions, then expands the matched tools into the visible set.
+
+A persona with a tool-visibility set overrides this selection: any exact
+set forces tool search into the client-side BM25 mechanism (tier 3)
+regardless of provider, and a **hard** set — one whose visible tools omit
+`tool_search` — disables tool search entirely.
+
+### Configuration
+
+Tool search is configured in `config.toml` under the `[tools]` section:
+
+```toml
+[tools]
+search = "auto"           # "auto", "on", or "off"
+search_threshold = 20     # minimum total tool count to activate
+search_max_results = 5    # max tools returned per search call
+```
+
+CLI flags override the config file:
+
+- `--tool-search {auto,on,off}` -- force tool search on or off, or let turnstone
+  decide based on threshold (default: `auto`).
+- `--tool-search-threshold N` -- minimum tool count to activate (default: 20).
+- `--tool-search-max-results N` -- max results per search (default: 5).
+
+### How it works
+
+1. **Threshold check**: At session startup, if the total tool count (built-in + MCP)
+   is below the threshold, tool search stays off and all tools are sent to the model
+   directly.
+
+2. **Partitioning**: When active, tools are split into two sets:
+   - **Always-on** -- the built-in tools present in the current session
+     (interactive sessions currently have 16; `BUILTIN_TOOL_NAMES` is the
+     28-tool built-in union). These are always visible to the model.
+   - **Deferred** -- all MCP tools. These are not sent in the tool list unless
+     the model searches for them.
+
+3. **Search and expand**: When the model calls `tool_search` (client-side) or the
+   provider's native search returns results, the matched tools are added to the
+   visible set via `expand_visible()`. Once expanded, a tool stays visible for
+   the remainder of the session.
+
+4. **Multi-turn persistence**: Expanded tools are never removed. This avoids
+   confusing the model when it references a tool it discovered in an earlier turn.
+
+### Agent exemption
+
+Task sub-agents do not use tool search. They operate on the scoped tool set
+(`TASK_AGENT_TOOLS`) with MCP tools merged in. Tool search is only active for
+the top-level session, where the model can interactively search for tools it
+needs.
+
+---
+
+## MCP Tools (External)
+
+> See also: [MCP Architecture diagram](diagrams/png/20-mcp-architecture.png)
+
+Turnstone supports the [Model Context Protocol](https://modelcontextprotocol.io/)
+(MCP) for connecting external tool servers — GitHub, databases, filesystems, or any
+MCP-compatible service.
+
+### How it works
+
+1. **Configuration**: MCP servers are defined in `config.toml` under `[mcp.servers.*]`
+   sections, or via a standard MCP JSON config file (`--mcp-config`).
+
+2. **Discovery**: At startup, `MCPClientManager` connects to each configured server
+   (via stdio subprocess or HTTP) and negotiates the protocol revision: a
+   `server/discover` probe adopts 2026-07-28 when the server offers it, and a server
+   that refuses the probe gets the 2025-11-25 `initialize` handshake. It then calls
+   `tools/list` to discover available tools, and checks the server's capabilities for
+   `tools.listChanged` support (push notifications).
+
+3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
+   function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
+   A tool whose `inputSchema` is not valid JSON Schema is left out of the catalog, for
+   every model, including models that would have accepted it: providers that check
+   tool schemas refuse a whole request when one is invalid, so the tool would fail
+   every request that offers it (with tool search, every request after a search loads
+   it). The schema is checked against the metaschema of the dialect its `$schema`
+   names when that is draft-06, draft-07, 2019-09 or 2020-12 (under either URI
+   scheme), and against 2020-12 otherwise. Only its structure is checked: a `pattern`
+   is not compiled, since JSON Schema patterns follow ECMA-262 syntax rather than
+   Python's. A schema holding NaN or an infinity, which no JSON request can carry, is
+   left out too. Rules a provider adds beyond JSON Schema are not checked: a provider
+   that refuses, say, an array schema without `items` still refuses requests that
+   offer such a tool. The server's other tools are published as usual. Its status
+   lists each tool left out with the schema field that is wrong (`skipped_tools`,
+   shown in the admin console's MCP Servers tab), and a warning in the log names them
+   when a catalog first leaves them out and whenever they change (once for each user's
+   catalog of a per-user server).
+
+4. **Merging**: MCP tools are appended after the role's built-in tools via
+   `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
+   When dynamic tool search is active, MCP tools are deferred rather than directly
+   visible -- the model discovers them via search as needed (see
+   [Dynamic Tool Search](#dynamic-tool-search) above).
+
+5. **Dispatch**: When the LLM calls an MCP tool, `_prepare_mcp_tool()` builds a
+   generic approval preview and `_exec_mcp_tool()` calls `MCPClientManager.call_tool_sync()`,
+   which dispatches the call to the background asyncio event loop.
+
+   If the caller's timeout expires, turnstone cancels its local wait without changing
+   the server's circuit-breaker failure count. This also applies to resource reads,
+   prompt retrievals, and calls still waiting for a per-user session lock. Observed
+   transport failures still count. Static reconnection precedes the operation timeout;
+   per-user calls include token lookup, connection, and lock waiting in their budget.
+   A timeout does not confirm remote cancellation: the server may continue working,
+   and timed-out tool calls retain an unknown outcome. A connected server that never
+   answers can continue to consume each caller's timeout budget.
+
+   HTTP 5xx responses fail waiting calls promptly and count against the server's
+   circuit breaker. A 404 for a held session discards that session so the next call
+   reconnects. HTTP 401/403 failures stay outside the breaker; per-user calls retain
+   their token refresh and consent handling. These rules cover tools, resources,
+   and prompts on both shared and per-user connections. A JSON-RPC error returned
+   with HTTP 200 remains a protocol rejection and keeps the session usable.
+
+### Approval behavior
+
+MCP tools **require user approval by default** (`needs_approval: True`). turnstone
+does not auto-approve MCP tools based on their schema, since it cannot guarantee
+that external tools are read-only. However, global overrides such as
+`--skip-permissions` will auto-approve all tools, including MCP tools. The
+interactive "Always" button adds specific tool types to the per-tool auto-approve
+set. The web UI and server use `approval_label` for MCP tools, giving
+per-prompt/per-resource granularity. The CLI uses `func_name`, which
+gives per-tool-type granularity (e.g., all `use_prompt` calls).
+
+### Sub-agent availability
+
+MCP tools are available to:
+- **Main session** — full access
+- **Task sub-agents** — via `self._task_tools` (merged list)
+
+### Naming convention
+
+MCP tool names follow the pattern `mcp__{server}__{original}`:
+
+- `mcp__github__search_repos` — `search_repos` tool from `github` server
+- `mcp__postgres__query` — `query` tool from `postgres` server
+
+Server names must not contain `__` (double underscore), which is reserved as the
+delimiter. Servers with `__` in their name are rejected at connection time.
+
+### Configuration
+
+**TOML** (`~/.config/turnstone/config.toml`):
+
+```toml
+[mcp.servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp.servers.github.env]
+GITHUB_TOKEN = "ghp_..."
+
+[mcp.servers.remote]
+type = "http"
+url = "https://mcp.example.com/mcp"
+```
+
+**JSON** (standard `mcpServers` format, via `--mcp-config`):
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_TOKEN": "ghp_..."}
+    }
+  }
+}
+```
+
+#### Optional 2026-07-28 settings
+
+Three optional keys tune features of the 2026-07-28 MCP revision. Servers on the
+earlier 2025-11-25 revision ignore them, except that `log_level` also filters any log
+messages such a server sends unasked.
+
+| Key | Where | Type | Default | What it does |
+|---|---|---|---|---|
+| `log_level` | `[mcp]` | string | unset | The lowest severity of server log messages (`notifications/message`) that turnstone writes to its own log, for every MCP server. On 2026-07-28 connections, every request also asks the server for messages at this level and above (`_meta["io.modelcontextprotocol/logLevel"]`). Messages are logged under the server's name, stripped of control characters, and capped at `WARNING`, so a server cannot raise an `ERROR` in turnstone's log. When unset, server log messages are dropped. |
+| `log_level` | `[mcp.servers.<name>]` or `mcpServers.<name>` | string | the `[mcp]` value | Overrides `[mcp].log_level` for one server. |
+| `resource_subscriptions` | `[mcp.servers.<name>]` or `mcpServers.<name>` | list of strings | `[]` | Resource URIs to watch on a 2026-07-28 server that declares `resources.subscribe`. When the server reports that one changed (`notifications/resources/updated`), turnstone drops its cached copy, so the next `read_resource` fetches it again. Other servers ignore the key. |
+
+Log levels, lowest to highest: `debug`, `info`, `notice`, `warning`, `error`,
+`critical`, `alert`, `emergency`. Case does not matter, and an unrecognized value is
+ignored.
+
+```toml
+[mcp]
+log_level = "warning"
+
+[mcp.servers.docs]
+type = "http"
+url = "https://mcp.example.com/mcp"
+log_level = "info"
+resource_subscriptions = ["docs://index"]
+```
+
+The per-server keys are read only from configuration files. Servers added or imported
+in the admin console do not carry them, and configuration files are not read at all
+while the database holds an enabled MCP server. `[mcp].log_level` applies to every
+server.
+
+#### Servers with self-signed certificates
+
+turnstone verifies a Streamable HTTP server's certificate against the operating
+system's trust store. A server whose certificate comes from your own certificate
+authority works once that authority is in the store, or in the bundle named by
+`SSL_CERT_FILE` or `SSL_CERT_DIR`. That bundle replaces the store for the whole
+process, so it must also hold the public roots other connections need.
+
+When a certificate cannot be trusted that way, as with a device that generates its
+own self-signed certificate, verification can be turned off for that one server: set
+`tls_skip_verify = true` in its `[mcp.servers.<name>]` section or `mcpServers.<name>`
+entry, or turn on **Skip certificate verification** in the admin console's server
+form (`tls_skip_verify` in the API). Every connection to that server then accepts
+whatever certificate it presents, checking neither the issuer nor the host name. The
+traffic stays encrypted, but anyone who can intercept it can pose as the server: read
+or change the requests, including any credentials in its headers, and send the model
+tool results of their own. Use it only for servers on a network you control.
+
+```toml
+[mcp.servers.kvm-rack1]
+type = "http"
+url = "https://192.0.2.10/mcp"
+tls_skip_verify = true
+```
+
+- In a configuration file, only the boolean `true` turns verification off; any other
+  value, such as the string `"true"`, leaves it on. The admin API takes `true` or
+  `false` and refuses anything else, `null` included (import lists the server among
+  its errors).
+- Per-user OAuth servers (`oauth_user`, `oauth_obo`) always verify the certificate,
+  because every user's bearer token is sent to them. The console refuses the setting
+  for them, and for stdio servers, which make no TLS connection.
+- The setting stays with the server when its URL changes, like its headers. Turn it
+  off in the same edit when the new address should be verified.
+- Unlike the keys above, it is also kept when a configuration file is imported in the
+  admin console. **Test connection** uses the form's setting.
+- The admin console's server list marks every server saved in the console that skips
+  verification. It lists a server from a node's configuration file with placeholder
+  settings, so it does not mark one there. Changing the setting in the console
+  reconnects the server on every node.
+- Every audit event for creating, editing, importing or testing a server that skips
+  verification records `tls_skip_verify`, and an edit that turns it off records
+  `false`. Creating or importing any Streamable HTTP server also records where it
+  points, as `scheme://host:port`, so the audit log keeps the host after the server
+  is deleted.
+
+### Introspection
+
+Use the `/mcp` slash command to list all connected MCP tools:
+
+```
+/mcp
+MCP tools (3):
+  mcp__github__search_repos  [MCP: github] Search GitHub repositories
+  mcp__github__create_issue  [MCP: github] Create a GitHub issue
+  mcp__postgres__query       [MCP: postgres] Run a SQL query
+```
+
+### Dynamic tool refresh
+
+MCP tool lists stay up-to-date without restart through two mechanisms:
+
+1. **Push notifications** -- MCP servers that declare `tools.listChanged: true` in
+   their capabilities send `notifications/tools/list_changed` when their tool list
+   changes. `MCPClientManager` registers a `message_handler` on each `ClientSession`
+   that triggers an immediate refresh for that server (debounced per server and
+   notification kind, and run off the receive loop). A refresh that fails while
+   the connection stays up is retried automatically on the next health-loop tick
+   until one completes. On 2026-07-28 connections the notifications arrive on a
+   `subscriptions/listen` stream, reopened whenever the server ends it, with a full
+   refresh after each reopen in case a notification was missed in between.
+
+2. **Manual** -- `/mcp refresh` re-fetches tools from all servers immediately.
+   `/mcp refresh <server>` targets a single server. If a server has disconnected,
+   manual refresh attempts reconnection. The console admin panel exposes the
+   same controls (refresh / reconnect buttons per server) for cluster-wide
+   fan-out.
+
+Reconnects (health-loop, dispatch-driven, or operator-forced) always end in a
+full catalog rediscovery, so a server that changed its tools while disconnected
+comes back current.
+
+When tools change, `MCPClientManager` rebuilds its merged tool list using copy-on-write
+(new list/dict objects assigned atomically) and notifies all active `ChatSession`
+instances via registered listener callbacks. Each session rebuilds its `_tools`,
+`_task_tools`, and reconstructs its `ToolSearchManager` (if active),
+preserving the set of previously expanded (discovered) tools.
+
+```
+/mcp refresh
+MCP refresh complete:
+  github: +1 added
+    + mcp__github__create_pr
+  postgres: no changes
+
+/mcp refresh github
+MCP refresh complete:
+  github: no changes
+```
+
+---
+
+## MCP Resources
+
+MCP servers can expose **resources** -- named data items (files, database rows,
+API responses) addressable by URI. turnstone discovers resources at startup and
+makes them available to the model via the `read_resource` built-in tool.
+
+### Discovery
+
+When a connection opens, `MCPClientManager` checks the server's capabilities for
+the `resources` capability. For servers that declare it:
+
+1. `list_resources` fetches static resources (fixed URIs).
+2. `list_resource_templates` fetches URI templates (parameterized patterns like
+   `db://tables/{table}/rows/{id}`).
+
+The protocol advertises both lists through one aggregate `resources`
+capability, so a server may implement only one of them. If either request
+returns the JSON-RPC `Method not found` code (`-32601`), turnstone treats that
+half of the catalog as empty and keeps the other half; authentication,
+validation, transport, and all other discovery errors still fail the
+connection or refresh.
+
+Both are stored as `{uri, name, description, mimeType, server}` dicts and
+merged into a unified catalog.
+
+### Resource catalog in system message
+
+The first 50 resources are injected into the system message as an XML-delimited
+block so the model knows what URIs are available:
+
+```xml
+<mcp-resources>
+  file:///project/README.md  Project readme
+  db://users/schema  User table schema
+</mcp-resources>
+Use read_resource(uri='...') to access the resources listed above.
+```
+
+### read_resource tool
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `uri`     | string | yes      | The resource URI to read. |
+
+- **What it does**: Reads the resource from its MCP server via `MCPClientManager.read_resource_sync()`. Returns text content for text resources or base64-encoded data for binary resources. Output is truncated by the standard tool output limiter.
+- **Auto-approve**: No -- requires user confirmation (reads external data).
+- **Agent availability**: `task_agent`.
+
+### Caching
+
+On 2026-07-28 connections, turnstone keeps a resource read for as long as the server's cache
+hint (`ttlMs`, at most 24 hours) allows; a read larger than 1 MiB is not kept, and nothing is
+cached on 2025-11-25 connections. A change notice from the server drops the reads it covers:
+`notifications/resources/list_changed` drops all of them, and `notifications/resources/updated`
+the one URI it names (see `resource_subscriptions` under
+[Optional 2026-07-28 settings](#optional-2026-07-28-settings)).
+
+On a per-user server (`oauth_user` or `oauth_obo`), a read the server marks
+`cacheScope: "public"` is shared: other users of that server get it from memory until it
+expires, and the server does not check their access. A server that marks per-user data public
+by mistake would leak it across users ([#1388](https://github.com/turnstonelabs/turnstone/issues/1388)).
+
+### Capability guards
+
+The `read_resource` tool schema is always loaded (it is a built-in JSON schema),
+but resource discovery only runs for servers that declare the `resources`
+capability. Servers without the capability contribute zero resources to the
+catalog.
+
+### Refresh
+
+Resource lists stay current through the same mechanisms as tool lists:
+
+1. **Push** -- Servers declaring `resources.listChanged: true` send
+   `notifications/resources/list_changed`, triggering an immediate refresh
+   (with the same failed-refresh retry on the health-loop tick).
+2. **Manual** -- `/mcp refresh` re-fetches resources alongside tools.
+
+Servers without push support are refreshed whenever they reconnect (every
+reconnect ends in full rediscovery) or when an operator refreshes manually;
+there is no periodic polling.
+
+---
+
+## MCP Prompts
+
+MCP servers can also expose **prompts** -- reusable message templates with
+optional arguments. turnstone discovers prompts at startup for servers that
+declare the `prompts` capability.
+
+### Discovery
+
+Prompt discovery mirrors resource discovery: `list_prompts` is called when a
+connection opens. Each prompt is stored with its prefixed name
+(`mcp__{server}__{prompt}`), description, and argument schema.
+
+### use_prompt tool
+
+| Parameter   | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `name`      | string | yes      | The prompt name (e.g. `mcp__server__prompt_name`). |
+| `arguments` | object | no       | Key-value argument pairs for the prompt. Values must be strings. |
+
+- **What it does**: Invokes an MCP prompt by name via `MCPClientManager.get_prompt_sync()`, expanding it into messages. Returns the expanded prompt content formatted as `[role]: content` blocks joined with blank lines. The prompt catalog is listed in the system message so the model knows which prompts are available. Output is truncated by the standard tool output limiter.
+- **Auto-approve**: No -- requires user confirmation (invokes external prompt servers).
+- **Agent availability**: `task_agent`.
+
+### Invocation
+
+`MCPClientManager.get_prompt_sync()` calls the server's `get_prompt` method
+with the provided arguments and returns the expanded messages. The `use_prompt`
+built-in tool exposes this to the model as a function call.
+
+### Governance Sync
+
+Discovered MCP prompts are automatically synced into the `prompt_templates`
+table (which stores skills) as first-class governed skills:
+
+- **Origin tracking**: MCP-sourced skills have `origin="mcp"` and
+  `mcp_server` set to the server name. Manual skills have
+  `origin="manual"`.
+- **Read-only**: MCP-sourced skills are `readonly=True`. The admin API
+  changes only their runtime config (enabled, approvals, allowed tools,
+  completion notification, priority, menu visibility), ignores any other field,
+  and refuses to unlock them. The admin UI opens them for viewing and shows an
+  origin badge.
+- **Precedence**: If a manual skill and MCP prompt share the same name,
+  the manual skill wins and the MCP prompt is skipped (with a log
+  warning).
+- **Lifecycle**: Skills are created on connect, updated on prompt list
+  refresh, and removed when the MCP server no longer exposes the prompt.
+  A skill an admin has disabled is kept instead, still disabled, and the
+  prompt returns to it if the server lists it again.
+  The sync runs automatically on connect, on `PromptListChangedNotification`,
+  and on manual `/mcp refresh`.
+- **Schema**: Migration 009 adds `origin`, `mcp_server`, and `readonly`
+  columns to the `prompt_templates` table.
+
+The `use_prompt` tool allows the model to invoke any discovered MCP prompt at
+runtime. A catalog of up to 30 prompts is injected into the system message
+inside `<mcp-prompts>` XML tags so the model can discover available prompts.
+
+---
+
+## MCP UI Visibility
+
+MCP server, resource, and prompt counts are surfaced across the UI:
+
+- **Server `/health` endpoint**: Returns `mcp.servers`, `mcp.resources`,
+  `mcp.prompts` when MCP is configured
+- **Server UI**: Magenta status badge in the header showing server count,
+  with resource/prompt counts in tooltip
+- **Console cluster status bar**: MCP metrics (servers/resources/prompts)
+  with magenta LED dot indicator, shown after a divider from workstream
+  metrics
+- **Console node detail**: Per-node MCP summary showing server, resource,
+  and prompt counts
+- **Console collector**: Aggregates MCP counts across all nodes in the
+  cluster overview
+
+MCP indicators use the `--magenta` design token for consistent theming
+across light and dark modes.

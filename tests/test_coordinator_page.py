@@ -1,0 +1,2011 @@
+"""Tests for the /coordinator/{ws_id} HTML page handler.
+
+The handler serves the shared template with the ws_id injected as a
+``data-ws-id`` attribute.  It does NOT enforce auth on the page itself —
+auth gating happens on the API endpoints the page calls (an unauthenticated
+visitor lands on the page but all API calls fail).
+"""
+
+from __future__ import annotations
+
+import re
+
+import pytest
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
+from tests._js_harness_helpers import extract_braced as _extract_braced
+from tests._js_harness_helpers import strip_js_comments as _strip_comments
+from turnstone.console.server import coordinator_page
+
+
+@pytest.fixture
+def client():
+    app = Starlette(routes=[Route("/coordinator/{ws_id}", coordinator_page, methods=["GET"])])
+    return TestClient(app)
+
+
+def test_valid_ws_id_injects_data_attr(client):
+    from turnstone import __version__
+
+    ws_id = "a" * 32
+    resp = client.get(f"/coordinator/{ws_id}")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    body = resp.text
+    # ws_id is injected into the html data-ws-id attribute.
+    assert f'data-ws-id="{ws_id}"' in body
+    # Template placeholder is fully substituted.
+    assert "{{WS_ID}}" not in body
+    # First-party tags are versioned; version-named vendor assets stay stable.
+    assert f"/shared/base.css?v={__version__}" in body
+    assert f"/static/coordinator/coordinator.css?v={__version__}" in body
+    assert "/shared/katex-0.19.1/katex.min.css?v=" not in body
+    # Inline module imports are outside version_html's src/href boundary.  The
+    # static route's no-cache policy makes this URL revalidate on every reload.
+    assert 'from "/static/coordinator/coordinator.js"' in body
+
+
+def test_coordinator_page_revalidates_with_etag(client):
+    ws_id = "b" * 32
+    first = client.get(f"/coordinator/{ws_id}")
+    assert first.headers["cache-control"] == "no-cache"
+    assert first.headers["etag"]
+
+    unchanged = client.get(
+        f"/coordinator/{ws_id}", headers={"If-None-Match": first.headers["etag"]}
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.headers["cache-control"] == "no-cache"
+    assert unchanged.headers["etag"] == first.headers["etag"]
+
+
+def test_non_hex_ws_id_returns_400(client):
+    """Only hex chars are allowed to avoid HTML injection."""
+    resp = client.get("/coordinator/not-hex-chars-here")
+    assert resp.status_code == 400
+
+
+def test_ws_id_too_long_returns_400(client):
+    resp = client.get("/coordinator/" + "a" * 65)
+    assert resp.status_code == 400
+
+
+def test_uppercase_hex_rejected(client):
+    # Our ws_ids are lowercase hex; reject mixed/upper to avoid surprises.
+    resp = client.get("/coordinator/" + "A" * 32)
+    assert resp.status_code == 400
+
+
+def test_coordinator_js_exposes_inline_approval_helpers():
+    """Smoke guard for two layers of the coord chat frontend: the
+    children-tree inline approve/deny block (the original Chunk 3
+    landing) and the PR #447 tool-batch construct that replaced the
+    pinned approval dock for the coord-self surface.  Both layers'
+    helper symbols must remain reachable in the served JS so a
+    refactor that accidentally renames or removes them surfaces here
+    instead of in production where the affected gates silently stop
+    rendering.  Asserts string presence only — no DOM parsing —
+    since coord.js has no JS test framework today (per the plan's
+    testing notes)."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    # Approval-block rendering helpers
+    assert "function renderApprovalBlock" in body
+    assert "maxSeverityItem," in body  # imported from conversation.js (5e.1b)
+    assert "function _renderSubItem" in body
+    # The submit + 409 race-handling path
+    assert "function submitChildApproval" in body or "submitChildApproval(" in body
+    # The shared approve POST helper (parameterized for child ws_ids)
+    assert "function approveWorkstream" in body or "approveWorkstream(" in body
+    # The 409 stale-call_id retry path uses invalidateLiveBadge +
+    # scheduleLiveFetch (Stage 3 cleanup removed the urgent flag —
+    # cache invalidation makes the TTL gate fall through naturally).
+    assert "invalidateLiveBadge(targetWsId)" in body
+    # Server-side payload field — drift here means the JS reads stale keys
+    assert "pending_approval_detail" in body
+    # Reconnect parity (chunk 4): the SSE re-open handler must drop
+    # non-permanent entries from the live-badge cache so a stale
+    # pending_approval_detail (left from before the disconnect)
+    # can't render zombie approve/deny buttons on a row whose
+    # approval was resolved during the gap. The implementation
+    # iterates the cache and deletes only !permanent entries —
+    # asserting the literal helper call keeps a refactor back to
+    # _liveBadgeCacheClear() (which would re-pay 403s on every
+    # reconnect for denied ids) from sneaking in.
+    assert "_liveBadgeCacheDelete" in body
+    # Edge-case matrix sentinel labels — POLICY-BLOCKED renders when
+    # an item has error set + needs_approval=False (server-side
+    # tool policy already blocked the call); "(judge unavailable)"
+    # renders when no verdict (judge or heuristic) and no
+    # judge_pending. Refactors that drop either branch silently
+    # regress to a buttoned approve UI on the wrong state.
+    assert "POLICY-BLOCKED" in body
+    assert "judge unavailable" in body
+    # Critical-risk handling: bug-1 was that risk_level='critical' rendered as
+    # low because the old severity table only mapped 'crit'.  The crit/critical
+    # alias moved to the shared conversation.js (step 5e.1b); verify it there so
+    # a 'critical' verdict still ranks like 'crit'.
+    shared = Path(__file__).resolve().parent.parent / ("turnstone/shared_static/conversation.js")
+    assert 'crit: "critical"' in shared.read_text(encoding="utf-8")
+
+
+def test_coordinator_js_approval_keyboard_shortcuts():
+    """Step 7 designer P2 (the console twin of the interactive.js fix): a pending
+    tool-batch's kbd hints (Enter approve / D deny / Shift+A approve-all) must
+    actually fire.  Pane-owned keydown on `root` routing to _resolveBatchAction
+    via _currentPendingBatch (the last un-resolved pending batch), with a focus
+    guard (don't hijack composer typing) and the disabled-button double-fire guard.
+    Asserts string presence only (no JS framework for coord.js)."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert 'root.addEventListener("keydown"' in body, (
+        "the approval shortcuts must be a pane-owned keydown on root"
+    )
+    assert "function _currentPendingBatch()" in body, (
+        "the keydown must resolve the current pending batch (not a stale/resolved one)"
+    )
+    # The double-fire guard: skip a batch whose actions are already disabled.
+    assert "btn.disabled) continue" in body
+    # Routes the three verbs to the existing resolve path.
+    assert "_resolveBatchAction(batch, true, false)" in body  # Enter -> approve
+    assert "_resolveBatchAction(batch, false, false)" in body  # D/Esc -> deny
+    assert "_resolveBatchAction(batch, true, true)" in body  # Shift+A -> approve-all
+    # Focus guard so the keys never hijack composer/input typing.
+    assert 'ae.tagName === "TEXTAREA"' in body and "ae.isContentEditable" in body
+    # Child approves must round-trip through the routing proxy at
+    # /v1/api/route/workstreams/{ws_id}/approve — the bare
+    # /v1/api/workstreams/.../approve path only works for the
+    # coord-self ws_id (the coord lives on the console process).
+    # Children live on cluster nodes and 404 without the prefix.
+    assert "/v1/api/route/workstreams/" in body
+    # Late-arriving LLM judge verdicts — Stage 3 Step 5 promoted
+    # ``intent_verdict`` and ``approval_resolved`` to first-class
+    # cluster-bus event types, so the coord adapter dispatches them
+    # as ``child_ws_intent_verdict`` / ``child_ws_approval_resolved``
+    # on the parent's SSE stream. The browser handlers write
+    # directly to liveBadgeCache (bypassing scheduleLiveFetch's
+    # visibility gate cleanly) so off-screen rows pick up verdicts
+    # without polling. Replaced the old ``_judgePollTick`` 90-second
+    # global poll loop and its visibility-gate-bypass workaround.
+    assert "handleChildIntentVerdict" in body
+    assert "handleChildApprovalResolved" in body
+    assert "child_ws_intent_verdict" in body
+    assert "child_ws_approval_resolved" in body
+    # Reload parity for the coord-self approval gate: init() must
+    # consume the authoritative GET /workstreams snapshot's
+    # pending_approval_detail so a freshly opened tab can render
+    # Approve/Deny before SSE replay arrives.
+    assert "wsSnapshot.pending_approval_detail" in body
+    assert "appendToolBatch(pendingDetail.items" in body
+    # Tool-batch construct (PR #447) — the inline replacement for the
+    # pinned approval-dock pattern.  These helpers carry the
+    # state-machine that pairs each tool call with its result and
+    # embeds the approval flow.  Refactors that rename or drop them
+    # silently regress the entire coord-self approval surface — the
+    # most novel and risky behavior in the PR.
+    assert "function appendToolBatch" in body
+    assert "function _morphBatchResolved" in body
+    assert "function _resolveBatchAction" in body
+    assert "function _refreshBatchTier" in body
+    assert "function _refreshRowStatus" in body
+    # State modifiers driven by the upgrade-in-place path
+    # (--running orphan promoted to --pending or --auto when SSE
+    # arrives with the authoritative shape).  Both class names must
+    # remain reachable from JS — dropping either breaks the reload
+    # state machine that PR #447's review pass surfaced.  (5e.2c: the
+    # coordinator now emits the shared neutral .conv-* vocabulary.)
+    assert "conv-batch--running" in body
+    assert "conv-batch--pending" in body
+    # History replay's outcome classifier — denied / errored tool
+    # turns must render with the correct batch state on reload, not
+    # the contradictory "✓ approved" pill that pre-fix showed for
+    # any prior denial.  bug-1 / bug-3 from the second /review pass.
+    # Post wire-shape unification the deny/error classification is shared by
+    # both browser reducers. Pin the coordinator's use of the occurrence-aware
+    # helper and the helper's live reads of the projected flags; call ids may
+    # repeat across turns and therefore cannot be classified by a global map.
+    tool_projection = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/tool_projection.js"
+    ).read_text(encoding="utf-8")
+    assert "indexHistoryToolOutcomes(historyMessages)" in body
+    assert "historyBatchOutcomes.get(m)" in body
+    assert "result.denied" in tool_projection
+    assert "result.is_error" in tool_projection
+    # User-message attachment pills — both live send (coordSend) and
+    # history replay route through appendUserMessageWithAttachments.
+    # Renaming or dropping the helper would silently regress the
+    # attachment affordance to the pre-fix plain-text bubble, which
+    # would only surface in manual testing of an attached-file flow.
+    # The CSS class is the visual anchor (coordinator.css) — keeping
+    # both literals in the smoke layer covers JS↔CSS drift in either
+    # direction.
+    assert "function appendUserMessageWithAttachments" in body
+    assert "msg-user-attach" in body
+    # PR #487 — whitespace-only assistant content (Qwen3 with vLLM
+    # ``--reasoning-parser`` strips ``<think>…</think>`` and emits only
+    # ``"\n\n"`` as content before a tool call) must be skipped on
+    # history replay or the empty ``.msg.assistant`` card surfaces as
+    # a phantom row.  The literal substring ``content.trim()`` is the
+    # single-line guard the rendering branch uses; a refactor that
+    # drops the trim() (e.g. simplifies to ``if (!content)``) silently
+    # regresses the phantom-card fix on the multi-node coord path.
+    # Mirrors ``test_app_js.py``'s same-shape pin on ``app.js``.
+    assert "content.trim()" in body
+    # PR #487 — coord history replay must render the assistant content
+    # card BEFORE the tool batch, not after, so DOM order matches the
+    # chronological order the model emitted (text → dispatch → results).
+    # Pre-fix the tool_calls branch sat at the role-agnostic top of the
+    # loop and rendered ahead of the assistant text that announced the
+    # batch, putting parallel fan-outs visually above their narrating
+    # message.  The fix hoisted the synthesis into ``renderAssistantToolBatch``
+    # called from inside the assistant branch AFTER the content card —
+    # asserting the helper name lets a refactor that re-inlines or
+    # renames it surface here instead of via manual reload testing.
+    assert "function renderAssistantToolBatch" in body
+    assert "renderAssistantToolBatch(m)" in body
+
+
+def test_coordinator_js_handle_child_state_no_longer_reads_sse_pending_approval_detail():
+    """Stage 3 cleanup — ``pending_approval_detail`` is no longer
+    piggybacked on child_ws_state events. Approval items now arrive
+    via bulk fetch on the activity_state="approval" transition;
+    verdicts via the explicit ``child_ws_intent_verdict`` event class;
+    resolution via ``child_ws_approval_resolved``. A refactor that
+    re-introduces the piggyback would silently re-open the
+    duplicate-path race the dedicated event classes were added to
+    eliminate.
+
+    Structural assertions (regex against multi-line source) — symbol-
+    presence alone wouldn't catch a guard that keeps the names but
+    inverts the comparison or drops the ``prev.live`` check. This
+    codebase has no JS test framework, so locking the guard's shape
+    here is the next-best thing to a behavioral test."""
+    import re
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    # The piggyback read is gone from handleChildState. (The string
+    # may still appear elsewhere — e.g. handleChildIntentVerdict
+    # reading from cache, or comments — but never as ``ev.pending_approval_detail``.)
+    assert "ev.pending_approval_detail" not in body
+    # The pre-fix urgent-fetch on activity_state transitions is gone.
+    assert "enteredApproval" not in body
+    assert "leftApproval" not in body
+    # ``pendingApproval`` flag derivation must check BOTH state and
+    # activity_state. The worker thread can fire the state transition
+    # to "attention" before approve_tools updates activity_state, so
+    # checking only activity_state misses children that legitimately
+    # need approval. Pin the disjunction so the regression doesn't
+    # silently re-introduce.
+    assert re.search(
+        r'existing\.state\s*===\s*"attention"\s*\|\|\s*'
+        r'existing\.activity_state\s*===\s*"approval"',
+        body,
+    ), (
+        "handleChildState must derive pendingApproval from "
+        "(state==='attention' || activity_state==='approval')"
+    )
+
+    # SSE-authoritative window constant is defined and used.
+    assert re.search(r"\bconst\s+SSE_AUTHORITATIVE_MS\s*=\s*\d+", body), (
+        "SSE_AUTHORITATIVE_MS constant must be defined as a numeric literal"
+    )
+
+    # SSE writers tag entries with sseUpdatedAt: Date.now() so the
+    # merge guard in flushLiveFetches preserves them against stale
+    # bulk-fetch responses. handleChildState only stamps when it
+    # AUTHORITATIVELY clears the detail (off-approval transition);
+    # writers that stamp unconditionally are intent_verdict (verdict
+    # stamp), approval_resolved (clear), and the optimistic-clear
+    # path in submitChildApproval. Pinning the literal Date.now()
+    # call keeps a refactor that drops the SSE-source tag entirely
+    # from sneaking in.
+    assert re.search(
+        r"sseUpdatedAt:\s*Date\.now\(\)",
+        body,
+    ), "Critical SSE writers must stamp sseUpdatedAt: Date.now()"
+
+    # flushLiveFetches' merge guard structure: SSE-set pending_approval
+    # / _detail wins over a stale bulk-poll snapshot when (live) AND
+    # (prev exists) AND (prev.sseUpdatedAt set) AND (within window)
+    # AND (prev.live exists).  Inverting the comparison or dropping
+    # any of these guards reopens the clobber bug.
+    merge_guard = re.search(
+        r"if\s*\(\s*live\s*&&\s*prev\s*&&\s*prev\.sseUpdatedAt\s*&&\s*"
+        r"now\s*-\s*prev\.sseUpdatedAt\s*<\s*SSE_AUTHORITATIVE_MS\s*&&\s*"
+        r"prev\.live\s*\)",
+        body,
+    )
+    assert merge_guard is not None, (
+        "flushLiveFetches merge guard must be the conjunction "
+        "(live && prev && prev.sseUpdatedAt && now - prev.sseUpdatedAt < "
+        "SSE_AUTHORITATIVE_MS && prev.live).  An inverted comparison or "
+        "missing prev.live check would let a stale bulk-poll clobber a "
+        "fresh SSE-set approval."
+    )
+
+    # The merge body must preserve BOTH pending_approval and
+    # pending_approval_details from prev — preserving only one would
+    # render a row with a phantom badge but no buttons (or vice versa).
+    merge_body = re.search(
+        r"mergedLive\s*=\s*Object\.assign\(\s*\{\}\s*,\s*live\s*,\s*\{"
+        r"[^}]*pending_approval:\s*prev\.live\.pending_approval[^}]*"
+        r"pending_approval_details:\s*prev\.live\.pending_approval_details",
+        body,
+    )
+    assert merge_body is not None, (
+        "Merge body must preserve both pending_approval AND "
+        "pending_approval_details from prev.live — preserving only one "
+        "creates a half-rendered approval row."
+    )
+
+    # flushLiveFetches must forward sseUpdatedAt onto the new cache
+    # entry so the SSE-source tag survives the bulk-poll write back —
+    # without this, every bulk-poll resets the window and the next
+    # late-arriving poll silently clobbers.
+    assert re.search(
+        r"sseUpdatedAt:\s*prev\s*\?\s*prev\.sseUpdatedAt",
+        body,
+    ), (
+        "flushLiveFetches must forward prev.sseUpdatedAt onto the new "
+        "cache entry (preserving the SSE-source window across bulk-poll "
+        "cycles) — without this, the second bulk-poll after an SSE "
+        "transition silently clobbers."
+    )
+
+
+def test_coord_history_renders_system_turn_via_msg_variants():
+    """First-class operator-context ``system`` turns (output-guard findings,
+    user interjections, metacognitive nudges) replay through the coord
+    history loop's ``system``-role branch, labelled with the turn's
+    ``source`` and styled via the ``system`` ``_MSG_VARIANTS`` entry.  The
+    legacy ``replayAdvisoriesAfterTool`` envelope path is gone.
+
+    Mirrors ``test_app_js.py``'s same-shape pin on interactive's
+    ``replayHistory``."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    # The advisory-envelope replay helper is gone.
+    assert "replayAdvisoriesAfterTool" not in body, (
+        "replayAdvisoriesAfterTool should be deleted — operator context now "
+        "rides first-class system rows, not the tool envelope."
+    )
+    # The coord history loop has an explicit system-role branch labelling
+    # the bubble with the turn's source kind.
+    assert 'role === "system"' in body, (
+        "coord history loop must have a system-role branch for first-class operator-context turns."
+    )
+    # The ``system`` _MSG_VARIANTS entry gives the bubble operator styling and
+    # tags it with the shared ``operator-context`` marker (so the retry-skip
+    # walk steps over it — see test_coord_retry_walk_skips_operator_context_cards).
+    assert 'system: "system-context operator-context"' in body, (
+        "coordinator.js must map the system role to the "
+        "'system-context operator-context' variant so operator-context turns "
+        "get the operator styling AND carry the retry-skip marker."
+    )
+
+
+def test_coord_dedups_system_turn_against_history_by_event_id():
+    """The coord live ``system_turn`` handler skips an event already painted
+    from ``/history`` (matched by ``_event_id``) so an SSE replay redelivering
+    it past the resume cursor doesn't double-render the operator bubble.
+    Symmetric with ``test_app_js.py``'s interactive dedup and the row/event
+    id-alignment backend fix — both panes share the seam."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    assert "renderedSystemEventIds.has(" in body, (
+        "the coord system_turn handler must skip an event whose id was already "
+        "rendered from /history."
+    )
+    assert "renderedSystemEventIds.add(" in body, (
+        "the coord history loop (and live handler) must record system-turn ids."
+    )
+    assert "renderedSystemEventIds.clear(" in body, (
+        "refetchHistory must reset the dedup set so a re-render doesn't "
+        "false-skip after clear_ui / replay_truncated."
+    )
+
+    # The seam must be wired on BOTH read paths, not merely present somewhere
+    # in the file — a refactor that keeps the Set but drops the live-handler
+    # consultation (or the history-side record) silently re-opens the
+    # double-render. Scope each assertion to its block so the wiring, not the
+    # bare symbol, is pinned. (A dedupe-neutered factory — guard short-circuited
+    # to ``false`` — still contains ``renderedSystemEventIds.has(`` and so
+    # passes the file-global checks above; these slice checks catch it.)
+    sys_case = body.index('case "system_turn":')
+    # End at the NEXT switch case, not the first ``break;`` — the dedup-skip
+    # ``...has(sysEid)) break;`` is itself a break that precedes the ``.add(``,
+    # so a ``break;``-bounded slice would drop the record half.
+    # Whitespace-tolerant so a reformat can't silently break the bound.
+    next_case = re.search(r'\n\s*case "', body[sys_case + 1 :])
+    assert next_case, (
+        "no switch case found after system_turn to bound the pin slice — if "
+        "system_turn became the last case, re-anchor this pin's end marker."
+    )
+    live_block = body[sys_case : sys_case + 1 + next_case.start()]
+    assert "renderedSystemEventIds.has(" in live_block, (
+        "the live system_turn handler must CONSULT the dedup set (skip an id "
+        "already painted from /history) — not just reference the Set elsewhere."
+    )
+    assert "renderedSystemEventIds.add(" in live_block, (
+        "the live system_turn handler must RECORD the id it renders so a later "
+        "/history re-render (clear_ui) doesn't repaint it."
+    )
+
+    # The history render path must seed the set from each replayed system row's
+    # event_id, so a subsequent live replay of the same id is skipped.  Bound
+    # the slice structurally — from the system-role branch to the next role
+    # branch in the same chain (falling back to a generous window when it's
+    # the last branch) — so adding comments/fields inside the branch can't
+    # false-fail a pin that only cares about the wiring.
+    assert 'role === "system"' in body
+    sys_replay = body.index('role === "system"', body.index("refetchHistory"))
+    next_role = re.search(r"role\s*===", body[sys_replay + 1 :])
+    replay_end = sys_replay + 1 + next_role.start() if next_role else sys_replay + 1500
+    replay_window = body[sys_replay:replay_end]
+    assert "renderedSystemEventIds.add(" in replay_window, (
+        "the history render's system-role branch must record each replayed "
+        "turn's event_id so the live system_turn handler can dedup against it."
+    )
+
+
+def test_coord_retry_walk_skips_operator_context_cards():
+    """Retry must NOT regenerate a stale assistant turn when the last DOM row is
+    a tool batch trailed by an operator-context row.  ``_refreshRetryButton``
+    walks back past ``.operator-context`` rows before testing for
+    ``.coord-tool-batch`` — which only works if EVERY operator row carries the
+    shared marker.  Pin the walk predicate AND the marker on each structured
+    card so a new card kind (or a walk keyed on a single class) can't silently
+    re-introduce the wrong-turn retry regression."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    assert 'classList.contains("operator-context")' in body, (
+        "_refreshRetryButton must walk back past .operator-context rows so the "
+        "tool-only retry skip fires even when a card trails the tool batch."
+    )
+    # The watch-result card moved to the shared conversation.js (step 5e.1); the
+    # guard-finding + idle-children cards stay in the coordinator pane.
+    shared = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
+    ).read_text(encoding="utf-8")
+    assert '"msg watch-result operator-context"' in shared, (
+        "buildWatchResultCard must tag its card with the operator-context marker."
+    )
+    for builder, cls in (
+        ("appendGuardFinding", '"msg guard-finding operator-context"'),
+        ("appendIdleChildren", '"msg idle-children operator-context"'),
+        ("appendIdleTasks", '"msg idle-tasks operator-context"'),
+    ):
+        assert cls in body, (
+            f"{builder} must tag its card with the shared operator-context "
+            f"marker ({cls}) or the retry walk won't skip it."
+        )
+
+
+def test_coordinator_js_dispatches_idle_tasks_to_its_card():
+    """``renderSystemTurn`` is shared by the live SSE handler and history
+    replay, so a missing branch means the card paints live but degrades to a
+    plain labelled bubble on refresh — the exact live-vs-replay drift the
+    dispatcher exists to prevent."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert 'if (source === "idle_tasks" && m) return appendIdleTasks(m);' in body, (
+        "renderSystemTurn must route idle_tasks to its structured card."
+    )
+    # The role literal now reaches the DOM through the shared builder's
+    # ``tsRole`` parameter rather than an inline setAttribute, so pin the
+    # argument at the call site instead.
+    idx = body.index("function appendIdleTasks(")
+    assert '"idle_tasks",' in body[idx : idx + 1400], (
+        "appendIdleTasks must pass its data-ts-role to buildIdleCard for the "
+        "headless render checks."
+    )
+
+
+def test_idle_cards_share_one_style_block():
+    """``idle_children`` and ``idle_tasks`` are the same class of notice and
+    share grouped CSS rules — pinned so a restyle of one can't silently skip
+    the other, which is how the two cards would drift apart visually."""
+    from pathlib import Path
+
+    css = (Path(__file__).resolve().parent.parent / "turnstone/shared_static/chat.css").read_text(
+        encoding="utf-8"
+    )
+    for shared_rule in (
+        ".msg.idle-children .msg-idle-header,\n.msg.idle-tasks .msg-idle-header",
+        ".msg.idle-children .msg-idle-list,\n.msg.idle-tasks .msg-idle-list",
+        ".msg.idle-children .msg-idle-child,\n.msg.idle-tasks .msg-idle-child",
+    ):
+        assert shared_rule in css, f"idle cards must share the rule: {shared_rule!r}"
+
+
+def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
+    """coordinator.js must consume the /history resume cursor the same way
+    ui/static/app.js does: the shared make_history_handler trims the
+    executing in-flight orphan turn and returns a cursor, so the coord
+    client MUST open its initial SSE with that cursor (?last_event_id=) or
+    the trimmed turn is neither in /history nor delta-replayed — it vanishes
+    from the dashboard (a regression vs the prior #610 in-flight render).
+
+    Pins three invariants mirroring the app.js guards:
+      1. ``refetchHistory`` takes a ``seedCursor`` flag (default false) and
+         seeds ``lastEventId`` from ``hist.cursor`` only when set + non-null,
+         so the clear_ui re-render caller (live stream, no reconnect — the
+         one remaining seedless caller after the #882 dead-stream ruling)
+         doesn't rewind the live cursor.
+      2. every caller that reconnects opts in: init via
+         ``await refetchHistory(true)``, and the truncated resync via
+         ``loadHistoryThenReconnect``'s ``refetchHistory(true).finally``
+         (cursor adoption is the #882 fix core — /history trims the
+         in-flight turn whenever it returns a cursor).
+      3. ``connectSSE`` gates ``?last_event_id=`` on ``connectCursor !=
+         null`` so a cursor of 0 (a brand-new ws's first-turn boundary)
+         isn't dropped — where ``connectCursor`` presents a recorded
+         truncation gap over the advanced live cursor (the gap-repair
+         chokepoint; see the truncated fresh-connect test in
+         test_app_js.py).
+    """
+    import re
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    assert "async function refetchHistory(seedCursor = false)" in body, (
+        "refetchHistory must take a seedCursor flag (default false) so only "
+        "the reconnecting callers seed the resume cursor."
+    )
+    assert re.search(
+        r"if\s*\(\s*seedCursor\s*&&\s*hist\.cursor\s*!=\s*null\s*\)\s*"
+        r"lastEventId\s*=\s*hist\.cursor",
+        body,
+    ), "refetchHistory must seed lastEventId from hist.cursor only when seedCursor && != null."
+    assert "await refetchHistory(true)" in body, (
+        "the initial-connect path must call refetchHistory(true) to seed the cursor."
+    )
+    flow = re.search(
+        r"function loadHistoryThenReconnect\(manualAttempt = false\)\s*\{(.*?)\n  \}",
+        body,
+        re.S,
+    )
+    assert flow is not None, "loadHistoryThenReconnect not found"
+    assert "refetchHistory(true)" in flow.group(1) and ".then((outcome) => {" in flow.group(1), (
+        "the truncated resync (loadHistoryThenReconnect) must seed via "
+        "refetchHistory(true) and reconnect in its outcome-threaded settle."
+    )
+    assert re.search(
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*url\s*\+=\s*\"\?last_event_id=\"",
+        body,
+    ), "connectSSE must gate ?last_event_id= on connectCursor != null (so cursor 0 isn't dropped)."
+
+
+def test_coordinator_initial_history_handoff_is_one_shot_and_mismatch_refetches():
+    """Coordinator mirrors interactive's opaque REST -> initial-SSE handoff."""
+    import re
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    start = body.index("function connectSSE()")
+    end = body.index("function scheduleReconnect", start)
+    connect = body[start:end]
+
+    hidden = connect.index("if (document.hidden)")
+    capability = connect.index('"user_turn=1"')
+    handoff_query = connect.index('"history_token="')
+    construct = connect.index("new EventSource(url")
+    consume = connect.index("historyHandoffToken = null;", construct)
+    assert capability < hidden < handoff_query < construct < consume
+    assert 'url += "?last_event_id="' in connect
+    assert '(url.includes("?") ? "&" : "?")' in connect
+    assert connect.count('"user_turn=1"') == 1
+
+    refetch_start = body.index("async function refetchHistory(seedCursor = false)")
+    refetch = body[refetch_start : body.index("\n  function ", refetch_start + 1)]
+    assert re.search(
+        r"if\s*\(seedCursor\)\s*\{\s*historyHandoffToken\s*=\s*"
+        r"typeof hist\.handoff_token === \"string\"",
+        refetch,
+    )
+
+    mismatch = body.index('case "history_resync"')
+    truncated = body.index('case "replay_truncated"', mismatch)
+    mismatch_case = body[mismatch:truncated]
+    assert "historyRepair.begin(wsId);" in mismatch_case
+    assert "last_event_id" not in mismatch_case
+
+    # A mismatch is a durable-history repair, not a transport retry. Once it
+    # is latched, connectSSE may only schedule the bounded REST retry and
+    # return; it cannot construct a cursorless/tokenless EventSource.  The
+    # latch, budget, backoff, and parked prompt moved into the shared
+    # controller (history_handoff.createHistoryHandoffRepair) — pinned there,
+    # once; what stays pinned HERE is this pane's use of it.
+    repair_guard = connect.index("if (historyRepair.isRepairing(wsId))")
+    assert repair_guard < handoff_query < construct
+    guard_end = connect.index("if (historyHandoffToken != null)", repair_guard)
+    guard = connect[repair_guard:guard_end]
+    assert "historyRepair.schedule();" in guard
+    assert "return;" in guard
+
+    load_start = body.index("function loadHistoryThenReconnect(manualAttempt = false)")
+    load_end = body.index("function enterDegradedCatchup", load_start)
+    load = body[load_start:load_end]
+    # Admission before any work, then the budget charge, then exactly one
+    # handover of the verdict; the non-repair tail keeps its own reconnect.
+    admit = load.index("historyRepair.admitAttempt(manualAttempt)")
+    start_attempt = load.index("historyRepair.startAttempt(manualAttempt)", admit)
+    settle = load.index("historyRepair.settle({", start_attempt)
+    assert admit < start_attempt < settle
+    assert "hasToken: historyHandoffToken != null" in load[settle:]
+    repair_return = load.index("return;", settle)
+    assert "connectSSE();" not in load[settle:repair_return]
+
+    destroy_start = body.index("function destroy()")
+    destroy_end = body.index("function reconnect()", destroy_start)
+    assert "historyRepair.clear();" in body[destroy_start:destroy_end]
+
+
+def test_coordinator_refetch_failure_preserves_the_pane():
+    """A FAILED /history fetch must leave the message column and the
+    tool-row/batch tracking untouched (#882 G3): refetchHistory's wipe +
+    resets must sit AFTER the ``if (!hist) return`` guard.  Pre-fix the
+    wipe ran first, so a failed fetch — likeliest exactly during the
+    restart windows that trigger truncated resyncs — left an EMPTY pane
+    on a live stream with no retry record.  Stale-but-real beats blank,
+    and the maps stay valid against the untouched DOM."""
+    import re
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    start = body.index("async function refetchHistory(seedCursor = false)")
+    # Slice to the next function boundary — the pinned invariant is the
+    # ORDER below, not the density, and a char-count window dies with a
+    # bare ValueError every time an at-site comment grows.
+    fn = body[start : body.index("\n  function ", start + 1)]
+    guard = fn.index("if (!hist) return;")
+    wipe = fn.index("messagesEl.replaceChildren();")
+    resets = fn.index("toolRows.clear();")
+    assert guard < wipe and guard < resets, (
+        "refetchHistory must bail on a failed fetch BEFORE wiping the "
+        "pane or clearing the tool-row maps — a failed /history must be "
+        "a DOM no-op."
+    )
+    assert re.search(r"if \(!hist\) return;", fn), "failure guard missing"
+
+
+def test_coordinator_history_stale_latch_contract():
+    """#894 (the #890 port): a rewind/edit clicked during a clear_ui refetch
+    window — or after a FAILED refetch — must not count the stale pre-rewind
+    DOM.  Pins the latch's structural contract:
+
+      1. clear_ui sets ``historyStale = true`` BEFORE its seedless
+         ``refetchHistory()`` call (the only set site), so the gate closes
+         for the whole fetch window.
+      2. The DOM-counting affordances gate on ``busy || historyStale``
+         (_rewindToMessage / _editAndResend / _startEdit); _rewindToTurns
+         and _retryLast stay busy-only (explicit-arg / no-DOM-count paths —
+         the at-site rulings).
+      3. ``historyStale = false`` lives ONLY below the ``if (!hist)
+         return;`` failure guard in refetchHistory: a failed fetch keeps
+         the latch set (a refetch-in-flight flag would reopen on exactly
+         that exit — the over-rewind aftermath).
+      4. The idle-edge backstop is TRANSPORT-FREE: the arm behind the
+         pendingTruncatedResync consumer heals via plain
+         ``refetchHistory()``, never ``loadHistoryThenReconnect()`` —
+         a reconnecting heal draws the server's synthetic
+         state_change:idle back into its own trigger (the #890 round-5
+         zero-backoff storm).
+      5. The retry is bounded by construction: ``staleRetryTimer =
+         setTimeout`` appears exactly once (the clear_ui .then), so no
+         path — including the retry's own — can re-arm it.
+      6. destroy() cancels staleRetryTimer (terminal-only) while
+         closeStreamTransport does NOT (transport redials keep the heal
+         intent alive).
+      7. The render-time gate (r5/r6-derived): refetchHistory re-checks,
+         AFTER the await and BEFORE the wipe, the UNIVERSAL terms —
+         dispatch currency (seq) and the content refs — and the
+         SEEDLESS-only terms: the event-driven live-tool-call set (never
+         a DOM probe, which the render's own orphan repaint can forge —
+         the r6 critical; never plain busy — the r5 critical), the
+         optimistic busySource flavor, and stream-OPENness.  The
+         latch-clear sits below every skip point, so a skipped render
+         can never reopen the affordances over a stale DOM.  (Joined
+         pre-rewind server flights are closed SERVER-side — the #884
+         flight key folds in the truncation generation; an r8
+         client-epoch guard here was unreachable, being redundant with
+         the seq gate, and was removed in r9.)
+    """
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    # 1. Set site: inside the clear_ui case, before the refetch call.
+    assert body.count("historyStale = true;") == 1, (
+        "historyStale must be set in exactly one place (clear_ui arrival)."
+    )
+    clear_case = body.index('case "clear_ui"')
+    set_site = body.index("historyStale = true;")
+    refetch_call = body.index("refetchHistory()", clear_case)
+    assert clear_case < set_site < refetch_call, (
+        "clear_ui must latch historyStale BEFORE calling refetchHistory() "
+        "so the gate covers the whole fetch window."
+    )
+
+    # 2. Gates: DOM-counting affordances latch-gated; explicit-arg /
+    #    no-count paths stay busy-only.
+    def _fn_slice(name: str) -> str:
+        start = body.index("function " + name)
+        return body[start : body.index("\n  function ", start + 1)]
+
+    for gated in ("_rewindToMessage", "_editAndResend", "_startEdit"):
+        assert "if (busy || historyStale) return;" in _fn_slice(gated), (
+            f"{gated} must gate on busy || historyStale (#894)."
+        )
+    for ungated in ("_rewindToTurns", "_retryLast"):
+        sl = _fn_slice(ungated)
+        assert "if (busy) return;" in sl and "busy || historyStale" not in sl, (
+            f"{ungated} must stay busy-only (at-site ruling: explicit turn "
+            "count / no DOM count — latch-gating it blocks legitimate calls)."
+        )
+
+    # 3. Clear site: exactly one assignment to false (past the decl),
+    #    below the failure guard.
+    clears = re.findall(r"(?<!let )historyStale = false;", body)
+    assert len(clears) == 1, (
+        "historyStale must clear in exactly one place (refetchHistory's success path)."
+    )
+    fetch_start = body.index("async function refetchHistory(seedCursor = false)")
+    guard = body.index("if (!hist) return;", fetch_start)
+    clear_site = body.index("historyStale = false;", fetch_start)
+    assert guard < clear_site, (
+        "the latch clear must sit BELOW the failure guard — a failed fetch "
+        "keeps the latch set (that survival arms the retry/backstop)."
+    )
+
+    # 4. Transport-free backstop: the arm after the truncated consumer
+    #    refetches over REST and never reconnects — and it must be the
+    #    ELSE-IF of the truncated consumer (mutual exclusion: the
+    #    truncated branch's own reload heals the latch too; two separate
+    #    ifs would run both heals on one idle edge).
+    trunc_arm = body.index("if (pendingTruncatedResync)")
+    backstop = body.index("historyStale &&", trunc_arm)
+    assert "} else if (" in body[trunc_arm:backstop], (
+        "the staleness backstop must be the else-if sibling of the "
+        "pendingTruncatedResync consumer, never an independent if."
+    )
+    # The idle/error branch ends where the busy ``else`` begins.
+    idle_block_end = body.index("Every other state is a turn in flight", backstop)
+    # Comment-stripped: the arm's at-site ruling comments name every
+    # guard term, so raw-window presence asserts would go vacuous.
+    backstop_arm = _strip_comments(body[backstop:idle_block_end])
+    assert "refetchHistory();" in backstop_arm, (
+        "the staleness backstop must heal via a plain seedless refetchHistory()."
+    )
+    assert "loadHistoryThenReconnect();" not in backstop_arm, (
+        "TRANSPORT-FREE ruling: the staleness backstop must never "
+        "reconnect — a reload's fresh reconnect draws the synthetic "
+        "state_change:idle back into this trigger (zero-backoff storm)."
+    )
+    assert "!refetchesInFlight" in backstop_arm, (
+        "the backstop must yield to an in-flight refetch — without the "
+        "guard it stomps a same-snapshot fetch with a double render "
+        "(mirrors interactive's !_replayQueue pin)."
+    )
+    assert "!currentAssistantEl" in backstop_arm and "!currentReasoningEl" in backstop_arm, (
+        "the backstop's ref guards are LOAD-BEARING (coord's "
+        "refetchHistory does not reset streaming refs, and this arm "
+        "serves error edges where no stream_end nulled them) — a "
+        "simplify-to-match-interactive edit must not delete them."
+    )
+
+    # 5. Bounded retry: exactly one arm site; the ARM is teardown-gated;
+    #    the fire guard yields to an in-flight fetch and carries the
+    #    teardown sentinel.
+    assert body.count("staleRetryTimer = setTimeout") == 1, (
+        "the stale retry must be armed in exactly one place (clear_ui "
+        ".then) — bounded by construction."
+    )
+    assert body.count("if (historyStale && visHandler) {") == 1, (
+        "the arm must be gated on the teardown sentinel too — the "
+        "clear_ui .then can settle after destroy()/coordCloseSession, "
+        "and an ungated arm recreates the orphan timer destroy's cancel "
+        "exists to kill."
+    )
+    retry_arm = body.index("staleRetryTimer = setTimeout")
+    # #900 made the delay an expression over two SHARED constants, so the old
+    # literal `}, 2000);` anchor is gone.  Assert the new anchor EXISTS before
+    # slicing on it: `.index` would raise ValueError and the suite would ERROR
+    # with an anonymous traceback rather than fail on a named assertion, which
+    # is the exact failure mode this re-anchor exists to remove.  Coord and
+    # interactive must carry the identical expression or the herd-spread
+    # invariant silently forks.
+    # Unwindowed on purpose: the expression occurs exactly once in coord, so a
+    # fixed slice buys nothing and can truncate mid-expression (it did).
+    # Locality is established by the retry_fire slice below, which starts at
+    # the arm — this assertion only has to prove the anchor exists at all.
+    assert "STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS" in body, (
+        "the coord retry must keep the shared floor + jitter (#900)"
+    )
+    retry_fire = _strip_comments(body[retry_arm : body.index("STALE_RETRY_JITTER_MS", retry_arm)])
+    assert "!refetchesInFlight" in retry_fire, (
+        "the retry's fire guard must yield to an in-flight refetch "
+        "(mirrors interactive's !_replayQueue pin)."
+    )
+    assert "visHandler" in retry_fire, (
+        "the retry's fire guard must carry the teardown sentinel for the "
+        "coordCloseSession path, which nulls visHandler but does not "
+        "cancel the timer (evtSource is also null there post-suspend, "
+        "but the sentinel is the durable term)."
+    )
+    assert "!currentAssistantEl" in retry_fire and "!currentReasoningEl" in retry_fire, (
+        "the retry's ref guards skip a pointless fetch whose payload the "
+        "render-time gate would discard (the chokepoint carries the "
+        "correctness; these are the efficiency layer — keep them)."
+    )
+    # Whitespace-normalised, not indentation-exact: #900 made the delay an
+    # expression, which reflowed setTimeout to prettier's multi-line call form
+    # and re-indented this whole callback body.  Still an ORDERED-tail pin, so
+    # a mere comment mention cannot satisfy it.
+    cond_start = body.index("if (", retry_arm)
+    guard = " ".join(body[cond_start : body.index(") {", cond_start)].split())
+    assert guard.endswith("visHandler && evtSource && evtSource.readyState === EventSource.OPEN"), (
+        "the retry's fire guard must require an OPEN stream — not handle "
+        "existence: CONNECTING keeps the handle with a frozen cursor and "
+        "a pending replay, and a seedless heal then double-renders when "
+        "the replay lands.  Exact-tail pin so a comment mention cannot "
+        "satisfy it; re-anchor if the guard reflows."
+    )
+    assert "if (staleRetryTimer) clearTimeout(staleRetryTimer);" in body, (
+        "re-arming on a newer clear_ui must cancel the pending timer "
+        "first, or a double clear_ui leaks a timer."
+    )
+    # The consumer pins above are only meaningful while the PRODUCER
+    # brackets every fetch: without the ++/-- pair the counter is
+    # permanently 0 and both yield guards pass vacuously.  Count alone
+    # is not enough — the ORDER is the bracket (an increment moved below
+    # the await leaves the counter 0 during every fetch with both counts
+    # intact), so pin inc < await < finally < dec inside refetchHistory.
+    assert body.count("refetchesInFlight++") == 1, (
+        "refetchHistory must increment the in-flight counter before its "
+        "await — the yield guards read it."
+    )
+    assert body.count("refetchesInFlight--") == 1, (
+        "the in-flight counter must decrement in exactly one place (the "
+        "fetch finally) so every exit rebalances it."
+    )
+    inc = body.index("refetchesInFlight++", fetch_start)
+    awt = body.index("await Promise.race([", fetch_start)
+    fin = body.index("} finally {", fetch_start)
+    dec = body.index("refetchesInFlight--", fetch_start)
+    assert inc < awt < fin < dec, (
+        "the counter must bracket the await window: increment BEFORE the "
+        "fetch, decrement in its finally — any other order un-brackets "
+        "the very window the yield guards protect."
+    )
+
+    # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.
+    destroy_slice = _fn_slice("destroy()")
+    assert "clearTimeout(staleRetryTimer)" in destroy_slice, (
+        "destroy() must cancel the stale retry timer or it fires into "
+        "detached DOM (and pins the closure)."
+    )
+    cst_slice = _fn_slice("closeStreamTransport()")
+    assert "clearTimeout(staleRetryTimer)" not in cst_slice, (
+        "closeStreamTransport must NOT cancel the stale retry — transport "
+        "redials keep the pending heal intent (terminal-only cancel)."
+    )
+
+    # 7. Render-time gate (r5-derived, seedless-scoped after the
+    #    coord-restart family find): the post-await re-checks sit between
+    #    the failure guard and the wipe, so the latch-clear (below the
+    #    wipe) sits below every skip point by construction.  Universal
+    #    terms: dispatch currency (seq) and the content refs (skipping
+    #    always beats stranding a ref; seeded callers null theirs before
+    #    fetching, so it never blocks them).  SEEDLESS-only terms —
+    #    keyed on the seedCursor ARG: the event-driven live-tool-call
+    #    set (liveToolCalls — never a DOM probe, which the render's own
+    #    orphan repaint forges: the r6 critical; on the SEEDED resync
+    #    even genuine residue must not block — the render IS the
+    #    recovery, and a universal term wedged coord-restart outright),
+    #    the optimistic-send busySource flavor, and stream-OPENness
+    #    (CONNECTING keeps the handle with a frozen cursor and a
+    #    pending replay).  Plain ``busy`` must not appear:
+    #    it means a turn is EXECUTING, not that this DOM holds live
+    #    state (the r5 critical).
+    hist_guard = body.index("if (!hist) return;", fetch_start)
+    wipe = body.index("messagesEl.replaceChildren();", fetch_start)
+    latch_clear = body.index("historyStale = false;", fetch_start)
+    assert hist_guard < wipe < latch_clear, (
+        "the wipe must sit between the failure guard and the latch-clear "
+        "— every gate skip above the wipe then leaves the latch set."
+    )
+    gate_code = _strip_comments(body[hist_guard:wipe])
+    for term, why in (
+        ("if (seq !== refetchSeq) return;", "dispatch-currency (seq)"),
+        (
+            "if (currentAssistantEl || currentReasoningEl) return;",
+            "universal content-ref",
+        ),
+        ("!seedCursor &&", "seedless scoping"),
+        ('busySource === "optimistic"', "optimistic-row"),
+        ("liveToolCalls.size > 0", "live-tool-call"),
+        ("evtSource.readyState !== EventSource.OPEN", "stream-OPENness"),
+    ):
+        assert term in gate_code, (
+            f"the render-time gate must carry the {why} term (in CODE, not a comment)."
+        )
+    seedless_at = gate_code.index("!seedCursor &&")
+    assert gate_code.index("if (seq !== refetchSeq) return;") < seedless_at, (
+        "seq currency must be checked before the seedless group."
+    )
+    assert gate_code.index("if (currentAssistantEl || currentReasoningEl) return;") < seedless_at, (
+        "the universal ref check must precede the seedless group."
+    )
+    for term in (
+        'busySource === "optimistic"',
+        "liveToolCalls.size",
+        "evtSource.readyState !== EventSource.OPEN",
+    ):
+        assert seedless_at < gate_code.index(term), (
+            f"{term} must live INSIDE the !seedCursor group — the seeded "
+            "resync renders over a dead --running batch / an optimistic "
+            "row deliberately (blocking it wedges the coord-restart "
+            "recovery)."
+        )
+    assert not re.search(r"\bbusy\b(?!Source)", gate_code), (
+        "plain busy must not gate the render — busy means a turn is "
+        "EXECUTING, not that this DOM holds live state (the r5 critical: "
+        "_editAndResend flips busy before its POST and /rewind emits no "
+        "state_change, so a busy term skips the truncation render the "
+        "rewind exists to produce)."
+    )
+
+    # 8. Live-set discipline (r6): the tool-phase liveness signal is fed
+    #    ONLY by live SSE events and drained at settle/teardown edges —
+    #    and NO render path may touch it.  The r6 critical: the render's
+    #    own replay paints orphan batches with the same --running class
+    #    the live path uses, so a DOM-derived probe let one orphan paint
+    #    poison every seedless heal for the life of the page.
+    assert body.count("liveToolCalls.add(") == 2, (
+        "liveToolCalls must be fed by exactly the two live announce "
+        "events (tool_pending + tool_info)."
+    )
+    assert body.count("liveToolCalls.delete(") == 1, (
+        "tool_result must retire its call_id from the live set."
+    )
+    assert body.count("liveToolCalls.clear()") == 1, (
+        "the live set must drain at the settle edge ONLY — a "
+        "closeStreamTransport drain fails OPEN (the reconnect replay "
+        "does not re-announce a live batch, so an emptied set lets a "
+        "post-redial seedless render wipe the live batch: the r7 major)."
+    )
+    settle_block = body[
+        body.index('if (ev.state === "idle" || ev.state === "error") {') : body.index(
+            "Every other state is a turn in flight"
+        )
+    ]
+    assert "liveToolCalls.clear()" in settle_block, (
+        "the one drain must sit inside the idle/error settle block — "
+        "anywhere else either leaks dead ids (gate stuck) or drains live "
+        "ones (gate forged open)."
+    )
+    cst_code = _strip_comments(cst_slice)
+    assert "liveToolCalls" not in cst_code, (
+        "closeStreamTransport must not touch the live set (r7): transport "
+        "death is not a retirement event — a stale id fails CLOSED, an "
+        "emptied set fails OPEN into the wipe.  (The at-site ruling "
+        "comment may name it; the CODE may not.)"
+    )
+    tool_result_block = body[
+        body.index('case "tool_result":') : body.index(
+            "case ", body.index('case "tool_result":') + 10
+        )
+    ]
+    assert "liveToolCalls.delete(" in tool_result_block, (
+        "tool_result must retire its call_id inside its own case arm."
+    )
+    for case_name in ('case "tool_pending":', 'case "tool_info":'):
+        case_block = body[body.index(case_name) : body.index("break;", body.index(case_name))]
+        assert "liveToolCalls.add(" in case_block, (
+            f"{case_name} must feed the live set inside its own case arm "
+            "(the live announce events are the ONLY producers)."
+        )
+    fetch_end = body.index("\n  function ", fetch_start + 1)
+    fetch_body = body[fetch_start:fetch_end]
+    fetch_code = _strip_comments(fetch_body)
+    assert fetch_code.count("liveToolCalls") == 1, (
+        "refetchHistory may READ the live set exactly once (the gate) "
+        "and never write it — a render that touched liveness could "
+        "forge the very signal that guards it (the r6 lesson)."
+    )
+    # The await must be BOUNDED (r7): an accepted-but-never-answered
+    # /history would pin refetchesInFlight above zero for the life of
+    # the page and every heal would yield forever.
+    assert "if (histCtrl) histCtrl.abort();" in fetch_code
+    assert "deadlineHandle.dispose()" in fetch_code, (
+        "the fetch finally must retire its deadline through the module's "
+        "dispose() — direct state-slot pokes are the drift the shared "
+        "handle exists to prevent."
+    )
+    assert "createHistoryHandoffDeadline(" in fetch_code
+    assert "Promise.race([" in fetch_code and "deadlineHandle.promise" in fetch_code, (
+        "refetchHistory must have a logical deadline independent of abort — "
+        "older runtimes can lack AbortController and a request may ignore it."
+    )
+    # The seq stamp's PRODUCER must sit above the await, or the
+    # last-dispatch-wins gate is permanently vacuous (a stamp captured
+    # after the await always equals refetchSeq) — the twin of the
+    # refetchesInFlight bracket pin.
+    assert body.count("const seq = ++refetchSeq;") == 1, (
+        "refetchHistory must stamp its dispatch exactly once."
+    )
+    assert body.index("const seq = ++refetchSeq;", fetch_start) < awt, (
+        "the seq stamp must be captured BEFORE the await — captured "
+        "after, it always equals refetchSeq and the currency gate never "
+        "fires."
+    )
+
+    # The bound must actually be WIRED (r8): the signal must reach
+    # getJSON and getJSON must forward its init — the pinned abort/
+    # clearTimeout strings alone survive a dead bound.
+    assert "{ signal: histCtrl.signal }" in fetch_code, (
+        "the abort signal must reach the fetch — an unforwarded "
+        "controller aborts nothing and the await is unbounded again."
+    )
+    assert "function getJSON(url, init)" in body and (
+        'Object.assign({ credentials: "include" }, init || {})' in body
+    ), (
+        "getJSON must forward its init while preserving credentials — "
+        "narrowing it back to getJSON(url) silently unwires the bound."
+    )
+    # destroy() must abort the in-flight fetch (dead-not-inert, the
+    # staleRetryTimer ruling applied to the r7 bound).
+    # Producer pins first — the destroy() consumer sweep below is
+    # satisfiable by an always-empty Set without them.  ONE composite
+    # record per attempt: registering ctrl and deadline separately is the
+    # parallel-bookkeeping drift a future attempt site gets wrong.
+    assert body.count("histAttempts.add(attempt)") == 1, (
+        "every dispatch must register its composite {ctrl, deadline} record in the attempt Set."
+    )
+    assert body.count("histAttempts.delete(attempt)") == 1, (
+        "the fetch finally must release its own attempt record — without "
+        "the delete the Set grows for the life of the pane."
+    )
+    assert body.index("histAttempts.add(attempt)", fetch_start) < awt, (
+        "the attempt must be registered BEFORE the await."
+    )
+    assert fin < body.index("histAttempts.delete(attempt)", fetch_start), (
+        "the attempt release must sit in the fetch finally."
+    )
+    destroy_code = _strip_comments(destroy_slice)
+    assert "histAttempts.forEach" in destroy_code and ".abort()" in destroy_code, (
+        "destroy() must abort EVERY in-flight /history (a Set — a "
+        "newest-wins single slot left older overlapping fetches "
+        "unabortable); the 15s bound alone pins the destroyed closure "
+        "until it fires."
+    )
+    assert "attempt.deadline.dispose({ expire: true, resolve: true })" in destroy_code, (
+        "destroy must settle every logical deadline immediately (expired + "
+        "resolved, including when AbortController is unavailable) via the "
+        "module's dispose() — from the SAME composite record its abort "
+        "came from, never a parallel Set."
+    )
+
+
+def test_coordinator_js_early_paints_pending_tool_calls():
+    """The coord chat frontend must render a committed tool call on
+    ``tool_pending`` — before the intent judge verdict + approval gate
+    resolve — reusing the idempotent ``appendToolBatch`` upgrade path so the
+    authoritative ``approve_request`` / ``tool_info`` morphs the same
+    construct in place.  Guards the early-paint wiring (the #621 block) so a
+    refactor that drops the handler or the ``announce`` kicker branch surfaces
+    here instead of in production.  String presence only — coord.js has no JS
+    test framework today."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    assert 'case "tool_pending":' in body
+    assert "announce: true" in body
+    # Distinct "Evaluating" placeholder kicker for the pre-verdict shell.
+    assert "opts.announce" in body
+    assert '"Evaluating"' in body
+
+
+def test_coordinator_js_early_paint_screen_reader_announce():
+    """Coord screen-reader parity for the early paint: a committed tool call
+    routes to a POLITE off-screen announcer (not the assertive gate region,
+    not the messages log which is aria-live="off" mid-stream), and the
+    announced batch carries aria-busy until upgraded.  Silent failures, so
+    pin both the JS wiring and the index.html region."""
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
+
+    # Dedicated polite announcer + helper, distinct from the assertive one.  The
+    # markup is built by buildCoordChrome now (the standalone page went thin).
+    assert '"coord-sr-announcer-polite"' in coord_js
+    pos = coord_js.index('"coord-sr-announcer-polite"')
+    assert '"aria-live": "polite"' in coord_js[pos : pos + 200]
+    assert "function _announcePolite(" in coord_js
+    # Root-scoped now (de-globalized pane factory): the polite announcer is
+    # resolved off the pane root, not document.getElementById.
+    assert 'querySelector("#coord-sr-announcer-polite")' in coord_js
+    # tool_pending announces politely; the announce shell is marked busy.
+    assert "_announcePolite(_toolAnnounceText(ev.items" in coord_js
+    assert 'if (opts.announce) batch.setAttribute("aria-busy", "true")' in coord_js
+
+
+def test_coordinator_de_globalized_to_pane_factory():
+    """Step 4a: coordinator.js is a multi-instantiable pane factory, not a
+    page-global IIFE.  ``createCoordinatorPane(root, wsId)`` root-scopes every
+    lookup, owns its lifecycle (connect / destroy / onLogin), and exposes no
+    page-global ``window.coord*`` / ``onLoginSuccess`` collision point; the
+    standalone page bootstraps one pane filling the body."""
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
+    index_html = (base / "index.html").read_text(encoding="utf-8")
+
+    assert "function createCoordinatorPane(root, wsId, opts) {" in coord_js
+    # Step 5e.0: coordinator.js is a real ES module the shell imports — the bare
+    # `export` is its only seam.  No `window.*` bridge (unlike interactive.js,
+    # whose classic ui/static/app.js still needs the global): both the console
+    # shell and the standalone bootstrap import the factory.
+    assert "export { createCoordinatorPane };" in coord_js
+    assert "window.createCoordinatorPane" not in coord_js, (
+        "no dead window bridge — both consumers import the factory"
+    )
+    assert "function destroy() {" in coord_js, "a pane must have a teardown path"
+    # ws_id is a constructor arg now, not read off <html>; lookups are root-scoped.
+    assert "document.documentElement.dataset.wsId" not in coord_js
+    assert "document.getElementById(" not in coord_js, (
+        "pane code must root-scope, not getElementById"
+    )
+    # No page-global collision points (multi-instance safe).
+    for gone in ("window.coordSend", "window.coordCloseSession", "window.onLoginSuccess"):
+        assert gone not in coord_js, f"de-globalized: {gone} must be gone"
+    # Standalone page = one pane filling the body, bootstrapped by a MODULE that
+    # imports the factory (a classic eager IIFE would run before the deferred
+    # coordinator module loaded it); the inline close onclick is gone.
+    assert '<script type="module">' in index_html
+    assert (
+        'import { createCoordinatorPane } from "/static/coordinator/coordinator.js"' in index_html
+    )
+    assert "createCoordinatorPane(document.body" in index_html
+    assert 'onclick="coordCloseSession()"' not in index_html
+
+
+def test_coordinator_chrome_builder_and_thin_page():
+    """Step 4b: the coordinator chrome is built programmatically (createElement,
+    no innerHTML) by buildCoordChrome, so the SAME factory serves the standalone
+    page and a console pane.  The standalone page is now a thin bootstrap passing
+    {standalone:true}; its static chrome + inline <style> are gone (CSS migrated)."""
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
+    index_html = (base / "index.html").read_text(encoding="utf-8")
+
+    assert "function buildCoordChrome(root, opts)" in coord_js
+    assert "buildCoordChrome(root, opts);" in coord_js, "the factory must build its own chrome"
+    assert ".innerHTML" not in coord_js, "the chrome builder must stay innerHTML-free"
+    # Pane-hosted close routes through opts.onClose (close the pane), not a redirect.
+    assert "opts.onClose" in coord_js, "coordCloseSession must close the pane when pane-hosted"
+    # Standalone page is thin: static chrome gone, links the migrated stylesheet,
+    # bootstraps with the standalone flag (adds back-link / theme / toast).
+    assert 'id="coord-header"' not in index_html, (
+        "static chrome must be gone (the factory builds it)"
+    )
+    assert "coord-chrome.css" in index_html, "standalone must link the migrated chrome CSS"
+    assert "standalone: true" in index_html
+    assert (base / "coord-chrome.css").exists(), "the migrated chrome stylesheet must exist"
+
+
+def test_compact_presentation_coordinator_wiring_and_ordering():
+    """Coordinator retains its own result lifecycle but shares presentation.
+
+    The running-state cleanup must precede settlement, which must precede the
+    coordinator's scheduled follow. Replay stages the same fold without
+    a completion announcement, and only the rail-less page mounts a control.
+    """
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    body = (base / "coordinator.js").read_text(encoding="utf-8")
+    css = (base / "coord-chrome.css").read_text(encoding="utf-8")
+
+    for symbol in (
+        "clearConvVerdictPending",
+        "getTranscriptPresentation",
+        "mountTranscriptPresentationToggle",
+        "preserveTranscriptBottomPin",
+        "registerTranscriptScroller",
+        "isConvVerdictCompactBlocker",
+        "markConvRowResultSettled",
+        "createReasoningActivity",
+        "setConvBatchExpanded",
+    ):
+        assert symbol in body
+
+    chrome = _extract_braced(body, "function buildCoordChrome(root, opts) {")
+    toolbar = chrome.index('id: "coord-standalone-toolbar"')
+    coord_body = chrome.index('id: "coord-body"')
+    assert "if (opts.standalone)" in chrome[:toolbar]
+    assert toolbar < coord_body
+    assert 'role: "toolbar"' in chrome
+    assert "mountTranscriptPresentationToggle" not in chrome
+    assert "#coord-standalone-toolbar" in css
+
+    create = _extract_braced(body, "function createCoordinatorPane(root, wsId, opts) {")
+    mount = create.index("mountTranscriptPresentationToggle(")
+    assert create.rfind("if (opts && opts.standalone)", 0, mount) >= 0
+    assert 'querySelector("#coord-status-bar")' in create
+    status_mount = create.index('querySelector("#coord-status-bar")')
+    assert mount < status_mount, "the presentation control must not enter the live status region"
+    assert "registerTranscriptScroller(messagesEl," in create
+
+    live = _extract_braced(
+        body,
+        "  function appendToolResult(name, callId, output, isError, opts) {",
+    )
+    append = live.index("_appendResultToRow(")
+    running_cleanup = live.index("_unsetBatchRunningIfAllResults(", append)
+    settlement = live.index("markConvRowResultSettled(", running_cleanup)
+    scheduled_scroll = live.index("_scheduleScroll()", settlement)
+    assert append < running_cleanup < settlement < scheduled_scroll
+    assert "settlement.autoFolded" in live
+    assert 'getTranscriptPresentation() === "compact"' in live
+    assert '_announcePolite("Completed: "' in live
+
+    replay = _extract_braced(body, "  async function refetchHistory(seedCursor = false) {")
+    occurrence = replay.index("if (occurrence && occurrence.row)")
+    replay_append = replay.index("_appendResultToRow(", occurrence)
+    replay_cleanup = replay.index("_unsetBatchRunningIfAllResults(", replay_append)
+    replay_settlement = replay.index("markConvRowResultSettled(", replay_cleanup)
+    assert replay_append < replay_cleanup < replay_settlement
+    assert '_announcePolite("Completed: "' not in replay[occurrence:replay_settlement]
+
+    tier = _extract_braced(body, "  function _refreshBatchTierImmediate(batch) {")
+    assert 'querySelector(".conv-batch-disclosure")' in tier
+    assert "head.insertBefore(tierEl, disclosure || null)" in tier
+
+    result = _extract_braced(
+        body,
+        "  function _appendResultToRow(row, output, isError, opts) {",
+    )
+    assert result.index("clearConvVerdictPending(row)") < result.index("row.dataset.effectStatus")
+    assert result.index("setToolOutputReviewState(row, output)") < result.index(
+        "row.dataset.effectStatus"
+    )
+    assert result.index("setConvBatchExpanded(") < result.index(
+        'batch.classList.add("conv-batch--error")'
+    )
+    warning = _extract_braced(body, "  function _attachOutputWarningChip(row, oa) {")
+    assert warning.index("setConvBatchExpanded(") < warning.index("buildConvWarning(")
+    pending = _extract_braced(body, "  function _appendJudgePendingLineTo(row) {")
+    assert pending.index("setConvBatchExpanded(") < pending.index("buildConvVerdict(null")
+
+    verdict = _extract_braced(body, "  function _appendVerdictLineTo(row, verdict) {")
+    pin = verdict.index("preserveTranscriptBottomPin(")
+    assert "row.isConnected" in verdict[:pin]
+    assert verdict.index("setConvBatchExpanded(") < verdict.index("buildConvVerdict(verdict)") < pin
+    assert "? preserveTranscriptBottomPin(messagesEl, renderVerdict)" in verdict
+    assert ": renderVerdict();" in verdict
+
+    destroy = _extract_braced(body, "  function destroy() {")
+    assert "unregisterTranscriptScroller();" in destroy
+    assert "unmountTranscriptPresentation();" in destroy
+
+    reasoning = _extract_braced(body, "  function appendReasoningToken(text) {")
+    assert "reasoningActivity.attach(currentReasoningEl)" in reasoning
+    content = _extract_braced(body, "  function appendContentToken(text) {")
+    assert "reasoningActivity.finish()" in content
+    finish = _extract_braced(body, "  function finishAssistantStream() {")
+    assert "reasoningActivity.finish()" in finish
+    busy = _extract_braced(body, "  function setBusy(b, source) {")
+    assert "if (!next) {" in busy
+    assert "reasoningActivity.finish();" in busy
+    assert "currentReasoningEl = null;" in busy
+    assert 'currentReasoningBuf = "";' in busy
+    cancelled = body[body.index('case "cancelled"') : body.index('case "clear_ui"')]
+    assert cancelled.index("reasoningActivity.finish()") < cancelled.index("if (!busy) break")
+
+
+def test_coordinator_close_409_uses_plain_retry_copy():
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    start = body.index("async function coordCloseSession()")
+    end = body.index("// ------------------------------------------------------------------", start)
+    close = body[start:end]
+
+    assert "resp.status === 409" in close
+    assert (
+        "Conversation history is still being saved. Try ending the session again shortly." in close
+    )
+    assert "resumeSse();" in close, "a refused close must retain and resume the live pane"
+
+
+def test_coord_child_links_open_interactive_pane():
+    """Step 5c (+ split revival): a coordinator child ws link (children tree +
+    linkified tool output) opens the child as a node-proxied interactive pane
+    in the console L-shell — in a split cell BESIDE the coordinator
+    (openPaneBeside; the parent stays on screen, and the click's pointerdown
+    focused the coordinator's cell first).  A delegated handler on the pane
+    root reads data-ws-id/data-node-id and passes the CHILD's node; the link's
+    href stays the standalone fallback (the standalone coordinator page has no
+    PaneManager, so the new-tab nav stands)."""
+    from pathlib import Path
+
+    coord_js = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    # Delegated handler, gated on the pane host so standalone keeps the href nav.
+    assert '.closest(".ws-link, .coord-ws-link")' in coord_js
+    assert "window.TS_SHELL && window.TS_SHELL.panes" in coord_js
+    assert 'pm.openPaneBeside("interactive", childWs, { nodeId: childNode })' in coord_js
+    # Both link sites carry the ids the handler reads.
+    assert "a.dataset.wsId = safeWs;" in coord_js  # renderChildRow (DOM)
+    assert "a.dataset.nodeId = safeNode;" in coord_js
+    assert 'data-ws-id="' in coord_js  # renderToolOutput (string)
+    assert 'data-node-id="' in coord_js
+    # The /node/{id}/?ws_id= href fallback must remain for the standalone page.
+    assert '"/node/"' in coord_js
+
+
+def test_coordinator_js_gates_send_on_cross_user_busy():
+    """The coordinator pane mirrors the interactive pane's shared-workstream
+    send gate: while another participant's turn is in flight it blocks this
+    viewer's send (the UX complement to the server-side 409). String-presence
+    guard — coord.js has no JS test framework."""
+    from pathlib import Path
+
+    coord_js = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    # tracks the acting user from state_change, clears on settle
+    assert "actingUserId = ev.acting_user_id;" in coord_js
+    assert "actingUserId = null;" in coord_js
+    # compares against the viewer's own id and drives the composer hard block
+    assert 'sessionStorage.getItem("ts.user_id")' in coord_js
+    assert "actingUserId !== me" in coord_js
+    assert "composer.setSendBlocked(" in coord_js
+    assert "function reconcileSendBlock()" in coord_js
+    # reactive 409 fallback — the fetch-stage conversion and the status ARM
+    # both live in the shared helper (composer_queue.postAndSettleSend /
+    # settleSendResponse), one implementation for both panes and for both of
+    # each pane's send flows.  The pane owns only the request, so its
+    # edit-and-resend flow can no longer miss the conversion and report a
+    # refused resend as a connection error.
+    assert "cross_user_interjection" not in coord_js, (
+        "the 409 conversion must not be re-derived per pane"
+    )
+    assert coord_js.count("postAndSettleSend(") == 2, "composer send + edit-and-resend"
+    helper = (
+        Path(__file__).resolve().parents[1] / "turnstone/shared_static/composer_queue.js"
+    ).read_text(encoding="utf-8")
+    assert "response.status === 409" in helper
+    assert 'status: "cross_user_interjection"' in helper
+    assert 'status === "cross_user_interjection"' in helper
+
+
+def test_task_status_vocabulary_is_pinned_across_every_surface():
+    """A new task status must be classified on EVERY surface or fail CI.
+
+    ``_TASK_STATUS_IS_OPEN`` in coordinator_client.py is the source of
+    truth; ``_TASK_STATUSES`` and ``TASK_OPEN_STATUSES`` derive from it,
+    so the observer's trigger set can't drift.  The three surfaces that
+    cannot derive from Python — the model-facing JSON enum, the JS label
+    map, and the CSS chip rules — are pinned here instead.  Without this
+    a new status silently defaults to "not open" in the observer (no
+    nudge ever fires for it) and to the neutral unlabelled chip in the
+    pane, with no test or type error anywhere.
+    """
+    import json
+    from pathlib import Path
+
+    from turnstone.console.coordinator_client import _TASK_STATUS_IS_OPEN, TASK_OPEN_STATUSES
+
+    root = Path(__file__).resolve().parent.parent
+    statuses = set(_TASK_STATUS_IS_OPEN)
+
+    # The derived sets stay consistent with the classification.
+    assert {s for s, is_open in _TASK_STATUS_IS_OPEN.items() if is_open} == TASK_OPEN_STATUSES
+
+    # 1. The model-facing tool schema enum.
+    schema = json.loads((root / "turnstone/tools/tasks.json").read_text(encoding="utf-8"))
+    assert set(schema["parameters"]["properties"]["status"]["enum"]) == statuses
+
+    # 2. The JS label map — every status needs operator-facing text, or
+    #    the chip renders the raw machine string.
+    coord_js = (root / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    labels_block = coord_js.split("const TASK_STATUS_LABELS = {", 1)[1].split("};", 1)[0]
+    labelled = {line.split(":", 1)[0].strip() for line in labels_block.splitlines() if ":" in line}
+    assert labelled == statuses, "TASK_STATUS_LABELS must cover exactly the Python statuses"
+
+    # 3. The CSS chip rules.  ``pending`` intentionally has no rule (it
+    #    falls back to the neutral base chip), so every OTHER status needs
+    #    one or it is visually indistinguishable from pending.
+    css = (root / "turnstone/console/static/coordinator/coord-chrome.css").read_text(
+        encoding="utf-8"
+    )
+    for status in statuses - {"pending"}:
+        assert f".status-{status}" in css, f"status {status!r} needs a chip rule"
+
+
+def test_task_field_caps_are_pinned_across_every_surface():
+    """The cap the server enforces and the cap the model is told must be
+    the same number.
+
+    ``TASK_TITLE_MAX`` / ``TASK_NOTE_MAX`` in metacognition.py are the
+    source of truth: the write path rejects on them and, since the
+    prepare-layer gate landed, so does the approval path.  The schema
+    states the same limit twice per field — a ``maxLength`` a provider
+    may enforce client-side, and prose the model reads — and neither can
+    derive from Python, so they are pinned here.
+
+    Drift is silent and one-directional: raise the schema alone and the
+    model is invited to send a title the server then refuses, which is
+    the two-surfaces-disagree class the display sanitiser work spent
+    this branch removing.
+    """
+    import json
+    from pathlib import Path
+
+    from turnstone.core.metacognition import TASK_NOTE_MAX, TASK_TITLE_MAX
+
+    root = Path(__file__).resolve().parent.parent
+    props = json.loads((root / "turnstone/tools/tasks.json").read_text(encoding="utf-8"))[
+        "parameters"
+    ]["properties"]
+
+    for field, cap in (("title", TASK_TITLE_MAX), ("note", TASK_NOTE_MAX)):
+        assert props[field]["maxLength"] == cap, (
+            f"{field} maxLength must equal TASK_{field.upper()}_MAX ({cap})"
+        )
+        # The prose is the half the model actually reads on providers
+        # that ignore ``maxLength``.
+        assert f"Max {cap} chars" in props[field]["description"], (
+            f"{field} description must state the {cap}-char cap"
+        )
+
+
+def test_needs_user_chip_darkens_warn_for_contrast():
+    """Raw ``var(--warn)`` on ``--warn-soft`` measures ~3.6:1 in the light
+    theme — under the 4.5:1 AA floor that applies at this chip's
+    10px/600/uppercase, and the worst of the four status chips on the one
+    status whose whole purpose is to be noticed.  The house color-mix
+    darkening (the approval disclosure's ``rec-*`` scheme) puts it at
+    ~5.0:1."""
+    from pathlib import Path
+
+    css = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coord-chrome.css"
+    ).read_text(encoding="utf-8")
+    block = css.split(".task-row .status-needs_user {", 1)[1].split("}", 1)[0]
+    assert "color-mix(in srgb, var(--warn) 70%, var(--ink-2))" in block, (
+        "needs_user chip text must darken --warn or it fails AA in the light theme"
+    )
+    assert "color: var(--warn);" not in block
+
+
+def test_task_note_wraps_in_both_surfaces():
+    """The same model-authored note renders in the sidebar and in the
+    idle-tasks card.  A ``needs_user`` ask is exactly where an
+    unbroken token lands (a URL, a path), and flex items default to
+    ``min-width: auto`` — so without word-break the sidebar row is forced
+    past its fixed width."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pane_css = (root / "turnstone/console/static/coordinator/coord-chrome.css").read_text(
+        encoding="utf-8"
+    )
+    card_css = (root / "turnstone/shared_static/chat.css").read_text(encoding="utf-8")
+
+    pane_block = pane_css.split(".task-row .meta {", 1)[1].split("}", 1)[0]
+    card_block = card_css.split(".msg.idle-tasks .msg-idle-note {", 1)[1].split("}", 1)[0]
+    assert "word-break: break-word" in pane_block
+    assert "word-break: break-word" in card_block
+
+
+def test_idle_cards_share_one_dom_builder():
+    """The two cards share grouped CSS *and* a DOM builder — pinned so a
+    change to one card's accessibility attributes or scroll behaviour
+    cannot silently skip the other."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert "function buildIdleCard(" in body
+    for caller in ("function appendIdleChildren(", "function appendIdleTasks("):
+        idx = body.index(caller)
+        assert "buildIdleCard(" in body[idx : idx + 1400], (
+            f"{caller} must delegate to the shared builder"
+        )
+
+
+def test_idle_children_card_carries_an_ident_column():
+    """Both idle cards need an identifier column, because a name is not an
+    identity — and on the children card the ident IS the row now.
+
+    Fresh ``idle_children`` meta is ids-and-states only (card honesty:
+    the card records what the model was told, and the delivered body
+    carries no child names), so ``appendIdleChildren`` renders ident +
+    state and builds a name cell ONLY for old persisted rows that still
+    carry one — those nudges did deliver the name to the model at the
+    time.  The mapping must never invent a name (no ``|| c.ws_id``
+    fallback: that would render a "name" the model never received, and
+    duplicate the ident column).  The 8-char slice matches the prefix
+    the model-facing body's bullet renders, so the operator and the
+    model name the same child the same way.  The grouped CSS rule is
+    pinned too: an ident column styled for one card only butts against
+    the text on the other.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    body = (root / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    idx = body.index("function appendIdleChildren(")
+    block = body[idx : idx + 1400]
+    assert 'ident: c && c.ws_id ? String(c.ws_id).slice(0, 8) : ""' in block, (
+        "appendIdleChildren must pass the ws_id prefix as `ident` — it is "
+        "the row's only identifier on fresh (nameless) meta."
+    )
+    assert 'name: c && c.name ? String(c.name) : ""' in block, (
+        "the name cell is old-rows-only: render a name exactly when the "
+        "persisted row carries one, and never fall back to the ws_id — a "
+        "fresh row must render ident + state with no name cell."
+    )
+    assert "c.name || c.ws_id" not in block, (
+        "the id-as-name fallback chain must not return: it renders a "
+        '"name" the model never received on fresh rows.'
+    )
+    css = (root / "turnstone/shared_static/chat.css").read_text(encoding="utf-8")
+    assert (
+        ".msg.idle-children .msg-idle-child-ident,\n.msg.idle-tasks .msg-idle-child-ident" in css
+    ), "the ident column must be styled on BOTH idle cards, not tasks-only"
+
+
+def test_idle_tasks_card_uses_the_shared_status_label():
+    """The conversation card and the sidebar chip must show one name per
+    state — ``in_progress`` in one place and ``in progress`` in the other
+    is two names for one thing on one screen."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert "function taskStatusLabel(" in body
+    idx = body.index("function appendIdleTasks(")
+    assert "taskStatusLabel(" in body[idx : idx + 1400]
+    idx_row = body.index("function renderTaskRow(")
+    assert "taskStatusLabel(" in body[idx_row : idx_row + 1400]
+
+
+def test_coordinator_js_status_bar_approval_chip():
+    """The coord status bar carries the same pending-approval chip as the
+    interactive pane.  The coord keeps no cycle map — pending state IS the
+    DOM — so the count is re-derived from ``.conv-batch--pending`` under the
+    transcript at every place that state can change: a pending batch paint
+    (either return path, gated on ``opts.pending`` so a history render's
+    per-batch calls never scan the transcript), the resolve morph, and the
+    history wipe.  The click targets ``_currentPendingBatch`` — the SAME
+    batch the keyboard shortcuts act on — and focuses its head, never an
+    action button.  Asserts string presence only (no JS framework for
+    coord.js)."""
+    from pathlib import Path
+
+    from tests._js_harness_helpers import extract_braced
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert 'id: "coord-sb-approval",' in body
+    assert 'class: "warn-chip ws-sb-approval",' in body
+    assert "_revealPendingApproval();" in body, "the chip click must route to the reveal"
+    # The chip is a button INSIDE root, which carries the approval keydown
+    # handler: without a guard, Enter on the focused chip approves the batch.
+    assert "if (ae && ae === sbApprovalEl) return;" in body, (
+        "the approval keydown handler must ignore keys originating on the chip"
+    )
+    sync = extract_braced(body, "function _syncApprovalChip() {")
+    assert '".conv-batch.conv-batch--pending"' in sync, (
+        "the count must derive from the transcript's pending batches"
+    )
+    assert "StatusBar.paintApprovalChip(" in sync
+    assert "focusFallbackEl: composer && composer.inputEl" in sync
+    # Every pending-state transition recounts — and only those.
+    append = extract_braced(body, "function appendToolBatch(items, opts) {")
+    upgrade_return = append.index("return existing;")
+    fresh_return = append.index("return batch;")
+    upgrade_recount = append.index("if (opts.pending) _syncApprovalChip();")
+    fresh_recount = append.index("if (opts.pending) _syncApprovalChip();", upgrade_recount + 1)
+    assert upgrade_recount < upgrade_return < fresh_recount < fresh_return, (
+        "each appendToolBatch return path must recount when it can add a pending batch"
+    )
+    assert (
+        "\n    _syncApprovalChip();" not in append and "\n      _syncApprovalChip();" not in append
+    ), (
+        "an unconditional recount in appendToolBatch scans the transcript once per "
+        "replayed batch — quadratic on a long history render"
+    )
+    morph = extract_braced(body, "function _morphBatchResolved(batch, opts) {")
+    assert "_syncApprovalChip();" in morph
+    refetch = extract_braced(body, "async function refetchHistory(seedCursor = false) {")
+    wipe = refetch.index("messagesEl.replaceChildren();")
+    assert wipe < refetch.index("_syncApprovalChip();", wipe), (
+        "the history wipe must recount (a history render never paints a pending batch)"
+    )
+    # Click target == keyboard target, and that target must really be pending.
+    current = extract_braced(body, "function _currentPendingBatch() {")
+    assert 'if (!b.classList.contains("conv-batch--pending")) continue;' in current, (
+        "a resolved batch keeps data-needs-approval on its rows and has no button, "
+        "so without the class check it outranks an older still-pending batch"
+    )
+    reveal = extract_braced(body, "function _revealPendingApproval() {")
+    assert "_currentPendingBatch()" in reveal, "click target must equal the keyboard target"
+    assert "setConvBatchExpanded(batch, true, { blocker: true });" in reveal
+    assert "StatusBar.scrollToApprovalTarget(batch);" in reveal
+    assert "focusConvBatchHead(batch);" in reveal, (
+        "a reveal must land focus on the batch head, never on Approve (Space would fire it)"
+    )
+    assert "_focusBatchPrimary" not in reveal
+    shared = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
+    ).read_text(encoding="utf-8")
+    assert "export function focusConvBatchHead(batch) {" in shared
+
+
+def test_coordinator_js_children_pending_count_is_a_reveal_chip():
+    """The "x pending" half of the Children heading's "(N · x pending)" count
+    is now a warn chip (the status-bar approval chip's sibling): coloured,
+    clickable, hidden at zero, reading "x approvals".  Its click scrolls the
+    tree to the first child whose approval is pending, flashes the row, and
+    lands temporary focus on the row's approval region or the row — never
+    the child's link or an Approve button.  The count repaints from the
+    live-badge cache helpers, the one place the pending set changes (the
+    bulk live fetch that first discovers a pending approval reaches no
+    render otherwise), and the bulk fetch's row swap goes through the
+    single-row update so it keeps focus, the flash and the visibility
+    observer.  Structural pins; the behavior runs under node below."""
+    from pathlib import Path
+
+    from tests._js_harness_helpers import extract_braced, strip_js_comments
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert '"coord-children-pending",' in body, "the children section must request the chip"
+    assert 'class: "warn-chip side-count-pending",' in body
+    assert "_revealPendingChild();" in body, "the chip click must route to the reveal"
+    count = extract_braced(body, "function _refreshChildrenCount() {")
+    assert "StatusBar.paintWarnChip(" in count
+    assert 'label: pending + " approval" + (pending === 1 ? "" : "s"),' in count
+    assert "focusFallbackEl: composer && composer.inputEl" in count
+    for helper in (
+        "function _liveBadgeCacheSet(id, entry) {",
+        "function _liveBadgeCacheDelete(id) {",
+        "function _liveBadgeCacheClear() {",
+    ):
+        assert "_refreshChildrenCount();" in extract_braced(body, helper), (
+            f"{helper} mutates the pending set and must repaint the count"
+        )
+    flush = strip_js_comments(extract_braced(body, "async function flushLiveFetches() {"))
+    assert "_updateChildRow(id);" in flush and ".replaceWith(" not in flush, (
+        "the bulk fetch's row swap must go through _updateChildRow (focus, observer, count)"
+    )
+    capture = extract_braced(body, "function _captureRowFocusKey(scopeEl) {")
+    assert 'role: "row"' in capture and 'role: "approval"' in capture
+    restore = extract_braced(body, "function _restoreRowFocus(scopeEl, focusKey) {")
+    assert "focusTemporarily(target);" in restore, (
+        "a role target is a plain div on the fresh row; a raw focus() is a no-op there"
+    )
+    approve = extract_braced(body, "function handleChildApproveRequest(ev) {")
+    assert 'childrenState.set(childId, { ws_id: childId, name: "" });' in approve, (
+        "an approve_request ahead of the first state tick must still have a row to reveal"
+    )
+    assert (
+        'if (child.ws_id && child.ws_id === _flashWsId) row.classList.add("highlight");' in body
+    ), "renderChildRow must re-apply the flash across a row swap"
+    reveal = extract_braced(body, "function _revealPendingChild() {")
+    assert "pendingApprovalIds.has(" in reveal, "the target must come from the pending set"
+    assert "_setSidebarExpanded" not in body, (
+        "a collapsed sidebar hides the chip too, so a reveal never needs to expand it"
+    )
+    assert "StatusBar.scrollToApprovalTarget(row);" in reveal
+    assert "_flashChildRow(row.dataset.wsId);" in reveal
+    assert 'focusTemporarily(row.querySelector(".approval-block") || row);' in reveal
+    assert ".ws-link" not in reveal
+    shared = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
+    ).read_text(encoding="utf-8")
+    assert "export function focusTemporarily(el) {" in shared
+
+
+def test_coordinator_children_pending_chip_behavior(tmp_path):
+    """Run ``_refreshChildrenCount`` and ``_revealPendingChild`` under node
+    against the fake DOM: the count paints "(N)" plus a chip with the
+    pending count; the reveal targets the FIRST pending row in tree order,
+    expands the sidebar, scrolls, highlights, and focuses the approval
+    region when painted (else the row); zero pending is a no-op."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    from tests._js_harness_helpers import FAKE_DOM, extract_braced
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    count_fn = extract_braced(body, "function _refreshChildrenCount() {")
+    reveal_fn = extract_braced(body, "function _revealPendingChild() {")
+    flash_fn = extract_braced(body, "function _flashChildRow(wsId) {")
+    unflash_fn = extract_braced(body, "function _unflashChildRow(wsId) {")
+    script = tmp_path / "children_chip.mjs"
+    script.write_text(
+        FAKE_DOM
+        + f"""
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+const painted = [];
+const scrolled = [];
+const focused = [];
+const timers = [];
+globalThis.StatusBar = {{
+  paintWarnChip: (els, n, text) => painted.push({{ els, n, text }}),
+  scrollToApprovalTarget: (el) => scrolled.push(el),
+}};
+globalThis.focusTemporarily = (el) => focused.push(el);
+globalThis.setTimeout = (fn) => {{ timers.push(fn); return timers.length; }};
+globalThis.clearTimeout = () => {{}};
+globalThis.cssEscape = (s) => s;
+globalThis._flashWsId = null;
+globalThis._flashTimer = null;
+globalThis.FLASH_MS = 1200;
+globalThis.composer = {{ inputEl: new FakeElement("textarea") }};
+globalThis.childrenCountEl = new FakeElement("span");
+globalThis.childrenPendingEl = new FakeElement("button");
+globalThis.childrenState = new Map([["a", {{}}], ["b", {{}}], ["c", {{}}]]);
+globalThis.pendingApprovalIds = new Set();
+globalThis.childrenTreeEl = new FakeElement("div");
+html.appendChild(childrenTreeEl);
+function row(id, withBlock) {{
+  const r = new FakeElement("div");
+  r.className = "ch-row";
+  r.dataset.wsId = id;
+  if (withBlock) {{
+    const block = new FakeElement("div");
+    block.className = "approval-block";
+    r.appendChild(block);
+  }}
+  childrenTreeEl.appendChild(r);
+  return r;
+}}
+const rowA = row("a", false);
+const rowB = row("b", true);
+const rowC = row("c", false);
+{count_fn}
+{reveal_fn}
+{flash_fn}
+{unflash_fn}
+
+_refreshChildrenCount();
+assert(childrenCountEl.textContent === "(3)", "count must be the total alone: " + childrenCountEl.textContent);
+assert(painted.length === 1 && painted[0].n === 0, "zero pending paints the chip hidden");
+assert(painted[0].els.chipEl === childrenPendingEl, "the chip element must be the heading button");
+assert(painted[0].els.focusFallbackEl === composer.inputEl, "hidden-under-focus falls back to the composer");
+_revealPendingChild();
+assert(scrolled.length === 0 && focused.length === 0, "zero pending: reveal is a no-op");
+
+pendingApprovalIds.add("c");
+pendingApprovalIds.add("b");
+_refreshChildrenCount();
+assert(painted[1].n === 2 && painted[1].text.label === "2 approvals", "chip must carry the pending count with its noun");
+assert(/first child/.test(painted[1].text.title), "plural title names the first child");
+_revealPendingChild();
+assert(scrolled.length === 1 && scrolled[0] === rowB, "must scroll to the FIRST pending row in tree order");
+assert(rowB.classList.contains("highlight"), "the row must flash");
+assert(_flashWsId === "b", "the flash is held by id so a row swap can re-apply it");
+assert(focused.length === 1 && focused[0] === rowB.children[0], "focus lands on the painted approval region");
+// A live fetch swaps the row mid-flash: the timer strips the class from the
+// row that now carries the id, not the detached one.
+const rowB2 = new FakeElement("div");
+rowB2.className = "ch-row";
+rowB2.dataset.wsId = "b";
+if (rowB2.dataset.wsId === _flashWsId) rowB2.classList.add("highlight");
+rowB.remove();
+childrenTreeEl.appendChild(rowB2);
+assert(rowB2.classList.contains("highlight"), "a re-rendered row inside the window re-applies the flash");
+timers.splice(0).forEach((fn) => fn());
+assert(!rowB2.classList.contains("highlight") && _flashWsId === null, "the flash must clear on the live row");
+
+pendingApprovalIds.delete("b");
+_refreshChildrenCount();
+assert(painted[2].n === 1 && painted[2].text.label === "1 approval", "singular label");
+assert(!/first/.test(painted[2].text.title), "singular title does not say first");
+_revealPendingChild();
+assert(scrolled[1] === rowC, "after b resolves, c is next");
+assert(focused[1] === rowC, "no approval block yet: the row itself takes focus");
+
+// A pending id with no rendered row (tree not loaded) is a no-op.
+pendingApprovalIds.clear();
+pendingApprovalIds.add("zz");
+_revealPendingChild();
+assert(scrolled.length === 2, "unknown row: nothing to scroll to");
+console.log("children chip OK");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, f"children chip harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+def test_coordinator_row_focus_restore_handles_reveal_targets(tmp_path):
+    """``_captureRowFocusKey`` / ``_restoreRowFocus`` survive the row swaps
+    a child state tick or live fetch performs while the Children-heading
+    chip's reveal has parked temporary focus on the row or its approval
+    region: those are captured as roles (their classNames are transient)
+    and restored through ``focusTemporarily`` on the fresh row, while a
+    focused button inside the row still restores by className."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    from tests._js_harness_helpers import FAKE_DOM, extract_braced
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    capture_fn = extract_braced(body, "function _captureRowFocusKey(scopeEl) {")
+    restore_fn = extract_braced(body, "function _restoreRowFocus(scopeEl, focusKey) {")
+    script = tmp_path / "row_focus.mjs"
+    script.write_text(
+        FAKE_DOM
+        + f"""
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+FakeElement.prototype.matches = function (sel) {{ return this._matches(sel); }};
+const temporary = [];
+globalThis.focusTemporarily = (el) => {{ temporary.push(el); document.activeElement = el; }};
+globalThis.cssEscape = (s) => s;
+{capture_fn}
+{restore_fn}
+const tree = new FakeElement("div");
+html.appendChild(tree);
+function buildRow() {{
+  const row = new FakeElement("div");
+  row.className = "ch-row";
+  row.dataset.wsId = "b";
+  const block = new FakeElement("div");
+  block.className = "approval-block";
+  const btn = new FakeElement("button");
+  btn.className = "approve-btn";
+  block.appendChild(btn);
+  row.appendChild(block);
+  tree.appendChild(row);
+  return {{ row, block, btn }};
+}}
+let a = buildRow();
+
+// Focus on the row itself (reveal without a painted block): role, not class.
+a.row.classList.add("highlight");
+document.activeElement = a.row;
+let key = _captureRowFocusKey(tree);
+assert(key && key.role === "row" && key.wsId === "b", "row focus captures the row role: " + JSON.stringify(key));
+a.row.remove();
+let b = buildRow();
+_restoreRowFocus(tree, key);
+assert(temporary[0] === b.row, "row role restores onto the fresh row with a temporary tabindex");
+
+// Focus on the approval region.
+document.activeElement = b.block;
+key = _captureRowFocusKey(tree);
+assert(key && key.role === "approval", "region focus captures the approval role");
+b.row.remove();
+let c = buildRow();
+_restoreRowFocus(tree, key);
+assert(temporary[1] === c.block, "approval role restores onto the fresh region");
+
+// The region is gone on the resolution swap: the caret stays on the row.
+document.activeElement = c.block;
+key = _captureRowFocusKey(tree);
+c.row.remove();
+const bare = new FakeElement("div");
+bare.className = "ch-row";
+bare.dataset.wsId = "b";
+tree.appendChild(bare);
+_restoreRowFocus(tree, key);
+assert(temporary[2] === bare, "a resolved row without a region takes the focus itself");
+bare.remove();
+c = buildRow();
+
+// Focus on a button inside the row: the className marker path, raw focus.
+document.activeElement = c.btn;
+key = _captureRowFocusKey(tree);
+assert(key && key.marker === "approve-btn" && !key.role, "button focus keeps the className marker");
+c.row.remove();
+let d = buildRow();
+_restoreRowFocus(tree, key);
+assert(document.activeElement === d.btn && temporary.length === 3, "a focusable restores with a plain focus()");
+
+// Focus outside the tree: nothing captured, restore is a no-op.
+document.activeElement = html;
+assert(_captureRowFocusKey(tree) === null, "focus outside the scope captures nothing");
+_restoreRowFocus(tree, null);
+console.log("row focus OK");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, f"row focus harness failed:\n{proc.stderr}\n{proc.stdout}"

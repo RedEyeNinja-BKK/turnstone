@@ -1,0 +1,205 @@
+"""Tests for turnstone.core.tools — JSON auto-loading and schema validation."""
+
+from turnstone.core.tools import (
+    _META,
+    PRIMARY_KEY_MAP,
+    TASK_AGENT_TOOLS,
+    TASK_AUTO_TOOLS,
+    TOOLS,
+)
+
+
+class TestToolsSchema:
+    def test_all_tools_have_function_type(self):
+        for tool in TOOLS:
+            assert tool["type"] == "function", f"Tool missing type='function': {tool}"
+
+    def test_all_tools_have_name(self):
+        for tool in TOOLS:
+            assert "name" in tool["function"], f"Tool missing name: {tool}"
+            assert isinstance(tool["function"]["name"], str)
+
+    def test_all_tools_have_description(self):
+        for tool in TOOLS:
+            assert "description" in tool["function"], f"Tool missing description: {tool}"
+            assert len(tool["function"]["description"]) > 0
+
+    def test_all_tools_have_parameters(self):
+        for tool in TOOLS:
+            params = tool["function"]["parameters"]
+            assert params["type"] == "object"
+            assert "properties" in params
+
+    def test_required_fields_exist_in_properties(self):
+        for tool in TOOLS:
+            func = tool["function"]
+            params = func["parameters"]
+            required = params.get("required", [])
+            properties = params["properties"]
+            for field in required:
+                assert field in properties, (
+                    f"Tool '{func['name']}': required field '{field}' not in properties"
+                )
+
+    def test_tool_names_unique(self):
+        names = [t["function"]["name"] for t in TOOLS]
+        assert len(names) == len(set(names)), f"Duplicate tool names: {names}"
+
+    def test_task_agent_tools_subset(self):
+        tool_names = {t["function"]["name"] for t in TOOLS}
+        task_names = {t["function"]["name"] for t in TASK_AGENT_TOOLS}
+        assert task_names.issubset(tool_names), (
+            f"TASK_AGENT_TOOLS has names not in TOOLS: {task_names - tool_names}"
+        )
+
+    def test_task_agent_tools_not_empty(self):
+        assert len(TASK_AGENT_TOOLS) > 0
+
+
+class TestToolsMetadata:
+    """Validate the metadata extracted from JSON files."""
+
+    def test_tool_count(self):
+        # 31 tool files total: 12 coordinator-only + the rest interactive,
+        # with memory/skills/notify/read_resource/use_prompt dual-kind.
+        assert len(TOOLS) == 31
+
+    def test_task_agent_tools_count(self):
+        assert len(TASK_AGENT_TOOLS) == 13
+
+    def test_coordinator_tools_count(self):
+        from turnstone.core.tools import COORDINATOR_TOOLS
+
+        assert len(COORDINATOR_TOOLS) == 17
+        assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
+            "spawn_workstream",
+            "spawn_batch",
+            "close_all_children",
+            "inspect_workstream",
+            "send_to_workstream",
+            "close_workstream",
+            "cancel_workstream",
+            "delete_workstream",
+            "list_workstreams",
+            "list_nodes",
+            "tasks",
+            "wait_for_workstream",
+            # ``memory`` is dual-kind (coordinator + interactive) so
+            # coords can persist orchestration context for their children
+            # via the new ``coordinator`` scope.
+            "memory",
+            # ``skills`` is dual-kind (replaces legacy ``skill`` +
+            # ``list_skills``).  Read actions (find, get) auto-approve;
+            # write actions require operator approval + the
+            # ``model.skills.write`` permission.  ``load`` errors on
+            # coord sessions — coords delegate skill assignment via
+            # ``spawn_workstream(skill=...)``.
+            "skills",
+            # ``notify`` is dual-kind so coordinators can post status
+            # updates at narrative beats (fan-out complete, batch
+            # failed, phase done) without spawning a child purely to
+            # ship a message.  Routing logic is session-kind-agnostic.
+            "notify",
+            # ``read_resource``/``use_prompt`` are dual-kind (#725):
+            # coordinators get the full MCP surface — tools, resources,
+            # prompts — persona-gated like every session.  The catalog
+            # blocks in the system prompt and the name-keyed dispatch
+            # light up together with these schemas; both tools keep
+            # auto_approve:false, so coordinator calls prompt like any
+            # other MCP-backed action.
+            "read_resource",
+            "use_prompt",
+        }
+
+    def test_auto_approve_sets_match(self):
+        expected = {
+            "read_file",
+            "search",
+            "diff_file",
+            "web_fetch",
+            "web_search",
+            "notify",
+            # Background-shell follow-ups: ``bash_output`` is read-only;
+            # ``kill_shell`` only signals process groups the session itself
+            # spawned via an approved bash call — strictly risk-reducing,
+            # so gating cleanup behind approval adds friction, not safety.
+            "bash_output",
+            "kill_shell",
+            # Coordinator read-only tools (no-mutation, safe to auto-approve):
+            "inspect_workstream",
+            "list_workstreams",
+            "list_nodes",
+            "wait_for_workstream",
+        }
+        assert expected == TASK_AUTO_TOOLS
+
+    def test_primary_key_map(self):
+        expected = {
+            "bash": "command",
+            "read_file": "path",
+            "search": "query",
+            "write_file": "content",
+            "edit_file": "old_string",
+            "web_fetch": "url",
+            "web_search": "query",
+            "open_preview": "target",
+            "task_agent": "prompt",
+            "bash_output": "id",
+            "kill_shell": "id",
+            "memory": "name",
+            "recall": "query",
+            "notify": "message",
+            "watch": "command",
+            "read_resource": "uri",
+            "use_prompt": "name",
+            "skills": "action",
+            "diff_file": "path_a",
+            # Coordinator tools:
+            "spawn_workstream": "initial_message",
+            "spawn_batch": "children",
+            "close_all_children": "reason",
+            "inspect_workstream": "ws_id",
+            "send_to_workstream": "message",
+            "close_workstream": "ws_id",
+            "cancel_workstream": "ws_id",
+            "delete_workstream": "ws_id",
+            "tasks": "action",
+        }
+        assert expected == PRIMARY_KEY_MAP
+
+    def test_no_metadata_in_function_dicts(self):
+        """Ensure turnstone metadata keys are stripped from the OpenAI schema."""
+        meta_keys = {"task_agent", "coordinator", "auto_approve", "primary_key"}
+        for tool in TOOLS:
+            func = tool["function"]
+            leaked = meta_keys & set(func)
+            assert not leaked, f"Tool '{func['name']}' leaks metadata into function dict: {leaked}"
+
+    def test_meta_has_all_tools(self):
+        tool_names = {t["function"]["name"] for t in TOOLS}
+        assert set(_META.keys()) == tool_names
+
+
+class TestNestedDeeperThan:
+    """``nested_deeper_than`` measures parsed JSON without recursing."""
+
+    @staticmethod
+    def _nest(depth: int) -> object:
+        value: object = "leaf"
+        for _ in range(depth):
+            value = [value]
+        return value
+
+    def test_counts_objects_and_lists_not_scalars(self) -> None:
+        from turnstone.core.tools import nested_deeper_than
+
+        assert nested_deeper_than("text", 0) is False
+        assert nested_deeper_than({"a": [1, {"b": 2}]}, 3) is False
+        assert nested_deeper_than({"a": [1, {"b": 2}]}, 2) is True
+
+    def test_a_value_too_deep_for_recursive_code(self) -> None:
+        from turnstone.core.tools import nested_deeper_than
+
+        assert nested_deeper_than(self._nest(100), 100) is False
+        assert nested_deeper_than(self._nest(101), 100) is True
+        assert nested_deeper_than(self._nest(50_000), 100) is True

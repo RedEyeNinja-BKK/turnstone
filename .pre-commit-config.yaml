@@ -1,0 +1,17 @@
+repos:
+  # Keep rev equal to the dev extra's ruff pin in pyproject.toml; Renovate bumps both together.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.4
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: lint-hypothesis
+        name: HYPOTHESIS.md math delimiters and residues
+        entry: python lint_hypothesis.py --check
+        language: python
+        files: ^(HYPOTHESIS\.md|lint_hypothesis\.py)$
+        pass_filenames: false

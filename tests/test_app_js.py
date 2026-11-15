@@ -1,0 +1,4761 @@
+"""Static smoke guards for ``turnstone/ui/static/app.js``.
+
+The interactive WebUI's app.js has no JS test framework on the
+project side. This file holds Python-side string-presence assertions
+that catch regressions on critical paths — the kind of one-line
+deletion or rename that breaks the UI silently and only surfaces in
+manual testing.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests._js_harness_helpers import extract_braced, run_node_source, slice_braced_block
+from tests._js_harness_helpers import strip_js_comments as _strip_js_comments
+
+_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
+_INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
+_MCP_ERROR_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.js"
+_SHELL_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/shell.js"
+_REDACT_CREDENTIALS_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/shared_static/redact_credentials.js"
+)
+_CONSOLE_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
+_CONSOLE_INDEX = Path(__file__).resolve().parent.parent / "turnstone/console/static/index.html"
+
+
+def _pane_method_offset(body: str, name: str) -> int:
+    """Return the start offset of class method ``name`` in ``body``.
+
+    Indent-agnostic — matches the method header at any leading-whitespace
+    depth (2 spaces for the current class, 4 if the class is ever
+    wrapped in an IIFE or module, etc.) so slice tests survive deferred
+    modernization without silent ``ValueError`` failures.  Asserts on
+    miss so a refactor that renames the method fails loudly at the
+    pinning slice instead of further downstream.
+    """
+    pattern = re.compile(r"^\s{2,}" + re.escape(name) + r"\(", re.MULTILINE)
+    m = pattern.search(body)
+    assert m is not None, f"class method {name!r} not found in interactive.js"
+    return m.start()
+
+
+def test_close_workstream_maps_unresolved_history_to_plain_retry_copy() -> None:
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("function closeWorkstream(wsId)")
+    end = body.index("//  10. Dashboard", start)
+    close = body[start:end]
+
+    assert "result.status === 409" in close
+    assert (
+        "Conversation history is still being saved. Try ending the session again shortly." in close
+    )
+    assert "delete workstreams[wsId]" in close, "successful close behavior must remain intact"
+
+
+@pytest.mark.parametrize("bundle", [_APP_JS, _CONSOLE_APP_JS], ids=["node", "console"])
+def test_dashboard_persistence_badges_render_sanitized_operator_states(bundle: Path) -> None:
+    """Both dashboards render the same three non-healthy journal states."""
+    body = bundle.read_text(encoding="utf-8")
+    display_anchor = body.index("const PERSISTENCE_DISPLAY =")
+    display_body = _slice_balanced_body(body, display_anchor)
+    helper_body = _slice_function_body(body, "appendPersistenceStatus")
+    assert display_body is not None
+    assert helper_body is not None
+
+    script = f"""
+const PERSISTENCE_DISPLAY = {display_body};
+const document = {{
+  createElement: function (tag) {{
+    return {{
+      tag: tag, dataset: {{}}, attrs: {{}}, className: "", textContent: "", title: "",
+      setAttribute: function (name, value) {{ this.attrs[name] = value; }},
+    }};
+  }},
+}};
+function appendPersistenceStatus(container, ws) {helper_body}
+function probe(state) {{
+  const container = {{ children: [], appendChild: function (el) {{ this.children.push(el); }} }};
+  appendPersistenceStatus(container, {{ persistence_state: state }});
+  return container.children[0] || null;
+}}
+console.log(JSON.stringify({{
+  pending: probe("pending"),
+  retrying: probe("retrying"),
+  conflict: probe("conflict"),
+  healthy: probe("healthy"),
+}}));
+"""
+    try:
+        proc = subprocess.run(
+            ["node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    assert proc.returncode == 0, proc.stderr
+    rendered = json.loads(proc.stdout)
+    assert rendered["pending"]["textContent"] == "History save pending"
+    assert rendered["retrying"]["textContent"] == "History save retrying"
+    assert rendered["conflict"]["textContent"] == "History save blocked"
+    assert rendered["conflict"]["dataset"]["state"] == "conflict"
+    assert "Operator intervention is required" in rendered["conflict"]["title"]
+    assert rendered["healthy"] is None
+
+
+def test_switch_tab_opens_an_interactive_pane() -> None:
+    """In the L-shell ``switchTab`` is a thin shim onto the PaneManager: it
+    opens/focuses the session as an interactive pane.  The split-pane
+    ``createPane`` bootstrap is retired."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("function switchTab(wsId) {")
+    fn = body[start : start + 400]
+    assert "openSessionPane(wsId)" in fn, (
+        "switchTab must delegate to openSessionPane (PaneManager.openPane "
+        "'interactive'), not the retired createPane bootstrap."
+    )
+    assert "createPane" not in body, "the split-pane createPane bootstrap is retired."
+
+
+def test_tool_error_does_not_overwrite_approval_badge() -> None:
+    """When an approved tool subsequently errors, the existing
+    ``✓ approved`` (or ``✓ auto-approved``) pill must remain visible —
+    the error indicator is appended as a sibling pill, not by mutating
+    the approval pill in place. Pre-fix, both ``appendToolOutput``
+    (live) and ``replayHistory`` (history reconstruction) located the
+    existing approval badge via ``querySelector(".ts-approval-badge")``
+    and overwrote its className + textContent with the ``--error``
+    state, so the user lost the record that they had approved the
+    call. This test pins the new append-sibling behaviour."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # Affirmatively check that an idempotency guard exists somewhere:
+    # a ``querySelector(".ts-approval-badge--error")`` lookup is the
+    # structural marker of the fix. Pre-fix the modifier never appeared
+    # in app.js at all. Loose on quote style and surrounding form (the
+    # guard might be a negated ``if (!q) {build...}`` block at a call
+    # site, or a positive ``if (q) return;`` early-exit inside an
+    # extracted helper) so a later refactor doesn't trip CI on
+    # cosmetics.
+    # 5e.2c: the resolved/error pills converged onto the shared .conv-status
+    # vocabulary; the error variant is .conv-status--error.
+    error_guard_re = re.compile(
+        r"""querySelector\(\s*['"]\.conv-status--error['"]\s*\)""",
+    )
+    assert error_guard_re.search(body), (
+        "The error-badge code path must guard creation with a "
+        "querySelector for .conv-status--error so duplicate fires "
+        "(live + history re-render) do not stack badges."
+    )
+    # Forbid the mutate-existing-badge sequence: a generic
+    # ``.ts-approval-badge`` lookup followed within a handful of lines
+    # by mutating that same handle into the ``--error`` state. Two
+    # unrelated call sites (history rendering + live tool-output
+    # insertion) legitimately query ``.ts-approval-badge`` to position
+    # output above it, so the bare query alone is not the anti-pattern;
+    # the close pairing with an ``--error`` class mutation is. Accept
+    # either quote style and catch both ``className = "..."`` and
+    # ``classList.add("ts-approval-badge--error")`` forms.
+    overwrite_re = re.compile(
+        r"""(\w+)\s*=\s*\w+\.querySelector\(\s*(["'])\.conv-status\2\s*\)\s*;"""
+        r""".{0,200}?"""
+        r"""(?:"""
+        r"""\1\.className\s*=\s*(["'])[^"']*\bconv-status--error\b[^"']*\3"""
+        r"""|"""
+        r"""\1\.classList\.add\([^)]*(["'])conv-status--error\4[^)]*\)"""
+        r""")""",
+        re.DOTALL,
+    )
+    assert not overwrite_re.search(body), (
+        "Found the badge-overwrite anti-pattern: a queried "
+        ".conv-status handle is mutated into the --error variant "
+        "(via className overwrite or classList.add). Append a sibling "
+        "badge instead so the approval verdict stays visible alongside "
+        "the error."
+    )
+
+
+def test_replay_history_renders_content_before_tool_block() -> None:
+    """In ``replayHistory``'s ``role === "assistant"`` branch, the
+    ``msg.content`` render must precede the ``msg.tool_calls`` render.
+
+    Two reasons, both load-bearing:
+
+    1. **Structural** — the next loop iteration's ``role === "tool"``
+       message anchors to ``lastToolBlock``. The tool-block branch sets
+       that anchor; the content branch clears it. If content runs after
+       the tool block, the clear silently drops the upcoming tool
+       result. Pre-fix, every interactive tool result was missing from
+       saved-workstream replays whenever the assistant turn carried
+       both narration and tool calls (very common output shape).
+
+    2. **Visual** — the live SSE path renders content first
+       (``stream_text`` streams before ``tool_info`` /
+       ``approve_request``), so replay should match.
+
+    The test pins the order via the offsets of the ``msg.content`` and
+    ``msg.tool_calls`` branch headers inside the function body."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(body, "replayHistory")
+    end = _pane_method_offset(body, "_attachRetryToLastAssistant")
+    fn = body[start:end]
+    # Locate the assistant branch and bound the search to its body —
+    # the function also handles user / tool roles which would otherwise
+    # confuse the offset comparison.
+    asst_start = fn.index('msg.role === "assistant"')
+    asst_end = fn.index('msg.role === "tool"', asst_start)
+    asst = fn[asst_start:asst_end]
+    # ``if (msg.content && msg.content.trim())`` guards against a
+    # whitespace-only content row (Qwen-style "\n\n" left over after a
+    # reasoning-parser model strips ``<think>…</think>`` and emits
+    # nothing else before the tool call).  Pre-trim guard, those rows
+    # rendered as a visible-but-empty ``.msg.assistant`` card on
+    # replay.  Match the substring up to ``msg.content`` so the test
+    # tolerates either guard shape without locking the trim() in.
+    content_idx = asst.index("if (msg.content")
+    tool_calls_idx = asst.index("if (msg.tool_calls && msg.tool_calls.length)")
+    assert content_idx < tool_calls_idx, (
+        "replayHistory must render msg.content BEFORE msg.tool_calls "
+        "inside the assistant branch — otherwise the lastToolBlock "
+        "anchor is clobbered before the next iteration's tool result "
+        "can attach to it (and the visual order also drifts from the "
+        "live SSE flow)."
+    )
+
+
+def test_replay_history_renders_persisted_verdict_badge() -> None:
+    """Saved-workstream replays must paint the persisted intent verdict
+    next to each tool div, using the same ``renderVerdictBadge`` helper
+    the live ``showInlineToolBlock`` path uses. Pre-fix the audit trail
+    was complete in storage (``intent_verdicts`` table) but never
+    surfaced on replay — operators reviewing a saved workstream
+    couldn't see what the heuristic / LLM judge thought of any tool
+    call. This test pins the call site so a refactor that drops the
+    decoration regresses the audit surface."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(body, "replayHistory")
+    end = _pane_method_offset(body, "_attachRetryToLastAssistant")
+    fn = body[start:end]
+    # Match a `renderVerdictBadge(<something>.verdict, ...)` call inside
+    # the replay loop.  Loose on whitespace + identifier so a future
+    # rename of the iteration variable doesn't trip CI.
+    badge_call_re = re.compile(
+        r"buildConvVerdict\(\s*\w+\.verdict\b",
+    )
+    assert badge_call_re.search(fn), (
+        "replayHistory must call buildConvVerdict(tc.verdict, ...) "
+        "when a persisted verdict is attached to a tool_call entry — "
+        "otherwise the audit-trail data persisted to intent_verdicts "
+        "doesn't surface on saved-workstream replays."
+    )
+
+
+def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
+    """``_refetchHistory`` must seed ``_lastEventId`` from a non-null
+    ``data.cursor`` so the initial ``connectSSE`` opens with
+    ``?last_event_id=`` and takes the ``replay_ok`` fast-forward —
+    rebuilding the executing in-flight turn that ``/history`` omitted
+    (the fresh-connect-during-parallel-batch fix).
+
+    Two load-bearing guards are pinned here:
+
+    1. The seed is gated on ``seedCursor`` so ONLY callers that
+       reconnect (``_loadHistoryThenConnect`` — first paint, ws switch,
+       and both truncated-resync branches) seed it; the clear_ui
+       re-render caller runs on a LIVE stream with no reconnect and
+       must NOT rewind ``_lastEventId`` off the live position.
+    2. ``connectSSE`` gates the ``?last_event_id=`` param on
+       ``!= null`` (not truthiness) so a valid cursor of 0 — a brand-new
+       ws's first-turn boundary — isn't silently dropped to the fresh
+       snapshot path."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # ``_refetchHistory`` is an ``async`` method, which the shared
+    # ``_pane_method_offset`` header regex doesn't match — anchor on the
+    # definition directly and bound at the next method.
+    start = body.index("async _refetchHistory(")
+    end = body.index("handleEvent(", start)
+    fn = body[start:end]
+    # (1a) seed is gated on BOTH seedCursor AND a non-null cursor.
+    seed_re = re.compile(
+        r"if\s*\(\s*seedCursor\s*&&\s*data\.cursor\s*!=\s*null\s*\)\s*"
+        r"this\._lastEventId\s*=\s*data\.cursor"
+    )
+    assert seed_re.search(fn), (
+        "_refetchHistory must seed this._lastEventId only when "
+        "seedCursor AND data.cursor != null — so re-render callers don't "
+        "rewind the live stream and a 0 cursor still fast-forwards."
+    )
+    assert "seedCursor = false" in fn, (
+        "seedCursor must default false so the clear_ui re-render caller "
+        "(which passes only 2 args and stays on the live stream) never "
+        "seeds the cursor."
+    )
+    # (1b) the initial-connect path opts in with seedCursor=true.
+    assert "_refetchHistory(wsId, token, true)" in body, (
+        "_loadHistoryThenConnect must call _refetchHistory(..., true) so "
+        "the reconnecting initial-connect path is the only seeder."
+    )
+    # (2) connectSSE gates the last_event_id param on != null, not
+    # truthiness, and a recorded truncation gap overrides the live cursor
+    # (the connect-chokepoint half of the gap-repair guarantee).
+    assert re.search(
+        r"const connectCursor =\s*this\._truncatedFromCursor != null\s*"
+        r"\?\s*this\._truncatedFromCursor\s*:\s*this\._lastEventId;",
+        body,
+    ), (
+        "connectSSE must present the truncation-time cursor while a gap "
+        "is on record — the advanced live cursor would draw replay_ok "
+        "and silently forget the gap."
+    )
+    assert re.search(
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*"
+        r"evtUrl\s*\+=\s*\"\?last_event_id=\"",
+        body,
+    ), (
+        "connectSSE must gate the ?last_event_id= param on "
+        "connectCursor != null (not truthiness) — else a cursor of 0 "
+        "(brand-new ws first turn) is dropped to the fresh snapshot path."
+    )
+
+
+def test_initial_history_handoff_token_is_one_shot_and_resyncs_on_mismatch() -> None:
+    """The opaque /history handoff belongs only to the next SSE bootstrap.
+
+    It must survive a hidden-tab deferral, compose with a valid cursor of 0,
+    and be consumed only after an EventSource is constructed.  A server-side
+    revision mismatch takes the full REST-history path; it must never try to
+    heal a missing committed row with numeric ring replay.
+    """
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = body.index("  connectSSE(wsId) {")
+    end = body.index("  _onVisibilityChange() {", start)
+    connect = body[start:end]
+
+    hidden = connect.index("if (document.hidden)")
+    capability = connect.index('"user_turn=1"')
+    handoff_query = connect.index('"history_token="')
+    construct = connect.index("new EventSource(evtUrl)")
+    consume = connect.index("this._historyHandoffToken = null;", construct)
+    assert capability < hidden < handoff_query < construct < consume, (
+        "the bootstrap token must survive hidden-tab deferral and be consumed "
+        "only by a successfully constructed EventSource"
+    )
+    assert 'evtUrl += "?last_event_id="' in connect
+    assert '(evtUrl.includes("?") ? "&" : "?")' in connect, (
+        "history_token must compose with ?last_event_id=0 instead of replacing it"
+    )
+    assert connect.count('"user_turn=1"') == 1
+
+    refetch_start = body.index("async _refetchHistory(")
+    refetch_end = body.index("_beginReplayQuiesce(", refetch_start)
+    refetch = body[refetch_start:refetch_end]
+    assert re.search(
+        r"if\s*\(seedCursor\)\s*\{\s*this\._historyHandoffToken\s*=\s*"
+        r"typeof data\.handoff_token === \"string\"",
+        refetch,
+    ), "only a seeded history fetch may arm the initial SSE handoff"
+
+    mismatch = body.index('case "history_resync"')
+    truncated = body.index('case "replay_truncated"', mismatch)
+    mismatch_case = body[mismatch:truncated]
+    assert "this._historyRepair.begin(this.wsId);" in mismatch_case
+    assert "last_event_id" not in mismatch_case
+
+    # Once the server says the rendered history revision is stale, every
+    # reconnect chokepoint must fail closed until a new response has rendered
+    # and supplied its proof.  A failed fetch schedules one capped retry; it
+    # must not fall through to a cursorless/tokenless EventSource.  The latch,
+    # budget, backoff, and parked prompt moved into the shared controller
+    # (history_handoff.createHistoryHandoffRepair) — those are pinned there,
+    # once; what stays pinned HERE is the pane's use of it.
+    repair_guard = connect.index("if (this._historyRepair.isRepairing(wsId))")
+    assert repair_guard < handoff_query < construct
+    guard_end = connect.index("if (this._historyHandoffToken != null)", repair_guard)
+    guard = connect[repair_guard:guard_end]
+    assert "this._historyRepair.schedule();" in guard
+    assert "return;" in guard
+
+    load_start = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false)")
+    load_end = body.index("async _refetchHistory(", load_start)
+    load = body[load_start:load_end]
+    # Admission before any work, then the budget charge, then exactly one
+    # handover of the verdict; the non-repair tail keeps its own reconnect.
+    admit = load.index("this._historyRepair.admitAttempt(manualAttempt)")
+    start_attempt = load.index("this._historyRepair.startAttempt(manualAttempt,", admit)
+    settle = load.index("this._historyRepair.settle({", start_attempt)
+    ordinary = load.index("// Ordinary first paint", settle)
+    assert admit < start_attempt < settle < ordinary
+    assert "hasToken: this._historyHandoffToken != null" in load[settle:ordinary]
+    assert "this.connectSSE(wsId);" not in load[settle:ordinary]
+    assert "return;" in load[settle:ordinary]
+
+    # Both terminal paths invalidate the in-flight load and kill the timer;
+    # a late retry/fetch settlement cannot resurrect the pane.
+    assert body.count("pane._historyRepair.clear();") >= 2
+
+    # The strong repair attempt has a logical 15s deadline, not merely an
+    # AbortController timeout: authFetch's Retry-After sleep is not abort-aware
+    # and old runtimes can lack AbortController entirely. The pane still owns
+    # this per-attempt bound (the coordinator bounds every /history centrally
+    # instead), and hands the controller a teardown that expires and settles
+    # the race so no detached pane waits for the deadline.
+    assert "Promise.race([" in load
+    assert "createHistoryHandoffDeadline(" in load
+    assert "deadlineHandle.promise" in load
+    assert "HISTORY_HANDOFF_FETCH_TIMEOUT_MS" in load
+    assert "if (repairAttempt && repairAttempt.expired) return;" in refetch
+    teardown = load[start_attempt:settle]
+    assert "deadlineHandle.dispose({ expire: true, resolve: true })" in teardown, (
+        "the mid-flight teardown must expire AND settle the race through the "
+        "module's dispose() — direct state-slot pokes are the drift the "
+        "shared handle exists to prevent."
+    )
+    assert "repairCtrl.abort()" in teardown
+
+
+def test_shared_utils_no_longer_defines_replay_advisories_after_tool() -> None:
+    """Operator context (interjections / guard findings / nudges) no longer
+    rides the tool envelope — it is first-class ``{"role": "system"}`` rows
+    — so the ``replayAdvisoriesAfterTool`` advisory-walk helper is gone.
+    Guard its removal so a stale re-introduction is caught.
+    """
+    utils_js = Path(__file__).resolve().parent.parent / "turnstone/shared_static/utils.js"
+    body = utils_js.read_text(encoding="utf-8")
+    assert "replayAdvisoriesAfterTool" not in body, (
+        "replayAdvisoriesAfterTool should be deleted — operator context now "
+        "rides first-class system rows, not the tool envelope."
+    )
+
+
+def test_replay_renders_system_turn_via_add_system_context() -> None:
+    """First-class operator-context ``system`` turns (output-guard findings,
+    user interjections, metacognitive nudges) replay through the ``system``
+    branch of ``replayHistory``, rendering an operator bubble via
+    ``addSystemContext``.  Pins the call site so a refactor that drops the
+    branch regresses the operator-context replay shape silently."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(body, "replayHistory")
+    end = _pane_method_offset(body, "_attachRetryToLastAssistant")
+    fn = body[start:end]
+    assert 'msg.role === "system"' in fn, (
+        "replayHistory must have a system-role branch for first-class operator-context turns."
+    )
+    # Whitespace-tolerant: the call carries a 3rd ``meta`` arg now, so the
+    # formatter wraps it across lines — match the call + first arg, not a
+    # brittle contiguous substring.
+    assert re.search(r"addSystemContext\(\s*msg\.content", fn), (
+        "the system-role branch must route the turn through addSystemContext "
+        "so it renders as an operator bubble."
+    )
+
+
+def test_system_turn_dedups_against_history_by_event_id() -> None:
+    """The live ``system_turn`` handler skips an event already painted from
+    ``/history`` (matched by ``_event_id``), so an SSE replay that redelivers
+    it past the resume cursor doesn't double-render the operator bubble —
+    belt-and-braces for the row-vs-event id-alignment fix."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert re.search(r"_renderedSystemEventIds\s*\.\s*has\(", body), (
+        "the system_turn handler must skip an event whose id was already rendered from /history."
+    )
+    assert re.search(r"_renderedSystemEventIds\s*\.\s*add\(", body), (
+        "replayHistory (and the live handler) must record system-turn ids for the dedup set."
+    )
+
+    # Pin the wiring on BOTH read paths, scoped to its method — a refactor that
+    # keeps the Set but drops the live-handler consultation (or the
+    # replayHistory-side record) silently re-opens the double-render while the
+    # file-global checks above still pass.
+    live_start = body.index('case "system_turn":')
+    # End at the NEXT switch case, not the first ``break;`` — the dedup-skip
+    # path breaks before the ``.add(``, so a ``break;``-bounded slice would
+    # drop the record half and false-fail the ``.add(`` assertion below.
+    # Whitespace-tolerant so a reformat can't silently break the bound.
+    next_case = re.search(r'\n\s*case "', body[live_start + 1 :])
+    assert next_case, (
+        "no switch case found after system_turn to bound the pin slice — if "
+        "system_turn became the last case, re-anchor this pin's end marker."
+    )
+    live_block = body[live_start : live_start + 1 + next_case.start()]
+    assert re.search(r"_renderedSystemEventIds[\s\S]*?\.\s*has\(", live_block), (
+        "the live system_turn handler must CONSULT the dedup set (skip an id "
+        "already painted from /history), not merely reference the Set elsewhere."
+    )
+    assert re.search(r"_renderedSystemEventIds[\s\S]*?\.\s*add\(", live_block), (
+        "the live system_turn handler must RECORD the id it renders so a later "
+        "/history re-render (clear_ui) doesn't repaint it."
+    )
+
+    replay_start = _pane_method_offset(body, "replayHistory")
+    replay_end = _pane_method_offset(body, "_attachRetryToLastAssistant")
+    replay_block = body[replay_start:replay_end]
+    assert re.search(r"_renderedSystemEventIds[\s\S]*?\.\s*add\(", replay_block), (
+        "replayHistory must record each replayed system row's event_id so the "
+        "live system_turn handler can dedup against it."
+    )
+
+
+def test_retry_walk_skips_operator_context_cards() -> None:
+    """Interactive twin of the coord retry-skip guard.
+    ``_attachRetryToLastAssistant`` walks back past ``.operator-context`` rows
+    before testing for ``.ts-approval`` — so a watch-result / guard-finding
+    card (or a plain system bubble) trailing a tool-only turn doesn't make retry
+    attach to a stale earlier assistant turn.  Pin the walk predicate (scoped to
+    the method) AND the shared marker on every operator row that can trail a
+    tool batch, so adding a card kind without the marker fails loudly here."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(body, "_attachRetryToLastAssistant")
+    end = _pane_method_offset(body, "announceToolBlock")
+    fn = body[start:end]
+    assert 'classList.contains("operator-context")' in fn, (
+        "_attachRetryToLastAssistant must walk back past .operator-context "
+        "rows so the tool-only retry skip fires even when a card trails."
+    )
+    # Every operator row that can trail a tool batch carries the shared marker.
+    # The watch-result card moved to the shared conversation.js (step 5e.1); the
+    # plain system-context + guard-finding cards stay in the pane.
+    shared = (_INTERACTIVE_JS.parent / "conversation.js").read_text(encoding="utf-8")
+    assert '"msg watch-result operator-context"' in shared, (
+        "buildWatchResultCard must carry the operator-context marker."
+    )
+    for cls in (
+        '"msg system-context operator-context"',
+        '"msg guard-finding operator-context"',
+    ):
+        assert cls in body, (
+            f"operator row className {cls} must carry the operator-context "
+            "marker or the retry walk won't skip it."
+        )
+
+
+def test_operator_nudge_labels_use_shared_helper() -> None:
+    """Operator-context nudge bubbles collapse the metacognition nudge types
+    (including legacy persisted start / resume / repeat turns) to one
+    'metacognition' category via the shared ``utils.js`` ``operatorSourceLabel``
+    helper rather than leaking the raw ``_source`` (the 'operator · start'
+    regression).  Both panes call the one helper so they can't drift."""
+    root = Path(__file__).resolve().parent.parent
+    utils = (root / "turnstone/shared_static/utils.js").read_text(encoding="utf-8")
+    assert "function operatorSourceLabel(" in utils
+    for t in ("start", "resume", "correction", "denial", "completion", "repeat"):
+        assert f'{t}: "metacognition"' in utils, f"nudge type {t!r} must label as metacognition"
+    assert 'tool_error: "tool error"' in utils
+    assert 'skill_hint: "skill hint"' in utils
+    app = (root / "turnstone/shared_static/interactive.js").read_text(encoding="utf-8")
+    coord = (root / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    assert "operatorSourceLabel(source)" in app, "interactive pane must use the shared label helper"
+    assert "operatorSourceLabel(source)" in coord, "coord pane must use the shared label helper"
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — Chunk D: MCP error embed + settings panel UX
+# ---------------------------------------------------------------------------
+
+_INDEX_HTML = Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html"
+_STYLE_CSS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/style.css"
+
+# Pins the absence of unsafe DOM-write and dynamic-code sinks.  Spell
+# the property/identifier names out of literal string concatenation so
+# the tooling that flags occurrences in code strings doesn't
+# false-positive on the test source.
+#
+# The pattern catches each of:
+#   * plain HTML-assignment   — inner/outer-HTML to a value
+#   * concat HTML-assignment  — inner/outer-HTML += value (the
+#     ``\+?`` makes the ``+`` optional so a regression switching the
+#     sink to concat-assignment doesn't bypass the lint)
+#   * insertAdjacent HTML     — ``insertAdjacentHTML(...)`` (the
+#     ``HTML\(`` suffix excludes ``insertAdjacentElement``, which
+#     takes a DOM node and is not an XSS sink)
+#   * legacy doc-write        — ``document`` + ``.write(...)``
+#   * string-to-code helpers  — the JS ``ev`` + ``al`` builtin, the
+#     dynamic-Function constructor (``new`` + ``Function(...)``), and
+#     ``setTimeout``/``setInterval`` whose first arg is a string
+#     literal (function-first-arg forms remain unflagged)
+#
+# The trailing ``(?!=)`` negative-lookahead on the HTML assignments
+# excludes ``===`` / ``==`` reads — only the write sinks are flagged.
+#
+# The scan in ``test_no_unsafe_code_sinks_in_static_assets`` runs the
+# regex over the *entire file body* (not line-by-line) so that ``\s*``
+# can span newlines and catch multi-line sinks like
+# ``el.innerHTML\n  = X``.
+_UNSAFE_CODE_SINK_RE = re.compile(
+    r"\.(?:inner|outer)"
+    + r"HTML\s*\+?=(?!=)"
+    + r"|\.insertAdjacent"
+    + r"HTML\s*\("
+    + r"|"
+    + r"document"
+    + r"\."
+    + r"write"
+    + r"\("
+    + r"|\b"
+    + r"eval\s*\("
+    + r"|\bnew\s+"
+    + r"Function\s*\("
+    + r"|\bset(?:Timeout|Interval)\s*\(\s*['\"`]"
+)
+
+
+def test_phase8_mcp_error_helpers_defined() -> None:
+    """``tryParseMcpError`` (envelope detector) + ``buildMcpErrorEmbed``
+    (consent / forbidden / operator card) live in the shared ``mcp_error.js``
+    module — lifted out of interactive.js by #725 so BOTH conversation
+    surfaces render the same card: the interactive pane AND the coordinator
+    pane (whose sessions carry the same MCP surface, persona-gated).
+    The consent-badge state (``_pendingConsentServers`` /
+    ``_onConsentDetected``) stays in the standalone shell — it drives the
+    rail's Manage-row badge — and the pane reaches it through the
+    ``host.onConsentDetected`` seam.  The shared host bridges that seam to the
+    standalone via ``window.TS_APP.onConsentDetected`` (undefined on the
+    console, so it stays a no-op there).  Pin the module, both consumers, and
+    the bridge."""
+    mod = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    assert "function tryParseMcpError" in mod
+    assert "function buildMcpErrorEmbed" in mod
+    # The actionable branch surfaces consent via the THREADED callback, not a
+    # direct shell call — that decoupling is what lets the console no-op it.
+    assert "if (onConsent) onConsent(err.server)" in mod
+    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert 'from "./mcp_error.js"' in inter, (
+        "the interactive pane must consume the shared MCP error module"
+    )
+    assert "onConsentDetected(s)" in inter, (
+        "the pane must notify consent through host.onConsentDetected"
+    )
+    # The shared host bridges the seam to the standalone subsystem (feature-
+    # detected, so the console — which never defines the hook — no-ops).
+    assert "window.TS_APP.onConsentDetected(server)" in inter, (
+        "the shared interactive host must bridge onConsentDetected to the TS_APP seam"
+    )
+    # The coordinator pane is the second consumer (#725): a coordinator MCP
+    # dispatch hitting consent-required must render the card, not raw JSON.
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    assert '"/shared/mcp_error.js"' in coord, (
+        "the coordinator pane must import the shared MCP error module (#725)"
+    )
+    assert "tryParseMcpError(" in coord and "buildMcpErrorEmbed(" in coord, (
+        "the coordinator pane must dispatch structured MCP errors to the shared card"
+    )
+    app = _APP_JS.read_text(encoding="utf-8")
+    assert "_pendingConsentServers" in app
+    assert "function _onConsentDetected" in app
+    assert "window.TS_APP.onConsentDetected = _onConsentDetected" in app, (
+        "the standalone must expose _onConsentDetected on the TS_APP seam for the pane bridge"
+    )
+
+
+def test_consent_badge_drives_rail_manage_row() -> None:
+    """The pending-consent badge was re-homed off the retired settings gear
+    (``#settings-btn``, deleted in the L-shell renovation, which silently made
+    the badge invisible) onto the rail's Manage > Connections row.  Classic
+    app.js can't import the ESM rail module, so it drives the rail's generic
+    ``setRowBadge`` hook through the ``window.TS_SHELL`` bridge — keyed on the
+    standalone's Connections tab.  Pin the new lane and the absence of the dead
+    gear lookup."""
+    app = _APP_JS.read_text(encoding="utf-8")
+    # The badge refresh must drive the rail bridge, not the deleted gear.
+    assert 'getElementById("settings-btn")' not in app, (
+        "the consent badge must no longer target the retired #settings-btn gear"
+    )
+    assert "shell.setRowBadge(_CONSENT_BADGE_TAB" in app, (
+        "_refreshConsentBadge must drive the rail Manage-row badge via the TS_SHELL bridge"
+    )
+    assert 'const _CONSENT_BADGE_TAB = "connections"' in app, (
+        "the standalone badge rides the Connections Manage tab (its MCP surface)"
+    )
+    # The hydrate + clear paths must still funnel through the single refresh.
+    assert "function loadPendingConsents" in app and "_refreshConsentBadge()" in app
+
+
+def test_media_player_activation_not_duplicated_in_standalone() -> None:
+    """The media-player activation (``_loadHls`` / ``_activatePlayer`` + the
+    click/keydown delegate) moved into the shared interactive pane so BOTH the
+    standalone server and the console activate the Play button.  The standalone
+    app.js must NOT keep its own copy — a duplicate document-level listener
+    would double-fire on the standalone (two players swapped in) while the lift
+    is what fixed the console (where app.js was never the host).  Pin the
+    standalone clean so the stale copy can't drift back in."""
+    app = _APP_JS.read_text(encoding="utf-8")
+    for name in ("_loadHls", "_activatePlayer", "_isHlsUrl", "media-play-btn"):
+        assert name not in app, (
+            f"standalone app.js must not re-declare the lifted media player "
+            f"({name!r}) — it lives in shared_static/interactive.js now"
+        )
+    # The lift target carries the real implementation (the click delegate too).
+    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert "function _activatePlayer(" in inter
+    assert "activateMediaPlayButton(btn)" in inter
+
+
+def test_phase8_settings_panel_handlers_defined() -> None:
+    """The settings modal exposes four entry points that the inline
+    ``onclick`` attributes in index.html depend on. Renaming or
+    deleting any of them breaks the modal silently (the buttons are
+    still rendered but click-to-action is dead). Catch that here."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    for name in [
+        "function openSettingsPanel",
+        "function closeSettingsPanel",
+        "function confirmRevokeMcp",
+        "function cancelRevokeMcp",
+    ]:
+        assert name in body, f"Missing required handler: {name}"
+    # The connections list is fetched against the Phase-7 endpoint —
+    # pin the URL so a server-side rename forces an explicit UI bump.
+    assert "/v1/api/mcp/oauth/connections" in body, (
+        "Settings panel must fetch /v1/api/mcp/oauth/connections — "
+        "a server-side rename needs an explicit UI update."
+    )
+
+
+def test_phase8_appendtooloutput_dispatches_mcp_error_before_renderer() -> None:
+    """``appendToolOutput`` must call ``tryParseMcpError`` inside its
+    ``isError`` branch BEFORE falling through to the plain
+    ``renderToolOutput`` path. The ordering is what makes the
+    interactive consent card replace the JSON dump; reverse the calls
+    and the user sees the raw error envelope as text again."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(body, "appendToolOutput")
+    end = _pane_method_offset(body, "sendMessage")
+    fn = body[start:end]
+    parse_idx = fn.find("tryParseMcpError(")
+    # The plain-output render is the shared renderCollapsibleOutput helper; the
+    # ordering invariant is unchanged — MCP dispatch must precede it.
+    render_idx = fn.find("renderCollapsibleOutput(")
+    assert parse_idx >= 0, (
+        "appendToolOutput must call tryParseMcpError on the error path "
+        "before the plain renderer, otherwise the consent card never "
+        "replaces the plain JSON output."
+    )
+    assert render_idx >= 0, "renderCollapsibleOutput call must remain present"
+    assert parse_idx < render_idx, (
+        "tryParseMcpError must run BEFORE the plain renderer so the "
+        "interactive card path takes precedence over plain rendering."
+    )
+
+
+_UTILS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/utils.js"
+_AUTH_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/auth.js"
+_KB_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/kb.js"
+_COORD_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator/coordinator.js"
+)
+_CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
+_CONSOLE_GOVERNANCE_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/console/static/governance.js"
+)
+_CONSOLE_SCHEDULE_BUILDER_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/console/static/schedule_builder.js"
+)
+
+
+_UNSAFE_CODE_SINK_LINT_TARGETS = [
+    ("turnstone/ui/static/app.js", _INTERACTIVE_JS),
+    ("turnstone/shared_static/utils.js", _UTILS_JS),
+    ("turnstone/shared_static/auth.js", _AUTH_JS),
+    ("turnstone/shared_static/kb.js", _KB_JS),
+    ("turnstone/shared_static/mcp_error.js", _MCP_ERROR_JS),
+    ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
+    ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
+    ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
+    ("turnstone/console/static/app.js", _CONSOLE_APP_JS),
+    ("turnstone/console/static/schedule_builder.js", _CONSOLE_SCHEDULE_BUILDER_JS),
+]
+
+
+@pytest.mark.parametrize(
+    "label,path",
+    _UNSAFE_CODE_SINK_LINT_TARGETS,
+    ids=[label for label, _ in _UNSAFE_CODE_SINK_LINT_TARGETS],
+)
+def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
+    """Whole-file pin: no direct DOM-write *or* dynamic-code sinks
+    in any of the static JS bundles that render LLM output, tool
+    results, operator-supplied data, or user input.  Covers
+    inner/outer-HTML assignment (plain and concat), insertAdjacentHTML,
+    legacy doc-write, string-eval, dynamic-Function constructor, and
+    string-first-arg timer scheduling.
+
+    Two distinct cleanup postures across the targets:
+
+    1. **Strict DOM-construction** (``ui/static/app.js``,
+       ``shared_static/utils.js``, ``shared_static/auth.js``,
+       ``shared_static/kb.js``, ``coordinator.js`` chat entry,
+       ``console/static/app.js``): renderer output routes through the
+       streaming helpers or ``setSafeHtml`` (for pre-baked HTML strings);
+       every other site uses ``createElement`` + ``textContent`` +
+       ``append`` / ``replaceChildren``.  Missing escapes are
+       structurally impossible — no HTML string is ever interpolated.
+    2. **Sink-free string-concat** (``console/static/admin.js``,
+       ``console/static/governance.js``): operator-facing admin /
+       governance pages still build HTML via ``escapeHtml`` + string
+       concat, but the unsafe sink is off the call site (everything
+       routes through ``setSafeHtml``).  XSS defence still depends on
+       every interpolated value going through escapeHtml; the lint
+       catches the sink but cannot catch a missing escape.
+
+    All admin-side bundles are now covered.
+
+    The regex covers inner/outer-HTML assignment (plain and
+    concat-assignment), ``insertAdjacentHTML``, legacy doc-write, and
+    the dynamic-code constructors (string-eval, dynamic-Function,
+    string-first-arg timer scheduling).  ``insertAdjacentElement`` is
+    intentionally not flagged — it takes a DOM node, not a string.
+
+    Parametrized so each target is its own pytest case — a failure on
+    one file is attributed precisely without masking offenders in the
+    others.
+
+    Scans the whole file body (not line-by-line) so the regex's
+    ``\\s*`` can span newlines and catch multi-line sinks like
+    ``el.innerHTML\\n  = X``.  Match positions map back to line
+    numbers for the failure message."""
+    body = path.read_text(encoding="utf-8")
+    lines = body.splitlines()
+    offenders: list[tuple[int, str]] = []
+    for m in _UNSAFE_CODE_SINK_RE.finditer(body):
+        line_no = body.count("\n", 0, m.start()) + 1
+        offenders.append((line_no, lines[line_no - 1].rstrip()))
+    assert not offenders, (
+        f"Found {len(offenders)} unsafe code/DOM sink(s) in "
+        f"{label}:\n"
+        + "\n".join(f"  line {n}: {line}" for n, line in offenders[:10])
+        + "\nUse DOM construction (createElement + textContent + "
+        "append/replaceChildren) or route trusted HTML through "
+        "setSafeHtml() in shared/utils.js."
+    )
+
+
+def test_perception_role_surfaced_in_admin_and_filtered_from_settings() -> None:
+    """The perception fallback (``perception.model_alias``) landed backend-only —
+    its admin UI was missing.  It must (1) appear as a Models → Roles row so an
+    operator can point it at a vision / omni model, and (2) be filtered OUT of the
+    raw Settings tab.  The Settings filter derives its skip-set from MODEL_ROLES,
+    so no role can quietly drift back into the Settings list again (the original
+    miss — stt/tts/reranker had leaked the same way)."""
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    # (1) Roles sub-tab row.
+    assert 'label: "Perception"' in admin, "the perception role must carry a UX label"
+    assert '"perception.model_alias"' in admin, "perception must have a MODEL_ROLES entry"
+    # (2) Settings filter derives the skip-set from MODEL_ROLES — drift-proof, so
+    # perception (and every other role alias) is excluded, not hand-listed.
+    assert "for (let ri = 0; ri < MODEL_ROLES.length; ri++)" in admin, (
+        "the Settings role-key filter must derive from MODEL_ROLES"
+    )
+    assert "roleKeys[MODEL_ROLES[ri].aliasKey] = 1" in admin
+
+
+def test_audio_roles_gated_to_openai_sdk_providers() -> None:
+    """Voice roles (stt/tts) ride the OpenAI-SDK audio surface — an Anthropic
+    (-compatible) model has no audio content block, so admin must exclude it
+    from those role dropdowns (mirrors ``_provider_carries_audio`` in
+    core/audio.py).  Reranker is a ``/rerank`` endpoint, not audio, so it must
+    NOT be provider-gated."""
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    assert "function _providerCarriesAudio(" in admin, "the provider-audio gate helper must exist"
+    body = admin[admin.index("function _audioModelEligible(") :]
+    body = body[: body.index("\nfunction ")]
+    assert '(mediaRole === "stt" || mediaRole === "tts")' in body, (
+        "only the voice roles are provider-gated (reranker is not an audio role)"
+    )
+    # A blank/unset provider must default to "openai" (matches the backend's
+    # _provider_carries_audio), else a provider-less model is wrongly excluded.
+    assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
+
+
+def test_judge_integer_settings_render_as_bounded_number_inputs() -> None:
+    """The Judge tab has a custom schema renderer separate from Settings.
+
+    Integer settings must not fall through to its text-input branch: doing so
+    drops the registry's step/min/max affordances for parallel_evaluations.
+    """
+    governance = _CONSOLE_GOVERNANCE_JS.read_text(encoding="utf-8")
+    start = governance.index("function renderJudgeSettings()")
+    end = governance.index("\nfunction saveJudgeSetting(", start)
+    body = governance[start:end]
+    assert 's.type === "float" || s.type === "int"' in body
+    assert '(s.type === "int" ? "1" : "0.01")' in body
+    assert "s.min_value" in body
+    assert "s.max_value" in body
+
+
+# Tile keys that are deliberately NOT ``ModelCapabilities`` fields.
+# ``supports_rerank`` is a registry-level flag read off the model row.
+_NON_DATACLASS_TILES = {"supports_rerank"}
+
+
+def test_capability_bool_lift_agrees_with_the_backend_coercion() -> None:
+    """The tile lift coerces a stored capability the way the backend does.
+
+    The capabilities dict is hand-edited JSON, so a stored string
+    ``"false"`` is TRUTHY to JS while ``apply_capability_overrides`` reads
+    it as ``False``.  Lifting it into a tile with bare ``!!`` renders the
+    row checked and then persists boolean ``true`` on the next save —
+    inverting the capability without the operator touching it.  For
+    ``server_parses_reasoning`` that silently disables the inline tag scan,
+    which is the leak model_turn's own comment names.
+
+    Cases are generated FROM the Python table, so a spelling added on one
+    side and not the other fails here rather than in the field.
+    """
+
+    from turnstone.core.model_turn import _CAPABILITY_BOOL_STRINGS
+
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    table = re.search(r"const _CAP_BOOL_STRINGS = \{.*?\n\};", admin, re.S)
+    fn = re.search(r"function _capBool\(value\) \{.*?\n\}", admin, re.S)
+    assert table and fn, "capability bool coercion not found in admin.js"
+
+    checks: list[str] = []
+    for spelling, expected in _CAPABILITY_BOOL_STRINGS.items():
+        # Same spelling, uppercased, and padded — the Python arm strips and
+        # lowercases before lookup, so the JS must too.
+        for variant in (spelling, spelling.upper(), f"  {spelling}  "):
+            lit = json.dumps(variant)
+            checks.append(
+                f"if (_capBool({lit}) !== {json.dumps(expected)}) "
+                f"throw new Error('spelling ' + {lit} + ' -> ' + _capBool({lit}));"
+            )
+    checks += [
+        "if (_capBool(true) !== true) throw new Error('boolean true');",
+        "if (_capBool(false) !== false) throw new Error('boolean false');",
+        "if (_capBool(1) !== true) throw new Error('number 1');",
+        "if (_capBool(0) !== false) throw new Error('number 0');",
+        # Unrecognized values must NOT coerce — the caller leaves them in the
+        # raw JSON instead of rewriting them (the thinking_mode policy).
+        "if (_capBool('maybe') !== undefined) throw new Error('garbage string');",
+        "if (_capBool(null) !== undefined) throw new Error('null');",
+        "if (_capBool({}) !== undefined) throw new Error('object');",
+    ]
+    harness = table.group(0) + chr(10) + fn.group(0) + chr(10) + chr(10).join(checks)
+
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, (
+        f"_capBool disagrees with the backend coercion.  stderr={proc.stderr!r}"
+    )
+
+    # The lift must actually USE it — a reverted call site would leave the
+    # helper in place and every case above still passing.
+    assert "_modelCapsExplicit[k] = !!capsObj[k]" not in admin
+    assert "const asBool = _capBool(capsObj[k]);" in admin
+
+
+def test_capability_tiles_agree_with_the_capabilities_dataclass() -> None:
+    """Every tile is a real capability, rendered, and defaulted like Python.
+
+    The tile matrix is a hand-maintained mirror of
+    :class:`ModelCapabilities`, so it drifts silently: a renamed field
+    leaves a tile that writes a key nothing reads, and a JS default that
+    disagrees with the dataclass shows the operator a state the backend
+    would not apply.  A tile whose key is not a capability field is
+    allowed only by NAME (``_NON_DATACLASS_TILES``) — a blanket
+    "skip what the dataclass lacks" would exempt exactly the rename this
+    test exists to catch.
+    """
+    from turnstone.core.providers._protocol import ModelCapabilities
+
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+
+    keys_block = re.search(r"const _MODEL_CAP_KEYS = \[(.*?)\];", admin, re.S)
+    defaults_block = re.search(r"const _MODEL_CAP_DEFAULTS = \{(.*?)\};", admin, re.S)
+    assert keys_block and defaults_block, "capability tile matrix not found in admin.js"
+    keys = re.findall(r'"(\w+)"', keys_block.group(1))
+    defaults = {
+        k: v == "true" for k, v in re.findall(r"(\w+):\s*(true|false)", defaults_block.group(1))
+    }
+    assert keys, "no capability tile keys parsed"
+
+    # The tile is only reachable if it renders INSIDE the container
+    # ``_modelTileEl`` queries; outside it, ``_modelGetTile`` silently falls
+    # back to the default and a saved ``true`` is rewritten as ``false``.
+    grid_start = html.index('id="model-capgrid"')
+    grid = html[grid_start : html.index("</div>", grid_start)]
+
+    caps = ModelCapabilities()
+    for key in keys:
+        assert f'data-cap="{key}"' in grid, f"tile {key} renders outside #model-capgrid"
+        assert key in defaults, f"tile {key} has no entry in _MODEL_CAP_DEFAULTS"
+        # No hasattr escape hatch: a tile whose key is neither a capability
+        # field nor a known registry flag writes a key nothing reads, which
+        # is the first drift this test exists to catch.
+        assert hasattr(caps, key) or key in _NON_DATACLASS_TILES, (
+            f"tile {key} is neither a ModelCapabilities field nor a known registry flag"
+        )
+        if hasattr(caps, key):
+            assert defaults[key] == getattr(caps, key), (
+                f"tile default for {key} disagrees with ModelCapabilities"
+            )
+    assert set(defaults) == set(keys), "_MODEL_CAP_DEFAULTS and _MODEL_CAP_KEYS disagree"
+
+    # The inline-tag scan is a FALLBACK for servers with no reasoning parser
+    # (and for misconfigured ones).  An operator running vLLM/llama.cpp with a
+    # parser configured needs a discoverable way to say so — without it the
+    # only route is hand-editing the raw capabilities JSON.
+    assert "server_parses_reasoning" in keys
+
+
+def test_model_response_controls_are_capability_driven_and_sparse() -> None:
+    """The model shelf surfaces Responses-only scalar controls without
+    hard-coding GPT-5.6 IDs or pinning inherited capability-table values."""
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="model-response-controls"' in html
+    assert 'aria-labelledby="model-response-controls-title"' in html
+    assert 'id="model-output-verbosity"' in html
+    assert 'for="model-output-verbosity"' in html
+    assert 'id="model-reasoning-mode"' in html
+    assert 'for="model-reasoning-mode"' in html
+    for value in ("low", "medium", "high"):
+        assert f'<option value="{value}">' in html
+    for value in ("standard", "pro"):
+        assert f'<option value="{value}">' in html
+    assert 'data-cap="supports_verbosity"' in html
+    assert 'data-cap="supports_pro_mode"' in html
+
+    assert '"supports_verbosity"' in admin
+    assert '"supports_pro_mode"' in admin
+    surface = _slice_function_body(admin, "_modelUsesResponsesSurface")
+    assert surface is not None
+    assert 'provider === "openai"' in surface
+    assert 'provider === "openai-compatible"' in surface
+    assert 'value === "responses"' in surface
+    visibility = _slice_function_body(admin, "_updateModelResponseControls")
+    assert visibility is not None
+    assert "_modelGetTile(spec.supportKey)" in visibility
+    assert 'supportKey: "supports_verbosity"' in admin
+    assert 'supportKey: "supports_pro_mode"' in admin
+    assert "gpt-5.6" not in visibility, "visibility must come from capabilities, not model IDs"
+
+    assert "function _captureModelResponseControls(" in admin
+    assert "function _mergeModelResponseControls(" in admin
+    assert "_captureModelResponseControls(capsObj)" in admin
+    assert "_mergeModelResponseControls(caps)" in admin
+    assert "let _modelResponseCaptured = {};" in admin
+    assert "let _modelResponseDirty = {};" in admin
+    assert "_modelResponseCaptured[spec.key] = value" in admin
+    assert "nextIdentity === _modelResponseInitialIdentity" in admin
+    identity = _slice_function_body(admin, "_modelIdentity")
+    assert identity is not None
+    assert 'provider === "openai-compatible"' in identity
+    assert ': ""' in identity
+    merge = _slice_function_body(admin, "_mergeModelResponseControls")
+    assert merge is not None
+    # The dirty flag (select touched) may only override Advanced JSON for
+    # the identity that made it dirty — a stale flag from a renamed row
+    # must not delete a hand-typed JSON key.
+    assert "if (_modelResponseDirty[spec.key] && sameIdentity) delete caps[spec.key]" in merge
+    # The captured-value fallback is load-bearing, not a gating bug: a value
+    # lifted out of the row JSON on edit-open must stay visible and re-save
+    # for the same identity even when the baseline table says unsupported.
+    # The baseline arrives async (or never, on the compat lane); yielding to
+    # it would silently drop the pinned value on an unrelated edit-save.
+    # Wire safety lives server-side (emission gates on merged supports_*).
+    for body in (visibility, merge):
+        assert "_modelGetTile(spec.supportKey) || capturedFallback" in body
+        assert "sameIdentity" in body
+        assert "!(spec.supportKey in _modelCapsExplicit)" in body
+
+    create = _slice_function_body(admin, "showCreateModelModal")
+    assert create is not None
+    assert "_modelCapsSeq++" in create, "a fresh shelf must invalidate prior lookups"
+
+    assert "displayCaps.supports_verbosity !== false" in admin
+    assert "displayCaps.supports_pro_mode !== false" in admin
+
+    change = _slice_function_body(admin, "_onModelFieldChange")
+    assert change is not None
+    assert "_modelCapsSeq++" in change, "model changes must invalidate in-flight baselines"
+    assert "_modelCapsBaseline = {}" in change
+    assert 'apiSurfEl.addEventListener("change", _onModelFieldChange)' in admin
+
+
+def test_model_max_concurrency_form_round_trips_strict_integer() -> None:
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="model-max-concurrency"' in html
+    assert 'max="2147483647"' in html
+    assert "0 = unlimited" in html
+
+    create = _slice_function_body(admin, "showCreateModelModal")
+    edit = _slice_function_body(admin, "showEditModelModal")
+    render = _slice_function_body(admin, "_renderModels")
+    assert create is not None and edit is not None and render is not None
+    assert 'getElementById("model-max-concurrency").value = "0"' in create
+    assert "m.max_concurrency != null ? m.max_concurrency : 0" in edit
+    # submitCreateModel is longer than the balanced-slice helper's bounded
+    # window; these names are unique to that form path, so whole-file pins are
+    # both stable and unambiguous.
+    assert "Number.isInteger(maxConcurrency)" in admin
+    assert "maxConcurrency > 2147483647" in admin
+    assert "form.max_concurrency = maxConcurrency" in admin
+    assert 'overrides.push("limit=" + m.max_concurrency)' in render
+
+
+def test_shared_utils_defines_set_safe_html_helper() -> None:
+    """``setSafeHtml`` in ``shared/utils.js`` is the single audited entry
+    point for installing trusted HTML strings into a DOM element outside
+    renderer.js.  It parses via ``DOMParser`` (avoiding the unsafe sink
+    entirely); its markdown callers use it directly (coordinator
+    ``appendMsg``, preview.js), while renderer.js's streaming helpers
+    write their own sanctioned in-file ``innerHTML`` — which is exactly
+    why renderer.js is excluded from the sink scan.  A refactor that
+    drops or renames the helper would break its call sites silently at
+    runtime."""
+    body = _UTILS_JS.read_text(encoding="utf-8")
+    assert "function setSafeHtml(el, html)" in body, (
+        "shared/utils.js must define setSafeHtml(el, html) — the "
+        "sanctioned trusted-HTML installation chokepoint."
+    )
+    # The DOMParser path is what avoids the unsafe sink.  The absence
+    # of the unsafe assignment inside the helper is pinned by the
+    # broader ``test_no_unsafe_code_sinks_in_static_assets`` scan
+    # above; pin DOMParser presence here too so a refactor that swaps
+    # to e.g. ``Range.createContextualFragment`` forces an explicit
+    # reviewer decision.
+    assert "DOMParser()" in body, (
+        "setSafeHtml must parse via DOMParser, not the unsafe DOM-write "
+        "sink — that is what keeps the audit surface at one location."
+    )
+
+
+def test_phase8_no_unsafe_dom_write_in_settings_panel() -> None:
+    """Defensive XSS guard: the settings panel renders user-controlled
+    server names, scope strings, and timestamp values into the DOM.
+    The whole section MUST go through ``textContent``-style APIs; an
+    unsafe-DOM-write assignment would be a regression vector. Bound
+    the check to the section 15 body to avoid false positives
+    elsewhere."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("//  15. MCP server connections settings panel")
+    # Bound to the full settings section (terminates at the next
+    # top-level keydown handler block).
+    end = body.index('document.addEventListener("keydown"', start)
+    section = body[start:end]
+    assert not _UNSAFE_CODE_SINK_RE.search(section), (
+        "Section 15 must not assign to the unsafe DOM-write property — "
+        "server names and scope values flow through here and would be "
+        "XSS-injectable. Use textContent / DOM APIs instead."
+    )
+
+
+def test_gear_retired_mcp_in_manage_pane() -> None:
+    """Step 6: the floating settings gear is retired — no #settings-btn, no
+    toggle/open/close gear handlers.  MCP server connections moved into the
+    Admin pane's Connections panel (#view-admin), reached via the rail's
+    Manage > Connections row (the TS_ADMIN seam)."""
+    index = _INDEX_HTML.read_text(encoding="utf-8")
+    app = _APP_JS.read_text(encoding="utf-8")
+    assert 'id="settings-btn"' not in index, "the floating settings gear is retired."
+    assert "toggleSettingsMenu" not in app, "the gear dropdown handlers are retired."
+    assert 'id="view-admin"' in index and 'id="settings-mcp-table"' in index, (
+        "MCP connections render into the Admin pane's #view-admin panel."
+    )
+    assert "window.TS_ADMIN.openTab = function" in app and '"connections"' in app, (
+        "the Manage > Connections row opens the MCP panel via the TS_ADMIN seam."
+    )
+
+
+def test_dashboard_is_the_main_pane_body() -> None:
+    """In the L-shell the dashboard is the Dashboard pane's body (#main) — the
+    shell adopts #main — not a floating overlay.  It holds the launcher + the
+    workstreams table and is not a modal."""
+    body = _INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="main"' in body, "the dashboard content lives in #main (the Dashboard pane body)."
+    start = body.index('id="main"')
+    # Window spans the launcher (composer + options) through the workstreams
+    # table — it grows as launcher options are added (e.g. the project picker),
+    # so the bound just needs to keep BOTH inside #main, not be tight.
+    chunk = body[start : start + 4500]
+    assert 'id="dashboard-input"' in chunk and 'id="dash-ws-table"' in chunk, (
+        "#main must hold the new-session launcher + the workstreams table."
+    )
+    assert 'class="dashboard-overlay"' not in body, "the fixed dashboard overlay is retired."
+
+
+def test_mcp_connections_panel_and_revoke_modal_in_index_html() -> None:
+    """MCP connections moved from the floating #settings-overlay into the Admin
+    pane's Connections panel (#view-admin), reusing the same #settings-mcp-*
+    table ids so the render code is unchanged.  The revoke confirm lives on the
+    hatch dialog tier (native document-modal)."""
+    body = _INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="settings-overlay"' not in body, "the floating MCP settings overlay is retired."
+    assert 'id="view-admin"' in body, "the Admin pane host (#view-admin) must exist."
+    va = body.index('id="view-admin"')
+    panel = body[va : va + 1500]
+    assert 'id="settings-mcp-table"' in panel and 'id="settings-mcp-tbody"' in panel, (
+        "the MCP table (reused ids) must live inside #view-admin."
+    )
+    idx = body.index('id="revoke-mcp-dialog"')
+    chunk = body[max(0, idx - 200) : idx + 600]
+    assert "hatch--dialog" in chunk and 'role="alertdialog"' in chunk, (
+        "the revoke confirm is a hatch dialog-tier alertdialog "
+        "(native showModal supplies modality — no aria-modal attribute)."
+    )
+
+
+def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
+    """Adversarial input — the renderer for an MCP error envelope
+    must use ``textContent`` (not the unsafe DOM-write API) for every
+    field that flows from the server: ``err.detail``, ``err.server``,
+    scopes list. The card builder uses createElement + textContent
+    throughout so a script-tag server name renders harmlessly. Pin
+    the absence of the unsafe-write inside ``buildMcpErrorEmbed``."""
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    start = body.index("function buildMcpErrorEmbed(")
+    # Bound to the function body — find its closing brace at column 0.
+    rest = body[start:]
+    # Closing function brace at line start (matches existing functions)
+    end_match = re.search(r"\n}\n", rest)
+    assert end_match is not None
+    fn = rest[: end_match.end()]
+    assert not _UNSAFE_CODE_SINK_RE.search(fn), (
+        "buildMcpErrorEmbed must not use the unsafe-DOM-write API — "
+        "server names and detail strings flow through here. An "
+        "adversarial server name must render harmlessly via "
+        "textContent."
+    )
+
+
+def test_mcp_error_card_names_a_disabled_server() -> None:
+    """``mcp_server_disabled`` renders as an operator card titled for the cause, with no
+    button: re-consent cannot help, and the default category would title it Forbidden."""
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
+
+    def _function(name: str) -> str:
+        rest = body[body.index(f"function {name}(") :]
+        end = re.search(r"\n}\n", rest)
+        assert end is not None
+        return rest[: end.end()]
+
+    category = _function("_mcpErrorCategory")
+    branch = category[category.index('"mcp_server_disabled"') :]
+    assert branch.index("return") == branch.index('return "operator"')
+    assert 'case "mcp_server_disabled":\n      return "Server disabled";' in _function(
+        "_mcpErrorTitle"
+    )
+
+
+def test_mcp_error_button_gated_on_consent_url_not_code_alone() -> None:
+    """Review finding: the chat error card rendered a Connect / Re-consent
+    button from the error CODE alone, so an oauth_obo error (consent_url=None,
+    since sign-in passthrough has no per-server consent flow and /start rejects
+    obo rows) produced a button that dead-ended in a 'no consent URL' toast.
+    The button must render only when a valid per-server consent URL is present —
+    obo errors show the card's honest detail text without a broken affordance."""
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    start = body.index("function buildMcpErrorEmbed(")
+    rest = body[start:]
+    end_match = re.search(r"\n}\n", rest)
+    assert end_match is not None
+    fn = rest[: end_match.end()]
+    # The render gate combines the category with a consent-URL presence check.
+    assert "hasConsentAffordance" in fn, (
+        "buildMcpErrorEmbed must gate the action button on the presence of a "
+        "consent URL, not on the error category alone."
+    )
+    assert 'category === "actionable" && hasConsentAffordance' in fn, (
+        "the button-render condition must require BOTH an actionable category "
+        "and a real consent URL"
+    )
+
+
+def test_phase8_css_classes_present_in_stylesheet() -> None:
+    """The MCP error-embed + connections classes app.js/interactive.js reference
+    must keep their CSS rules (else the consent / connections UX silently loses
+    its visual treatment). The settings OVERLAY is retired in step 6 — MCP
+    connections render in the Admin pane's Connections panel (#view-admin), not a
+    floating dialog — so #settings-overlay / #settings-box are no longer pinned.
+    The revoke confirm's chrome moved to /shared/hatch.css with the dialog-tier
+    conversion, so no #revoke-mcp-* rule is pinned here either.  The pending-
+    consent badge moved off the retired settings gear onto the rail's Manage row
+    (shell.css `.rail-badge`), so `.settings-consent-badge` is gone from here."""
+    css = _STYLE_CSS.read_text(encoding="utf-8")
+    for selector in [
+        ".mcp-error-card",
+        ".mcp-error-icon",
+        ".mcp-error-action-btn",
+        ".mcp-scope-pill",
+        ".settings-revoke-btn",
+    ]:
+        assert selector in css, f"Missing CSS rule for {selector}"
+    # The dead gear-badge rule must be GONE (its host #settings-btn was retired).
+    assert ".settings-consent-badge" not in css, (
+        "the retired settings-gear consent badge CSS must be removed "
+        "(the badge now lives on the rail Manage row — shell.css .rail-badge)"
+    )
+
+
+def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
+    """Defence-in-depth: the consent button's click handler must reject
+    any ``consent_url`` that doesn't start with the dispatcher's known
+    prefix (``/v1/api/mcp/oauth/start``). ``_build_consent_url`` always
+    emits a path-relative URL with that exact prefix; a non-prefix
+    value implies the producer drifted (or was compromised) and a
+    ``window.open("javascript:...")`` would be catastrophic.
+
+    The renderer is the last line of defence before ``window.open`` and
+    must not rely on the producer-side guarantee alone. Pin the prefix
+    string and the ``startsWith`` form so a future refactor can't
+    silently weaken the guard.
+    """
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    # Bound the search to the click handler region (between the
+    # ``buildMcpErrorEmbed`` function and the next top-level helper) to
+    # avoid false positives from unrelated string occurrences.
+    start = body.index("function buildMcpErrorEmbed(")
+    end = body.index("\n}\n", start) + 1
+    fn = body[start:end]
+    assert 'consentUrl.startsWith("/v1/api/mcp/oauth/start")' in fn, (
+        "Click handler must guard window.open with "
+        'consentUrl.startsWith("/v1/api/mcp/oauth/start"). Without it '
+        "a future producer drift to a non-path-relative URL (or a "
+        '"javascript:" injection) would be passed straight to '
+        "window.open."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Post-var-sweep invariants — added by chore/interactive-var-sweep
+# ---------------------------------------------------------------------------
+#
+# After the whole-file var → const/let sweep across these 7 bundles, three
+# guards keep the post-sweep state honest:
+#   1. ``node --check`` per bundle catches parse-level regressions on any
+#      future edit (mis-balanced braces, stray tokens) before they reach
+#      the browser.
+#   2. A var-free static assertion pins the keyword sweep — any future
+#      ``var`` declaration in these bundles fails CI loudly.
+#   3. A static const-reassign guard catches the specific bug class that
+#      shipped through the original sweep (``const X = …; … X = …``
+#      throws ``TypeError`` only at call-time, which ``node --check``
+#      does not surface).  This is the same paren/string/regex-aware
+#      reassignment check the sweep walker uses.
+#
+# A fourth guard runs ``_redactApiKeys`` via ``node -e`` as a runtime
+# smoke; the function is pure (no DOM dependency) so it transplants
+# cleanly into a standalone node invocation.
+
+
+# ``_slice_balanced_body`` is the shared comment-and-string-aware brace
+# walker from tests/_js_harness_helpers (imported at the top of this
+# file).  Comment awareness is a strict superset of the old string-only
+# local: most callers here pre-strip, where the two agree exactly, and a
+# few pass raw source (the persistence-badge and beforeunload pins),
+# where the shared walker is the more correct of the two — braces inside
+# comments no longer inflate its depth count.  One implementation means
+# a walker fix lands once for every suite.
+_slice_balanced_body = slice_braced_block
+
+
+def _slice_listener_body(body: str, event_name: str) -> str | None:
+    """Return the handler-function body registered via
+    ``addEventListener("<event_name>", function ...)``, sliced by
+    matching braces (robust to comment / formatting growth)."""
+    anchor = body.find(f'addEventListener("{event_name}"')
+    if anchor == -1:
+        return None
+    return _slice_balanced_body(body, anchor)
+
+
+def _slice_function_body(body: str, fn_name: str) -> str | None:
+    """Return the body of ``function <fn_name>(...) { ... }`` sliced by
+    matching braces."""
+    m = re.search(r"function\s+" + re.escape(fn_name) + r"\s*\(", body)
+    if m is None:
+        return None
+    return _slice_balanced_body(body, m.start())
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+# CLASSIC bundles that completed the var → const/let sweep.  Add a new JS
+# file here only after it has itself been swept — the var-free +
+# const-reassign guards below will otherwise fail loudly on any pre-sweep
+# `var` it contains.  coordinator.js is intentionally excluded (already
+# modern; 3 surviving `var` are by design per the sweep briefing).  The
+# shared_static files that used to sit here (auth/kb/utils) are ES modules
+# now — test_shell_js.py sweeps them with module semantics.
+_SWEPT_BUNDLES = [
+    _REPO_ROOT / "turnstone/ui/static/app.js",
+    _REPO_ROOT / "turnstone/console/static/admin.js",
+    _REPO_ROOT / "turnstone/console/static/governance.js",
+    _REPO_ROOT / "turnstone/console/static/app.js",
+    _REPO_ROOT / "turnstone/console/static/schedule_builder.js",
+]
+
+# The const-reassign analysis below is pure text — module vs script semantics
+# is irrelevant — so the var-free ES modules ride the same guard (their parse
+# + var + sink guards live in test_shell_js.py).
+_CONST_GUARD_BUNDLES = _SWEPT_BUNDLES + [
+    _REPO_ROOT / "turnstone/shared_static/auth.js",
+    _REPO_ROOT / "turnstone/shared_static/kb.js",
+    _REPO_ROOT / "turnstone/shared_static/utils.js",
+    _REPO_ROOT / "turnstone/shared_static/toast.js",
+    _REPO_ROOT / "turnstone/shared_static/shell.js",
+    _REPO_ROOT / "turnstone/shared_static/pane.js",
+    _REPO_ROOT / "turnstone/shared_static/rail.js",
+    _REPO_ROOT / "turnstone/shared_static/interactive.js",
+    _REPO_ROOT / "turnstone/shared_static/conversation.js",
+    _REPO_ROOT / "turnstone/shared_static/redact_credentials.js",
+]
+
+
+@pytest.mark.parametrize("bundle", _SWEPT_BUNDLES, ids=lambda p: p.name)
+def test_swept_bundle_parses(bundle: Path) -> None:
+    """``node --check`` each swept bundle.  Catches syntax-level
+    regressions (a future edit that drops a brace, mis-balances a
+    string, etc.) before they reach the browser.  Skipped silently if
+    ``node`` is not on PATH so local dev without Node still passes."""
+    node = "node"
+    try:
+        proc = subprocess.run(
+            [node, "--check", str(bundle)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    assert proc.returncode == 0, f"node --check failed for {bundle.name}:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize("bundle", _SWEPT_BUNDLES, ids=lambda p: p.name)
+def test_swept_bundle_has_no_var_decl(bundle: Path) -> None:
+    """Pin the var-free post-sweep state across all 7 bundles.  A
+    future ``var`` declaration here fails CI loudly so the sweep
+    doesn't regress in patches."""
+    body = bundle.read_text(encoding="utf-8")
+    # Line-start ``var`` declarations.
+    line_start = re.findall(r"^\s*var\s+\w", body, re.MULTILINE)
+    # ``for (var i …)`` counters anywhere on a line.
+    for_init = re.findall(r"\bfor\s*\(\s*var\s+", body)
+    stray = line_start + for_init
+    assert not stray, (
+        f"{bundle.name}: {len(stray)} stray ``var`` declarations found "
+        f"after the var-sweep — the post-sweep invariant is broken.  "
+        f"Convert to ``const``/``let``."
+    )
+
+
+def _strip_strings_and_line_comments(line: str) -> str:
+    """Return ``line`` with string-literal contents and ``// …`` tails
+    removed, so simple regex-based scanning can't be tricked by an
+    identifier embedded in a CSS class name or HTML attribute.
+    Mirrors the sweep walker's helper of the same purpose."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    in_str: str | None = None
+    while i < n:
+        ch = line[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_REGEX_OK_KEYWORDS = frozenset(
+    {
+        "return",
+        "throw",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "new",
+        "delete",
+        "void",
+        "do",
+        "yield",
+        "await",
+        "case",
+        "else",
+    }
+)
+
+
+def _is_regex_context_at(text: str, slash_pos: int) -> bool:
+    """``text[slash_pos]`` is ``/``.  Return ``True`` if it starts a regex
+    literal vs the division operator, by inspecting the previous significant
+    char (skipping whitespace and ``/* */`` block comments going backward)."""
+    i = slash_pos - 1
+    while i >= 0:
+        ch = text[i]
+        if ch.isspace():
+            i -= 1
+            continue
+        if ch == "/" and i >= 1 and text[i - 1] == "*":
+            open_i = text.rfind("/*", 0, i - 1)
+            if open_i == -1:
+                return True
+            i = open_i - 1
+            continue
+        if ch.isalnum() or ch in "_$":
+            k = i
+            while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
+                k -= 1
+            ident = text[k + 1 : i + 1]
+            return ident in _REGEX_OK_KEYWORDS
+        return ch not in ")]"
+    return True
+
+
+def _consume_regex_at(text: str, start: int) -> tuple[int, bool]:
+    """Consume regex literal starting at ``text[start] == '/'``.  Returns
+    ``(end_pos, ok)``.  Handles backslash escapes and ``[...]`` char classes
+    (a ``/`` inside a class doesn't end the regex)."""
+    n = len(text)
+    i = start + 1
+    in_class = False
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            return start, False
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            i += 1
+            while i < n and text[i] in "gimsuyd":
+                i += 1
+            return i, True
+        i += 1
+    return start, False
+
+
+def _build_brace_map(
+    text: str,
+) -> tuple[dict[int, int], list[int]]:
+    """Walk ``text`` once.  Returns ``(open_to_close, line_starts)`` where
+    ``open_to_close[open_off] = close_off`` for matched braces, and
+    ``line_starts[i]`` is the char offset where line index ``i`` (0-based)
+    begins.  Robust to JS regex literals, strings, ``//`` and ``/* */``
+    comments."""
+    n = len(text)
+    line_starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            line_starts.append(i + 1)
+    stack: list[int] = []
+    open_to_close: dict[int, int] = {}
+    in_str: str | None = None
+    in_comment: str | None = None
+    i = 0
+    while i < n:
+        ch = text[i]
+        if in_comment == "//":
+            if ch == "\n":
+                in_comment = None
+            i += 1
+            continue
+        if in_comment == "/*":
+            if ch == "*" and i + 1 < n and text[i + 1] == "/":
+                in_comment = None
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                in_comment = "//"
+                i += 2
+                continue
+            if text[i + 1] == "*":
+                in_comment = "/*"
+                i += 2
+                continue
+            if _is_regex_context_at(text, i):
+                end, ok = _consume_regex_at(text, i)
+                if ok:
+                    i = end
+                    continue
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            open_to_close[stack.pop()] = i
+        i += 1
+    return open_to_close, line_starts
+
+
+def _offset_to_line(line_starts: list[int], off: int) -> int:
+    lo, hi = 0, len(line_starts)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if line_starts[mid] <= off:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _enclosing_block(
+    decl_offset: int,
+    open_to_close: dict[int, int],
+    line_starts: list[int],
+    total_lines: int,
+) -> tuple[int, int]:
+    """Innermost block containing ``decl_offset``.  ``(start_line, end_line)``
+    inclusive.  Returns ``(0, total_lines - 1)`` when at top-level."""
+    candidates = [(op, cl) for op, cl in open_to_close.items() if op < decl_offset < cl]
+    if not candidates:
+        return 0, total_lines - 1
+    op, cl = max(candidates, key=lambda x: x[0])
+    return (
+        _offset_to_line(line_starts, op),
+        _offset_to_line(line_starts, cl),
+    )
+
+
+@pytest.mark.parametrize("bundle", _CONST_GUARD_BUNDLES, ids=lambda p: p.name)
+def test_swept_bundle_has_no_const_reassign(bundle: Path) -> None:
+    """For each ``const X = …`` declaration, fail if X is reassigned
+    *within the same block scope* (``X = …``, ``X +=``, ``X++``, ``++X``,
+    etc., with lookbehind to skip ``obj.X = …`` property writes).  Block
+    scope is found by brace-tracking with regex/string/comment awareness,
+    so a same-named ``let X`` in an unrelated function doesn't
+    false-positive against a ``const X`` in this one.  Caught the
+    original ``_redactApiKeys`` shipped bug (postfix ``redacted = …``)
+    and a sibling ``++_paneCounter`` prefix-increment that the first
+    iteration of this guard missed — both were ``TypeError`` at
+    call-time, invisible to ``node --check`` and to whole-file
+    keyword scans."""
+    body = bundle.read_text(encoding="utf-8")
+    lines = body.splitlines()
+    open_to_close, line_starts = _build_brace_map(body)
+    const_decl = re.compile(r"^(\s*)const\s+(\w+)\b")
+    bugs: list[tuple[int, str, int, str, str]] = []
+    for idx, line in enumerate(lines):
+        m = const_decl.match(line)
+        if not m:
+            continue
+        name = m.group(2)
+        decl_offset = line_starts[idx] + len(m.group(1))
+        start_line, end_line = _enclosing_block(decl_offset, open_to_close, line_starts, len(lines))
+        # Reassignment forms: postfix `X++`/`X--`, prefix `++X`/`--X`,
+        # compound `X +=`/`X -=`/.../`X ??=`, plain `X =` (not ==/===).
+        # Negative lookbehind skips property writes (`obj.X = …`).
+        pat = re.compile(
+            r"(?:"
+            r"(?<![A-Za-z0-9_$])(?:\+\+|--)"  # prefix `++X` / `--X`
+            + re.escape(name)
+            + r"(?![A-Za-z0-9_$])"
+            + r"|"
+            r"(?<![A-Za-z0-9_$.])"
+            + re.escape(name)
+            + r"\s*(?:\+\+|--|"  # postfix `X++` / `X--`
+            + r"(?:\+|-|\*\*?|/|%|&&?|\|\|?|\^|<<|>>>?|\?\?)=|"  # compound
+            + r"=(?!=))"  # plain `X =`
+            + r")"
+        )
+        decl_other = re.compile(
+            r"(?:^\s*(?:let|const|var)\s+|\bfor\s*\(\s*(?:let|const|var)\s+)"
+            + re.escape(name)
+            + r"\b"
+        )
+        param = re.compile(r"\((?:[^()]*?,\s*)?" + re.escape(name) + r"\s*[,)]")
+        for j in range(start_line, end_line + 1):
+            if j == idx:
+                continue
+            stripped = _strip_strings_and_line_comments(lines[j])
+            if not pat.search(stripped):
+                continue
+            if decl_other.search(stripped):
+                continue
+            if param.search(stripped):
+                cleaned = param.sub("(", stripped)
+                if not pat.search(cleaned):
+                    continue
+            bugs.append((idx + 1, name, j + 1, lines[idx].strip(), lines[j].strip()))
+            break
+    if bugs:
+        detail = "\n".join(
+            f"  {bundle.name}:{decl_ln} const {name} reassigned at "
+            f"{bundle.name}:{reass_ln}\n    decl:   {decl_text}\n    reass:  {reass_text}"
+            for decl_ln, name, reass_ln, decl_text, reass_text in bugs[:3]
+        )
+        suffix = f"\n  ... and {len(bugs) - 3} more" if len(bugs) > 3 else ""
+        raise AssertionError(
+            f"const declaration(s) reassigned within block scope.  "
+            f"Change to `let` or eliminate the reassignment:\n{detail}{suffix}"
+        )
+
+
+def test_redact_credentials_runtime_smoke() -> None:
+    """Runtime smoke for ``redactCredentials`` via a temp harness file.
+    The function is pure (no DOM dependency).  Tests the shared module
+    directly via ESM import (replaces the legacy ``_redactApiKeys`` test
+    which now delegates to this).
+
+    The tempfile is written with a ``.mjs`` extension so Node forces ESM
+    parsing regardless of any ``package.json`` ``type`` field in parent
+    directories.  The ``redact_credentials.js`` source file is imported
+    by absolute path so resolution is unambiguous.
+    """
+
+    mod_path = _REDACT_CREDENTIALS_JS.resolve()
+    harness = (
+        "import { redactCredentials, redactNamedValue } from "
+        + json.dumps(str(mod_path))
+        + ";\n"
+        + "const q = redactCredentials('https://x?api_key=abc&u=foo');\n"
+        + 'if (q !== "https://x?api_key=***&u=foo") '
+        + "throw new Error('query-string redact failed: ' + q);\n"
+        + 'const j = redactCredentials(\'{"api_key":"abc"}\');\n'
+        + 'if (j !== \'{"api_key":"***"}\') '
+        + "throw new Error('json-style redact failed: ' + j);\n"
+        + "// Bearer token redaction (raw input)\n"
+        + "const b = redactCredentials('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.test-token_here');\n"
+        + "if (!b.includes('[REDACTED:api_key]')) "
+        + "throw new Error('bearer redact failed: ' + b);\n"
+        + "// Connection string redaction (raw input)\n"
+        + "const c = redactCredentials('postgresql://user:supersecret@localhost/db');\n"
+        + "if (!c.includes('[REDACTED:password]')) "
+        + "throw new Error('conn-string redact failed: ' + c);\n"
+        + "// Authorization JSON key redaction (step 6 comprehensive)\n"
+        + 'const a = redactCredentials(\'{"Authorization": "Bearer canstillseethis"}\');\n'
+        + "if (!a.includes('[REDACTED:secret]')) "
+        + "throw new Error('authorization JSON redact failed: ' + a);\n"
+        + "// Single-quote JSON (Python dict repr / JS object literal)\n"
+        + "const sq = redactCredentials(\"{'Authorization': 'Bearer canstillseethis'}\");\n"
+        + "if (!sq.includes('[REDACTED:secret]')) "
+        + "throw new Error('single-quote authorization redact failed: ' + sq);\n"
+        + "// mongodb+srv connection string (Atlas SRV)\n"
+        + "const ms = redactCredentials('mongodb+srv://u:s3cretpw@cluster.mongodb.net/db');\n"
+        + "if (!ms.includes('[REDACTED:password]')) "
+        + "throw new Error('mongodb+srv redact failed: ' + ms);\n"
+        + "// lowercase bearer scheme (RFC 7235 case-insensitive)\n"
+        + "const lb = redactCredentials('authorization: bearer "
+        + "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig12345');\n"
+        + "if (!lb.includes('[REDACTED:api_key]')) "
+        + "throw new Error('lowercase bearer redact failed: ' + lb);\n"
+        + "// api_key= assignment redacts the whole token, not a garbled api_[REDACTED\n"
+        + "const ak = redactCredentials('api_key=abcdefghijklmnopqrstuvwxyz');\n"
+        + "if (ak !== '[REDACTED:api_key]') "
+        + "throw new Error('api_key= clean redact failed: ' + ak);\n"
+        + "// Prefilter fast path: plain text with no anchor substring is unchanged\n"
+        + "const fp = redactCredentials('build ok in 42s - 3 tests passed');\n"
+        + "if (fp !== 'build ok in 42s - 3 tests passed') "
+        + "throw new Error('prefilter fast-path no-op failed: ' + fp);\n"
+        + "// Bare credentials with no =, quote or @ anywhere must still redact\n"
+        + "// (these pin the prefilter as a superset of the pattern set)\n"
+        + "const bk = redactCredentials('loaded sk-abcdefghijklmnopqrstuvwx');\n"
+        + "if (bk !== 'loaded [REDACTED:api_key]') "
+        + "throw new Error('bare sk- redact failed: ' + bk);\n"
+        + "const aw = redactCredentials('using AKIAABCDEFGHIJKLMNOP now');\n"
+        + "if (aw !== 'using [REDACTED:api_key] now') "
+        + "throw new Error('bare AKIA redact failed: ' + aw);\n"
+        + "const bt = redactCredentials('Bearer abcdefghijklmnopqrstuvwxyz');\n"
+        + "if (bt !== '[REDACTED:api_key]') "
+        + "throw new Error('bare bearer redact failed: ' + bt);\n"
+        + "// SQLAlchemy dialect+driver connection URLs (psycopg2/asyncpg)\n"
+        + "const pg2 = redactCredentials('postgresql+psycopg2://user:s3cret@db:5432/app');\n"
+        + "if (pg2 !== 'postgresql+psycopg2://user:[REDACTED:password]@db:5432/app') "
+        + "throw new Error('psycopg2 conn redact failed: ' + pg2);\n"
+        + "const apg = redactCredentials('postgresql+asyncpg://user:s3cret@db/app');\n"
+        + "if (apg !== 'postgresql+asyncpg://user:[REDACTED:password]@db/app') "
+        + "throw new Error('asyncpg conn redact failed: ' + apg);\n"
+        + "// RFC 3986 schemes are case-insensitive - uppercase must not bypass\n"
+        + "const up = redactCredentials('POSTGRESQL+PSYCOPG2://user:s3cret@db/app');\n"
+        + "if (up !== 'POSTGRESQL+PSYCOPG2://user:[REDACTED:password]@db/app') "
+        + "throw new Error('uppercase scheme conn redact failed: ' + up);\n"
+        + "// PostgreSQL's short scheme carries a password as the long one does\n"
+        + "const pgs = redactCredentials('postgres://user:s3cret@db:5432/app');\n"
+        + "if (pgs !== 'postgres://user:[REDACTED:password]@db:5432/app') "
+        + "throw new Error('postgres:// conn redact failed: ' + pgs);\n"
+        + "// A bare JWT (no =, quote or @) redacts whole: pins eyJ in the prefilter\n"
+        + "const jw = redactCredentials('session eyJhbGciOiJIUzI1NiJ9."
+        + "eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U ok');\n"
+        + "if (jw !== 'session [REDACTED:api_key] ok') "
+        + "throw new Error('bare JWT redact failed: ' + jw);\n"
+        + "// A JWT under token= loses its payload and signature too, not only its header\n"
+        + "const jq = redactCredentials('https://x.example/cb?access_token=eyJhbGciOiJIUzI1NiJ9."
+        + "eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig-part_1&x=1');\n"
+        + "if (jq !== 'https://x.example/cb?access_token=[REDACTED:api_key]&x=1') "
+        + "throw new Error('query JWT redact failed: ' + jq);\n"
+        + "// Credential-named query parameters redact to the end of a dotted token\n"
+        + "const qd = redactCredentials('https://x.example/f?access_token=ya29.a0AfH6SMBx3kQ9zTy&alt=json');\n"
+        + "if (qd !== 'https://x.example/f?[REDACTED:secret]&alt=json') "
+        + "throw new Error('dotted query token redact failed: ' + qd);\n"
+        + "const qt = redactCredentials('https://x.example/f?token=AbCdEfGhIjKlMnOpQrStUv-wxyz_123&x=1');\n"
+        + "if (qt !== 'https://x.example/f?[REDACTED:secret]&x=1') "
+        + "throw new Error('base64url query token tail leaked: ' + qt);\n"
+        + "// Token names follow the token= rule, with or without the underscore\n"
+        + "const qn = redactCredentials('https://x.example/f?api_token=abcdefghij12&a=1&accessToken=abcdefgh12');\n"
+        + "if (qn !== 'https://x.example/f?[REDACTED:secret]&a=1&[REDACTED:secret]') "
+        + "throw new Error('prefixed query token names redact failed: ' + qn);\n"
+        + "// An encoded & is data in a plain query value\n"
+        + "const pa = redactCredentials('https://x.example/login?password=Longpass%26tail&y=1');\n"
+        + "if (pa !== 'https://x.example/login?[REDACTED:secret]&y=1') "
+        + "throw new Error('encoded & cut a plain query value: ' + pa);\n"
+        + "// Whole-value rules run before the key-prefix rules\n"
+        + "const qp = redactCredentials('https://x.example/v1?api_key=sk-proj-AbCdEfGhIjKlMnOpQrStUv_WxYz0123456789TAIL&x=1');\n"
+        + "if (qp !== 'https://x.example/v1?[REDACTED:secret]&x=1') "
+        + "throw new Error('prefixed key in a query value left a tail: ' + qp);\n"
+        + "// The legacy mask still hides a value an earlier rule replaced only in part\n"
+        + "const qa = redactCredentials('https://x.example/v1?auth=ghp_' + 'a'.repeat(36) + '.moresecret&x=1');\n"
+        + "if (qa !== 'https://x.example/v1?auth=***&x=1') "
+        + "throw new Error('partly redacted auth value left a tail: ' + qa);\n"
+        + "const cp = redactCredentials('postgresql://user:pa://ss@host/db');\n"
+        + "if (cp !== 'postgresql://user:[REDACTED:password]@host/db') "
+        + "throw new Error('conn-string password with :// redact failed: ' + cp);\n"
+        + '// "eyJ" repeated inside one token run must not rescan the run per occurrence\n'
+        + "const big = 'eyJ'.repeat(100000);\n"
+        + "const t0 = Date.now();\n"
+        + "if (redactCredentials(big) !== big) throw new Error('eyJ run altered');\n"
+        + "if (Date.now() - t0 > 2000) "
+        + "throw new Error('JWT scan is not linear: ' + (Date.now() - t0) + 'ms');\n"
+        + "// Fragment and escaped separators anchor the query rule too\n"
+        + "const fr = redactCredentials("
+        + "'https://app.example/cb#access_token=ya29.a0AfH6SMBx3kQ9zTy&token_type=Bearer');\n"
+        + "if (fr !== 'https://app.example/cb#[REDACTED:secret]&token_type=Bearer') "
+        + "throw new Error('fragment token redact failed: ' + fr);\n"
+        + "const am = redactCredentials('x.example/f?a=1&amp;access_token=ya29.a0AfH6SMBx3kQ9zTy');\n"
+        + "if (am !== 'x.example/f?a=1&amp;[REDACTED:secret]') "
+        + "throw new Error('&amp; token redact failed: ' + am);\n"
+        + "// A JWT inside a percent-encoded redirect_uri redacts whole\n"
+        + "const pe = redactCredentials('https://idp.example/l?redirect_uri=https%3A%2F%2Fapp%2Fcb"
+        + "%3Fid_token%3DeyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig-part_1&state=1');\n"
+        + "if (pe !== 'https://idp.example/l?redirect_uri=https%3A%2F%2Fapp%2Fcb"
+        + "%3Fid_token%3D[REDACTED:api_key]&state=1') "
+        + "throw new Error('percent-encoded JWT redact failed: ' + pe);\n"
+        + "// A long connection-string password is redacted at any length\n"
+        + "const lp = redactCredentials('postgresql://user:' + 'A'.repeat(300) + '@db/x');\n"
+        + "if (lp !== 'postgresql://user:[REDACTED:password]@db/x') "
+        + "throw new Error('long conn-string password redact failed: ' + lp);\n"
+        + "const ls = redactCredentials('postgresql://u:' + 'a/'.repeat(200) + '@host/db');\n"
+        + "if (ls !== 'postgresql://u:[REDACTED:password]@host/db') "
+        + "throw new Error('long conn-string password with / redact failed: ' + ls);\n"
+        + "// The @ gets past the prefilter, so the connection-string pattern runs\n"
+        + "const nbig = '@ https://h.example/' + 'https://'.repeat(32000);\n"
+        + "const t2 = Date.now();\n"
+        + "if (redactCredentials(nbig) !== nbig) throw new Error('nested schemes altered');\n"
+        + "if (Date.now() - t2 > 2000) "
+        + "throw new Error('connection-string scan is not linear: ' + (Date.now() - t2) + 'ms');\n"
+        + "const sbig = '@ postgres://u:' + 'postgres://'.repeat(30000);\n"
+        + "const t3 = Date.now();\n"
+        + "if (redactCredentials(sbig) !== sbig) throw new Error('nested short schemes altered');\n"
+        + "if (Date.now() - t3 > 2000) "
+        + "throw new Error('short-scheme scan is not linear: ' + (Date.now() - t3) + 'ms');\n"
+        + "const pbig = '%3DeyJ'.repeat(50000);\n"
+        + "const t1 = Date.now();\n"
+        + "if (redactCredentials(pbig) !== pbig) throw new Error('escaped eyJ run altered');\n"
+        + "if (Date.now() - t1 > 2000) "
+        + "throw new Error('escaped JWT scan is not linear: ' + (Date.now() - t1) + 'ms');\n"
+        + "// A run of capitals with no = after it, and BEGIN lines with no END: each\n"
+        + "// cut-off block runs to the next BEGIN, and the last has none after it\n"
+        + "const begin = '-----BEGIN PRIVATE KEY-----\\n';\n"
+        + "for (const [label, slow, want] of [['env-line', 'x=' + 'A'.repeat(320000), null],\n"
+        + "    ['private-key', begin.repeat(48000), '[REDACTED:private_key]'.repeat(47999) + begin]]) {\n"
+        + "  const t = Date.now();\n"
+        + "  if (redactCredentials(slow) !== (want === null ? slow : want)) "
+        + "throw new Error(label + ' run altered');\n"
+        + "  if (Date.now() - t > 2000) "
+        + "throw new Error(label + ' scan is not linear: ' + (Date.now() - t) + 'ms');\n"
+        + "}\n"
+        + "// An env key run may start with _ or digits and still name a secret\n"
+        + "for (const [env, want] of [['my_TOKEN=abcdef', 'my_TOKEN=[REDACTED:secret]'],\n"
+        + "    ['_SECRET_KEY=x', '_SECRET_KEY=[REDACTED:secret]'], ['9KEY=x', '9KEY=[REDACTED:secret]'],\n"
+        + "    ['_DATABASE_URL=x', '_DATABASE_URL=[REDACTED:secret]'], ['MONKEY=banana', 'MONKEY=banana']]) {\n"
+        + "  if (redactCredentials(env) !== want) "
+        + "throw new Error('env key redact failed: ' + env + ' -> ' + redactCredentials(env));\n"
+        + "}\n"
+        + "// The name rules for a value decoded from JSON, shown on its own\n"
+        + "if (redactNamedValue('password', 'hunter2-not-a-key') !== '[REDACTED:secret]') "
+        + "throw new Error('named secret not redacted');\n"
+        + "if (redactNamedValue('token', 'abc') !== '***') throw new Error('named token not masked');\n"
+        + "if (redactNamedValue('note', 'hello') !== 'hello') throw new Error('plain value changed');\n"
+        + "// A quote in a named value can't end the name rule's match short\n"
+        + "if (redactNamedValue('password', 'p\"ssw0rd-hunter2-long') !== '[REDACTED:secret]') "
+        + "throw new Error('named secret with an early quote shown');\n"
+        + "if (redactNamedValue('token', \"ab'cd\") !== '***') "
+        + "throw new Error('named token with a quote not masked whole');\n"
+        + "// Every private-key header; a cut-off key runs to the next BEGIN\n"
+        + "for (const label of ['DSA PRIVATE KEY', 'ENCRYPTED PRIVATE KEY', 'PGP PRIVATE KEY BLOCK']) {\n"
+        + "  const k = redactCredentials('-----BEGIN ' + label + '-----\\nMIIB\\n-----END ' + label + '-----');\n"
+        + "  if (k !== '[REDACTED:private_key]') throw new Error(label + ' not redacted: ' + k);\n"
+        + "}\n"
+        + "const cut = redactCredentials('-----BEGIN RSA PRIVATE KEY-----\\nMIIEow\\n'\n"
+        + "  + '-----BEGIN PRIVATE KEY-----\\nMIIEvQ\\n-----END PRIVATE KEY-----');\n"
+        + "if (cut !== '[REDACTED:private_key][REDACTED:private_key]') "
+        + "throw new Error('cut-off key shown: ' + cut);\n"
+        + "// A percent-encoded parameter with no =, quote or @ in sight: pins %3D in the prefilter\n"
+        + "const pq = redactCredentials('next%3Faccess_token%3Dya29.a0AfH6SMBx3kQ9zTy');\n"
+        + "if (pq !== 'next%3F[REDACTED:secret]') "
+        + "throw new Error('percent-encoded query token redact failed: ' + pq);\n"
+        + "// A value takes a password's punctuation but stops at the text's delimiters\n"
+        + "const pp = redactCredentials('(see https://x.example/l?password=Sup3r!S3cr*t$@:x).');\n"
+        + "if (pp !== '(see https://x.example/l?[REDACTED:secret]).') "
+        + "throw new Error('query value punctuation redact failed: ' + pp);\n"
+        + "const pl = redactCredentials(\"['https://a.example/x?token=abcdefgh','https://b.example/y?p=2']\");\n"
+        + "if (pl !== \"['https://a.example/x?[REDACTED:secret]','https://b.example/y?p=2']\") "
+        + "throw new Error('query value ran into the next list item: ' + pl);\n"
+        + "// The legacy query mask leaves an earlier rule's marker alone (backend parity)\n"
+        + "const pj = redactCredentials('url?token=eyJhbGciOiJIUzI1NiJ9."
+        + "eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig-part_1');\n"
+        + "if (pj !== 'url?token=[REDACTED:api_key]') "
+        + "throw new Error('legacy mask rewrote a marker: ' + pj);\n"
+        + "// Bare key= stays out of the query rule (short values untouched)\n"
+        + "const qk = redactCredentials('https://x.example/f?key=abcdefghijklmnop');\n"
+        + "if (qk !== 'https://x.example/f?key=abcdefghijklmnop') "
+        + "throw new Error('bare query key= over-redacted: ' + qk);\n"
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, (
+        f"redactCredentials runtime smoke failed.  stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+
+def test_beforeunload_closes_global_sse() -> None:
+    """The ``beforeunload`` handler closes ``globalEvtSource`` before navigation.
+    In the L-shell the per-pane streams are owned by PaneManager/interactive.js,
+    so this handler only owns the global Tier-1 stream."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    handler = _slice_listener_body(body, "beforeunload")
+    assert handler is not None, "beforeunload handler missing."
+    assert "globalEvtSource" in handler and ".close()" in handler, (
+        "beforeunload must close the global Tier-1 stream."
+    )
+
+
+def test_dead_sse_defensive_reconnect_registered() -> None:
+    """visibilitychange + focus listeners re-open the global Tier-1 stream if it
+    was closed (e.g. a cancelled navigation).  In the L-shell per-pane streams
+    are PaneManager's, so the helper only revives the global SSE."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert 'addEventListener("visibilitychange"' in body
+    assert 'addEventListener("focus"' in body
+    helper_body = _slice_function_body(body, "_reconnectDeadSSEs")
+    assert helper_body is not None, "_reconnectDeadSSEs helper missing."
+    assert "EventSource" in helper_body and "connectGlobalSSE()" in helper_body, (
+        "_reconnectDeadSSEs must revive the global SSE when closed."
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-D reconnect-with-replay: onerror must preserve native EventSource
+# auto-reconnect for transient errors
+# ---------------------------------------------------------------------------
+#
+# PR-D adds a server-side per-ws ring buffer + ``Last-Event-ID`` replay so
+# a brief disconnect transparently replays the missed events.  That whole
+# foundation is defeated if the browser's ``onerror`` handler explicitly
+# closes the EventSource on a transient network error — closing forces a
+# CONNECTING -> CLOSED state transition that prevents native auto-reconnect
+# from firing.  The post-PR-D contract is: never call ``.close()`` on a
+# transient error; let native reconnect run with the ``Last-Event-ID``
+# header.  Explicit closes survive only on terminal branches (401 expired
+# session, workstream-reassignment to a different ws).  These guards pin
+# the contract so a future refactor can't silently regress it.
+
+
+# ``_strip_js_comments`` is the shared string-aware, offset-preserving
+# stripper from tests/_js_harness_helpers (imported at the top of this
+# file) — one implementation for every suite, so the string-blind /
+# offset-destroying per-suite variants cannot diverge again.
+
+
+def _onerror_block(body: str, anchor_substring: str) -> str | None:
+    """Slice an ``X.onerror = ...`` handler body by matching braces.
+
+    ``anchor_substring`` is something that uniquely identifies the
+    enclosing function so we don't accidentally pick the wrong
+    ``.onerror = function ...`` (the file has several).  Returns the
+    body between the matching braces, or ``None`` if not found.
+    Strips comments first so apostrophes in comment prose can't
+    desync the brace walker.
+    """
+    stripped = _strip_js_comments(body)
+    anchor = stripped.find(anchor_substring)
+    if anchor == -1:
+        return None
+    onerror = stripped.find(".onerror", anchor)
+    if onerror == -1:
+        return None
+    return _slice_balanced_body(stripped, onerror)
+
+
+def _onerror_preserves_native_reconnect(body: str, source_var: str) -> tuple[bool, str]:
+    """Return (passed, reason).
+
+    ``source_var`` is the EventSource handle (e.g. ``this.evtSource``,
+    ``globalEvtSource``, ``evtSource``).  An onerror handler passes if:
+      1. Either it never calls ``source_var.close()`` directly OR every
+         such close is inside a 401-detection branch / login-overlay
+         early-return / wsId-reassignment branch (allowed terminal
+         exits).
+      2. OR the handler explicitly references ``last_event_id`` —
+         escape hatch for a future redesign that abandons native
+         reconnect entirely but takes explicit responsibility for the
+         replay header.
+    """
+    # If the body threads last_event_id, the implementer has taken
+    # explicit responsibility for the replay header — escape hatch.
+    if "last_event_id" in body or "lastEventId" in body:
+        # Caller still has to ensure the body doesn't ALSO have a
+        # naked close() outside a terminal branch; rely on the regex
+        # search below as well.
+        pass
+    # Walk lines, track depth of common terminal branches.  Simple
+    # heuristic: any ``source_var.close()`` line that isn't preceded by
+    # ``status === 401`` or ``loginOverlay`` or ``disconnectSSE()`` in
+    # the surrounding line window is a defect.
+    pattern = re.compile(
+        re.escape(source_var) + r"\.close\(\s*\)",
+    )
+    matches = list(pattern.finditer(body))
+    if not matches:
+        return True, "no close() calls — native reconnect preserved"
+    for m in matches:
+        start = m.start()
+        # Look back ~400 chars for a terminal-branch marker on the
+        # same conditional path.  ``r.status === 401`` is the canonical
+        # 401-detection guard; ``loginOverlay`` is the login-modal
+        # early-return; ``disconnectSSE()`` immediately followed by
+        # setting a new wsId is the reassignment path.
+        window = body[max(0, start - 400) : start]
+        is_401_branch = "status === 401" in window or "r.status === 401" in window
+        is_login_branch = "loginOverlay" in window
+        is_reassign_branch = "disconnectSSE()" in window
+        if not (is_401_branch or is_login_branch or is_reassign_branch):
+            snippet = body[max(0, start - 80) : min(len(body), start + 80)]
+            return False, (
+                f"naked {source_var}.close() at offset {start} — would "
+                f"defeat native auto-reconnect for transient errors. "
+                f"Context: ...{snippet}..."
+            )
+    return True, "all close() calls are in terminal branches (401 / login / reassign)"
+
+
+def test_pane_connectsse_onerror_preserves_native_reconnect() -> None:
+    """``Pane.connectSSE``'s onerror must not close evtSource on
+    transient errors — PR-D's reconnect-with-replay depends on native
+    EventSource auto-reconnect firing with the ``Last-Event-ID`` header."""
+    body = _strip_js_comments(_INTERACTIVE_JS.read_text(encoding="utf-8"))
+    # Slice the Pane.connectSSE method body, then the onerror handler
+    # inside it.  Reuse the indent-agnostic class-method finder.
+    method_start = _pane_method_offset(body, "connectSSE")
+    method = _slice_balanced_body(body, method_start)
+    assert method is not None, "Pane.connectSSE method body not found"
+    # ``_onerror_block`` re-strips internally; passing the already-
+    # stripped method body is idempotent (no comments left to strip).
+    onerror = _onerror_block(method, "this.evtSource.onerror")
+    assert onerror is not None, "Pane.connectSSE.onerror not found"
+    passed, reason = _onerror_preserves_native_reconnect(onerror, "this.evtSource")
+    assert passed, f"Pane.connectSSE.onerror regressed: {reason}"
+
+
+def test_connectglobalsse_onerror_preserves_native_reconnect() -> None:
+    """``connectGlobalSSE`` is the global-SSE counterpart of
+    Pane.connectSSE — same close-defeats-reconnect contract."""
+    body = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    fn = _slice_function_body(body, "connectGlobalSSE")
+    assert fn is not None, "connectGlobalSSE not found"
+    onerror = _onerror_block(fn, "globalEvtSource.onerror")
+    assert onerror is not None, "globalEvtSource.onerror not found"
+    passed, reason = _onerror_preserves_native_reconnect(onerror, "globalEvtSource")
+    assert passed, f"connectGlobalSSE.onerror regressed: {reason}"
+
+
+def test_ws_activity_never_reinserts_a_closed_workstream() -> None:
+    """A trailing ``ws_activity`` for a closed workstream must not re-create
+    a skeletal roster entry: its dashboard row can outlive ``ws_closed``
+    until the next REST-driven repaint, and a ghost entry both suppresses
+    the empty-state transition (``showDashboard``) and paints a nameless
+    rail tab until a full resync.  The arm is membership-gated like
+    ``ws_rename`` — read the entry, mutate it in place only when it exists,
+    and never assign into the roster map."""
+    body = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    start = body.index('data.type === "ws_activity"')
+    end = body.index('data.type === "ws_rename"', start)
+    arm = body[start:end]
+    assert "workstreams[data.ws_id] =" not in arm, (
+        "ws_activity assigns into the roster map — a trailing event for a "
+        "closed workstream would re-insert a ghost entry"
+    )
+    assert "const roster = workstreams[data.ws_id];" in arm
+    assert "if (roster)" in arm
+
+
+def test_coord_connectsse_onerror_preserves_native_reconnect() -> None:
+    """Coordinator's connectSSE has the same contract — without the
+    guard the coord's per-ws SSE silently drops events on any blip."""
+    coord_js = _REPO_ROOT / "turnstone/console/static/coordinator/coordinator.js"
+    body = _strip_js_comments(coord_js.read_text(encoding="utf-8"))
+    onerror = _onerror_block(body, "evtSource.onerror")
+    assert onerror is not None, "coordinator.js evtSource.onerror not found"
+    passed, reason = _onerror_preserves_native_reconnect(onerror, "evtSource")
+    assert passed, f"coordinator.js connectSSE.onerror regressed: {reason}"
+
+
+# ---------------------------------------------------------------------------
+# Coordinator-pane parity for the SSE overflow-recovery companions (issue #806).
+# The server-side fixes (emit-time batching, _ListenerQueue poison, out-of-band
+# closing) live in SessionUIBase and already cover EVERY SSE stream; these pin
+# the CLIENT-side companions ported into coordinator.js so it stops relying on
+# native reconnect alone — storm guard + degraded catch-up, close-on-hide /
+# replay-on-show, and drop-vs-render-wedge counters.
+# ---------------------------------------------------------------------------
+
+
+def test_coord_imports_shared_overflow_helpers() -> None:
+    """coordinator.js consumes the SAME sse_overflow.js helpers as the
+    interactive pane (over the /shared mount) so the trip threshold and cooldown
+    ladder cannot drift between the two surfaces."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(
+        r"import \{([^}]*)\} from \"/shared/sse_overflow\.js\";",
+        body,
+        re.S,
+    )
+    assert m is not None, "coordinator must import the shared overflow helpers"
+    imported = m.group(1)
+    for name in (
+        "OVERFLOW_TRIP_COUNT",
+        "OVERFLOW_TRIP_WINDOW_MS",
+        "DEGRADED_COOLDOWN_BASE_MS",
+        "DEGRADED_COOLDOWN_MAX_MS",
+        "DEGRADED_COOLDOWN_RESET_MS",
+        "overflowWindowTripped",
+        "degradedCooldownStep",
+    ):
+        assert name in imported, f"{name} must be imported from /shared/sse_overflow.js"
+    # No local fork of the extracted pure functions on the coordinator side.
+    assert not re.search(r"^\s*function overflowWindowTripped\(", body, re.M)
+    assert not re.search(r"^\s*function degradedCooldownStep\(", body, re.M)
+
+
+def test_coord_stream_overflow_case_counts_and_rate_limits() -> None:
+    """The coordinator handles the id-less ``stream_overflow`` frame: count it
+    (drop-vs-wedge field instrumentation) and feed the rolling-window storm
+    guard, exactly like the interactive pane."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    assert 'case "stream_overflow":' in body
+    assert "noteStreamOverflow();" in body
+    # The health object carries all four field-forensics counters; the
+    # truncated-resync counter distinguishes the replay-window class from
+    # the dropped-events class (overflows).
+    health = re.search(r"const streamHealth = \{(.*?)\};", body, re.S)
+    assert health is not None, "streamHealth initializer not found"
+    for field in ("overflows: 0", "renderThrows: 0", "malformedFrames: 0", "truncatedGaps: 0"):
+        assert field in health.group(1), f"streamHealth must init {field!r}"
+    assert "streamHealth.overflows += 1;" in body
+    assert "streamHealth.malformedFrames += 1;" in body
+    # Exactly two render-throw increment sites: the noteRenderThrow helper
+    # (all three contained render/finalize catches route through it — they
+    # recover with a plain-text fallback, so console.warn) and the onmessage
+    # dispatch catch (console.error class — the event is dropped outright).
+    # The three recovered call sites are pinned by label so a new render path
+    # that forgets to count surfaces loudly.
+    assert body.count("streamHealth.renderThrows += 1;") == 2
+    helper = re.search(r"function noteRenderThrow\(where, err\)\s*\{(.*?)\n  \}", body, re.S)
+    assert helper is not None, "noteRenderThrow helper not found"
+    assert "streamHealth.renderThrows += 1;" in helper.group(1)
+    assert 'noteRenderThrow("streamingRender", e);' in body
+    assert 'noteRenderThrow("in_progress_snapshot render", e);' in body
+    assert 'noteRenderThrow("streamingRenderFinalize", e);' in body
+    # Overflow closes route through the ONE shared churn step (also fed by
+    # truncated resyncs — see the truncated fresh-connect test), keeping the
+    # class-specific instrumentation in noteStreamOverflow itself.
+    note = re.search(r"function noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert note is not None, "noteStreamOverflow not found"
+    assert "recordChurnAndMaybeTrip();" in note.group(1)
+    # The counting step only counts + trips; the cooldown reset lives in
+    # enterDegradedCatchup (keyed off lastDegradedAt) — the finding [0] shape.
+    assert "degradedCooldownMs" not in note.group(1), (
+        "noteStreamOverflow must not touch the cooldown — that reset defeated the ladder escalation"
+    )
+
+
+def test_coord_handleevent_dispatch_is_wedge_guarded() -> None:
+    """A throw escaping onmessage does NOT close the EventSource, so an
+    unguarded handler throw left the streaming refs stale and wedged every later
+    turn.  The coordinator wraps the dispatch and counts the throw (render-wedge
+    class) so a field report tells it apart from a dropped-events gap."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"try \{\s*handleEvent\(data\);\s*\} catch \(err\) \{(.*?)\}", body, re.S)
+    assert m is not None, "handleEvent(data) must be wrapped in try/catch in onmessage"
+    assert "streamHealth.renderThrows += 1;" in m.group(1)
+
+
+def test_coord_degraded_catchup_stops_live_stream_and_retries() -> None:
+    """Three overflow closes inside the window drop the coordinator to a
+    degraded catch-up: suspend the live stream, say so plainly, and reconnect
+    after a doubling cooldown — the reconnect replays the gap (or falls to the
+    /history floor once it outgrows the ring)."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"function enterDegradedCatchup\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert m is not None, "enterDegradedCatchup not found"
+    method = m.group(1)
+    assert "degradedCooldownStep(" in method
+    assert "lastDegradedAt = now" in method
+    # Suspend the stream BEFORE arming the retry timer (mirrors interactive's
+    # disconnect-then-rearm ordering) or the fresh timer is cancelled at once.
+    assert method.index("suspendStream()") < method.index("degradedTimer = setTimeout")
+    # Plain-language status, not a silent stall.
+    assert "catching up" in method
+    # A fresh connect must cancel a pending degraded timer so it can't
+    # double-open behind the retry — connectSSE's prologue routes through the
+    # shared closeStreamTransport teardown, which owns that clear (alongside
+    # the reconnect timer + the EventSource close/null).
+    conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert conn is not None
+    assert "closeStreamTransport();" in conn.group(1)
+    teardown = re.search(r"function closeStreamTransport\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert teardown is not None, "closeStreamTransport not found"
+    assert "clearTimeout(degradedTimer)" in teardown.group(1)
+    assert "clearTimeout(reconnectTimer)" in teardown.group(1)
+    assert "evtSource = null;" in teardown.group(1)
+
+
+def test_coord_visibilitychange_closes_on_hide_reconnects_on_show() -> None:
+    """A hidden tab's throttled drain is the worst-case slow SSE consumer.  The
+    coordinator installs a visibilitychange handler that closes the stream on
+    hide (marking its OWN close via hiddenDisconnect) and reconnects on show from
+    the saved lastEventId, and removes the listener on teardown."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange", visHandler);' in body
+    assert 'document.removeEventListener("visibilitychange", visHandler);' in body
+    vis = re.search(r"function onVisibilityChange\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert vis is not None, "onVisibilityChange not found"
+    method = vis.group(1)
+    assert "document.hidden" in method
+    assert "suspendStream()" in method
+    assert "hiddenDisconnect = true;" in method
+    assert "else if (hiddenDisconnect)" in method
+    assert "connectSSE();" in method
+
+
+def test_coord_connectsse_defers_open_when_tab_hidden() -> None:
+    """connectSSE must never open an EventSource into a hidden tab — the single
+    chokepoint that also backstops a FIRST connect in a background tab (where the
+    close-on-hide handler never fires because there was no open stream).  It
+    marks hiddenDisconnect so the show edge owns the reconnect, marks the
+    deferral as a GAP (markStreamGap) so the eventual open runs the post-gap
+    recovery — without the mark a pane first opened in a background tab
+    silently missed every child/task created while hidden — and reports an
+    honest paused status instead of pinning "connecting" with no attempt in
+    flight."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert conn is not None
+    method = conn.group(1)
+    guard = method.index("if (document.hidden)")
+    open_idx = method.index("new EventSource(")
+    assert guard < open_idx, "the hidden guard must precede new EventSource"
+    head = method[guard:open_idx]
+    assert "markStreamGap();" in head, "the hidden deferral must count as a stream gap"
+    assert "hiddenDisconnect = true;" in head
+    assert "return;" in head
+    assert 'setSseStatus("paused' in head, "the deferral must report paused, not connecting"
+    # "connecting" is claimed only once an attempt actually starts — after
+    # the hidden guard, immediately before the EventSource construction.
+    connecting = method.index('setSseStatus("connecting')
+    assert guard < connecting < open_idx
+
+
+def test_coord_destroy_removes_visibility_handler_and_stream_transport() -> None:
+    """Teardown must detach the document-level visibilitychange listener (it
+    holds a strong ref to the closure) and tear down the stream transport —
+    closeStreamTransport closes the EventSource and cancels the reconnect +
+    degraded retry timers (pinned in the degraded-catchup test) — or a
+    destroyed pane leaks and a show edge / pending retry reopens its stream."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    d = re.search(r"function destroy\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert d is not None, "destroy not found"
+    method = d.group(1)
+    assert "removeVisibilityHandler();" in method
+    assert "closeStreamTransport();" in method
+
+
+def test_coord_close_session_detaches_visibility_reopen() -> None:
+    """coordCloseSession suspends the stream AND removes the visibilitychange
+    handler BEFORE awaiting the /close POST: a tab hide→show while the POST is
+    in flight must not reopen a stream against the workstream the server is
+    tearing down (404 / reconnect churn against a dead session).  The failure
+    paths resume via connectSSE, which reinstalls the handler at its
+    install-once chokepoint — so close-on-hide survives a failed close."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"async function coordCloseSession\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert m is not None, "coordCloseSession not found"
+    method = m.group(1)
+    suspend = method.index("suspendStream();")
+    unhook = method.index("removeVisibilityHandler();")
+    # The quoted URL fragment, not the bare word (comments mention /close too).
+    post = method.index('"/close"')
+    assert suspend < post, "stream suspension must precede the /close POST"
+    assert unhook < post, "visibility detach must precede the /close POST"
+    assert "resumeSse()" in method
+
+
+def test_coord_post_gap_sidebar_refresh_is_replay_aware() -> None:
+    """The replace-mode children/tasks refresh (a sidebar rebuild) must NOT
+    fire on every reconnect: child_ws_* / task-mutating events are ordinary
+    ring-buffer entries, so a cursor reconnect (replay_ok) redelivers them and
+    the sidebar heals through the normal handlers — a momentary blur→focus
+    under close-on-hide must not rebuild the sidebar.  The refresh fires
+    exactly when the replay cannot vouch for the gap: no resume cursor or an
+    over-threshold gap at onopen, or the server's replay_truncated envelope
+    (ring evicted), deduped per open via gapRefreshedAtOpen.  While a
+    truncation gap is on record the onopen arm stands down entirely
+    (truncatedFromCursor == null gate): the gap machinery owns sidebar
+    recovery — gap-start envelope refresh + heal-time refresh — and the
+    failed-resync retry loop (which nulls lastEventId and never re-seeds it
+    on failure) must not re-fire this refresh once per reconnect."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert conn is not None
+    method = conn.group(1)
+    gate = re.search(
+        r"wasReconnecting &&\s*truncatedFromCursor == null &&\s*"
+        r"\(lastEventId == null \|\| gapMs > GAP_REFRESH_THRESHOLD_MS\)",
+        method,
+    )
+    assert gate is not None, (
+        "onopen must gate the sidebar refresh on replay coverage AND on no "
+        "truncation gap being on record (the gap machinery owns recovery)"
+    )
+    assert "refreshSidebarAfterGap();" in method
+    assert "gapRefreshedAtOpen = true;" in method
+    # The ring-evicted signal triggers the same refresh (deduped per open).
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    assert "refreshSidebarAfterGap()" in trunc.group(1)
+    assert "gapRefreshedAtOpen" in trunc.group(1)
+    # Deliberate suspends (hide / overflow / close-session) mark the gap so
+    # the next open participates in the recovery decision at all.
+    sus = re.search(r"function suspendStream\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sus is not None, "suspendStream not found"
+    assert "markStreamGap();" in sus.group(1)
+    # The refresh helper carries the whole replace-mode bundle: children,
+    # tasks, and the live-badge purge (permanent 403/404 entries preserved).
+    ref = re.search(r"function refreshSidebarAfterGap\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert ref is not None, "refreshSidebarAfterGap not found"
+    assert "loadChildren({ replace: true });" in ref.group(1)
+    assert "loadTasks();" in ref.group(1)
+    assert "_liveBadgeCacheDelete(id)" in ref.group(1)
+
+
+def test_coord_defers_truncated_resync_and_consumes_at_idle() -> None:
+    """replay_truncated seen mid-stream must be DEFERRED, not dropped (matches
+    interactive's _pendingTruncatedResync): tearing down + refetching
+    immediately would detach the live bubble (content OR a reasoning-only
+    one), but skipping outright leaves the ring-evicted turns lost for the
+    session.  The guard covers both streaming targets and latches otherwise;
+    the next state_change=idle consumes the flag through the SAME dead-stream
+    flow as the immediate branch (loadHistoryThenReconnect, which owns the
+    streaming-ref reset) — recording the gap but NOT feeding the degraded
+    churn window (turn-settle timing already rate-limits this branch), and
+    NOT jittered (once per latch, staggered per pane by turn timing)."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    t = trunc.group(1)
+    assert "if (!currentAssistantEl && !currentReasoningEl)" in t
+    assert "pendingTruncatedResync = true;" in t
+    st = re.search(r'case "state_change":(.*?)\n      case ', body, re.S)
+    assert st is not None, "state_change case not found"
+    s = st.group(1)
+    idle = re.search(r"if \(pendingTruncatedResync\) \{(.*?)\n          \}", s, re.S)
+    assert idle is not None, "idle-edge truncated consumption not found"
+    i = idle.group(1)
+    assert "pendingTruncatedResync = false;" in i
+    assert "recordTruncatedGap();" in i
+    assert "loadHistoryThenReconnect();" in i
+    # Consume the latch, THEN record the gap and run the fresh-connect flow.
+    consume = i.index("pendingTruncatedResync = false;")
+    load = i.index("loadHistoryThenReconnect();")
+    assert consume < load
+    # No churn feed and no jitter at the idle edge — noteTruncatedResync /
+    # scheduleTruncatedResync belong to the immediate branch only.
+    assert "noteTruncatedResync" not in i
+    assert "scheduleTruncatedResync" not in i
+    # And no in-place seedless refetch on either consumption path.
+    assert "refetchHistory();" not in i
+    assert "refetchHistory();" not in t
+
+
+def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
+    """replay_truncated = the stream admitted losing events past recovery.
+    The coordinator pane must treat the connection as DEAD and mirror
+    interactive.js's converged recovery design (the #882 parity port).
+
+    Pinned: (1) the truncation-time cursor is recorded KEEP-OLDEST at the
+    envelope, BEFORE the mid-stream branch, and the connect chokepoint
+    presents it over the advanced live cursor while set — the
+    interleaving-proof half of the gap-repair guarantee (a cancellable
+    timer alone silently loses the repair when a hide/show cycle lands
+    inside the jitter window); (2) the record is cleared ONLY by a
+    successful full render (refetchHistory, below the ``!hist`` guard) —
+    never by the teardown chokepoint or suspendStream; (3) the immediate
+    branch routes through ``noteTruncatedResync()`` and SKIPS the resync
+    when the limiter just tripped (the cooldown disconnected the stream;
+    a ``.finally`` reconnect would defeat it), else SCHEDULES the fresh
+    connect behind the herd-spreading jitter; (4) churn accounting is ONE
+    shared step (``recordChurnAndMaybeTrip``) fed by BOTH overflow closes
+    and truncated resyncs, so the trip parameters cannot silently diverge;
+    (5) the jitter scheduler dedups to one pending resync and its fire
+    path nulls the handle BEFORE loading (the teardown inside the load
+    would cancel the work it is part of), while ``closeStreamTransport``
+    owns cancellation of a merely-pending timer; (6) the dead-stream flow
+    tears down FIRST, resets the streaming refs (refetchHistory does not
+    null them, and the envelope's own in_progress_snapshot may have
+    re-created a bubble inside the jitter window), seeds via
+    ``refetchHistory(true)``, and reconnects in ``.finally`` gated on the
+    pane still owning its stream lifecycle (``visHandler`` — the destroy /
+    close-session sentinel); (7) every ``truncatedGaps`` bump routes
+    through the one increment+log step; (8) the old in-place seedless
+    refetch must not come back; (9) repair-intent supersession is ONE
+    site — refetchHistory's success path clears the gap record, the
+    deferred latch, AND any pending resync timer together (a failed fetch
+    returns above the block and clears none, keeping the resync armed as
+    repair owner; a latch or timer surviving a heal fired a phantom
+    resync whose failed-fetch leg reconnected cursorless with nothing
+    armed) — and clear_ui carries no path-local cancel of its own;
+    (10) the envelope's sidebar refresh is deduped per GAP
+    (isNewTruncationGap) on top of the per-open flag — a failed-resync
+    retry loop must not re-stampede /children + /tasks once per reconnect
+    — with the retry-window staleness covered instead by ONE heal-time
+    refresh on the successful render inside loadHistoryThenReconnect."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    t = trunc.group(1)
+    # (1) keep-oldest record at the envelope, before the refs branch (the
+    # null-check rides the isNewTruncationGap capture, which also feeds the
+    # per-gap sidebar dedup below).
+    assert "if (isNewTruncationGap) {" in t
+    assert "truncatedFromCursor = lastEventId;" in t
+    record = t.index("truncatedFromCursor = lastEventId;")
+    branch = t.index("if (!currentAssistantEl && !currentReasoningEl)")
+    assert record < branch, "the gap must be recorded before the mid-stream branch"
+    # (10) sidebar refresh deduped per GAP as well as per open: a retry
+    # reconnect re-draws the envelope for the SAME unrepaired gap and must
+    # NOT re-stampede /children + /tasks (only /history rides the jitter).
+    assert "const isNewTruncationGap = truncatedFromCursor == null;" in t
+    assert t.index("const isNewTruncationGap") < record, (
+        "the new-gap capture must precede the keep-oldest record"
+    )
+    assert "if (isNewTruncationGap && !gapRefreshedAtOpen) refreshSidebarAfterGap();" in t
+    # (1) connect chokepoint: the recorded cursor overrides the live one,
+    # gated ``!= null`` (0/"0" are valid ids).
+    assert re.search(
+        r"const connectCursor =\s*truncatedFromCursor != null\s*"
+        r"\?\s*truncatedFromCursor\s*:\s*lastEventId;",
+        body,
+    ), (
+        "connectSSE must present the truncation-time cursor while a gap is "
+        "on record — the advanced live cursor would draw replay_ok and "
+        "silently forget the gap."
+    )
+    assert re.search(
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*"
+        r"url\s*\+=\s*\"\?last_event_id=\"",
+        body,
+    ), "connectSSE must gate ?last_event_id= on connectCursor != null"
+    # (2) cleared only by a successful full render — below the !hist guard,
+    # riding the wipe — and never by the teardown paths.  (Sliced to the
+    # next function boundary; the invariant is the ORDER, not the
+    # density, and a char-count window rots as at-site comments grow.)
+    start = body.index("async function refetchHistory(seedCursor = false)")
+    fn = body[start : body.index("\n  function ", start + 1)]
+    guard = fn.index("if (!hist) return;")
+    clear = fn.index("truncatedFromCursor = null;")
+    assert guard < clear, "the record must only clear once a payload rendered"
+    teardown = re.search(r"function closeStreamTransport\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert teardown is not None, "closeStreamTransport not found"
+    assert "truncatedFromCursor" not in teardown.group(1), (
+        "teardown must not clear the gap record — it is the durable repair state"
+    )
+    sus = re.search(r"function suspendStream\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sus is not None
+    assert "truncatedFromCursor" not in sus.group(1)
+    # (3) limiter check gates the JITTERED fresh connect in the immediate
+    # branch.
+    assert "if (!noteTruncatedResync())" in t
+    assert "scheduleTruncatedResync();" in t
+    # (8) the old in-place seedless refetch must not come back in the case.
+    assert "refetchHistory();" not in t
+    # (4) ONE shared churn step, fed by both classes; ladder reset stays in
+    # enterDegradedCatchup.
+    churn = re.search(r"function recordChurnAndMaybeTrip\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert churn is not None, "recordChurnAndMaybeTrip not found"
+    c = churn.group(1)
+    assert "overflowTimes.push(now);" in c
+    assert "overflowWindowTripped(" in c
+    assert "enterDegradedCatchup();" in c
+    assert "return true;" in c
+    assert "return false;" in c
+    assert "degradedCooldownMs" not in c
+    over = re.search(r"function noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert over is not None
+    assert "recordChurnAndMaybeTrip();" in over.group(1), (
+        "overflow closes must feed the same shared churn step"
+    )
+    note = re.search(r"function noteTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert note is not None, "noteTruncatedResync not found"
+    n = note.group(1)
+    assert "recordTruncatedGap();" in n
+    assert "return recordChurnAndMaybeTrip();" in n
+    # (5) jittered scheduler: dedup guard, jitter const, null-before-load,
+    # cancellation owned by the teardown chokepoint.
+    sched = re.search(r"function scheduleTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sched is not None, "scheduleTruncatedResync not found"
+    s = sched.group(1)
+    assert "if (truncatedResyncTimer != null) return;" in s
+    assert "Math.random() * TRUNCATED_RESYNC_JITTER_MS" in s
+    null_then_load = s.index("truncatedResyncTimer = null;")
+    load = s.index("loadHistoryThenReconnect();")
+    assert null_then_load < load, (
+        "the firing path must null the handle BEFORE loading, or the "
+        "teardown inside loadHistoryThenReconnect would cancel the work it "
+        "is part of"
+    )
+    assert "clearTimeout(truncatedResyncTimer)" in teardown.group(1)
+    # (6) the dead-stream flow: teardown first, refs reset, seeded refetch,
+    # guarded .finally reconnect, deferred latch superseded.
+    flow = re.search(
+        r"function loadHistoryThenReconnect\(manualAttempt = false\)\s*\{(.*?)\n  \}",
+        body,
+        re.S,
+    )
+    assert flow is not None, "loadHistoryThenReconnect not found"
+    f = flow.group(1)
+    assert f.index("suspendStream();") < f.index("refetchHistory(true)")
+    assert "currentAssistantEl = null;" in f
+    assert "currentReasoningEl = null;" in f
+    assert "pendingTruncatedResync = false;" in f
+    # Reborn-ring convergence: the load must DROP the live cursor before the
+    # fetch — without this, a post-restart heal on an idle ws (no /history
+    # cursor) re-presents the frozen pre-restart cursor against the reseeded
+    # empty ring, draws replay_truncated forever, and parks the pane in
+    # degraded cooldown cycles.  Found by recovery_e2e --scenario
+    # coord-restart (browser-level); invisible to source-pattern tests —
+    # this pin only keeps the fix from being "simplified" away.
+    assert "lastEventId = null;" in f
+    assert f.index("lastEventId = null;") < f.index("refetchHistory(true)")
+    # The settle rides the outcome-threaded terminal .then (a rendered
+    # tokenless 200 downgrades to the tokenless bootstrap; failures retry),
+    # with rejections normalized ahead of it — LOUDLY (round-4 review: a
+    # bare `.catch(() => undefined)` silently swallowed render throws).
+    assert 'console.error("history load/render failed"' in f
+    assert ".then((outcome) => {" in f
+    assert f.index("refetchHistory(true)") < f.index('console.error("history load/render failed"')
+    assert "if (visHandler) connectSSE();" in f
+    # (10) heal-time sidebar refresh: once, on the successful render only
+    # (record cleared), only on the cursor-SEEDED heal (the cursorless
+    # heal's fresh-connect onopen runs the same refresh via its no-cursor
+    # arm), and standing down when a SLOW heal (past the cursor-trust
+    # window, measured off the same disconnectedAt) guarantees onopen's
+    # over-threshold refresh — the two arms are exclusive by construction.
+    # Never on the failed-fetch leg of the retry loop.
+    assert "const onopenWillRefresh =" in f
+    assert "GAP_REFRESH_THRESHOLD_MS" in f
+    assert "truncatedFromCursor == null &&" in f
+    assert "lastEventId != null &&" in f
+    assert "!onopenWillRefresh" in f
+    assert "refreshSidebarAfterGap();" in f
+    # (7) single truncatedGaps bump site (running-count console invariant).
+    assert body.count("streamHealth.truncatedGaps += 1;") == 1
+    rec = re.search(r"function recordTruncatedGap\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert rec is not None, "recordTruncatedGap not found"
+    assert "console.warn(" in rec.group(1)
+    # (9) repair-intent supersession lives in refetchHistory's success path
+    # — record + deferred latch + pending timer, all below the !hist guard
+    # — and clear_ui carries no path-local cancel of the TRUNCATED repair
+    # intent.  Pin the specific timer, not all clearTimeout: #894's
+    # staleRetryTimer re-arm cancel in clear_ui is the staleness latch's
+    # own machinery, deliberately armed there (see the coord latch-contract
+    # test), not a truncated-repair cancel.
+    assert "pendingTruncatedResync = false;" in fn
+    assert "clearTimeout(truncatedResyncTimer)" in fn
+    assert guard < fn.index("pendingTruncatedResync = false;")
+    assert guard < fn.index("clearTimeout(truncatedResyncTimer)")
+    cu = re.search(r'case "clear_ui": \{(.*?)\n      \}', body, re.S)
+    assert cu is not None, "clear_ui case not found"
+    assert "clearTimeout(truncatedResyncTimer)" not in cu.group(1)
+
+
+def test_coord_detects_server_restart_by_backwards_event_id() -> None:
+    """A coordinator process restart resets the per-ws event counter, and the
+    replay path reports replay_ok for a stale-high cursor (past the new max), so
+    the gap is unsignalled and the sidebar goes stale.  onmessage catches it: a
+    live event id below the saved cursor == the counter reset → pull
+    authoritative sidebar state (deduped per open against onopen's refresh),
+    checked BEFORE the cursor is overwritten."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"evtSource\.onmessage = function \(event\) \{(.*?)\n    \};", body, re.S)
+    assert m is not None, "onmessage handler not found"
+    handler = m.group(1)
+    assert "Number(event.lastEventId) < Number(lastEventId)" in handler
+    assert "!gapRefreshedAtOpen" in handler
+    assert "refreshSidebarAfterGap();" in handler
+    check = handler.index("Number(event.lastEventId) < Number(lastEventId)")
+    overwrite = handler.index("lastEventId = event.lastEventId;")
+    assert check < overwrite
+
+
+def test_sse_cursor_captured_from_message_event_never_the_source_object() -> None:
+    """``lastEventId`` lives on the MessageEvent — EventSource exposes no
+    such property (WHATWG: url/withCredentials/readyState only), so an
+    object-form read like ``evtSource.lastEventId`` is undefined in every
+    real browser.  All three clients shipped exactly that dead
+    conditional: the cursor never tracked live traffic, every MANUAL
+    reconnect (close-on-hide show edge, degraded retry, recover beat)
+    connected fresh, and turns committed during the gap silently never
+    painted — the 2026-07 'turn disappeared' field mechanism.  Only a
+    real-browser harness could catch it (source-pattern tests pinned the
+    broken form as happily as the fixed one), so this tripwire at least
+    pins the corrected form and forbids the dead one by name.
+
+    Guard shape is pinned too — the explicit ``!= null && !== ""`` form.
+    On a DOMString this is behaviorally identical to truthiness (the
+    valid id "0" is a truthy STRING; only "" and null/undefined are
+    falsy here), so the pin is for cross-site symmetry with the NUMERIC
+    cursor gates (``_lastEventId != null`` / ``data.cursor != null``),
+    where truthiness genuinely drops a valid 0 — one visual idiom for
+    every cursor guard keeps a future editor from "simplifying" the
+    numeric ones to match a terser string form.
+
+    The GLOBAL stream (app.js) was pinned CURSORLESS here until #881
+    landed its boot-epoch signal: global ids are now
+    ``"{boot_epoch}-{counter}"``, so a cursor from a prior boot
+    mismatches the live epoch and draws ``replay_truncated`` + a fresh
+    node_snapshot instead of the old ``replay_ok``-empty ghost-roster
+    shape — the reason for cursorlessness is gone, and app.js now
+    captures/presents the cursor like the per-ws clients.  Its cursor
+    stays an OPAQUE STRING end to end (never ``parseInt``/``Number``
+    — the epoch prefix would NaN any numeric read), presented via
+    ``?last_event_id=`` (EventSource cannot set the header manually),
+    and cleared where the record dies: the ``replay_truncated``
+    handler, the ``node_snapshot`` recovery floor (required, not
+    belt-and-braces — that id-less frame's MessageEvent inherits the
+    connection's stale pre-restart cursor on NATIVE reconnects, so the
+    pre-dispatch capture re-stores it and only a branch-level clear
+    kills it), and ``onLogout``.  All three clears are pinned below —
+    a simplify pass dropping one reintroduces the redundant
+    dead-cursor truncated round.
+
+    Comments are stripped before the scan (module-level, string-aware
+    stripper) so documentation may name the anti-pattern verbatim — the
+    tripwire forbids the dead CODE, not its description."""
+    dead_form = re.compile(r"(?:this\.)?\w*[Ee]vtSource\.lastEventId")
+    for path, capture in (
+        (
+            _INTERACTIVE_JS,
+            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
+            r"this\._lastEventId = e\.lastEventId;",
+        ),
+        (
+            _COORD_JS,
+            r'if \(event\.lastEventId != null && event\.lastEventId !== ""\) \{',
+        ),
+        (
+            _APP_JS,
+            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
+            r"globalLastEventId = e\.lastEventId;",
+        ),
+    ):
+        body = path.read_text(encoding="utf-8")
+        code = _strip_js_comments(body)
+        hits = [m.group(0) for m in dead_form.finditer(code)]
+        assert not hits, (
+            f"{path.name}: cursor read off the EventSource OBJECT {hits} — "
+            "that property does not exist; capture from the MessageEvent."
+        )
+        assert re.search(capture, code), (
+            f"{path.name}: MessageEvent cursor capture (with the "
+            '``!= null && !== ""`` guard) not found'
+        )
+    app_code = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    # Presentation: manual reconnects carry the stored cursor as a query
+    # param, behind the same string-guard idiom (see docstring above for
+    # why the explicit form is pinned).
+    assert re.search(
+        r'if \(globalLastEventId != null && globalLastEventId !== ""\) \{\s*'
+        r'globalUrl \+= "\?last_event_id=" \+ encodeURIComponent\(globalLastEventId\);',
+        app_code,
+    ), (
+        "app.js: manual global reconnect must present the stored cursor "
+        "via ?last_event_id= behind the house string guard"
+    )
+    # The cursor is opaque — any numeric interpretation of it is a bug
+    # (the epoch prefix turns Number()/parseInt() into NaN silently).
+    assert not re.search(r"(?:Number|parseInt)\(\s*globalLastEventId", app_code), (
+        "app.js: the global cursor is an opaque epoch-tagged string — "
+        "never interpret it numerically"
+    )
+    # Dead-record clears (see docstring): truncated envelope, snapshot
+    # recovery floor (BEFORE the roster rebuild), and logout.
+    assert re.search(
+        r"globalLastEventId = null;\s*resyncRoster\(\);",
+        app_code,
+    ), "app.js: the replay_truncated handler must clear the spent cursor"
+    assert re.search(
+        r"globalLastEventId = null;\s*applyRosterSnapshot\(",
+        app_code,
+    ), (
+        "app.js: the node_snapshot branch must clear the cursor — on "
+        "native reconnects this id-less frame re-captured the stale one"
+    )
+    logout_body = re.search(r"window\.onLogout = function \(\) \{(.*?)\n\};", app_code, re.S)
+    assert logout_body is not None, "app.js: window.onLogout not found"
+    assert "globalLastEventId = null;" in logout_body.group(1), (
+        "app.js: onLogout must reset the cursor (roster identity reset)"
+    )
+
+
+def test_interactive_history_is_rest_first_not_sse() -> None:
+    """PR A converged interactive onto coord's REST-first history
+    model: first paint and post-rewind re-render fetch ``GET /history``
+    over REST (``_loadHistoryThenConnect`` / ``_refetchHistory``), and
+    the server no longer replays the conversation inline over SSE — so
+    the client must no longer consume a ``history`` SSE event. Guards
+    against a regression that re-couples first paint to the removed
+    inline-history replay."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert "_loadHistoryThenConnect" in body, (
+        "REST-first first-paint helper missing — interactive must fetch "
+        "history via GET /history before connecting SSE (coord's model)."
+    )
+    assert "_refetchHistory" in body
+    # Race/identity guard (PR #595 review follow-up): a load-generation token
+    # must discard a superseded refetch so a slow ws-A load cannot render over
+    # ws-B after a tab switch / child open.
+    assert "_historyLoadToken" in body, (
+        "missing the load-generation guard — a stale history refetch can "
+        "render the wrong workstream's history"
+    )
+    # Pre-PR-A interactive had no REST /history fetch; the quoted URL
+    # segment only appears in the new fetch concatenation.
+    assert '"/history"' in body
+    # The inline SSE ``history`` event is no longer emitted server-side,
+    # so the client must not handle it (history is REST-only now).
+    assert 'case "history":' not in body
+    # The server now projects the canonical wire shape at /history
+    # (make_history_handler → project_history_messages), so interactive
+    # feeds the payload straight to replayHistory — the client-side
+    # normaliser (history_normalize.js) was retired.
+    assert "normalizeHistoryMessages" not in body, (
+        "the client-side history normaliser was retired — interactive must "
+        "consume the server-projected /history shape directly"
+    )
+    assert "this.replayHistory(data.messages" in body, (
+        "interactive must feed the projected REST /history payload straight to replayHistory"
+    )
+    idx = (Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html").read_text(
+        encoding="utf-8"
+    )
+    assert "/shared/history_normalize.js" not in idx, (
+        "the retired history_normalize.js script tag must be removed from index.html"
+    )
+
+
+def test_early_paint_tool_pending_wiring() -> None:
+    """The interactive UI must paint a committed tool call on ``tool_pending``
+    — before the judge verdict / approval gate resolve — and then UPGRADE
+    that same block in place on the authoritative ``tool_info`` /
+    ``approve_request`` rather than appending a duplicate.  Pre-fix (PR #621)
+    the card waited on the verdict; this guards the early-paint wiring against
+    a rename/deletion that would silently revert to post-verdict rendering."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # Dispatch routes the early event to the announce painter.
+    assert 'case "tool_pending":' in body
+    assert "announceToolBlock(evt.items)" in body
+    # The announce painter + the idempotent take-or-build helper exist.
+    assert "announceToolBlock(items) {" in body
+    assert "_takeAnnouncedBlock(items) {" in body
+    # showInlineToolBlock reuses the announced shell rather than always
+    # creating + appending a fresh block (the duplicate-card bug).
+    assert "this._takeAnnouncedBlock(items)" in body
+    assert "if (!announced) this.messagesEl.appendChild(block);" in body
+
+
+def test_task_agent_steps_never_escape_their_card() -> None:
+    """A task agent's sub-tool steps (``parent_call_id`` stamped) must nest in
+    the task card, never render as top-level rows that look like the main
+    harness issued them.  Two seams keep that true; this guards both against a
+    rename/deletion:
+
+    1. ``tool_info`` routes through ``_routeAgentItems`` first — a sub-tool
+       auto-resolved by policy / "Always" arrives as a ``tool_info`` and must
+       nest, not paint a duplicate top-level block (Copilot review on #732).
+    2. A child step whose ``task_agent`` row hasn't painted yet (the 4-wide
+       tool pool's ordering window) is BUFFERED and flushed when the row lands,
+       instead of escaping to top-level; the card also survives the parent
+       row's pending->resolved rebuild.
+    3. SAFETY VALVE: a buffered step whose parent row NEVER paints (an id-
+       correlation mismatch / aborted agent) is escaped to a top-level row after
+       a grace window, so it stays VISIBLE rather than buffered forever.
+    """
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # 1. tool_info nests via the same router as tool_pending / approve_request.
+    info = body[body.index('case "tool_info":') : body.index('case "approve_request":')]
+    assert 'this._routeAgentItems(evt.items, "info")' in info, (
+        "tool_info must route a parent-tagged sub-tool into the task card "
+        "before any top-level showInlineToolBlock fallback."
+    )
+    # 2. _routeAgentItems buffers an orphan child (instead of returning false,
+    #    which escapes it to top-level) when the parent card isn't painted yet.
+    route = body[
+        _pane_method_offset(body, "_routeAgentItems") : _pane_method_offset(
+            body, "_ensureAgentCard"
+        )
+    ]
+    assert "_bufferAgentOrphan(parentId, items, mode)" in route, (
+        "a parent-tagged child with no card yet must buffer, not fall through to a top-level paint."
+    )
+    # The buffer / flush / escape / relink helpers exist.
+    assert "_bufferAgentOrphan(parentId, items, mode) {" in body
+    assert "_flushAgentOrphans(parentIds) {" in body
+    assert "_escapeAgentOrphans(parentId) {" in body
+    assert "_relinkAgentCards(items) {" in body
+    assert body.count("this._relinkAgentCards(") >= 2, (
+        "both announceToolBlock and showInlineToolBlock must relink + flush so "
+        "a buffered step nests as soon as a tool row appears."
+    )
+    # 3. Safety valve: _bufferAgentOrphan arms a grace timer to _escapeAgentOrphans
+    #    so a never-painting parent's steps can't vanish (or leak) — they escape
+    #    back to a visible top-level paint.
+    buf = body[
+        _pane_method_offset(body, "_bufferAgentOrphan") : _pane_method_offset(
+            body, "_flushAgentOrphans"
+        )
+    ]
+    assert "setTimeout(" in buf and "_escapeAgentOrphans(parentId)" in buf, (
+        "a buffered orphan must arm a grace-window escape so it never stays "
+        "buffered (invisible) forever."
+    )
+    escape = body[
+        _pane_method_offset(body, "_escapeAgentOrphans") : _pane_method_offset(
+            body, "_relinkAgentCards"
+        )
+    ]
+    assert "announceToolBlock(" in escape, (
+        "the escape valve must render the steps top-level (visible), the "
+        "pre-buffer behaviour, rather than dropping them."
+    )
+    # Flush is targeted to the just-painted parents, not the whole map.
+    flush = body[
+        _pane_method_offset(body, "_flushAgentOrphans") : _pane_method_offset(
+            body, "_escapeAgentOrphans"
+        )
+    ]
+    assert "parentIds.forEach" in flush
+    # _ensureAgentCard re-attaches a DETACHED card across a parent-row rebuild,
+    # but builds fresh on a still-attached (cross-turn reused) call_id rather
+    # than stealing the prior agent's steps.
+    ensure = body[
+        _pane_method_offset(body, "_ensureAgentCard") : _pane_method_offset(
+            body, "_bufferAgentOrphan"
+        )
+    ]
+    assert "!card.wrap.isConnected" in ensure
+    assert "parentRow.appendChild(card.wrap);" in ensure
+
+
+def test_risk_level_normalized_before_dom_interpolation() -> None:
+    """Server-supplied ``risk_level`` lands in className / data-risk strings the
+    verdict + warning CSS depend on, so every interpolation must funnel through
+    ``normalizeRiskLevel`` (issue #562).  Post-5e.2c the pane DELEGATES the card
+    DOM to the shared builders (conversation.js), which OWN the normalization —
+    so the pane must (a) carry no raw ``risk_level || "medium"`` fallback and
+    (b) build verdict/warning DOM only via the shared builders, never inline."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # No raw fallback antipattern anywhere in the pane.
+    assert 'risk_level || "medium"' not in body
+    assert 'risk_level) || "medium"' not in body
+    # Verdict + warning DOM is built by the shared builders (which normalize),
+    # not by an inline className / data-risk interpolation in the pane.
+    assert "buildConvVerdict(" in body
+    assert "buildConvWarning(" in body
+    # The chokepoint + its enum live in the shared module, and the builders there
+    # route the server risk through it.
+    shared = (_INTERACTIVE_JS.parent / "conversation.js").read_text(encoding="utf-8")
+    assert "export function normalizeRiskLevel(" in shared
+    assert "normalizeRiskLevel(verdict.risk_level)" in shared  # buildConvVerdict
+    assert "normalizeRiskLevel(a.risk_level)" in shared  # buildConvWarning
+    for level in ("low", "medium", "high", "critical"):
+        assert f'"{level}"' in shared
+
+
+def test_announced_rail_outspecifies_inline_cyan_hold() -> None:
+    """The early-paint announced card's left rail MUST out-specify
+    ``.msg.ts-approval--inline`` (specificity 0,2,0), which deliberately
+    sets ``border-left-color: var(--cyan)`` to hold resolved inline cards
+    cyan.  A bare ``.ts-approval--announced`` (0,1,0) loses that cascade and
+    silently renders the rail cyan — indistinguishable from a normal tool
+    card, defeating the whole "spot the committed call and Stop it" signal.
+    This is a render-only failure no JS string-guard catches, so pin the
+    high-specificity selector + the visible ``--accent`` (not the
+    near-invisible 15%-alpha ``--accent-dim``)."""
+    css = (_APP_JS.resolve().parent / "style.css").read_text(encoding="utf-8")
+    assert ".msg.ts-approval--inline.ts-approval--announced {" in css, (
+        "announced rail selector must qualify with .msg.ts-approval--inline to "
+        "beat the inline cyan-hold rule (0,2,0) — else it renders dashed cyan"
+    )
+    # The rule body uses the full --accent amber + dashed style.
+    block_start = css.index(".msg.ts-approval--inline.ts-approval--announced {")
+    block = css[block_start : block_start + 160]
+    assert "border-left-color: var(--accent)" in block
+    assert "border-left-style: dashed" in block
+    assert "--accent-dim" not in block  # 15%-alpha is invisible at 3px
+
+
+def test_early_paint_screen_reader_announce() -> None:
+    """Screen-reader parity for the early paint: a committed tool call must be
+    announced politely (messagesEl is flipped to aria-live="off" mid-stream, so
+    the appended shell alone is inaudible), and the announced shell must carry
+    aria-busy until the gate resolves.  All silent failures — no JS error, just
+    a blind operator who never hears the call land — so pin the wiring."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # Dedicated polite SR region (separate from the voice one) + summary builder.
+    assert "function toolAnnounce(" in body
+    assert "function _toolAnnounceText(" in body
+    assert 'setAttribute("aria-live", "polite")' in body
+    # Early paint announces + marks the shell busy; the upgrade clears it.
+    assert "toolAnnounce(_toolAnnounceText(list))" in body
+    assert 'block.setAttribute("aria-busy", "true")' in body
+    assert 'block.removeAttribute("aria-busy")' in body
+
+
+def test_global_stream_recovery_floor_and_render_coalescing() -> None:
+    """Perf-audit P0/P1 for the Tier-1 global stream.  The server's recovery
+    events for a truncated reconnect gap (``node_snapshot`` as the floor,
+    ``replay_truncated`` as the marker) used to fall through the handler
+    silently — workstreams created during a long hidden-tab gap never
+    rendered again, and missed ``ws_closed`` left ghost rows forever.  A
+    malformed frame is the same permanent drift (the cursor advances before
+    the parse), so it resyncs too.  ``fireRender`` is rAF-coalesced: every
+    ``ws_state`` (≥2 per tool round per workstream) used to trigger a
+    synchronous full rail rebuild."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert 'data.type === "node_snapshot"' in body
+    assert 'data.type === "replay_truncated"' in body
+    assert "function applyRosterSnapshot(" in body
+    assert "function resyncRoster(" in body
+    assert "malformed frame" in body
+    fire = body.index("function fireRender()")
+    assert "requestAnimationFrame(" in body[fire : fire + 700], (
+        "fireRender must coalesce subscriber repaints to one per frame"
+    )
+
+
+def test_server_global_accels_are_platform_aware_and_scoped() -> None:
+    """The standalone's keydown handler owns only the GLOBAL accels — new
+    workstream, switch, dashboard.  They pick the modifier per platform (Ctrl on
+    macOS where the browser owns Cmd, Alt elsewhere) so Ctrl+T/1-9 aren't eaten
+    by the browser off macOS.  The per-pane verbs (edit/refresh/fork/delete/
+    close) moved to shell.js, so the handler must not invoke them itself."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "const IS_MAC" in body and 'navigator.platform.indexOf("Mac")' in body, (
+        "the accelerators need a platform check to choose Ctrl vs Alt"
+    )
+    handler = body[body.index('document.addEventListener("keydown"') :]
+    assert "const paneMod" in handler, (
+        "global accels must gate on the platform-aware paneMod, not raw ctrlKey"
+    )
+    assert 'e.ctrlKey && e.key === "t"' not in handler, (
+        "Ctrl+T is browser-reserved off macOS — new workstream must bind via paneMod"
+    )
+    assert "newWorkstream()" in handler and "switchTab(" in handler, (
+        "the standalone handler still owns new + switch"
+    )
+    # macOS Ctrl+T / Ctrl+D are the Cocoa transpose / delete-forward text
+    # bindings; the creation/dashboard chords must yield while typing, through
+    # the shared TS_SHELL.inEditable guard (not a per-file copy).
+    assert "TS_SHELL.inEditable(" in handler, (
+        "new + dashboard must yield to text editing (macOS Ctrl+T / Ctrl+D)"
+    )
+    # The per-pane verbs are shell.js's job now — the standalone handler must not
+    # double-bind them (shell.js drives them off the active pane's menu).
+    for verb in ("editWorkstreamTitle()", "forkWorkstream()", "confirmDeleteWorkstream()"):
+        assert verb not in handler, (
+            f"{verb} moved to shell.js — the app.js handler must not also bind it"
+        )
+
+
+def test_shortcut_overlay_labels_match_the_platform_modifier() -> None:
+    """The '?' help overlay must advertise the same modifier the handler
+    listens for — Ctrl on macOS, Alt on Windows/Linux — instead of a hardcoded
+    Ctrl that is wrong (and non-functional) off macOS."""
+    index = _INDEX_HTML.read_text(encoding="utf-8")
+    assert "const PANE_MOD" in index and 'navigator.platform.indexOf("Mac")' in index, (
+        "the overlay must compute its modifier label per platform"
+    )
+    assert "${PANE_MOD}+T" in index, "the New-workstream badge must render through PANE_MOD"
+    assert '<span class="kb-key">Ctrl+T</span>' not in index, (
+        "the New-workstream badge must not hardcode Ctrl (wrong off macOS)"
+    )
+
+
+def test_pane_menu_accels_are_shared_and_platform_aware() -> None:
+    """shell.js is the single source of truth for the per-pane tab-menu
+    shortcuts: the badge string and the keydown handler come from ONE registry,
+    so a badge can't advertise a chord the handler ignores.  Badges must be
+    platform-aware (no hardcoded Ctrl), and the shared handler must drive the
+    ACTIVE pane's own menu so each surface contributes only what it supports."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "PANE_MENU_ACCELS" in shell and "function paneAccelBadge" in shell, (
+        "shell.js must own the accel registry + badge builder"
+    )
+    assert "const PANE_MOD_LABEL" in shell and 'navigator.platform.indexOf("Mac")' in shell, (
+        "the shared badge must be platform-aware (Ctrl on macOS, Alt elsewhere)"
+    )
+    # The tab-menu items carry a stable accel + a computed badge, NOT a hardcoded
+    # Ctrl string that would lie on Windows/Linux.
+    for accel in ("close-pane", "edit-title", "refresh-title", "delete"):
+        assert f'accel: "{accel}"' in shell, f"tab menu must tag the {accel} item"
+    assert 'key: "Ctrl+Shift+E"' not in shell and 'key: "Ctrl+W"' not in shell, (
+        "tab-menu badges must go through paneAccelBadge, not hardcoded Ctrl"
+    )
+    # The shared handler resolves the active pane and runs its menu item by accel.
+    assert "paneAccelFor(e)" in shell and "pane.tabMenu()" in shell, (
+        "the shared keydown handler must drive the active pane's menu by accel"
+    )
+    # The typing guard is shared (TS_SHELL.inEditable), not copied per surface.
+    assert "function inEditable(" in shell and "inEditable," in shell, (
+        "shell.js must define + expose the shared inEditable guard on TS_SHELL"
+    )
+    ui = _APP_JS.read_text(encoding="utf-8")
+    console = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert "_inEditable" not in ui and "_consoleInEditable" not in console, (
+        "surfaces must use TS_SHELL.inEditable, not a per-file copy of the guard"
+    )
+
+
+def test_console_has_matching_pane_hotkeys() -> None:
+    """The console regained pane hotkeys to match the standalone: a keydown
+    handler for switch (Mod+1-9) + dashboard (Ctrl+D), and a '?' overlay that
+    advertises them platform-aware.  New workstream and Fork are intentionally
+    omitted (no console fork / blank-new surface)."""
+    app = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert (
+        "_CONSOLE_IS_MAC" in app and "statefulTabs()" in app and 'openPane("dashboard")' in app
+    ), "the console must wire switch (statefulTabs) + dashboard hotkeys"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "const PANE_MOD" in index and '"Panes"' in index, (
+        "the console '?' overlay needs a platform-aware Panes section"
+    )
+    assert "${PANE_MOD}+W" in index and "${PANE_MOD}+Shift+E" in index, (
+        "console badges must render through PANE_MOD"
+    )
+    assert '"Fork"' not in index and "New workstream" not in index, (
+        "Fork + New are intentionally omitted on the console"
+    )
+
+
+def test_fork_hides_project_picker() -> None:
+    """A fork must NOT show a project picker. A fork inherits its source's project
+    (enforced server-side), and a re-fileable fork picker was a cross-tenant
+    history-relocation vector — so showNewWsModal hides the picker for forks and
+    the "Keep source's project" fork option is gone."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "projSelect.hidden = !!_forkFromWsId" in body, (
+        "the new-ws project picker must be hidden for forks"
+    )
+    assert "Keep source's project" not in body, (
+        "the fork project picker (and its 'Keep source's project' option) must be removed"
+    )
+
+
+def test_submit_gates_project_on_fork_flag() -> None:
+    """submitNewWs must send body.project_id ONLY for a fresh create
+    (!_forkFromWsId) — a fork never sends a project (its project is the source's,
+    enforced server-side). Not gated on picker visibility or a requireProject()
+    re-read."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    m = re.search(r"function submitNewWs\(\)\s*\{(.*?)\n\}", body, re.S)
+    assert m is not None, "could not locate submitNewWs"
+    fn = m.group(1)
+    assert "TurnstoneProjects.requireProject" not in fn, (
+        "submit must not re-read the requireProject() advisory"
+    )
+    assert re.search(r"project_id && !_forkFromWsId", fn), (
+        "submit must gate project_id on !_forkFromWsId (a fork never sends a project)"
+    )
+
+
+def test_strict_picker_requires_explicit_pick() -> None:
+    """Under require_project the fresh picker must NOT auto-select the first
+    project (which silently mis-files a required chat under a possibly-shared
+    project) — it offers a 'Select a project…' prompt so the user consciously
+    chooses."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "Select a project" in body, (
+        "strict picker must offer an explicit 'Select a project…' prompt"
+    )
+    m = re.search(
+        r"function _reconcileRequiredProjectSelection\(sel, choices\)\s*\{(.*?)\n\}",
+        body,
+        re.S,
+    )
+    assert m is not None, "could not locate _reconcileRequiredProjectSelection"
+    fn = m.group(1)
+    assert "real[0]" not in fn, "strict picker must not auto-select the first project"
+    # §6b polish: _populateProjectSelect threads its already-computed choices into
+    # reconcile rather than forcing a second projectChoices() recompute (the onClose
+    # creator caller still passes none and reconcile recomputes for it).
+    assert "_reconcileRequiredProjectSelection(sel, choices)" in body, (
+        "the populate helper must thread its computed choices into reconcile "
+        "(avoids a redundant projectChoices() recompute)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Composer selector FOUC — sync-paint-then-refresh guards
+# ---------------------------------------------------------------------------
+#
+# The project + persona composer selectors are painted from the warm shared
+# client cache (window.TurnstoneProjects / window.TurnstonePersonas, warmed by
+# the rail at startup) SYNCHRONOUSLY on open, BEFORE the deliberate async
+# refresh-and-repaint that catches items created elsewhere.  Pre-fix they were
+# painted only inside the refresh().then callback, so every open flashed an
+# empty dropdown for a network round-trip even when the data was already in
+# memory.  These guards pin the ordering — a synchronous populate must precede
+# the refresh().then — for all three composer surfaces (new-ws modal, dashboard
+# Options, console launcher).  The model/skill selectors (phase 2b) are covered
+# by the guards further down (search "models/skills composer FOUC").
+
+
+def _slice_top_level_fn(body: str, header: str) -> str:
+    """Slice a top-level ``function`` body from ``header`` to the next
+    column-0 ``function`` declaration (or EOF).  Unlike
+    ``_slice_balanced_body`` this needs no balanced braces at all, so it
+    survives a body the walker would refuse (an unterminated block, or a
+    regex literal the walker misreads as a comment).  Nested (indented)
+    ``function () {…}`` expressions never match the ``\\nfunction `` bound,
+    so the slice stops at the next top-level function."""
+    start = body.index(header)
+    nxt = body.find("\nfunction ", start + 1)
+    return body[start:] if nxt < 0 else body[start:nxt]
+
+
+def test_new_ws_modal_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix: the new-ws modal's project + persona pickers paint from the warm
+    shared cache SYNCHRONOUSLY on open, BEFORE the async refresh-and-repaint — so a
+    warm-cache open (the common case; the rail warms the caches at startup) shows
+    the populated dropdowns immediately instead of flashing empty for a network
+    round-trip.  The refresh-on-open is KEPT (it catches items created elsewhere);
+    these guards pin only that a synchronous populate precedes it."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function showNewWsModal(")
+    # Project is painted via the shared _paintProjectPicker helper (fork-gated);
+    # the sync-before-async pattern is pinned in test_paint_project_picker_syncs.
+    assert "_paintProjectPicker(projSelect" in fn, (
+        "the modal must paint the project picker via the shared _paintProjectPicker helper"
+    )
+    # Persona is painted via the shared _paintPersonaSelect wrapper (fork-gated);
+    # its sync-before-async ordering is pinned in the wrapper-internals test.
+    assert "_paintPersonaSelect(personaSelect" in fn, (
+        "the modal must paint the persona picker via the shared _paintPersonaSelect helper"
+    )
+
+
+def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix (dashboard composer twin of the modal): the dashboard Options
+    project + persona pickers paint synchronously from the warm cache before the
+    async refresh.  Also pins the deferred require_project polish — the dashboard
+    Project label carries a ``.label-hint`` span seeded ``required``/``optional``
+    from requireProject() synchronously, matching the new-ws modal."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
+    # Project is painted via the shared _paintProjectPicker helper.
+    assert "_paintProjectPicker(projSel" in fn, (
+        "the dashboard must paint the project picker via the shared _paintProjectPicker helper"
+    )
+    # Persona is painted via the shared _paintPersonaSelect wrapper (freshOnOpen:false).
+    assert "_paintPersonaSelect(personaSel, { freshOnOpen: false })" in fn, (
+        "the dashboard must paint the persona picker via _paintPersonaSelect (preserving)"
+    )
+    # require_project label-hint parity: the dashboard Project label gained a
+    # .label-hint span, seeded synchronously from requireProject() like the modal.
+    html = _INDEX_HTML.read_text(encoding="utf-8")
+    lbl = html.index('for="dashboard-project"')
+    assert 'class="label-hint"' in html[lbl : lbl + 120], (
+        "the dashboard Project label must carry a .label-hint span (required/optional cue)"
+    )
+    # The hint is seeded synchronously inside _paintProjectPicker (asserted there).
+
+
+def test_console_schedule_name_from_task() -> None:
+    """The Scheduled kind names a schedule from the task when the Name option
+    is empty: first line, whitespace collapsed, cut at 60 code points with an
+    ellipsis.  Driven through node like the builder helpers, because an
+    off-by-one or a surrogate split here mislabels every launcher-made
+    schedule (a lone surrogate would 500 the create)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    cut = re.search(r"const _SCHEDULE_NAME_CUT_CHARS = \d+;", body)
+    assert cut, "the derived-name cut must be a named constant"
+    fn = cut.group(0) + chr(10) + _slice_top_level_fn(body, "function _scheduleNameFromTask(")
+    cases = [
+        ("Check disk usage", "Check disk usage"),
+        ("First line\nsecond line", "First line"),
+        ("a   b\t c", "a b c"),
+        ("x" * 60, "x" * 60),
+        ("x" * 61, "x" * 59 + "\u2026"),
+        # A space landing at the cut is trimmed before the ellipsis.
+        ("x" * 58 + " " + "y" * 10, "x" * 58 + "\u2026"),
+        # An astral character spanning the cut stays whole (code points, not
+        # UTF-16 units).
+        ("x" * 58 + "\U0001f600" + "y" * 5, "x" * 58 + "\U0001f600" + "\u2026"),
+    ]
+    checks = [
+        f"if (_scheduleNameFromTask({json.dumps(task)}) !== {json.dumps(want)}) "
+        f"throw new Error('case ' + {json.dumps(task[:20])});"
+        for task, want in cases
+    ]
+    proc = run_node_source(fn + chr(10) + chr(10).join(checks))
+    assert proc.returncode == 0, f"_scheduleNameFromTask disagrees: stderr={proc.stderr!r}"
+
+
+def test_console_over_cap_counts_code_points_with_a_cheap_short_circuit() -> None:
+    """The launcher's caps count code points like the server, but only box a
+    string into an array once its UTF-16 length is already over the cap — a
+    UTF-16 length under the cap can never exceed it in code points."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _overCap(")
+    astral = "\U0001f600"
+    cases = [
+        ("x" * 10, 10, False),
+        ("x" * 11, 10, True),
+        (astral * 10, 10, False),  # 20 UTF-16 units, 10 code points: under
+        (astral * 11, 10, True),
+        ("x" * 9 + astral, 10, False),
+        ("", 10, False),
+    ]
+    checks = [
+        f"if (_overCap({json.dumps(text)}, {cap}) !== {json.dumps(want)}) "
+        f"throw new Error('case ' + {json.dumps(text[:8])} + ' cap ' + {cap});"
+        for text, cap, want in cases
+    ]
+    proc = run_node_source(fn + chr(10) + chr(10).join(checks))
+    assert proc.returncode == 0, f"_overCap disagrees: stderr={proc.stderr!r}"
+
+
+def test_console_next_launcher_kind() -> None:
+    """The kind toggle's arrow-key step: the neighbour in the available list,
+    wrapping at either end, and an end of the list when the active kind is no
+    longer offered (a permission refresh mid-session)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _nextLauncherKind(")
+    three = ["coordinator", "interactive", "scheduled"]
+    cases = [
+        (("coordinator", three, False), "interactive"),
+        (("scheduled", three, False), "coordinator"),
+        (("coordinator", three, True), "scheduled"),
+        (("interactive", three, True), "coordinator"),
+        (("interactive", ["interactive"], False), "interactive"),
+        (("coordinator", ["interactive", "scheduled"], False), "interactive"),
+        (("coordinator", ["interactive", "scheduled"], True), "scheduled"),
+        (("coordinator", [], False), "coordinator"),
+    ]
+    checks = [
+        f"if (_nextLauncherKind({json.dumps(cur)}, {json.dumps(avail)}, {json.dumps(back)}) "
+        f"!== {json.dumps(want)}) throw new Error({json.dumps(f'{cur} {avail} {back}')});"
+        for (cur, avail, back), want in cases
+    ]
+    proc = run_node_source(fn + chr(10) + chr(10).join(checks))
+    assert proc.returncode == 0, f"_nextLauncherKind disagrees: stderr={proc.stderr!r}"
+
+
+def test_console_launcher_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix (console launcher composer): the project + persona wrappers route
+    through the _paintHomeFromCache chokepoint — sync paint from the warm cache,
+    then refresh(callOpts)-and-repaint; the ordering discipline is asserted ONCE
+    on the helper (in the model/skill twin test).  Each wrapper must pair its OWN
+    bridge refresh with its OWN populate helper.  Also pins the persona
+    kind-default revert: _populateHomePersonaDropdown must fall back to
+    defaultPersona(kind) when the previous pick is no longer a valid choice (the
+    interactive/coordinator persona shelves are disjoint), or a kind toggle
+    silently degrades the picker to a bare placeholder.  The kind goes through
+    _launcherPersonaKind: a schedule dispatches an interactive workstream, so the
+    Scheduled kind draws from the interactive shelf."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    proj_fn = _slice_top_level_fn(body, "function _refreshAndPopulateProjects(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TP && TP\.refreshProjects,\s*_populateHomeProjectDropdown",
+        proj_fn,
+    ), "the launcher project wrapper must pair its bridge refresh + populate via the chokepoint"
+    persona_fn = _slice_top_level_fn(body, "function _refreshAndPopulatePersonas(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TP && TP\.refreshPersonas,\s*_populateHomePersonaDropdown",
+        persona_fn,
+    ), "the launcher persona wrapper must pair its bridge refresh + populate via the chokepoint"
+    pop = _slice_top_level_fn(body, "function _populateHomePersonaDropdown(")
+    assert '_restorePick("persona"' in pop, (
+        "the persona populate must restore a still-valid pick via _restorePick"
+    )
+    assert "defaultPersona(_launcherPersonaKind())" in pop, (
+        "the persona populate must revert to the kind default when the pick is gone"
+    )
+    assert "personaChoices(_launcherPersonaKind())" in pop, (
+        "the persona choices must come from the kind's persona shelf"
+    )
+    proj_pop = _slice_top_level_fn(body, "function _populateHomeProjectDropdown(")
+    assert '_restorePick("project"' in proj_pop, (
+        "the project populate must validate a previous pick via _restorePick (a "
+        "since-deleted project falls back to the placeholder, not a blank select)"
+    )
+
+
+def test_console_launcher_project_placeholder_tracks_require_project() -> None:
+    """require_project parity on the console launcher: with the gate on, BOTH
+    launcher kinds are refused a projectless create server-side (interactive at
+    the node, coordinator at the console's own mount), so the picker must stop
+    presenting "No project" as a normal choice.  Mirrors the interactive strict
+    picker's soft treatment — retitle the placeholder ("Select a project…", or
+    "No projects available" when none exist) and never auto-select a real
+    project; the server's coded 400 stays the enforcement."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _populateHomeProjectDropdown(")
+    assert "TP.requireProject()" in fn, (
+        "the launcher project populate must read the requireProject() advisory"
+    )
+    assert re.search(r'setOptionPlaceholder\(\s*"project"', fn), (
+        "strict mode must retitle the seeded placeholder via setOptionPlaceholder"
+    )
+    for label in ("Select a project…", "No projects available", "No project"):
+        assert label in fn, f"placeholder branch missing the {label!r} title"
+    # The has-projects check must see REAL projects only: the placeholder is
+    # computed before the "+ New project…" sentinel is appended, or an empty
+    # deployment would read as having one project and mis-title the prompt.
+    assert fn.index("setOptionPlaceholder") < fn.index("_PROJECT_NEW"), (
+        "the placeholder must be computed before the + New project… sentinel is appended"
+    )
+
+
+def test_paint_project_picker_syncs_before_refresh() -> None:
+    """The shared _paintProjectPicker (used by BOTH the modal and dashboard, so
+    the two can't drift and silently re-introduce the FOUC) seeds the required/
+    optional hint + paints via _populateProjectSelect, and routes its
+    sync-then-refresh tail through the _paintFromCache chokepoint — where the
+    sync-before-async + always-fresh:false discipline is asserted once.  Its
+    fork/absent-bridge path returns a resolved promise so the dashboard's chained
+    Options-chip recompute still runs.  Both paints reuse _populateProjectSelect
+    (preserving the #867 strict-picker invariant)."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _paintProjectPicker(")
+    assert "_populateProjectSelect(" in fn, (
+        "_paintProjectPicker must paint via _populateProjectSelect"
+    )
+    assert "hint.textContent" in fn, "_paintProjectPicker must seed the required/optional hint"
+    assert "opts.fork" in fn, "_paintProjectPicker must skip for a fork"
+    assert "return Promise.resolve();" in fn, (
+        "_paintProjectPicker's fork/absent-bridge path must return a resolved "
+        "promise (the dashboard chains its Options-chip recompute on the return)"
+    )
+    assert "return _paintFromCache(window.TurnstoneProjects.refreshProjects, paint, opts)" in fn, (
+        "_paintProjectPicker's tail must route through the _paintFromCache "
+        "chokepoint (sync paint(freshOnOpen) then always-fresh:false repaint)"
+    )
+
+
+# --- models/skills composer FOUC (phase 2b) --------------------------------
+#
+# The model + skill pickers had NO client cache: every composer open re-fetched
+# /v1/api/models and /v1/api/skills inline, flashing an empty dropdown for the
+# round-trip.  Phase 2b adds shared caches (models.js / skills.js) on the
+# extracted list_cache.js core that the composers read synchronously, then
+# refresh-and-repaint — the same pattern the project/persona pickers use.  These
+# guards pin the sync-before-async ordering on all three surfaces, the cache
+# fail-open/coalesce contract, the two-server-schema exposure, and the
+# single-repaint-path wiring.
+
+_LIST_CACHE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/list_cache.js"
+_MODELS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/models.js"
+_SKILLS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/skills.js"
+_PROJECTS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/projects.js"
+_PERSONAS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/personas.js"
+
+
+def test_paint_model_and_skill_wrappers_sync_before_refresh() -> None:
+    """The _paintFromCache chokepoint (PR #869 review: the three wrapper twins
+    repeated the same wiring, so the discipline now lives ONCE) paints from the
+    warm cache SYNCHRONOUSLY, then refreshes-and-repaints.  CRITICAL: the sync
+    paint mirrors the caller's freshOnOpen but the ASYNC repaint MUST pass
+    fresh:false — leaking freshOnOpen into the async paint would clobber a
+    mid-window pick (for the project picker that reconciles to "" -> a
+    require_project 400).  Each wrapper must pair its OWN bridge refresh with
+    its OWN populate helper and thread `fresh` through untouched."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    helper = _slice_top_level_fn(body, "function _paintFromCache(")
+    sync = helper.find("repaint(!!(opts && opts.freshOnOpen))")
+    async_ = helper.find("refresh().then")
+    assert 0 <= sync < async_, (
+        "_paintFromCache must sync-paint (repaint mirroring freshOnOpen) BEFORE "
+        "the async refresh repaint"
+    )
+    assert "repaint(false)" in helper[async_:], (
+        "_paintFromCache's async repaint must pass fresh:false (never leak "
+        "freshOnOpen, or it clobbers a mid-window pick)"
+    )
+    # Promise contract: callers (the dashboard Options-chip recompute) chain on
+    # the async repaint landing; the no-refresh path must still hand back a
+    # resolved promise or the chain throws on a cold bridge.
+    assert "return Promise.resolve()" in helper, (
+        "_paintFromCache must return an already-resolved promise when there is "
+        "no refresh (dashboard callers chain the Options-chip recompute)"
+    )
+    assert "return refresh().then" in helper, (
+        "_paintFromCache must return the async-repaint promise (callers act "
+        "after the repaint lands)"
+    )
+    for wrapper, bridge_refresh, populate in (
+        (
+            "function _paintModelSelects(",
+            "window.TurnstoneModels && window.TurnstoneModels.refreshModels",
+            "_populateModelSelect(modelSel, judgeSel, { fresh: fresh })",
+        ),
+        (
+            "function _paintSkillSelect(",
+            "window.TurnstoneSkills && window.TurnstoneSkills.refreshSkills",
+            "_populateSkillSelect(sel, { fresh: fresh })",
+        ),
+        (
+            "function _paintPersonaSelect(",
+            "window.TurnstonePersonas && window.TurnstonePersonas.refreshPersonas",
+            "_populatePersonaSelect(sel, { fresh: fresh })",
+        ),
+    ):
+        fn = _slice_top_level_fn(body, wrapper)
+        assert "return _paintFromCache(" in fn, f"{wrapper} must return the _paintFromCache promise"
+        assert bridge_refresh in fn, f"{wrapper} must pass its own bridge refresh"
+        assert populate in fn, f"{wrapper} must thread fresh through to its own populate helper"
+
+
+def test_new_ws_modal_renders_all_selects_fresh_on_open() -> None:
+    """Finding [0] fix — every composer select in the reused new-ws <dialog> renders
+    its ACTUAL value fresh on open (no stale carryover from the last open): model +
+    skill via the wrappers with freshOnOpen:true, persona via {fresh:true}, project
+    via _paintProjectPicker freshOnOpen:true.  The model paint is fork-gated."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function showNewWsModal(")
+    assert "_paintModelSelects(modelSelect, judgeSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint model+judge fresh-on-open via the shared wrapper"
+    )
+    assert "_paintSkillSelect(tplSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint skill fresh-on-open"
+    )
+    assert "_paintPersonaSelect(personaSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint persona fresh-on-open via the shared wrapper"
+    )
+    proj = fn[fn.find("_paintProjectPicker(projSelect") :]
+    assert "freshOnOpen: true" in proj[:120], (
+        "the modal must paint the project picker fresh-on-open"
+    )
+    # Fork-gates: the model + persona paints must each be the FIRST statement
+    # inside their own `if (!_forkFromWsId)` block.  (A first-gate ordering
+    # check is vacuous here — the first gate in showNewWsModal IS the model
+    # gate, so it would pass even with the paint hoisted out below it.)
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintModelSelects\(modelSelect", fn), (
+        "the modal model paint must be skipped for a fork"
+    )
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintPersonaSelect\(personaSelect", fn), (
+        "the modal persona paint must be skipped for a fork"
+    )
+
+
+def test_dashboard_paints_model_and_skill_via_wrappers_preserving() -> None:
+    """Dashboard twin — all four pickers paint via the SAME wrappers but
+    freshOnOpen:false (a persistent panel preserves a pick across a repaint), the
+    old fetch-once ``options.length <= 1`` guard is gone, and EVERY paint chains
+    _refreshDashboardOptionsSummary on its async repaint: a repaint can drop a
+    server-removed pick (or revert persona to its kind default) without firing
+    'change', and the collapsed Options chip must always name what submit sends."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
+    for paint in (
+        "_paintModelSelects(modelSel, judgeSel, { freshOnOpen: false })",
+        "_paintSkillSelect(skillSel, { freshOnOpen: false })",
+        "_paintProjectPicker(projSel, projHint, { fork: false })",
+        "_paintPersonaSelect(personaSel, { freshOnOpen: false })",
+    ):
+        assert re.search(re.escape(paint) + r"\.then\(\s*_refreshDashboardOptionsSummary", fn), (
+            f"dashboard paint must chain the Options-chip recompute: {paint[:36]}"
+        )
+    assert "options.length <= 1" not in fn, (
+        "the dashboard model/skill fetch-once guard must be removed (refresh-on-open now)"
+    )
+
+
+def test_new_ws_modal_fork_inherits_model_and_judge() -> None:
+    """Q2 — a fork INHERITS its source's model + judge: the modal hides both selects
+    for a fork (like skill/persona/project), and submitNewWs gates body.model AND
+    body.judge_model on !_forkFromWsId.  Asserts the model line SPECIFICALLY — its
+    guard `model && !_forkFromWsId` is a substring of the judge line, so a
+    model-unguarded regression would otherwise false-pass."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    modal = _slice_top_level_fn(body, "function showNewWsModal(")
+    assert "modelSelect.hidden = !!_forkFromWsId" in modal, (
+        "modal must hide the model select for a fork"
+    )
+    assert "judgeSelect.hidden = !!_forkFromWsId" in modal, (
+        "modal must hide the judge select for a fork"
+    )
+    # [4] fix: the skill paint is fork-gated too (skill is hidden for a fork).
+    # Tie the gate to the skill paint SPECIFICALLY — a first-gate check would be
+    # satisfied by the model gate even if the skill paint were left
+    # unconditional, so require the paint to be the FIRST statement inside its
+    # own gate block.  (A nearest-preceding-gate proximity window false-passes
+    # a gate block that CLOSES before the paint.)
+    skill_paint = modal.find("_paintSkillSelect(tplSelect")
+    assert skill_paint >= 0, "the modal must paint the skill picker"
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintSkillSelect\(tplSelect", modal), (
+        "the modal skill paint must be directly wrapped in `if (!_forkFromWsId)` "
+        "(skip the wasted fetch + hidden-select rebuild on a fork)"
+    )
+    submit = _slice_top_level_fn(body, "function submitNewWs(")
+    assert "if (model && !_forkFromWsId) body.model = model;" in submit, (
+        "submitNewWs must fork-gate body.model (distinct from the judge line)"
+    )
+    assert "if (judge_model && !_forkFromWsId) body.judge_model = judge_model;" in submit, (
+        "submitNewWs must fork-gate body.judge_model"
+    )
+
+
+def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> None:
+    """Console launcher — the four _refreshAndPopulate* wrappers route through the
+    _paintHomeFromCache chokepoint: sync paint from the warm cache BEFORE the
+    async refresh(callOpts)-and-repaint (callOpts threads {force:true} for the
+    models_changed / onLoginSuccess invalidation callers).  The ordering
+    discipline is asserted once, on the helper; the wrappers are pairing-checked
+    (model/skill here, project/persona in their twin test)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    helper = _slice_top_level_fn(body, "function _paintHomeFromCache(")
+    sync = helper.find("populate()")
+    async_ = helper.find("refresh(callOpts).then")
+    assert 0 <= sync < async_, (
+        "_paintHomeFromCache must sync-paint (populate()) BEFORE the async "
+        "refresh(callOpts).then repaint"
+    )
+    model_fn = _slice_top_level_fn(body, "function _refreshAndPopulateModels(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TM && TM\.refreshModels,\s*_populateHomeModelDropdowns", model_fn
+    ), "the launcher model wrapper must pair its bridge refresh + populate via the chokepoint"
+    skill_fn = _slice_top_level_fn(body, "function _refreshAndPopulateSkills(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TS && TS\.refreshSkills,\s*_populateHomeSkillDropdown", skill_fn
+    ), "the launcher skill wrapper must pair its bridge refresh + populate via the chokepoint"
+
+
+def test_console_relogin_rewarms_all_four_caches_with_force() -> None:
+    """onLoginSuccess re-warms ALL FOUR composer caches after auth lands (the boot
+    pass runs pre-login -> 401 -> fail-open empty), EACH with {force:true} so a
+    still-in-flight failing pre-auth fetch yields a trailing authenticated refetch
+    (skills/personas have no *_changed event to recover otherwise). Fixes [0]+[2]."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    start = body.index("window.onLoginSuccess = function ()")
+    # The four re-warm calls live before the // Active-coordinators marker; an
+    # assert falling outside this slice fails loudly rather than silently passing.
+    login = body[start : body.index("// Active-coordinators", start)]
+    for name in ("Skills", "Models", "Projects", "Personas"):
+        assert f"_refreshAndPopulate{name}({{ force: true }})" in login, (
+            f"onLoginSuccess must force-re-warm {name.lower()} after login"
+        )
+
+
+def test_models_changed_forces_trailing_single_repaint_path() -> None:
+    """The console ``models_changed`` handler repaints via the refresh wrapper with
+    {force:true} — so a burst of model-config changes converges to the latest server
+    state (trailing refresh) — and the launcher does NOT ALSO subscribe onModelsChange
+    (one repaint path, no double rebuild)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    mc = body.index('data.type === "models_changed"')
+    handler = body[mc : mc + 700]
+    assert "_refreshAndPopulateModels({ force: true })" in handler, (
+        "models_changed must force a trailing refresh so it converges to the latest"
+    )
+    assert "onModelsChange" not in body, (
+        "the console must not ALSO subscribe onModelsChange (single repaint path)"
+    )
+
+
+def test_models_label_centralized_on_bridge() -> None:
+    """Finding [7] — the "alias (model)" label lives ONCE in models.js: modelLabel is
+    exported AND registered on the window.TurnstoneModels bridge (the classic app.js
+    bundles reach it only via the bridge — an ES-only export throws at runtime), and
+    neither app keeps a local _resolveModelLabel copy."""
+    models_src = _MODELS_JS.read_text(encoding="utf-8")
+    assert "export function modelLabel(" in models_src, "models.js must export modelLabel"
+    assert "modelLabel: modelLabel" in models_src, (
+        "models.js must register modelLabel on the window.TurnstoneModels bridge "
+        "(classic bundles call it via the bridge)"
+    )
+    # [7] fix: modelLabel resolves via the core's O(1) keyField index, not a scan.
+    assert 'keyField: "alias"' in models_src, (
+        "models.js must index by alias (keyField) so modelLabel is an O(1) getByKey"
+    )
+    assert "getByKey(alias)" in models_src, (
+        "modelLabel must resolve via the core's getByKey index (not a per-paint scan)"
+    )
+    assert "_resolveModelLabel" not in _APP_JS.read_text(encoding="utf-8"), (
+        "the ui app must not keep a local _resolveModelLabel (use TurnstoneModels.modelLabel)"
+    )
+    assert "_resolveModelLabel" not in _CONSOLE_APP_JS.read_text(encoding="utf-8"), (
+        "the console app must not keep a local _resolveModelLabel"
+    )
+
+
+def test_models_skills_module_tagged_in_both_apps() -> None:
+    """All four data-layer modules (projects/personas/models/skills) are
+    ``<script type=module>``-tagged BEFORE /shared/shell.js in BOTH index.html.
+    shell.js is the LAST module tag and calls TS_APP.boot (the first dashboard /
+    launcher paint); module execution follows tag order, and classic app.js is
+    parse-time definitions only — so a data-layer tag reordered below shell.js
+    boots the app before that bridge installs: the sync paint no-ops AND the
+    refresh is skipped, a silent test-green FOUC regression without this guard."""
+    for idx in (_INDEX_HTML, _CONSOLE_INDEX):
+        html = idx.read_text(encoding="utf-8")
+        for mod in ("projects", "personas", "models", "skills"):
+            path = f"/shared/{mod}.js"
+            assert path in html, f"{mod}.js must be module-tagged in {idx.name}"
+            assert html.index(path) < html.index("/shared/shell.js"), (
+                f"{mod}.js must be tagged BEFORE shell.js in {idx.name} — its "
+                "bridge must install before TS_APP.boot paints the composers"
+            )
+
+
+def test_list_cache_core_is_failopen_coalesced_and_gated() -> None:
+    """The extracted list_cache.js core: non-force callers coalesce onto the in-flight
+    refresh; it fails open (keeps the prior cache + records the error, never rejects —
+    only the SUCCESS branch calls _setCache); the extra-reset is GATED on
+    resetExtraOnError across BOTH error branches (finding [1]); and a force caller
+    schedules a trailing refetch that converges to the latest (finding [2])."""
+    src = _LIST_CACHE_JS.read_text(encoding="utf-8")
+    assert "return _inflight;" in src, "non-force callers must coalesce onto the in-flight refresh"
+    assert src.count("_byKey = Object.create(null)") == 2, (
+        "both _byKey sites (declaration + _setCache rebuild) must be null-prototype "
+        "(a row keyed __proto__ must not swap the map's prototype; inherited members "
+        "must not resolve as rows)"
+    )
+    assert "_lastError = r.status" in src and "_lastError = 0" in src, (
+        "a non-OK status and a network/parse error must both be recorded (fail-open)"
+    )
+    assert src.count("_setCache(data[dataKey]") == 1, (
+        "only the success branch may repopulate the cache (non-OK/catch keep the prior cache)"
+    )
+    # finding [1]: the extra-reset must be gated on resetExtraOnError on BOTH the
+    # non-OK branch AND the network/parse .catch branch (a cosmetic extra must
+    # survive a network drop too, not just a non-OK status).
+    assert src.count("resetExtraOnError && extraDefaults") == 2, (
+        "resetExtraOnError must gate the extra-reset on BOTH error branches"
+    )
+    # finding [2]: a force caller gets a trailing refetch (converges to latest).
+    assert "callOpts.force" in src and "_pending" in src, (
+        "a force caller must schedule a trailing refetch so it converges to the latest state"
+    )
+    assert "firstLoad || fp !== _fingerprint" in src, (
+        "subscribers must fire on first load or a changed fingerprint only"
+    )
+
+
+def test_reset_extra_policy_per_cache() -> None:
+    """require_project (an advisory that GATES the picker) must fail open on error;
+    the models default-aliases (a COSMETIC annotation) must keep their last-known
+    value.  So projects opts INTO the reset, models opts OUT (finding [1])."""
+    assert "resetExtraOnError: true" in _PROJECTS_JS.read_text(encoding="utf-8"), (
+        "projects.js must reset the require_project advisory on error (fail-open)"
+    )
+    assert "resetExtraOnError: false" in _MODELS_JS.read_text(encoding="utf-8"), (
+        "models.js must keep last-known default aliases on error (cosmetic, not a gate)"
+    )
+
+
+def test_models_cache_exposes_both_server_schemas() -> None:
+    """models.js must carry ALL default-alias fields — the node server sends
+    default_alias, the console sends coordinator_default_alias, both send
+    judge_default_alias — so each app reads its own (via modelDefaults/captureExtra,
+    which drive the "Default — <alias>" placeholder).  The dead onChange
+    subscription (+ its fingerprint fold) was removed: models has no live-render
+    subscriber (the console repaints via its direct models_changed handler), so it
+    exposes no onModelsChange."""
+    src = _MODELS_JS.read_text(encoding="utf-8")
+    for field in ("default_alias", "judge_default_alias", "coordinator_default_alias"):
+        assert field in src, f"models.js must carry {field} for the two server schemas"
+    assert "window.TurnstoneModels" in src, "models.js must install the classic bridge"
+    assert "makeListCache" in src, "models.js must build on the shared list_cache core"
+    assert "onModelsChange" not in src, (
+        "models.js must not expose the dead onModelsChange subscription (no subscribers)"
+    )
+
+
+def test_skills_cache_returns_raw_rows() -> None:
+    """skills.js exposes raw rows (getSkills) — the ui pickers add a ' [MCP]' suffix
+    the console omits, so a single pre-formatted label in the cache would silently
+    change one app's labels."""
+    src = _SKILLS_JS.read_text(encoding="utf-8")
+    assert "window.TurnstoneSkills" in src, "skills.js must install the classic bridge"
+    assert "makeListCache" in src, "skills.js must build on the shared list_cache core"
+    assert "getSkills" in src, "skills.js must expose raw rows via getSkills"
+
+
+def test_projects_personas_keep_public_surface_on_factory() -> None:
+    """The projects.js / personas.js retrofit onto list_cache.js must preserve their
+    full public surface — rail.js and project_creator.js import these by name, and
+    the classic bundles read the window bridges."""
+    proj = _PROJECTS_JS.read_text(encoding="utf-8")
+    assert "makeListCache" in proj, "projects.js must build on the shared core"
+    for name in (
+        "refreshProjects",
+        "getProjects",
+        "projectsLoaded",
+        "projectsError",
+        "requireProject",
+        "projectName",
+        "projectChoices",
+        "onProjectsChange",
+        "createProject",
+    ):
+        assert f"function {name}(" in proj, f"projects.js must still export {name}"
+    assert "requireProject: false" in proj, (
+        "the require_project advisory must seed / fail-open to false"
+    )
+    persona = _PERSONAS_JS.read_text(encoding="utf-8")
+    assert "makeListCache" in persona, "personas.js must build on the shared core"
+    for name in (
+        "refreshPersonas",
+        "getPersonas",
+        "personasLoaded",
+        "personasError",
+        "personaLabel",
+        "defaultPersona",
+        "personaChoices",
+        "onPersonasChange",
+    ):
+        assert f"function {name}(" in persona, f"personas.js must still export {name}"
+
+
+_MCP_ERROR_CSS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.css"
+
+# The categories _mcpErrorCategory can return that carry their own CSS —
+# buildMcpErrorEmbed's interpolated `"mcp-error-" + category` class expands
+# to these plus "actionable", which is deliberately unstyled (the base card
+# look IS the actionable look: accent icon + Connect button).
+_MCP_ERROR_STYLED_CATEGORIES = ("operator", "transient", "forbidden")
+
+
+def test_mcp_error_css_owns_every_card_class() -> None:
+    """Every class mcp_error.js assigns has a rule in mcp_error.css.
+
+    The dual-static reach class (#725 review round 1: the standalone
+    coordinator page rendered the consent card bare because the card's
+    rules lived only in a host sheet it never linked).  The sheet pairs
+    with the module and every card host links it; this pin makes the
+    invariant structural — add a class to the card and this fails until
+    mcp_error.css owns it."""
+    js = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    css = _MCP_ERROR_CSS.read_text(encoding="utf-8")
+    tokens: set[str] = set()
+    for assignment in re.findall(r'className\s*=\s*"([^"]+)"', js):
+        for tok in assignment.split():
+            if tok.endswith("-"):
+                # Interpolated category suffix ("mcp-error-" + category).
+                tokens.update(tok + cat for cat in _MCP_ERROR_STYLED_CATEGORIES)
+            else:
+                tokens.add(tok)
+    assert "mcp-error-card" in tokens, "class extractor found nothing — regex rotted?"
+    missing = sorted(t for t in tokens if ("." + t) not in css)
+    assert not missing, f"mcp_error.css lacks rules for: {missing}"
+
+
+def test_mcp_error_css_linked_by_every_card_host() -> None:
+    """Every page that renders the MCP error card links its sheet — the
+    other half of the reach invariant (a future host that imports
+    mcp_error.js without the stylesheet regresses to bare markup)."""
+    root = Path(__file__).resolve().parent.parent
+    hosts = (
+        root / "turnstone/console/static/coordinator/index.html",
+        root / "turnstone/console/static/index.html",
+        root / "turnstone/ui/static/index.html",
+    )
+    for host in hosts:
+        html = host.read_text(encoding="utf-8")
+        assert "/shared/mcp_error.css" in html, f"{host.name} must link /shared/mcp_error.css"
+
+
+def test_console_consent_badge_seam() -> None:
+    """#874 badge half, console side: the console defines the same
+    TS_APP.onConsentDetected seam the node dashboard does (which the shared
+    pane host bridges interactive panes' detections to), hydrates from the
+    Phase 9 persistence endpoint at boot, and badges the Admin > MCP
+    Servers rail row through the shell bridge."""
+    js = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert "window.TS_APP.onConsentDetected" in js
+    assert '"/v1/api/mcp/oauth/pending"' in js
+    assert 'setRowBadge("mcp"' in js
+    assert "window.TS_APP.syncConsentBadge" in js
+
+
+def test_admin_mcp_panel_resyncs_consent_badge() -> None:
+    """The admin MCP panel re-syncs the badge to DB truth AFTER a
+    successful render (node Connections-flow semantics) — and only then:
+    a failed load keeps the pending signal.  The order is asserted inside
+    loadAdminMcp's body (a whole-file check would bind to unrelated
+    earlier .catch( sites and false-pass a move into the failure path)."""
+    js = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    body = js[js.index("function loadAdminMcp(") :]
+    body = body[: body.index("\nfunction ")]
+    assert (
+        body.index("_renderMcpServers(") < body.index("syncConsentBadge") < body.index(".catch(")
+    ), "syncConsentBadge must sit in loadAdminMcp's success path, after the render"
+
+
+def test_coordinator_pane_threads_consent_detection() -> None:
+    """#874 badge half, coordinator side: the single MCP-error helper
+    passes the consent callback to the card builder (both result paths get
+    detection), forwarding to the L-shell seam and the standalone
+    status-bar chip."""
+    js = _COORD_JS.read_text(encoding="utf-8")
+    assert "buildMcpErrorEmbed(mcpErr, output, _notifyConsentDetected)" in js
+    assert "onConsentDetected" in js
+    assert "coord-sb-consent" in js
+    # The chip is standalone-only chrome; the L-shell pane relies on the
+    # rail badge.
+    assert "opts.standalone" in js
+
+
+def test_consent_badge_visibility_resync_pins() -> None:
+    """#874 self-heal: both consent surfaces re-pull server truth on the
+    visibility-show edge (the consent popup is noopener — no cross-window
+    channel exists), with merge-on-success semantics: the mirrors diff
+    against a preFetch snapshot so a detection landing mid-fetch survives
+    and a failed fetch never blanks a possibly-valid warning.  A blind
+    clear()-then-refill would clobber mid-fetch adds — the preFetch
+    marker is the pin against that regression."""
+    app = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange"' in app
+    assert "_resyncPendingConsents" in app
+    assert app.count("preFetch") >= 2
+    # Single-flight: overlapping fetches can resolve out of order and no
+    # ordering guard covers every interleaving (stale clobber, failure
+    # suppression, phantom re-adds) — exclusion plus one queued rerun is
+    # the pinned shape, with a bounded flight so a stalled fetch cannot
+    # wedge the gate shut.  The timeout signal is feature-detected (old
+    # runtimes, per the codebase's AbortController guards) so it can
+    # never throw the gate wedged.
+    assert "_resyncInFlight" in app
+    assert "_resyncQueued" in app
+    assert app.count("AbortSignal.timeout") >= 2  # guard + use
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange"' in coord
+    assert coord.count("preFetch") >= 2
+    assert "hydrateInFlight" in coord
+    assert "hydrateQueued" in coord
+    assert coord.count("AbortSignal.timeout") >= 2  # guard + use
+
+
+def test_reload_toast_console_phrasing_pins() -> None:
+    """Reload-toast truth table (#725): a node-less install reads
+    'Reload sent to console' instead of '0 node(s) + console'; a failed
+    console entry appends its explicit note; and failed beats reconciled
+    if a malformed entry ever carries both shapes."""
+    js = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    assert '"Reload sent to console"' in js
+    assert '"; console reload failed"' in js
+    assert "!consoleFailed &&" in js
+
+
+def test_every_system_turn_source_has_a_fallback_label() -> None:
+    """``OPERATOR_SOURCE_LABELS`` must cover every SYSTEM_TURN_SOURCES
+    member, carded or not — a missing entry leaks the raw ``_source``
+    ("operator · idle_children").
+
+    Two routes reach the label: uncarded kinds (compaction_pending,
+    background_shell_exit, participant_joined) have no dispatch branch
+    and arrive on EVERY render; carded kinds arrive when a replayed
+    turn's persisted ``_source_meta`` is absent, because every card
+    dispatch is guarded on the turn carrying ``meta``.  ``compaction`` is
+    the one exception — handled first and unguarded in both panes.
+
+    Pinned as a set comparison rather than named entries so the next
+    source added to the Python vocabulary fails here instead of leaking
+    silently."""
+    from turnstone.core.tool_advisory import SYSTEM_TURN_SOURCES
+
+    root = Path(__file__).resolve().parent.parent
+    utils = (root / "turnstone/shared_static/utils.js").read_text(encoding="utf-8")
+    block = utils.split("const OPERATOR_SOURCE_LABELS = {", 1)[1].split("};", 1)[0]
+    labelled = {ln.split(":", 1)[0].strip() for ln in block.splitlines() if ":" in ln}
+    missing = set(SYSTEM_TURN_SOURCES) - labelled - {"compaction"}
+    assert not missing, f"system turn sources with no operator label: {sorted(missing)}"
+
+
+def test_memory_description_editor_defers_normalization_to_server() -> None:
+    root = Path(__file__).resolve().parent.parent
+    governance = (root / "turnstone/console/static/governance.js").read_text(encoding="utf-8")
+
+    editor = governance.split("function editMemoryDescription(memoryId) {", 1)[1].split(
+        "\nfunction showMemoryDetailModal", 1
+    )[0]
+    assert "JSON.stringify({ description: value })" in editor
+    assert ".replace(" not in editor
+    assert "Array.from(" not in editor
+
+
+def test_memory_health_refresh_lifecycle() -> None:
+
+    governance = _CONSOLE_GOVERNANCE_JS.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    load_memories = _slice_function_body(governance, "loadAdminMemories")
+    load_health = _slice_function_body(governance, "loadMemoryIndexHealth")
+    edit_memory = _slice_function_body(governance, "editMemoryDescription")
+    delete_memory = _slice_function_body(governance, "deleteAdminMemory")
+    assert load_memories and load_health and edit_memory and delete_memory
+
+    # Activation owns the ordinary refresh; list/search/filter work never does.
+    memories_tab = re.search(r'if \(tab === "memories"\) \{(?P<body>.*?)\n\s*\}', admin, re.S)
+    assert memories_tab is not None
+    assert memories_tab.group("body").count("loadAdminMemories();") == 1
+    assert memories_tab.group("body").count("loadMemoryIndexHealth();") == 1
+    assert "loadMemoryIndexHealth" not in load_memories
+    # Each successful mutation forces exactly one new health generation.
+    assert edit_memory.count("loadMemoryIndexHealth(true);") == 1
+    assert delete_memory.count("loadMemoryIndexHealth(true);") == 1
+
+    script = f"""
+let _memoryHealthRequest = null;
+let _memoryHealthGeneration = 0;
+let _memoryHealthHasValid = false;
+const banner = {{ textContent: "", style: {{ display: "none" }} }};
+const document = {{
+  getElementById: function (id) {{
+    if (id !== "memory-index-warning") throw new Error("unexpected element " + id);
+    return banner;
+  }},
+}};
+const pending = [];
+function authFetch(url, options) {{
+  if (url !== "/v1/api/admin/memories/index-health") throw new Error(url);
+  return new Promise(function (resolve, reject) {{
+    pending.push({{ resolve: resolve, reject: reject, options: options }});
+  }});
+}}
+function response(health) {{
+  return {{ ok: true, json: function () {{ return Promise.resolve(health); }} }};
+}}
+function loadMemoryIndexHealth(force) {load_health}
+
+(async function () {{
+  const first = loadMemoryIndexHealth();
+  const coalesced = loadMemoryIndexHealth();
+  if (first !== coalesced || pending.length !== 1) throw new Error("not single flight");
+  pending[0].resolve(response({{
+    over_budget: true, over_by_chars: 7, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await first;
+  if (!banner.textContent.includes("7") || banner.style.display !== "block")
+    throw new Error("first health did not render");
+
+  const stale = loadMemoryIndexHealth();
+  const newer = loadMemoryIndexHealth(true);
+  if (pending.length !== 3) throw new Error("forced refresh did not start");
+  if (!pending[1].options.signal.aborted) throw new Error("old request was not aborted");
+  pending[2].resolve(response({{
+    over_budget: true, over_by_chars: 2, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await newer;
+  const newestBanner = banner.textContent;
+  pending[1].resolve(response({{
+    over_budget: true, over_by_chars: 999, budget_chars: 65536,
+    invalid_description_count: 9,
+  }}));
+  await stale;
+  if (banner.textContent !== newestBanner || !banner.textContent.includes("2"))
+    throw new Error("stale response won");
+
+  const failed = loadMemoryIndexHealth();
+  pending[3].reject(new Error("offline"));
+  await failed;
+  if (banner.textContent !== newestBanner) throw new Error("valid banner was erased");
+  const retry = loadMemoryIndexHealth();
+  if (pending.length !== 5) throw new Error("failed request blocked retry");
+  pending[4].resolve(response({{
+    over_budget: false, over_by_chars: 0, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await retry;
+  if (banner.style.display !== "none") throw new Error("retry did not publish");
+}})().catch(function (error) {{
+  console.error(error.stack || error);
+  process.exitCode = 1;
+}});
+"""
+    proc = run_node_source(script)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_copy_button_survives_retry_teardown_in_both_clients() -> None:
+    """Every assistant bubble carries a persistent copy button in its
+    ``.msg-actions`` bar; the retry-holder teardown in BOTH clients must
+    remove only the transient buttons (``.msg-retry-btn`` /
+    ``.msg-tts-btn``), never the bar — removing the bar (the pre-copy
+    behavior) silently strips copy from the previous holder bubble on
+    every busy→idle edge, and only manual testing would notice.
+
+    Interactive: the tracked-holder teardown targets the button classes.
+    Coordinator: ``_refreshRetryButton``'s sweep collects
+    ``.msg-retry-btn`` nodes, not whole ``.msg-actions`` bars."""
+    interactive = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(interactive, "_attachRetryToLastAssistant")
+    end = _pane_method_offset(interactive, "announceToolBlock")
+    teardown = interactive[start:end]
+    assert '".msg-retry-btn, .msg-tts-btn"' in teardown, (
+        "interactive teardown must remove the transient retry/TTS buttons by class"
+    )
+    assert "oldBar.remove()" not in teardown, (
+        "interactive teardown removes the whole .msg-actions bar — that "
+        "strips the persistent copy button from the previous holder bubble"
+    )
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    refresh_start = coord.index("function _refreshRetryButton()")
+    refresh_end = coord.index("async function init()", refresh_start)
+    refresh = coord[refresh_start:refresh_end]
+    assert '".msg.assistant .msg-retry-btn"' in refresh, (
+        "coordinator _refreshRetryButton must sweep retry BUTTONS"
+    )
+    assert '".msg.assistant .msg-actions"' not in refresh, (
+        "coordinator _refreshRetryButton sweeps whole .msg-actions bars — "
+        "that strips every bubble's persistent copy button"
+    )
+
+
+def test_every_assistant_bubble_creation_path_attaches_copy() -> None:
+    """The copy button attaches at bubble CREATION on every assistant
+    render path — both live-stream branches and the history replay in the
+    interactive pane, and the single ``appendMsg`` chokepoint in the
+    coordinator (guarded on the literal role, so the unknown-role
+    fallback variant doesn't grow one).  A path that skips the attach
+    ships bubbles that silently cannot be copied."""
+    interactive = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # Structural call statements only (line-anchored), so a comment or
+    # string mentioning the method cannot satisfy or break the count.
+    # The two live-stream branches share one creation helper; the replay
+    # branch attaches on its own bubble.
+    stream_calls = len(re.findall(r"^\s+this\._newAssistantBubble\(", interactive, re.M))
+    assert stream_calls == 2, (
+        "expected the content + in_progress_snapshot branches to create "
+        f"bubbles via this._newAssistantBubble(); found {stream_calls} call sites"
+    )
+    calls = len(re.findall(r"^\s+this\._addCopyAction\(", interactive, re.M))
+    assert calls == 2, (
+        "expected the shared creation helper + the replay branch to call "
+        f"this._addCopyAction(…); found {calls} call sites"
+    )
+    replay_start = _pane_method_offset(interactive, "replayHistory")
+    replay_end = _pane_method_offset(interactive, "_attachRetryToLastAssistant")
+    replay = interactive[replay_start:replay_end]
+    assert "streamingRenderFinalize(bodyEl, msg.content)" in replay, (
+        "replayed assistant bubbles must render through "
+        "streamingRenderFinalize — the finalize helper is what stashes "
+        "the raw markdown the copy affordance reads"
+    )
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    append_start = coord.index("function appendMsg(role, html, opts)")
+    append_end = coord.index("function appendText(", append_start)
+    append = coord[append_start:append_end]
+    assert 'role === "assistant"' in append and "buildMsgCopyButton(el)" in append, (
+        "coordinator appendMsg must attach the copy bar for assistant bubbles at creation"
+    )
+
+
+def test_block_copy_btn_css_box_matches_js_constants() -> None:
+    """The floating copy button's placement clamps (copy_actions.js FAB_W /
+    FAB_H) mirror the CSS box (.block-copy-btn width/height in shared
+    chat.css).  The CSS is the source of truth; this pin is what makes a
+    CSS resize fail loudly instead of silently desyncing every clamp —
+    placement itself has no unit assertions (the livepass harness owns
+    rendered placement)."""
+    ca = (_REPO_ROOT / "turnstone/shared_static/copy_actions.js").read_text(encoding="utf-8")
+    css = (_REPO_ROOT / "turnstone/shared_static/chat.css").read_text(encoding="utf-8")
+    w = re.search(r"const FAB_W = (\d+);", ca)
+    h = re.search(r"const FAB_H = (\d+);", ca)
+    assert w and h, "FAB_W / FAB_H constants not found in copy_actions.js"
+    # The box must be declared in exactly ONE .block-copy-btn rule: a
+    # second declaration (a media query, a state variant) would override
+    # the box while this pin kept watching the base rule — silent desync.
+    rules = re.findall(r"\.block-copy-btn[^{}]*\{[^}]*\}", css)
+    assert rules, ".block-copy-btn rules not found in chat.css"
+    declaring = [r for r in rules if re.search(r"\b(width|height)\s*:", r)]
+    assert len(declaring) == 1, (
+        ".block-copy-btn width/height must live in exactly one rule so the "
+        "JS mirror has one source of truth; found: " + repr(declaring)
+    )
+    block = declaring[0]
+    assert f"width: {w.group(1)}px" in block, (
+        ".block-copy-btn width in chat.css no longer matches FAB_W — "
+        "update the JS mirror (and its clamps) with the CSS box"
+    )
+    assert f"height: {h.group(1)}px" in block, (
+        ".block-copy-btn height in chat.css no longer matches FAB_H — "
+        "update the JS mirror (and its clamps) with the CSS box"
+    )
+
+
+def test_retry_and_token_copy_degrade_without_the_module_lane() -> None:
+    """Two classic-script affordances predate the shared ES-module lane and
+    must keep working when it fails to load (script fetch error on a
+    degraded LAN): the coordinator's retry button and the admin one-time
+    token dialog's copy.  Both prefer the bridged helpers and must carry a
+    zero-dependency fallback — a silent early-return (retry never renders)
+    or an unguarded bridge call (uncaught TypeError in the token modal)
+    regresses main's contract."""
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    retry_start = coord.index("function _addRetryAction(el)")
+    retry_end = coord.index("function _refreshRetryButton()", retry_start)
+    retry = coord[retry_start:retry_end]
+    assert 'typeof ensureMsgActionsBar === "function"' in retry, (
+        "coordinator retry must feature-detect the bridged helpers"
+    )
+    assert 'document.createElement("button")' in retry and "msg-retry-btn" in retry, (
+        "coordinator retry lost its zero-dependency fallback — with the "
+        "module lane down the retry button must still be built in place"
+    )
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    copy_start = admin.index("function copyCreatedToken()")
+    copy_fn = admin[copy_start : admin.index("\nfunction ", copy_start + 1)]
+    assert 'typeof window.copyTextToClipboard !== "function"' in copy_fn, (
+        "admin token copy must feature-detect the bridged helper — an "
+        "unguarded bridge call throws with the module lane down"
+    )
+    # The no-bridge branch is not selection-only: it attempts the native
+    # async API directly (the degraded page is usually an HTTPS console
+    # where it works) before degrading to select-the-text.
+    no_bridge = copy_fn[
+        copy_fn.index('typeof window.copyTextToClipboard !== "function"') : copy_fn.index(
+            "window.copyTextToClipboard(_lastCreatedToken)"
+        )
+    ]
+    assert "navigator.clipboard" in no_bridge and ".writeText(_lastCreatedToken)" in no_bridge, (
+        "the no-bridge branch must attempt navigator.clipboard.writeText "
+        "directly before falling back to manual selection"
+    )
+    assert copy_fn.count("selectTokenFallback") >= 3, (
+        "admin token copy lost its select-the-text fallback (needed for "
+        "the clipboard-less, the copy-rejected and the bridge-failed paths)"
+    )
+
+
+def test_copy_affordances_are_idle_only() -> None:
+    """Every copy affordance is unavailable while the pane is busy, gated on
+    the ONE pane-level fact both clients already maintain (data-busy on
+    the messages container) — there is no per-bubble streaming stamp.
+    Three pins keep the contract honest:
+
+    * no ``.is-streaming`` mechanism anywhere in either client or the
+      shared stylesheet (its per-bubble gate was replaced wholesale);
+    * the chat.css busy rule covers ALL action buttons — no copy
+      exemption;
+    * the module enforces the gate in JS at each activation path (bubble
+      click, floating-button click, Enter keydown, hover reveal, and the
+      within-block fast path's dismissal) — CSS pointer-events alone is
+      keyboard-bypassable."""
+    interactive = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    css = (_REPO_ROOT / "turnstone/shared_static/chat.css").read_text(encoding="utf-8")
+    for label, body in (
+        ("interactive.js", interactive),
+        ("coordinator.js", coord),
+        ("chat.css", css),
+    ):
+        assert "is-streaming" not in body, (
+            f"{label} resurrects the per-bubble is-streaming gate — the busy "
+            "gate is pane-level data-busy only"
+        )
+    assert '[data-busy="true"] .msg-action-btn {' in css, (
+        "chat.css must disable every .msg-action-btn while busy"
+    )
+    assert ":not(.msg-copy-btn)" not in css, (
+        "the busy rule must not exempt the copy button — copy is idle-only"
+    )
+    ca = (_REPO_ROOT / "turnstone/shared_static/copy_actions.js").read_text(encoding="utf-8")
+    assert "'[data-busy=\"true\"]'" in ca, (
+        "copy_actions.js lost its JS-side busy gate (_isBusy) — the CSS "
+        "pointer-events rule alone is keyboard-bypassable"
+    )
+    for path_marker in (
+        # bubble copy click
+        "if (_isBusy(msgEl)) {",
+        # floating-button click guard
+        "if (_isBusy(target)) {",
+        # Enter-on-block keydown
+        "if (_isBusy(block)) {",
+        # hover reveal
+        "&& !_isBusy(block)",
+        # within-block fast path — a turn starting under a shown button
+        # must dismiss on the next move, not once the pointer leaves
+        "if (_isBusy(_fabTarget)) _hideFab();",
+    ):
+        assert path_marker in ca, (
+            f"copy_actions.js busy gate missing at an activation path: {path_marker!r}"
+        )
+
+
+def test_coordinator_tool_output_pres_are_focusable() -> None:
+    """Any pre inside a .msg-body hosts the pointer copy affordance, and
+    the keyboard copy path acts on the FOCUSED block — so every <pre> the
+    coordinator's tool-output formatter emits must carry tabindex, or the
+    same content a pointer user copies in one click is unreachable by
+    keyboard.  Pinned on every <pre> exit of renderToolOutput so a new
+    exit cannot ship pointer-only."""
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    start = coord.index("function renderToolOutput(")
+    fn = coord[start : coord.index("\n  }", start)]
+    pres = re.findall(r"<pre[^>]*>", fn)
+    assert pres, "renderToolOutput no longer emits <pre> blocks"
+    assert all('tabindex="0"' in p for p in pres), (
+        "a renderToolOutput <pre> exit lost its tabindex — pointer-copyable "
+        "but keyboard-unreachable:\n" + "\n".join(pres)
+    )
+    # The MCP-error card's raw-payload pre reaches .msg-body through the
+    # coordinator's orphan-result path — same invariant, shared module.
+    mcp = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    assert 'pre.setAttribute("tabindex", "0")' in mcp, (
+        "the MCP-error card's raw-payload pre must stay focusable — it is "
+        "pointer-copyable wherever the card mounts inside a .msg-body"
+    )
+    # And an emptied action bar may not linger as a zero-control toolbar
+    # landmark on the coordinator's degraded (no-bridge) lane, where the
+    # fallback bar holds ONLY the transient retry button.
+    assert "if (!bar.children.length) bar.remove();" in coord, (
+        "the coordinator retry sweep must remove a bar emptied of its last "
+        "control — screen readers announce empty 'Message actions' toolbars"
+    )
+
+
+def test_admin_js_auth_mode_fallbacks_match_registry() -> None:
+    """The model shelf's fail-open fallback literals track the server maps.
+
+    At runtime the served constraints are authoritative and these hand-kept
+    fallbacks only cover a missing/failed fetch — but a drifted fallback
+    silently misclassifies exactly when the authority is unavailable, so
+    each one is pinned against the registry's classification maps.
+    """
+    from turnstone.core.model_registry import (
+        DYNAMIC_MODEL_AUTH_MODES,
+        MODEL_AUTH_MODE_PROFILES,
+        MODEL_AUTH_MODES,
+        SCOPES_MODEL_AUTH_MODES,
+    )
+
+    body = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    # The ONE hoisted fallback pairing map (_AUTH_MODE_FALLBACK_PROFILES):
+    # _syncModelAuthFields uses it directly and _isDynamicAuthMode's
+    # fallback list derives from its keys, so pinning the map's entries
+    # covers both consumers.
+    for mode, profile in MODEL_AUTH_MODE_PROFILES.items():
+        assert f'{mode}: "{profile}"' in body, f"fallback pairing for {mode} missing/drifted"
+    assert "Object.keys(_AUTH_MODE_FALLBACK_PROFILES)" in body, (
+        "the dynamic-mode fallback must derive from the pairing map's keys"
+    )
+    # Every registry-classified dynamic mode must appear as a map key.
+    for mode in DYNAMIC_MODEL_AUTH_MODES:
+        assert f'{mode}: "' in body, f"dynamic-mode fallback missing {mode}"
+    # The scopes fallback stays its own literal array (not derivable from
+    # the pairing map): every scopes mode must appear as a quoted literal.
+    for mode in SCOPES_MODEL_AUTH_MODES:
+        assert f'"{mode}"' in body, f"scopes-mode fallback missing {mode}"
+    # Same contract for the app-identity fallback (the model list's auth
+    # badge derives per-user vs deployment from it), and the badge site
+    # must classify via the shared predicates, never a hand list.
+    from turnstone.core.model_registry import APP_IDENTITY_MODEL_AUTH_MODES
+
+    for mode in APP_IDENTITY_MODEL_AUTH_MODES:
+        assert f'"{mode}"' in body, f"app-identity fallback missing {mode}"
+    assert body.count("_isAppIdentityAuthMode") >= 2, (
+        "the model-list badge must classify via the shared app-identity predicate"
+    )
+    # And the shelf's select ships an option per registry mode, so no mode
+    # depends on the injected-option skew path on a current page.
+    index_body = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    for mode in sorted(MODEL_AUTH_MODES):
+        assert f'value="{mode}"' in index_body, f"index.html option missing {mode}"
+
+
+def test_default_labels_name_a_model_the_list_lacks() -> None:
+    """#1359: a configured default a model list doesn't hold is named, never
+    hidden behind a bare "Default model". Only the node's list is complete (every
+    model it loaded), so only the node's picker calls it not available; a console
+    list holds stored definitions alone and can't vouch for config.toml models."""
+    models_src = _MODELS_JS.read_text(encoding="utf-8")
+    label_fn = models_src.split("export function modelLabel(", 1)[1].split("\n}\n", 1)[0]
+    assert "return row ? _fmtLabel(row) : alias;" in label_fn
+    assert "not available" not in label_fn
+    node_src = _APP_JS.read_text(encoding="utf-8")
+    picker_fn = node_src.split("function _populateModelSelect(", 1)[1].split("\n}\n", 1)[0]
+    assert 'alias + " (not available)"' in picker_fn
+    # A judge alias this node hasn't loaded doesn't judge (#1529), so it reads the same way.
+    assert 'defaultLabel(defaults.judge_default_alias || "")' in picker_fn
+    admin_src = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    schedule_fn = admin_src.split("function _decorateScheduleModelPlaceholder(", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert "label = alias;" in schedule_fn
+    assert "not available" not in schedule_fn
+    models_fn = admin_src.split("function _renderModels(", 1)[1].split("\n}\n", 1)[0]
+    assert "' is disabled. Enable it, or set another default." in models_fn
+    assert "' is not stored here or reported by any node. " in models_fn
+
+
+# The browser's checks before a create uploads its files: the interactive UI's
+# copy (new-workstream modal and dashboard composer) and the console launcher's.
+_ATTACH_CONST_NAMES = (
+    "IMAGE_MIMES",
+    "AUDIO_MIMES",
+    "AUDIO_EXTENSIONS",
+    "TEXT_APP_MIMES",
+    "TEXT_EXTENSIONS",
+    "KIND_CAPS",
+    "TOTAL_CAP",
+    "MAX_FILES",
+)
+_ATTACH_POLICIES = [
+    pytest.param(_APP_JS, "_ATTACH", "_attachmentKind", id="interactive"),
+    pytest.param(_CONSOLE_APP_JS, "_HOME", "_homeAttachmentKind", id="console"),
+]
+
+
+def _attach_policy_source(src: str, prefix: str) -> str:
+    """The ``<prefix>_*`` attachment constants declared in ``src``, as runnable JS."""
+    decls = []
+    for name in _ATTACH_CONST_NAMES:
+        m = re.search(
+            rf"^const {prefix}_{name} = (?:\[.*?\]|\{{.*?\}}|[^\n]*?);$", src, re.S | re.M
+        )
+        assert m, f"{prefix}_{name} not found"
+        decls.append(m.group(0))
+    return "\n".join(decls)
+
+
+def _attach_policy(path: Path, prefix: str) -> dict[str, Any]:
+    src = path.read_text(encoding="utf-8")
+    fields = ", ".join(f"{name}: {prefix}_{name}" for name in _ATTACH_CONST_NAMES)
+    proc = run_node_source(
+        _attach_policy_source(src, prefix) + f"\nconsole.log(JSON.stringify({{ {fields} }}));"
+    )
+    assert proc.returncode == 0, proc.stderr
+    policy: dict[str, Any] = json.loads(proc.stdout)
+    return policy
+
+
+def _default_accept_entries() -> set[str]:
+    """The entries of the shared composer's ATTACH_DEFAULT_ACCEPT (a workstream's own picker)."""
+    composer = (_APP_JS.parents[2] / "shared_static" / "composer.js").read_text(encoding="utf-8")
+    decl = re.search(r"var ATTACH_DEFAULT_ACCEPT =(.*?);", composer, re.S)
+    assert decl, "ATTACH_DEFAULT_ACCEPT not found in composer.js"
+    return set("".join(re.findall(r'"([^"]*)"', decl.group(1))).split(","))
+
+
+def test_pre_create_attachment_limits_match_the_server() -> None:
+    """Both copies hold the server's caps and types, so they refuse what a create would."""
+    from turnstone.core.attachments import (
+        _TEXT_ATTACHMENT_EXTENSIONS,
+        ALLOWED_AUDIO_MIMES,
+        AUDIO_SIZE_CAP,
+        CREATE_ATTACHMENTS_TOTAL_CAP,
+        IMAGE_SIZE_CAP,
+        MODEL_IMAGE_MIMES,
+        PDF_SIZE_CAP,
+        TEXT_DOC_SIZE_CAP,
+    )
+
+    interactive = _attach_policy(_APP_JS, "_ATTACH")
+    assert interactive["KIND_CAPS"] == {
+        "image": IMAGE_SIZE_CAP,
+        "pdf": PDF_SIZE_CAP,
+        "audio": AUDIO_SIZE_CAP,
+        "text": TEXT_DOC_SIZE_CAP,
+    }
+    assert interactive["TOTAL_CAP"] == CREATE_ATTACHMENTS_TOTAL_CAP
+    assert interactive["MAX_FILES"] == 10
+    assert sorted(interactive["IMAGE_MIMES"]) == sorted(MODEL_IMAGE_MIMES)
+    assert sorted(interactive["AUDIO_MIMES"]) == sorted(ALLOWED_AUDIO_MIMES)
+    assert sorted(interactive["TEXT_EXTENSIONS"]) == sorted(_TEXT_ATTACHMENT_EXTENSIONS)
+    # The audio extensions are the rest of a workstream picker's extensions.
+    picker_extensions = {e for e in _default_accept_entries() if e.startswith(".")}
+    assert sorted(interactive["AUDIO_EXTENSIONS"]) == sorted(
+        picker_extensions - _TEXT_ATTACHMENT_EXTENSIONS - {".pdf"}
+    )
+    assert _attach_policy(_CONSOLE_APP_JS, "_HOME") == interactive
+
+
+@pytest.mark.parametrize(("path", "prefix", "kind_fn"), _ATTACH_POLICIES)
+def test_pre_create_attachment_kinds(path: Path, prefix: str, kind_fn: str) -> None:
+    """PDFs and audio are taken by type or by extension; types the server refuses are not."""
+    src = path.read_text(encoding="utf-8")
+    cases = {
+        ("a.pdf", "application/pdf"): "pdf",
+        ("b.PDF", ""): "pdf",
+        ("c.mp3", "audio/mpeg"): "audio",
+        ("d.m4a", "audio/x-m4a"): "audio",
+        ("e.wav", ""): "audio",
+        ("f.png", "image/png"): "image",
+        ("g.gif", "image/gif"): "",
+        ("h.md", ""): "text",
+        ("i.exe", "application/x-msdownload"): "",
+    }
+    files = [{"name": name, "type": mime} for name, mime in cases]
+    harness = "\n".join(
+        [
+            _attach_policy_source(src, prefix),
+            extract_braced(src, f"function {kind_fn}(file) {{"),
+            f"const files = {json.dumps(files)};",
+            f"console.log(JSON.stringify(files.map((f) => {kind_fn}(f))));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == list(cases.values())
+
+
+_ATTACH_SIZE_HELPERS = """
+const MiB = 1024 * 1024;
+const pdf = (size) => ({ name: "doc.pdf", type: "application/pdf", size });
+const mp3 = (size) => ({ name: "talk.mp3", type: "audio/mpeg", size });
+"""
+
+
+def test_pre_create_attachment_refusals() -> None:
+    """Each kind keeps its own cap, and one create's files share the total."""
+    src = _APP_JS.read_text(encoding="utf-8")
+    harness = "\n".join(
+        [
+            _attach_policy_source(src, "_ATTACH"),
+            extract_braced(src, "function _formatAttachSize(n) {"),
+            extract_braced(src, "function _attachmentKind(file) {"),
+            extract_braced(src, "function _attachmentRefusal(file, staged) {"),
+            _ATTACH_SIZE_HELPERS,
+            "const staged = [pdf(30 * MiB), mp3(24 * MiB)];",
+            "console.log(JSON.stringify([",
+            "  _attachmentRefusal(pdf(32 * MiB), []),",
+            "  _attachmentRefusal(pdf(32 * MiB + 1), []),",
+            "  _attachmentRefusal(mp3(25 * MiB + 1), []),",
+            "  _attachmentRefusal(pdf(10 * MiB), staged),",
+            "  _attachmentRefusal(pdf(10 * MiB + 1), staged),",
+            "  _attachmentRefusal(pdf(1), Array(10).fill(pdf(1))),",
+            '  _attachmentRefusal({ name: "x.exe", type: "", size: 1 }, []),',
+            "]));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "",
+        "doc.pdf exceeds the 32.0 MB cap",
+        "talk.mp3 exceeds the 25.0 MB cap",
+        "",
+        "doc.pdf would take the attachments over the 64.0 MB total",
+        "At most 10 attachments per workstream",
+        "Unsupported file type: x.exe (allowed: png/jpeg/webp images, PDF, audio, text)",
+    ]
+
+
+def test_both_pre_create_composers_stage_through_the_shared_check() -> None:
+    src = _APP_JS.read_text(encoding="utf-8")
+    for fn, staged in (
+        ("_newWsAddFiles", "_newWsStagedFiles"),
+        ("_addDashboardFiles", "_dashboardStagedFiles"),
+    ):
+        body = slice_braced_block(src, src.index(f"function {fn}(files) {{"))
+        assert body and f"_attachmentRefusal(f, {staged})" in body, fn
+
+
+def _console_stage_harness() -> list[str]:
+    """``_homeStageFile`` and the launcher code it calls, with the page around it stubbed."""
+    src = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    return [
+        _attach_policy_source(src, "_HOME"),
+        extract_braced(src, "function _homeFormatSize(n) {"),
+        extract_braced(src, "function _homeAttachmentKind(file) {"),
+        extract_braced(src, "function _homeStageFile(file) {"),
+        "globalThis.window = {};",
+        'let _launcherKind = "coordinator";',
+        "let _homeStagedFiles = [];",
+        'let lastError = "";',
+        "function _homeShowError(msg) { lastError = msg; }",
+        "function _homeRenderChips() {}",
+        _ATTACH_SIZE_HELPERS,
+        "const named = (f, name) => ({ ...f, name });",
+    ]
+
+
+def test_console_launcher_stages_pdf_and_audio_within_the_total() -> None:
+    harness = "\n".join(
+        [
+            *_console_stage_harness(),
+            "const steps = [",
+            "  pdf(33 * MiB), pdf(30 * MiB), mp3(24 * MiB), pdf(10 * MiB + 1), pdf(10 * MiB),",
+            "];",
+            "console.log(JSON.stringify(steps.map((f) => _homeStageFile(f) || lastError)));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "doc.pdf exceeds the 32.0 MB cap",
+        True,
+        True,
+        "doc.pdf would take the attachments over the 64.0 MB total",
+        True,
+    ]
+
+
+def test_console_launcher_refuses_an_eleventh_file_and_an_unsupported_type() -> None:
+    harness = "\n".join(
+        [
+            *_console_stage_harness(),
+            "for (let i = 0; i < 10; i++) {",
+            '  _homeStageFile({ name: "n" + i + ".md", type: "text/markdown", size: 1 });',
+            "}",
+            "const results = [",
+            '  _homeStageFile({ name: "n10.md", type: "text/markdown", size: 1 }) || lastError,',
+            "];",
+            "_homeStagedFiles = [];",
+            "results.push(",
+            '  _homeStageFile({ name: "x.exe", type: "application/x-msdownload", size: 1 }) ||',
+            "    lastError,",
+            ");",
+            "console.log(JSON.stringify(results));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "At most 10 attachments per workstream",
+        "Unsupported file type: x.exe (allowed: png/jpeg/webp images, PDF, audio, text)",
+    ]
+
+
+def test_console_launcher_keeps_a_refusal_shown_when_later_files_are_accepted() -> None:
+    # The composer stages a drop one file at a time, so a file accepted after a refused one
+    # must not clear the refusal, or the user never learns why a file is missing.
+    harness = "\n".join(
+        [
+            *_console_stage_harness(),
+            "const drop = [",
+            '  named(pdf(30 * MiB), "a.pdf"),',
+            '  named(pdf(30 * MiB), "b.pdf"),',
+            '  named(pdf(10 * MiB), "c.pdf"),',
+            '  { name: "notes.md", type: "text/markdown", size: 10 },',
+            "];",
+            "drop.forEach((f) => _homeStageFile(f));",
+            "const staged = _homeStagedFiles.map((f) => f.name);",
+            "console.log(JSON.stringify({ staged, shown: lastError }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "staged": ["a.pdf", "b.pdf", "notes.md"],
+        "shown": "c.pdf would take the attachments over the 64.0 MB total",
+    }
+
+
+@pytest.mark.parametrize(
+    ("fn", "staged", "error_fn", "render_fns"),
+    [
+        ("_newWsAddFiles", "_newWsStagedFiles", "_newWsError", ["_newWsRenderChips"]),
+        (
+            "_addDashboardFiles",
+            "_dashboardStagedFiles",
+            "_dashboardError",
+            ["_renderDashboardChips", "_refreshDashboardSubmitLabel"],
+        ),
+    ],
+    ids=["new-workstream", "dashboard"],
+)
+def test_a_refused_file_mid_batch_is_skipped_and_the_rest_staged(
+    fn: str, staged: str, error_fn: str, render_fns: list[str]
+) -> None:
+    # A refused file is named and skipped, and the files around it are staged and shown as
+    # chips, as the console launcher does, so nothing goes out with the create unseen.
+    src = _APP_JS.read_text(encoding="utf-8")
+    harness = "\n".join(
+        [
+            _attach_policy_source(src, "_ATTACH"),
+            extract_braced(src, "function _formatAttachSize(n) {"),
+            extract_braced(src, "function _attachmentKind(file) {"),
+            extract_braced(src, "function _attachmentRefusal(file, staged) {"),
+            extract_braced(src, f"function {fn}(files) {{"),
+            "globalThis.window = {};",
+            f"let {staged} = [];",
+            'let shownError = "";',
+            "let renderedNames = null;",
+            f"function {error_fn}(msg) {{ shownError = msg; }}",
+            *[
+                f"function {name}() {{ renderedNames = {staged}.map((f) => f.name); }}"
+                for name in render_fns
+            ],
+            _ATTACH_SIZE_HELPERS,
+            'const drop = ["a.pdf", "b.pdf", "c.pdf"].map((name) => ({ ...pdf(30 * MiB), name }));',
+            'drop.push({ name: "notes.md", type: "text/markdown", size: 10 });',
+            f"const handled = {fn}(drop);",
+            "console.log(JSON.stringify({ handled, renderedNames, shownError }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "handled": True,
+        "renderedNames": ["a.pdf", "b.pdf", "notes.md"],
+        "shownError": "c.pdf would take the attachments over the 64.0 MB total",
+    }
+
+
+def _dashboard_submit_harness() -> list[str]:
+    """``dashboardSubmit`` and the staging it uses, with the page and the network stubbed.
+
+    The stubbed create answers ``globalThis.createReply`` when a test sets it, and succeeds
+    otherwise.
+    """
+    src = _APP_JS.read_text(encoding="utf-8")
+    return [
+        _attach_policy_source(src, "_ATTACH"),
+        extract_braced(src, "function _formatAttachSize(n) {"),
+        extract_braced(src, "function _attachmentKind(file) {"),
+        extract_braced(src, "function _attachmentRefusal(file, staged) {"),
+        extract_braced(src, "function _addDashboardFiles(files) {"),
+        extract_braced(src, "function hideDashboard() {"),
+        extract_braced(src, "function dashboardSubmit() {"),
+        """
+globalThis.window = {};
+const els = {
+  "dashboard-input": { value: "summarize these", disabled: false },
+  "dashboard-submit-btn": { disabled: false },
+  "dashboard-model": { value: "" },
+  "dashboard-judge-model": { value: "" },
+  "dashboard-skill": { value: "" },
+  "dashboard-project": { value: "" },
+  "dashboard-persona": { value: "" },
+};
+globalThis.document = { getElementById: (id) => els[id] || null };
+class FormData {
+  constructor() { this.parts = []; }
+  append(key, value) { this.parts.push([key, value && value.name ? value.name : value]); }
+}
+globalThis.FormData = FormData;
+const sent = [];
+globalThis.authFetch = (url, opts) => {
+  sent.push(opts.body instanceof FormData ? opts.body.parts : opts.body);
+  const reply = globalThis.createReply || { ws_id: "w1", name: "n" };
+  return Promise.resolve({ json: () => Promise.resolve(reply) });
+};
+const workstreams = {};
+function switchTab() {}
+let _dashboardStagedFiles = [];
+let shown = "";
+let rendered = null;
+function _dashboardError(msg) { shown = msg; }
+function _renderDashboardChips() { rendered = _dashboardStagedFiles.map((f) => f.name); }
+function _refreshDashboardSubmitLabel() {}
+""",
+        _ATTACH_SIZE_HELPERS,
+        "const named = (f, name) => ({ ...f, name });",
+    ]
+
+
+def test_a_dashboard_create_clears_its_message_and_files() -> None:
+    # The sent files would otherwise stay staged, count toward the next create's total and
+    # go out with it again. A file dropped while the create runs isn't part of it, so it stays.
+    harness = "\n".join(
+        [
+            *_dashboard_submit_harness(),
+            '_addDashboardFiles([named(pdf(30 * MiB), "a.pdf"), named(pdf(30 * MiB), "b.pdf")]);',
+            "dashboardSubmit();",
+            '_addDashboardFiles([named(pdf(1 * MiB), "late.pdf")]);',
+            "await new Promise((r) => setTimeout(r, 10));",
+            'const sentFiles = sent[0].filter(([k]) => k === "file").map(([, v]) => v);',
+            'const input = els["dashboard-input"].value;',
+            "const staged = _dashboardStagedFiles.map((f) => f.name);",
+            "const afterCreate = { staged, rendered, input };",
+            '_addDashboardFiles([named(pdf(10 * MiB), "next.pdf")]);',
+            "const next = _dashboardStagedFiles.map((f) => f.name);",
+            "console.log(JSON.stringify({ sentFiles, afterCreate, next, shown }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "sentFiles": ["a.pdf", "b.pdf"],
+        "afterCreate": {"staged": ["late.pdf"], "rendered": ["late.pdf"], "input": ""},
+        "next": ["late.pdf", "next.pdf"],
+        "shown": "",
+    }
+
+
+def test_a_failed_dashboard_create_keeps_its_message_and_files() -> None:
+    harness = "\n".join(
+        [
+            *_dashboard_submit_harness(),
+            'globalThis.createReply = { error: "No capacity" };',
+            '_addDashboardFiles([named(pdf(1 * MiB), "a.pdf")]);',
+            "dashboardSubmit();",
+            "await new Promise((r) => setTimeout(r, 10));",
+            "const staged = _dashboardStagedFiles.map((f) => f.name);",
+            'const input = els["dashboard-input"].value;',
+            "console.log(JSON.stringify({ staged, input, shown }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "staged": ["a.pdf"],
+        "input": "summarize these",
+        "shown": "No capacity",
+    }
+
+
+def test_pre_create_pickers_offer_what_the_workstream_composer_takes() -> None:
+    """The dashboard and new-workstream pickers list every type a workstream's composer does."""
+    shared = _default_accept_entries()
+    index = (_APP_JS.parent / "index.html").read_text(encoding="utf-8")
+    for input_id in ("dashboard-attach-input", "new-ws-attach-input"):
+        tag = re.search(r'<input[^>]*id="' + input_id + r'"[^>]*>', index, re.S)
+        accept = tag and re.search(r'accept="([^"]*)"', tag.group(0))
+        assert accept, input_id
+        missing = shared - set(accept.group(1).split(","))
+        assert not missing, (input_id, sorted(missing))

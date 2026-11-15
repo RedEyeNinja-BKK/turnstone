@@ -1,0 +1,117 @@
+@startuml
+!theme plain
+title Turnstone — Tool Pipeline: Prepare, Approve, Execute, Fold
+
+start
+
+partition "Phase 1 — Prepare and assess" #E8F5E9 {
+    :Receive tool calls from one assistant Turn;
+    :Capture the generation's cancel event\nand acting principal;
+
+    while (more tool calls?) is (yes)
+        :Parse arguments and dispatch to\nthe tool-specific preparer;
+        if (preparation succeeds?) then (yes)
+            :Build item: call_id, name, header, preview,\nneeds_approval, execute closure;
+        else (no)
+            :Build an error item for this call only;\nkeep sibling calls valid;
+        endif
+        :Attach operation-local cancellation witness\nand pinned principal;
+    endwhile (no)
+
+    :Reject only unsafe ordering shapes\n(for example tasks read + write in one batch);
+    :Run heuristic intent assessment immediately;
+    :Start generation-pinned LLM judge in background;
+    :Stamp one immutable Smart Approval\nsettings snapshot on the batch;
+
+    note right
+      Preparation is per-call isolated: one bad preparer
+      becomes one error Tool Turn rather than orphaning the
+      assistant's entire tool-call set.
+    end note
+}
+
+partition "Phase 2 — Approval cycle" #FFF3E0 {
+    :Apply explicit bypasses:\nskill / always / policy / blanket;
+
+    if (Smart Approvals enabled?) then (yes)
+        :Wait within the batch's bounded judge deadline;
+        :Auto-approve only LLM approve verdicts\nat or above the captured threshold;
+    endif
+
+    if (human-gated items remain?) then (yes)
+        :Acquire approval-publication lease;
+        :Register independent ApprovalCycle\n(cycle_id, call_ids, event, result);
+        :Publish approve_request + heuristic verdicts;
+
+        note right
+          Parallel task agents can hold several cycles at once.
+          A decision selects one cycle_id / call_id (or the oldest
+          cycle for a legacy selector-less client). Double resolve
+          is a guarded no-op; one cycle cannot wake a sibling.
+        end note
+
+        if (operator approves?) then (yes)
+            :Record decision and optional feedback;
+        else (denies / policy blocks)
+            :Mark only pending items denied;\nEffectStatus = none;
+        endif
+        :Publish approval_resolved;\nunregister this cycle;
+    else (all bypassed / auto-approved)
+        :Publish tool_info with the exact\nauto-approve reason per item;
+    endif
+
+    if (owning operation cancelled?) then (yes)
+        :Cancel only cycles carrying that witness;
+        :Stage every unstarted call as\nEffectStatus = none;
+        stop
+    endif
+}
+
+partition "Phase 3 — Execute" #E3F2FD {
+    :Generation + cancellation checkpoint;
+
+    if (batch requires serial ordering?) then (yes)
+        :Execute in provider order;
+    else (no)
+        :Execute via bounded ThreadPoolExecutor;
+    endif
+
+    note right
+      Each worker marks its call started only after the final
+      generation/cancel check. A missing result after that edge is
+      conservatively unknown; an unstarted call is definitively none.
+    end note
+
+    :Stream tool chunks to the matching call card;
+    :Capture result / error / preview and effect disposition;
+
+    if (Stop interrupts execution?) then (yes)
+        :Abort child model scopes and subprocess groups;
+        :Synthesize cancellation receipts;
+        note right
+          EffectStatus vocabulary:
+          committed / none / unknown /
+          partial / rolled_back.
+
+          Observed but unreviewed bytes are omitted from the
+          model-facing receipt; effect truth is retained.
+        end note
+    endif
+}
+
+partition "Phase 4 — Guard and atomic fold" #F3E5F5 {
+    if (compaction already owed?) then (yes)
+        :Compact before sizing/folding results;\npreserve the assistant tool-call Turn;
+    endif
+
+    :Truncate each result against the remaining shared budget;
+    :Run heuristic + optional LLM output guard;
+    :Re-check generation after guard work;
+
+    :Under one generation commit, append the complete\nTool Turn block + advisories + feedback;
+    :Persist rows and effect/preview metadata\non the ordered durability lane;
+    :Return results to the next model turn;
+}
+
+stop
+@enduml

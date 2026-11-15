@@ -1,0 +1,1739 @@
+"""Static smoke guards for the shared_static ES-module bundles.
+
+The whole shared substrate is ES modules now (utils/toast/auth/composer/…
+followed shell.js + pane.js; only theme.js — FOUC-critical — and the vendored
+libs stay classic).  This mirrors ``test_app_js.py``'s posture — Python-side
+string / parse assertions that catch the silent one-line regression — adapted
+for module semantics: ``node --check`` only parses ``import`` / ``export``
+when the file carries an ``.mjs`` extension, so the parse guard copies to a
+temp ``.mjs`` first.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+import tempfile
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit
+
+import pytest
+
+from tests._js_harness_helpers import (
+    extract_braced,
+    node_skip,
+    run_node_source,
+    slice_braced_block,
+    strip_js_comments,
+)
+
+_ROOT = Path(__file__).resolve().parent.parent
+_SHARED = _ROOT / "turnstone/shared_static"
+_SHELL_JS = _SHARED / "shell.js"
+_PANE_JS = _SHARED / "pane.js"
+_SHELL_CSS = _SHARED / "shell.css"
+_CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
+_CONSOLE_APP = _ROOT / "turnstone/console/static/app.js"
+_CONSOLE_ADMIN = _ROOT / "turnstone/console/static/admin.js"
+_UI_INDEX = _ROOT / "turnstone/ui/static/index.html"
+
+_RAIL_JS = _SHARED / "rail.js"
+
+# Every shared ES module — parse-guarded with module semantics.  (auth/kb/
+# utils moved here from test_app_js's classic sweep when they were converted.)
+_ESM_BUNDLES = [
+    _SHELL_JS,
+    _PANE_JS,
+    _RAIL_JS,
+    _SHARED / "utils.js",
+    _SHARED / "toast.js",
+    _SHARED / "kb.js",
+    _SHARED / "cards.js",
+    _SHARED / "auth.js",
+    _SHARED / "renderer.js",
+    _SHARED / "status_bar.js",
+    _SHARED / "composer_paste_text.js",
+    _SHARED / "composer.js",
+    _SHARED / "composer_attachments.js",
+    _SHARED / "composer_queue.js",
+    _SHARED / "interactive.js",
+    _SHARED / "conversation.js",
+    _SHARED / "transcript_presentation.js",
+    _SHARED / "preview.js",
+    _SHARED / "filesystem.js",
+    _SHARED / "redact_credentials.js",
+    _SHARED / "mcp_error.js",
+    _SHARED / "copy_actions.js",
+    _SHARED / "tool_projection.js",
+    _SHARED / "avatar.js",
+]
+
+# Sink scan: everything except renderer.js — the one sanctioned HTML-string
+# producer (its output is consumed via setSafeHtml; see utils.js docstring).
+_ESM_SINK_BUNDLES = [b for b in _ESM_BUNDLES if b.name != "renderer.js"]
+
+# Style ratchet: var-free modules only.  The lifted legacy bundles (cards/
+# renderer/status_bar/composer*) keep their pre-module `var` style — converting
+# them was a loader change, not a rewrite; don't grow NEW var use elsewhere.
+_ESM_NO_VAR_BUNDLES = [
+    _SHELL_JS,
+    _PANE_JS,
+    _RAIL_JS,
+    _SHARED / "utils.js",
+    _SHARED / "toast.js",
+    _SHARED / "kb.js",
+    _SHARED / "auth.js",
+    _SHARED / "composer_paste_text.js",
+    _SHARED / "interactive.js",
+    _SHARED / "conversation.js",
+    _SHARED / "transcript_presentation.js",
+    _SHARED / "preview.js",
+    _SHARED / "filesystem.js",
+    _SHARED / "redact_credentials.js",
+    _SHARED / "mcp_error.js",
+    _SHARED / "copy_actions.js",
+    _SHARED / "tool_projection.js",
+    _SHARED / "avatar.js",
+]
+
+# The same unsafe DOM-write / dynamic-code sink set that ``test_app_js.py``
+# pins for the classic bundles — kept local so the two test files stay
+# independent.  Covers inner/outer-HTML assignment (plain + concat),
+# insertAdjacentHTML, legacy doc-write, string-eval, dynamic Function, and
+# string-first-arg timer scheduling.
+_UNSAFE_CODE_SINK_RE = re.compile(
+    r"\.(?:inner|outer)HTML\s*\+?=(?!=)"
+    r"|\.insertAdjacentHTML\s*\("
+    r"|document\.write\("
+    r"|\beval\s*\("
+    r"|\bnew\s+Function\s*\("
+    r"|\bset(?:Timeout|Interval)\s*\(\s*['\"`]"
+)
+
+
+@pytest.mark.parametrize("bundle", _ESM_BUNDLES, ids=lambda p: p.name)
+def test_esm_bundle_parses(bundle: Path) -> None:
+    """``node --check`` each ESM bundle.  Copied to a temp ``.mjs`` so node
+    parses it with module semantics (``import`` / ``export``).  Skipped if
+    ``node`` is not on PATH so local dev without Node still passes."""
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    with tempfile.TemporaryDirectory() as td:
+        mjs = Path(td) / (bundle.stem + ".mjs")
+        mjs.write_text(bundle.read_text(encoding="utf-8"), encoding="utf-8")
+        proc = subprocess.run(
+            ["node", "--check", str(mjs)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    assert proc.returncode == 0, f"node --check failed for {bundle.name}:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize("bundle", _ESM_SINK_BUNDLES, ids=lambda p: p.name)
+def test_esm_bundle_no_unsafe_sink(bundle: Path) -> None:
+    """The shell builds DOM with createElement / textContent / append — never
+    an HTML-string sink.  Keep it that way (XSS-free by construction once the
+    rail starts rendering cluster/workstream data in steps 2-3)."""
+    body = bundle.read_text(encoding="utf-8")
+    offenders = [body.count("\n", 0, m.start()) + 1 for m in _UNSAFE_CODE_SINK_RE.finditer(body)]
+    assert not offenders, f"{bundle.name}: unsafe DOM/code sink at line(s) {offenders[:10]}"
+
+
+@pytest.mark.parametrize("bundle", _ESM_NO_VAR_BUNDLES, ids=lambda p: p.name)
+def test_esm_bundle_has_no_var_decl(bundle: Path) -> None:
+    """Match the modern-keyword posture of the swept classic bundles."""
+    body = bundle.read_text(encoding="utf-8")
+    stray = re.findall(r"^\s*var\s+\w", body, re.MULTILINE) + re.findall(
+        r"\bfor\s*\(\s*var\s+", body
+    )
+    assert not stray, f"{bundle.name}: {len(stray)} stray `var` — use const/let."
+
+
+def test_pane_exports_manager_and_base() -> None:
+    """``pane.js`` must export both classes ``shell.js`` imports."""
+    body = _PANE_JS.read_text(encoding="utf-8")
+    assert "export class PaneManager" in body
+    assert "export class ShellPane" in body
+
+
+def test_shell_drives_legacy_boot_and_registers_dashboard() -> None:
+    """The step-1 handoff has a few load-bearing wires: the shell imports the
+    PaneManager, registers the default dashboard pane, and drives the classic
+    app boot once the rail + status DOM exist.  It also relocates the cluster
+    stream's status targets by id (re-point without rewiring connectSSE)."""
+    body = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'from "./pane.js"' in body, "shell must import from pane.js"
+    assert "window.TS_APP.boot()" in body, "shell must drive the legacy app boot"
+    assert 'registerType("dashboard"' in body, "shell must register the dashboard pane"
+    assert 'getElementById("status-bar")' in body, (
+        "shell must relocate the connectSSE status target"
+    )
+    assert 'from "./rail.js"' in body, "shell must import the rail module"
+    assert "mountRail(" in body, "shell must mount the live rail (Cluster + Workspaces)"
+
+
+def test_console_index_loads_shell_module_and_caps() -> None:
+    """The console index must wire the ESM shell, its stylesheet, and the
+    capability flags — losing any of them silently un-installs the L-shell."""
+    body = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert '<script type="module" src="/shared/shell.js">' in body, (
+        "console index must load the shell ES module"
+    )
+    assert "/shared/shell.css" in body, "console index must link shell.css"
+    assert "TURNSTONE_SHELL_CAPS" in body, "console index must set the shell capability flags"
+
+
+@pytest.mark.parametrize("index", [_CONSOLE_INDEX, _UI_INDEX], ids=["console", "node"])
+def test_served_module_graph_has_one_auth_instance(index: Path) -> None:
+    """URL queries identify distinct ESM instances even when file contents match.
+
+    Two auth instances share sessionStorage but own separate change listeners;
+    the first writer can suppress the second instance's login notification.
+    Traverse the actual versioned entry points and static imports as the browser
+    resolves them, so either duplicating auth or losing it fails this guard.
+    """
+    from turnstone.core.web_helpers import version_html
+
+    class ModuleScripts(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.urls: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "script" and attrs.get("type") == "module" and attrs.get("src"):
+                self.urls.append(attrs["src"])
+
+    parser = ModuleScripts()
+    parser.feed(version_html(index.read_text()))
+    pending = [urljoin("https://console.test/", url) for url in parser.urls]
+    seen: set[str] = set()
+    while pending:
+        url = pending.pop()
+        if url in seen:
+            continue
+        seen.add(url)
+        path = urlsplit(url).path
+        source = (
+            _SHARED / path.removeprefix("/shared/")
+            if path.startswith("/shared/")
+            else index.parent / path.removeprefix("/static/")
+        )
+        body = strip_js_comments(source.read_text())
+        imports = re.findall(
+            r"^\s*import\s+(?:[^;]*?\bfrom\s+)?[\"']([^\"']+)[\"']", body, re.MULTILINE
+        )
+        pending.extend(urljoin(url, specifier) for specifier in imports)
+    auth_urls = {url for url in seen if urlsplit(url).path == "/shared/auth.js"}
+    assert len(auth_urls) == 1, auth_urls
+
+
+def test_persona_picker_surfaces_wired() -> None:
+    """The persona creation/authoring surfaces are wired the same way every
+    other feature is — losing an id or the shared data-layer script tag
+    silently drops the picker without a JS error.
+
+    The standalone server UI carries BOTH creation pickers (the quick-create
+    ``dashboard-persona`` select and the full ``new-ws-persona`` dialog select)
+    plus the shared ``personas.js`` data layer; the console carries the same
+    data layer plus the admin authoring ``persona-shelf`` dialog, mounted by
+    admin.js.  (The console launcher's own picker is a composer OPTION field,
+    not a static id — see test_console_launcher_routes_by_kind.)
+    """
+    ui_index = _UI_INDEX.read_text(encoding="utf-8")
+    assert 'id="new-ws-persona"' in ui_index, "the new-ws dialog must carry the persona select"
+    assert 'id="dashboard-persona"' in ui_index, "the quick-create persona select must exist"
+    assert '<script type="module" src="/shared/personas.js">' in ui_index, (
+        "the standalone UI must load the shared personas data layer"
+    )
+    console_index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert '<script type="module" src="/shared/personas.js">' in console_index, (
+        "the console must load the shared personas data layer"
+    )
+    assert 'id="persona-shelf"' in console_index, "the admin persona authoring shelf must exist"
+    admin = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    assert "function loadAdminPersonas(" in admin, "admin.js must mount the persona list loader"
+    assert "function submitPersonaShelf(" in admin, "admin.js must wire the persona-shelf submit"
+    assert 'tab: "personas"' in admin, "the Personas admin tab must be in the IA (perm-gated)"
+
+
+def test_console_app_exposes_boot_for_shell() -> None:
+    """app.js must expose ``window.TS_APP.boot`` (driven by the shell) rather
+    than auto-running init at parse, while keeping ``window.onLoginSuccess`` —
+    the path that actually starts the Tier-1 stream on login / refresh."""
+    body = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "window.TS_APP.boot = function" in body, (
+        "app.js must expose TS_APP.boot for the shell to drive"
+    )
+    assert "window.onLoginSuccess" in body, "the SSE-start hook must remain intact"
+
+
+def test_rail_seam_exposed_and_bottom_bar_retired() -> None:
+    """Step 2: app.js exposes the Tier-1 rail seam (getClusterState + onRender,
+    fired from renderFromState), and the legacy bottom #cluster-status-bar + its
+    renderers are GONE (the rail replaces it — single writer per region)."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "window.TS_APP.getClusterState" in app, "app.js must expose getClusterState for the rail"
+    assert "window.TS_APP.onRender" in app, "app.js must expose the onRender subscribe hook"
+    assert "_fireRenderSubs()" in app, "renderFromState must fire rail subscribers"
+    for gone in ("renderStatusBar", "renderNodePicker", "cluster-status-bar", "csb-"):
+        assert gone not in app, f"retired bottom-bar symbol {gone!r} must be gone from app.js"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "cluster-status-bar" not in index, "the #cluster-status-bar markup must be deleted"
+
+
+def test_rail_conveys_state_and_kind() -> None:
+    """rail.js conveys state by shape+colour via the shared ui-base .ui-glyph-*
+    vocabulary (not a private glyph class), nests children via the shared bucket
+    helper, and tags sessions by KIND (COORD/INT)."""
+    body = _RAIL_JS.read_text(encoding="utf-8")
+    assert "ui-glyph-" in body, "rail must use ui-base .ui-glyph-* for state (shape+colour)"
+    assert "bucketByParent" in body, "rail must nest children via the shared bucket helper"
+    assert "COORD" in body and "INT" in body, "rail must tag sessions by kind"
+
+
+def test_console_launcher_routes_by_kind() -> None:
+    """Step 2b: the dashboard launcher carries a workstream kind, scope-gates
+    the interactive option, branches submit + create by kind (coordinator =
+    console-local, interactive = node-proxy), routes saved activation to the
+    node for interactive rows, and the active-coordinators home table is gone
+    (the rail covers it).  Pins the console-JS convention for the new logic."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "function _setLauncherKind" in app and "_launcherKind" in app
+    assert 'perm: "workstreams.create"' in app, "launcher must scope-gate the interactive kind"
+    assert 'kind === "interactive"' in app, "submitHomeCoord must branch by kind"
+    assert "function _createInteractive" in app, "the interactive create path must exist"
+    assert '"/v1/api/cluster/workstreams/new"' in app, (
+        "interactive create must use the node-proxy endpoint"
+    )
+    assert 's.kind !== "coordinator"' in app, (
+        "saved activation must route interactive sessions to their node"
+    )
+    for gone in ("function _renderHomeView", "_activeCoordsFromClusterState"):
+        assert gone not in app, f"removed home-view symbol {gone!r} must stay gone from app.js"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert 'id="active-coordinators"' not in index, (
+        "the active-coordinators table must be removed (the rail covers it)"
+    )
+    # "personas" now means the capability-bundle feature; the kind toggle
+    # ids were reclaimed to kind-* (launcher-kinds / kind-coordinator / ...).
+    assert 'id="launcher-kinds"' in index, "the kind toggle must be in the launcher panel"
+    assert 'id="launcher-personas"' not in index, (
+        "the old persona-squatting toggle id must stay gone"
+    )
+
+
+def test_console_launcher_creates_open_panes() -> None:
+    """Workstream-lifecycle bugfix: BOTH launcher kinds open the new session as
+    an L-shell PANE (openPane), not a full-page nav — coordinator and interactive
+    alike.  Full-page nav survives only as the shell-absent fallback."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert 'pm.openPane("coordinator", res.data.ws_id)' in app, (
+        "coordinator create must open a pane, not full-page nav"
+    )
+    assert 'pm.openPane("interactive", wsId, { nodeId: node || null })' in app, (
+        "interactive create must open a node-proxied pane with the created node as hint"
+    )
+    # The saved-row interactive resume opens a pane (the pane resolves+opens the
+    # node itself) — the bespoke restoreInteractiveSession helper is retired.
+    assert 'pm.openPane("interactive", s.ws_id, { nodeId: s.node_id || null })' in app, (
+        "saved interactive resume must open a pane with the origin node as hint"
+    )
+    assert "function restoreInteractiveSession" not in app, (
+        "restoreInteractiveSession is folded into resolveInteractiveNode + the pane factory"
+    )
+
+
+def test_console_resolve_interactive_node_seam() -> None:
+    """The console exposes resolveInteractiveNode(wsId, hint): origin-first
+    POST /open (reuse a session already loaded on its node, no duplicate), with a
+    rendezvous (/v1/api/route) fallback when the origin is gone.  This is what
+    makes a node-proxied pane survive a reload — the shell's interactive factory
+    calls it before streaming (the node /events 404s on a not-loaded ws)."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId)" in app
+    assert "/v1/api/workstreams/" in app and '"/open"' in app, (
+        "origin-first must POST the node /open verb"
+    )
+    assert '"/v1/api/route?ws_id="' in app, "must rendezvous-fallback when the origin is gone"
+
+
+def test_console_launcher_node_strategy() -> None:
+    """Workstream-lifecycle bugfix: the interactive launcher gains a node-selection
+    strategy (Least loaded | Specific node) with a live node picker, and the shared
+    composer's task hint + node fields track the active kind."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert 'id: "node_strategy"' in app and 'id: "node_id"' in app, (
+        "launcher must expose the node-strategy + node-picker option fields"
+    )
+    assert "function _applyLauncherFields" in app, (
+        "kind switch must update the hint + node-field visibility"
+    )
+    assert "function _populateLauncherNodes" in app, (
+        "the specific-node picker must populate from the live cluster snapshot"
+    )
+    resolver = slice_braced_block(app, app.index("function _resolveNodePlacement("))
+    assert resolver and 'opts.node_strategy !== "node"' in resolver, (
+        "creates must pin to the chosen node only under the Specific strategy"
+    )
+    composer = (_SHARED / "composer.js").read_text(encoding="utf-8")
+    assert "Composer.prototype.setPlaceholder" in composer, (
+        "composer must support a per-kind placeholder swap"
+    )
+    assert "Composer.prototype.setOptionFieldVisible" in composer, (
+        "composer must support conditionally revealing an option field"
+    )
+    # Review bug-1 regression: picking a node fires the composer `change` event,
+    # which re-runs _populateLauncherNodes -> setOptionChoices (a rebuild that
+    # resets the <select>).  The selection MUST be captured + restored across the
+    # rebuild, else a Specific-node session can never be launched.
+    assert 'const previous = _homeCoordComposer.getOptionValue("node_id")' in app, (
+        "_populateLauncherNodes must snapshot the current node pick before rebuild"
+    )
+    assert 'if (previous) _homeCoordComposer.setOptionValue("node_id", previous)' in app, (
+        "_populateLauncherNodes must restore the node pick after rebuild (bug-1)"
+    )
+
+
+def test_console_launcher_interactive_create_carries_attachments() -> None:
+    """Create-time attachments for interactive sessions: the launcher gate is gone
+    and ``_createInteractive`` frames a multipart body (``meta`` JSON + ``file``
+    parts, via the shared ``_createWorkstreamFetchOpts`` helper) when files are
+    staged, so the cluster proxy can forward the blobs to the node.  Was
+    previously blocked with "Attachments aren't supported for interactive
+    sessions yet"."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "Attachments aren't supported for interactive sessions yet." not in app, (
+        "the create-time interactive attachment gate must be removed"
+    )
+    # The shared create-fetch helper frames multipart (meta JSON + file parts).
+    helper = app[app.index("function _createWorkstreamFetchOpts(") :]
+    helper = helper[: helper.index("\nfunction ")]
+    assert "new FormData()" in helper
+    assert 'form.append("meta"' in helper and 'form.append("file"' in helper, (
+        "the create-fetch helper must send meta JSON + file parts"
+    )
+    # _createInteractive routes through that helper, so staged files are sent.
+    rest = app[app.index("function _createInteractive(") + 1 :]
+    cut = rest.find("\nfunction ")
+    interactive = rest if cut == -1 else rest[:cut]
+    assert "_createWorkstreamFetchOpts(body, files)" in interactive, (
+        "_createInteractive must build its create body via the shared helper"
+    )
+
+
+def test_console_launcher_scheduled_kind() -> None:
+    """#1090: the dashboard launcher carries a third kind, Scheduled — a
+    schedule the console's scheduler later dispatches as an interactive
+    workstream.  Pins the radio + its scope gate, the kind list the toggle
+    walks (no two-kind ternary cycle), the interactive field set minus judge
+    model + attachments, the When builder mounted from the shared template,
+    and the submit branch posting the schedule create."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert 'id="kind-scheduled"' in index, "the third kind radio must be in the toggle"
+    assert 'id="launcher-when"' in index and 'id="launcher-when-mount"' in index, (
+        "the When builder needs its section + mount under the composer"
+    )
+    assert 'id="schedule-when-template"' in index, "the builder markup must be a template"
+    assert '<script src="/static/schedule_builder.js"></script>' in index
+    assert index.index("/static/schedule_builder.js") < index.index('src="/static/admin.js"'), (
+        "the builder script must load before its classic consumers"
+    )
+    for fragment in ('kind: "scheduled"', 'id: "kind-scheduled"', 'perm: "admin.schedules"'):
+        assert fragment in app, f"the kind list must carry the Scheduled entry ({fragment})"
+    # The registry is the one place a kind's permission is named: the gate is
+    # derived from `perm`, and the named helpers read the registry.
+    assert "return _consoleHasPermission(k.perm);" in app, (
+        "each kind's gate must be derived from its registry perm"
+    )
+    assert '_consoleHasPermission(_launcherPerm("coordinator"))' in app, (
+        "_hasCoordPermission must read the registry, not restate the string"
+    )
+    assert "function _hasSchedulePermission" not in app, (
+        "no per-kind permission helper beside the registry (the gate is derived)"
+    )
+    # One permission gate for every kind, driven by the registry.
+    submit = slice_braced_block(app, app.index("function submitHomeCoord("))
+    assert submit and 'showToast((entry ? entry.perm : kind) + " permission required")' in submit
+    assert "_consoleHasPermission(" not in submit, (
+        "submit must not hardcode a per-kind permission check beside the registry"
+    )
+    # Success bookkeeping: the typed name belongs to the schedule just made,
+    # and a composer the user has moved on from is left alone.
+    create = slice_braced_block(app, app.index("function _createSchedule("))
+    assert create and '_homeCoordComposer.setOptionValue("name", "")' in create
+    assert "const submittedKind = _launcherKind;" in create
+    assert "_launcherKind !== submittedKind" in create
+    # Ctrl/Cmd+Enter submits from anywhere in the panel — the When block too.
+    assert 'const panel = document.getElementById("coord-composer-panel");' in app, (
+        "the keyboard submit must cover the whole launcher panel, not just the composer"
+    )
+    for gone in (
+        '? _launcherKind === "interactive"',
+        'const map = {\n    "kind-coordinator": "coordinator",',
+    ):
+        assert gone not in app, f"two-kind hardcoding {gone!r} must be gone (the list walks)"
+    assert "function _launcherPersonaKind" in app, (
+        "Scheduled must draw personas from the interactive shelf"
+    )
+    assert "function _createSchedule" in app and 'kind === "scheduled"' in app, (
+        "submitHomeCoord must branch to the schedule create"
+    )
+    assert 'authFetch("/v1/api/admin/schedules", {' in app
+    assert "_launcherWhen.compile()" in app, "the create must compile timing via the builder"
+    for creator in ("function _createInteractive(", "function _createSchedule("):
+        body = slice_braced_block(app, app.index(creator))
+        assert body and "_resolveNodePlacement(opts)" in body, (
+            f"{creator} must resolve node placement through the shared resolver"
+        )
+        assert 'opts.node_strategy === "node"' not in body, (
+            f"{creator} must not restate the placement rule beside the resolver"
+        )
+    assert "function _scheduleNameFromTask" in app, "an empty Name derives from the task"
+    assert 'setOptionFieldVisible("judge_model", !scheduled)' in app
+    fields = slice_braced_block(app, app.index("function _applyLauncherFields("))
+    assert fields and "setAttachVisible(!scheduled)" in fields, (
+        "the paperclip must be hidden through the composer's API"
+    )
+    assert "attachBtn.hidden" not in fields, (
+        "the kind switch must not poke the composer's attach button directly"
+    )
+    stage = slice_braced_block(app, app.index("function _homeStageFile("))
+    assert stage and 'if (_launcherKind === "scheduled") {' in stage, (
+        "_homeStageFile must refuse attachments in the Scheduled kind"
+    )
+    # A large paste is synthesized into a File by the composer; refusing it
+    # keeps the text inline, which is right for a schedule's task — so that
+    # case must stay silent while a real drop still gets the message.
+    assert "paste.isPastedTextFile(file)" in stage, (
+        "the Scheduled refusal must recognise a pasted-text file and stay silent for it"
+    )
+    paste_mod = (_SHARED / "composer_paste_text.js").read_text(encoding="utf-8")
+    assert "export function isPastedTextFile(file)" in paste_mod
+    assert "isPastedTextFile,\n" in paste_mod, "the window bridge must expose isPastedTextFile"
+    assert 'if (v.judge_model && _launcherKind !== "scheduled")' in app, (
+        "the options summary must not claim a judge model the Scheduled kind drops"
+    )
+    assert 'aria-controls="launcher-when"' in index, (
+        "the Scheduled radio must name the When region it reveals"
+    )
+    assert index.index('id="launcher-when"') < index.index('id="home-coord-composer-mount"'), (
+        "the When block must precede the composer (required input before the action)"
+    )
+    # One owner for the message row: kind switch and submit clear it, the
+    # schedule create confirms through it, and the confirmation is inline
+    # (nothing opens, so a toast would evaporate before the time is read).
+    assert "function _homeShowMessage" in app
+    create = slice_braced_block(app, app.index("function _createSchedule("))
+    assert create and 'Manage it under Admin › Schedules.", true)' in create
+    # The confirmation is the inline row; a toast only stands in when the
+    # user has already switched kinds while the create was in flight.
+    assert create.count("showToast(") == 1 and create.index(
+        "_launcherKind !== submittedKind"
+    ) < create.index("showToast("), (
+        "the schedule confirmation is the inline message row; a toast only for a moved-on user"
+    )
+    assert "_launcherWhen.showErrors()" in create, (
+        "a refused compile must flag the builder's untouched-mode hint as an error"
+    )
+    # Files staged before the switch are refused at submit, ahead of the
+    # files-need-a-task guard whose advice could never resolve the refusal.
+    assert submit and submit.index('kind === "scheduled" && files.length > 0') < submit.index(
+        "Add a message to send with this attachment."
+    ), "the Scheduled attachment refusal must precede the files-need-a-task guard"
+    composer = (_SHARED / "composer.js").read_text(encoding="utf-8")
+    for api in ("Composer.prototype.setSendLabel", "Composer.prototype.setAttachVisible"):
+        assert api in composer, f"the composer must expose {api} for the launcher"
+    assert re.search(r'setSendLabel\(\s*scheduled \? "Schedule" : "Start"', app), (
+        "the send button must read Schedule in the Scheduled kind"
+    )
+
+
+def test_admin_schedule_shelf_uses_shared_builder() -> None:
+    """#1090: the admin shelf's Runs builder moved to schedule_builder.js so the
+    launcher can share it.  The shelf keeps a mount + the footer read-out; the
+    in-file compile / reverse-parse / preview copies are gone."""
+    admin = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    builder = (_ROOT / "turnstone/console/static/schedule_builder.js").read_text(encoding="utf-8")
+    assert 'id="sch-when-mount"' in index, "the shelf mounts the builder"
+    assert 'id="sch-seg"' not in index and "data-sch-pane" not in index, (
+        "the shelf's inline builder markup must be gone (it lives in the template)"
+    )
+    assert "new window.TurnstoneScheduleBuilder.ScheduleBuilder(" in admin
+    for method in (
+        "_schWhen.reset()",
+        "_schWhen.preview()",
+        "_schWhen.apply(",
+        "_schWhen.compile()",
+    ):
+        assert method in admin, f"the shelf must route {method} through the builder"
+    for gone in (
+        "function _schCompile",
+        "function _cronToScheduleMode",
+        "function _schApplyTiming",
+        "function _schPreview(",
+        "function _schFmtUtc",
+        "function _localToUtcIso",
+        "function _utcToLocalDatetime",
+    ):
+        assert gone not in admin, f"{gone!r} must not survive in admin.js"
+    assert "window.TurnstoneScheduleBuilder = {" in builder
+    assert 'const TEMPLATE_ID = "schedule-when-template"' in builder
+    assert '"/v1/api/admin/schedules/preview"' in builder
+    assert "seq !== self._previewSeq" in builder, "a superseded preview must be dropped"
+    # Every id-bearing attribute of the cloned template goes through scopedId
+    # (the pure transform test_schedule_builder_js.py pins), so two instances
+    # can share a page with their labels still pointing at their own inputs.
+    for wiring in (
+        "el.id = scopedId(el.id, prefix)",
+        'el.setAttribute("for", scopedId(el.getAttribute("for"), prefix))',
+        'scopedId(el.getAttribute("aria-labelledby"), prefix)',
+    ):
+        assert wiring in builder, f"instance scoping must route {wiring!r} through scopedId"
+    assert "_schWhen.showErrors()" in admin, (
+        "a refused shelf submit must flag the builder's untouched-mode hint as an error"
+    )
+
+
+def test_schedule_when_template_ids_carry_the_instance_prefix() -> None:
+    """scopedId rewrites only ids beginning with ``when-``; an id (or a
+    ``for`` / ``aria-labelledby`` reference) added to the template without
+    it would collide between the shelf's and the launcher's instances with no
+    runtime signal, so the contract is pinned here.  The template element's
+    own id is outside the cloned content and exempt."""
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    start = index.index('<template id="schedule-when-template">') + len(
+        '<template id="schedule-when-template">'
+    )
+    block = index[start : index.index("</template>", start)]
+    refs = re.findall(r'(?:\bid|\bfor|aria-labelledby)="([^"]+)"', block)
+    assert len(refs) >= 14, "the template lost its ids"
+    bad = [r for r in refs if not r.startswith("when-")]
+    assert not bad, f"template ids / references must carry the when- prefix: {bad}"
+    # No defaults in the markup: reset() on mount writes defaultState() into
+    # every control, so a value here would be a second, dead source of truth.
+    assert 'aria-pressed="true"' not in block, "the template must not pre-press a segment"
+    assert not re.search(r'<input[^>]*\svalue="', block), "template inputs carry no default value"
+
+
+def test_pane_persists_meta_for_rehydrate() -> None:
+    """Workstream-lifecycle bugfix: PaneManager persists a pane's serializable
+    open-time meta (the interactive pane's resolved nodeId) and hands it back as
+    `extra` on rehydrate, so a reload restores a node-proxied pane onto the SAME
+    node (origin-first) instead of re-routing + duplicate-loading."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "setPaneMeta(paneId, meta)" in pane, "PaneManager must expose setPaneMeta"
+    assert "entry.meta = p.meta" in pane, "_persist must include a pane's meta when present"
+    assert "this.openPane(item.type, item.id, item.meta)" in pane, (
+        "rehydrate must hand the persisted meta back to the factory as extra"
+    )
+
+
+def test_step3_admin_pane_registered_and_manage_mounted() -> None:
+    """Step 3: the shell registers the singleton Admin pane (which adopts
+    #view-admin) and mounts the rail's Manage groups from the admin IA seam."""
+    body = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'registerType("admin"' in body, "shell must register the admin pane type"
+    assert 'getElementById("view-admin")' in body, "the admin pane must adopt #view-admin"
+    assert "mountManage(" in body, "shell must mount the rail Manage groups"
+    assert "mountManage" in body and 'from "./rail.js"' in body, (
+        "shell must import mountManage from rail.js"
+    )
+
+
+def test_step3_rail_manage_builds_from_admin_seam() -> None:
+    """rail.js builds the Manage groups from the TS_ADMIN seam — perm-filtered,
+    collapsible .grp vocabulary, programmatic DOM — and routes a row click
+    through the seam's openTab rather than reaching into admin DOM."""
+    body = _RAIL_JS.read_text(encoding="utf-8")
+    assert "export function mountManage" in body, "rail must export mountManage"
+    assert "window.TS_ADMIN" in body, "Manage must read the admin IA seam"
+    assert "isTabAllowed" in body, "Manage must permission-filter its tabs"
+    assert "openTab" in body, "a Manage row click must route through the seam's openTab"
+    assert '"grp"' in body and '"grp-items"' in body, "Manage reuses the .grp vocabulary"
+    # collapse + active state ride a class + aria, never colour alone
+    assert "aria-expanded" in body, "collapsible group heads must expose aria-expanded"
+
+
+def test_rail_manage_row_badge_hook() -> None:
+    """rail.js owns a GENERIC Manage-row count badge — `setRowBadge(tabKey, count,
+    label?)` stamps a glyph+count chip on a tab row (DS warn `.rail-badge`), and so
+    a COLLAPSED group never hides the signal, mirrors the group's running total onto
+    its head.  rail.js stays agnostic about what the count means (no consent
+    specifics here); a subsystem drives it.  `mountManage` registers the row/head
+    refs and re-applies live counts across a (re)mount.  This is the re-homing
+    target for the MCP consent badge after its settings-gear host was deleted."""
+    body = _RAIL_JS.read_text(encoding="utf-8")
+    assert "export function setRowBadge(tabKey, count, label)" in body, (
+        "rail must export the generic setRowBadge hook (mechanism, not meaning)"
+    )
+    # The chip pairs colour with a glyph (never colour alone — chip-contrast rule).
+    assert "rail-badge" in body and '"⚠"' in body, (
+        "the badge must carry a ⚠ glyph alongside the count (not colour alone)"
+    )
+    # The collapsed-group head must carry the group total so a hidden row's signal
+    # still surfaces — pin the head propagation + the per-group sum.
+    assert "function _groupCount(" in body, "the head badge must sum the group's tab counts"
+    assert "_groupEls" in body and "_rowEls" in body, (
+        "mountManage must register row + owning-group-head refs for the badge hook"
+    )
+    assert "_reapplyBadges()" in body, (
+        "a (re)mount must re-apply any live badge state (the refs are rebuilt)"
+    )
+    # rail.js stays agnostic — the hook takes a generic tabKey/count, with no
+    # consent-specific endpoint, fetch, or branch (an explanatory comment naming a
+    # sample caller is fine; logic is not).  `setRowBadge` itself never fetches.
+    badge_fn = body[body.index("export function setRowBadge") :]
+    badge_fn = badge_fn[: badge_fn.index("\n}\n") + 3]
+    assert "fetch" not in badge_fn and "/v1/" not in badge_fn, (
+        "the generic badge hook must not reach into a subsystem (no fetch / endpoint)"
+    )
+    # No colour-only treatment: the chip uses DS warn tokens AND a glyph.
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".rail-badge" in css, "shell.css must carry the .rail-badge chip rule"
+    badge_block = css[css.index(".rail-badge") :]
+    badge_block = badge_block[: badge_block.index("\n.grp") if "\n.grp" in badge_block else 800]
+    assert "var(--warn" in badge_block, (
+        "the badge chip must use the DS --warn family (theme-flips by construction)"
+    )
+    assert "#" not in badge_block, "the badge chip must be token-only (no hex) so themes flip"
+
+
+def test_shell_bridges_setrowbadge_for_classic_subsystems() -> None:
+    """shell.js is the ESM module bridge: a classic-script subsystem (the
+    standalone consent badge in ui/static/app.js) can't import rail.js, so the
+    shell re-exports `setRowBadge` on the `window.TS_SHELL` seam.  Pin the import
+    and the seam so the bridge can't be silently dropped (which would re-break the
+    badge the same way the gear deletion did)."""
+    body = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'setRowBadge } from "./rail.js"' in body, "shell must import setRowBadge from rail.js"
+    ts_shell = body[body.index("window.TS_SHELL = {") :][:200]
+    assert "setRowBadge" in ts_shell, (
+        "TS_SHELL must expose setRowBadge for classic subsystems (the consent-badge bridge)"
+    )
+
+
+def test_step3_admin_seam_and_thin_show_admin() -> None:
+    """admin.js exposes the TS_ADMIN seam (IA + shared perm gate + active-tab +
+    openTab) and showAdmin is now a thin delegator that opens the singleton
+    Admin pane — the legacy in-#main view toggle + history push are gone."""
+    body = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    assert "const ADMIN_IA = [" in body, "admin must define the IA data"
+    assert "window.TS_ADMIN.ia = ADMIN_IA" in body, "admin must expose the IA seam"
+    assert "window.TS_ADMIN.isTabAllowed" in body and "window.TS_ADMIN.openTab" in body
+    assert "function adminTabAllowed(tab)" in body, "the shared permission gate must exist"
+    assert 'pm.openPane("admin")' in body, "showAdmin must open the singleton Admin pane"
+    for gone in ('currentView = "admin"', 'history.pushState({ view: "admin" }'):
+        assert gone not in body, f"legacy admin view-model bit {gone!r} must be gone"
+    # 3b — the in-pane sidebar's mobile-drawer machinery + dead nav refs are deleted.
+    for gone in (
+        "_mobileSidebarOpen",
+        "_injectMobileToggle",
+        "_toggleMobileSidebar",
+        ".admin-nav",
+    ):
+        assert gone not in body, f"retired admin sidebar/mobile symbol {gone!r} must be gone"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert 'id="admin-sidebar"' not in index, (
+        "the in-pane admin sidebar markup must be deleted — the rail Manage groups navigate"
+    )
+    assert 'id="admin-content"' in index, "the admin content host must remain (the pane adopts it)"
+    assert 'aria-labelledby="tab-' not in index, (
+        "the adopted admin panels' dangling tab-* aria-labelledby (pointing at the deleted "
+        "sidebar buttons) must be stripped"
+    )
+
+
+def test_step4_coordinator_pane_registered_and_wired() -> None:
+    """Step 4b: the shell registers a ws_id-keyed coordinator pane (build chrome +
+    controller on mount, connect on activate, destroy on close), installs the login
+    fan-out registry, the rail opens coordinators as panes (not full-page nav), and
+    the console loads the coordinator controller + its migrated chrome CSS."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'registerType("coordinator"' in shell, "shell must register the coordinator pane type"
+    assert "createCoordinatorPane(this.bodyEl, id" in shell, (
+        "onMount must build the controller into the pane body"
+    )
+    assert "this._ctl.connect()" in shell and "this._ctl.destroy()" in shell, (
+        "per-pane Tier-2 connect on activate, destroy on close"
+    )
+    assert "pm.close(pane.id)" in shell, (
+        "the coordinator's `end` must close the pane (not reload the whole console)"
+    )
+    assert "window.TS_LOGIN" in shell, "shell must install the login fan-out registry"
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert 'paneManager.openPane("coordinator", ws.id)' in rail, (
+        "rail coordinator clicks must open a pane, not full-page nav"
+    )
+    assert "if (caps.orchestration)" in shell, (
+        "step 6.0: the coordinator import is gated on the orchestration capability "
+        "(a standalone turnstone-server has no /static/coordinator/*)"
+    )
+    assert "await import(" in shell and '"/static/coordinator/coordinator.js"' in shell, (
+        "step 6.0: the shell imports the coordinator controller LAZILY (dynamic import) "
+        "so a static import can't 404 the whole module on a standalone deployment"
+    )
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "/static/coordinator/coordinator.js" not in index, (
+        "coordinator.js is imported by shell.js now, not <script>-tagged in the console"
+    )
+    assert "coord-chrome.css" in index, "console must load the coordinator chrome CSS"
+
+
+def test_step5_interactive_pane_registered_and_wired() -> None:
+    """Step 5b: the shell registers a ws_id-keyed interactive pane over the
+    NODE-PROXIED transport.  Both panes are ES modules the shell IMPORTS (step
+    5e.0 lifted the coordinator off window too).  The pane is REHYDRATE-SAFE: on
+    first activate it RESOLVES its owning node and (re)opens the session there
+    before streaming (ensureInteractiveNode -> the console's resolveInteractiveNode
+    origin-first POST /open; the node /events stream 404s on a ws not loaded on
+    that node, so a reloaded pane can't connect blind), then PERSISTS the resolved
+    node so a reload restores the pane onto the same node.  The rail opens it
+    passing the owning node; the console loads the shared interactive stylesheet."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'import { createInteractivePane } from "./interactive.js"' in shell, (
+        "interactive is ESM — the shell imports it (as it now does the coordinator)"
+    )
+    assert 'registerType("interactive"' in shell, "shell must register the interactive pane type"
+    assert "createInteractivePane(pane.bodyEl, id, {" in shell, (
+        "first activate must build the controller into the pane body"
+    )
+    # Rehydrate-safety: the node is RESOLVED + the session (re)opened before the
+    # pane streams, and the resolved node is persisted for the next reload.
+    assert "ensureInteractiveNode(" in shell, (
+        "the node-proxy target must be resolved (origin-first open) — rehydrate-safe"
+    )
+    assert "function ensureInteractiveNode(" in shell, "shell must define the node resolver/opener"
+    assert "function nodeForWs(" in shell, "shell must keep the Tier-1 node fallback"
+    assert "pm.setPaneMeta(pane.id" in shell, (
+        "the resolved node must be persisted so a reload restores the same node"
+    )
+    # Hot-path optimisation (review perf-1): a LIVE session (Tier-1 already names
+    # its node) connects directly — only the dormant/reload case pays the
+    # resolve+open round-trip.
+    assert "const liveNode = caps.cluster ? nodeForWs(id)" in shell, (
+        "a live ws (Tier-1 names its node) must connect directly, skipping POST /open"
+    )
+    # Focus-tracking lifecycle: connect/deactivate/destroy + login re-arm.
+    for hook in ("this._ctl.connect()", "this._ctl.deactivate()", "this._ctl.destroy()"):
+        assert hook in shell, f"interactive pane missing lifecycle {hook!r}"
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "this._types.get(type)(id, extra)" in pane, (
+        "openPane must thread the open-time hint to the factory"
+    )
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert 'openPane("interactive", ws.id, { nodeId: ws.node })' in rail, (
+        "rail interactive clicks must open a node-proxied pane, not full-page nav"
+    )
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "/shared/interactive.css" in index, "console must load the interactive stylesheet"
+
+
+def test_step5d_rail_open_marker_tracks_active_pane() -> None:
+    """Step 5d (designer fix): the rail's Workspaces `.open` marker tracks the
+    active pane instead of being hardcoded to Dashboard, so the rail map and the
+    tab bar agree on what is focused.  PaneManager exposes getActive/onActiveChange
+    and fires on activate/close; the rail keys `.open` off it and re-renders."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "getActive()" in pane and "onActiveChange(cb)" in pane
+    assert "_notifyActive()" in pane, "active-change must fan out to subscribers"
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert "paneManager.getActive()" in rail
+    assert "onActiveChange(render)" in rail, "rail must re-render on pane activation"
+    # The Dashboard row is no longer unconditionally open; a session row gets it.
+    assert 'dash.className = "row open"' not in rail
+    assert "active && active.rawId === ws.id" in rail
+
+
+def test_step7_tab_dropdown_mechanism() -> None:
+    """Step 7: PaneManager owns the GENERIC tab-action dropdown — a caret on any
+    pane that exposes ``tabMenu()`` (the Dashboard home exposes none, so no
+    caret), opening a keyboard-navigable ``.tab-menu``. The menu button is a sibling
+    of the selection button. The menu is also reachable through ContextMenu / Shift+F10,
+    and a single menu is open
+    at a time (Escape / outside-click close it)."""
+    body = _PANE_JS.read_text(encoding="utf-8")
+    assert "_openTabMenu(" in body and "_closeTabMenu(" in body, (
+        "PaneManager must own the dropdown open/close mechanism"
+    )
+    assert 'typeof pane.tabMenu === "function"' in body, (
+        "the caret is gated on the pane exposing a tabMenu() descriptor"
+    )
+    assert '"tab-caret"' in body, "the tab must get a caret affordance"
+    for cls in ('"tab-menu"', '"tab-menu-item"', '"tab-menu-sep"'):
+        assert cls in body, f"the dropdown must build the namespaced {cls} chrome"
+    assert "ContextMenu" in body and "F10" in body, (
+        "the menu must be keyboard-openable (ContextMenu / Shift+F10)"
+    )
+    assert 'e.key === "Escape"' in body, "Escape must close the open menu"
+
+
+def test_step7_tab_menu_wired_per_kind() -> None:
+    """Step 7: the shell wires each pane type's tab menu via convTabMenu —
+    pane-type AND deployment derived.  The load-bearing recovery: the coordinator
+    header's removed Export + end (5e.2e) return here as Export + Close workstream
+    (its controller's closeSession).  The three-verb close (Close pane = pm.close
+    != Close workstream != Delete) is the spine; the standalone interactive verbs
+    prefer the feature-detected globals (which also manage its local roster), and
+    a deployment without them (the console) falls back to the base-aware lane
+    (see test_tab_menu_base_aware_verb_lane)."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "function convTabMenu(" in shell, "the shared tab-menu builder must exist"
+    assert shell.count("pane.tabMenu =") >= 3, (
+        "coordinator, interactive, and admin panes must each expose a tabMenu"
+    )
+    # The three-verb close — the BRIEFING's load-bearing distinction.
+    assert '"Close pane"' in shell and "pm.close(pane.id)" in shell
+    assert '"Close workstream"' in shell, "Close workstream must be distinct from Close pane"
+    assert '"Delete"' in shell
+    # Coordinator recovery: Close workstream routes to the controller's server-close.
+    assert "pane._ctl.closeSession()" in shell, (
+        "the coordinator's Close workstream must call the controller's closeSession "
+        "(the end button removed from its header in 5e.2e)"
+    )
+    assert "exportWorkstreamDownload" in shell, "Export conversation must wire the shared util"
+    # Deployment-aware: the standalone interactive verbs are feature-detected globals.
+    assert 'typeof window.closeWorkstream === "function"' in shell, (
+        "the interactive Close workstream prefers the standalone global (feature-detected)"
+    )
+    assert "refreshWorkstreamTitle" in shell and "confirmDeleteWorkstream" in shell, (
+        "the interactive title/delete verbs prefer the standalone globals"
+    )
+
+
+def test_node_proxied_close_409_uses_plain_retry_copy() -> None:
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    start = shell.index('typeof window.closeWorkstream === "function"')
+    end = shell.index("return convTabMenu", start)
+    close = shell[start:end]
+
+    assert "r.status === 409" in close
+    assert (
+        "Conversation history is still being saved. Try ending the session again shortly." in close
+    )
+    assert "pm.close(pane.id)" in close, "successful and already-closed cases still drop the tab"
+
+
+@node_skip
+def test_node_proxied_title_and_delete_name_the_holder_on_a_lease_refusal() -> None:
+    """A pane whose node lost the workstream says where it is open, and keeps the tab."""
+    utils = (_SHELL_JS.parent / "utils.js").read_text(encoding="utf-8")
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    helpers = ""
+    for name, params in (("leaseRefusalWhere", "status, data"), ("readRefusal", "r")):
+        body = slice_braced_block(utils, utils.index(f"export function {name}("))
+        assert body is not None
+        helpers += f"function {name}({params}) {body}\n"
+    menu_body = slice_braced_block(shell, shell.index("function convTabMenu("))
+    assert menu_body is not None
+    result = run_node_source(
+        helpers
+        + """
+import assert from 'node:assert/strict';
+const toasts = []; const closed = [];
+const window = { showToast: (m, k) => toasts.push([k, m]), confirm: () => true,
+                 prompt: () => "new title" };
+globalThis.window = window;
+const paneAccelBadge = () => "";
+const findWs = () => null;
+const refused = { ok: false, status: 409,
+  json: async () => ({ code: "workstream_lease_held", holder_node_id: "node-b" }) };
+const postWsVerb = async () => refused;
+function convTabMenu(pane, pm, wsId, opts) """
+        + menu_body
+        + """
+const pm = { close: (id) => closed.push(id) };
+const items = convTabMenu({ id: "p1" }, pm, "ws1",
+  { deleteVerb: true, titleVerbs: true, base: () => "/node/x" });
+for (const label of ["Delete", "Edit title"]) {
+  items.find((i) => i.label === label).action();
+}
+await new Promise((r) => setTimeout(r, 20));
+const held = "This session is open on node 'node-b'. Retry once it closes there.";
+assert.deepEqual(toasts, [["warn", held], ["warn", held]]);
+assert.deepEqual(closed, []);  // a refused delete keeps the tab
+"""
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_coordinator_tab_menu_enables_title_verbs() -> None:
+    """Coordinators carry LLM/auto titles like interactive workstreams, so
+    their tab dropdown must surface Refresh/Edit title — convTabMenu's
+    ``titleVerbs`` block, POSTed to the console-origin coord
+    ``refresh-title`` / ``title`` routes via the base-aware lane (default
+    base ""). Scoped to the coordinator registerType block so it can't
+    pass on the interactive pane's long-standing ``titleVerbs``."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    start = shell.index('registerType("coordinator"')
+    tail = shell[start:]
+    nxt = tail.find("registerType(", 1)  # bound at the next pane registration
+    coord_block = tail[:nxt] if nxt != -1 else tail
+    assert "pane._ctl.closeSession()" in coord_block, (
+        "sanity: the extracted block is the coordinator pane"
+    )
+    assert "convTabMenu(" in coord_block, "the coordinator pane must wire a tab menu"
+    assert "titleVerbs: true" in coord_block, (
+        "the coordinator tab menu must enable titleVerbs (Refresh/Edit title)"
+    )
+
+
+def test_tab_menu_base_aware_verb_lane() -> None:
+    """Lifecycle round 2: a proxied interactive pane's tab menu must act on the
+    pane's OWN transport base, not the console origin — the globals lane only
+    exists on the standalone.  convTabMenu therefore takes a `base` getter and
+    falls back to POSTing the verb at {base}/v1/api/workstreams/{ws}/{verb}; a
+    node-verb is OMITTED while no base is resolvable (never aimed at the wrong
+    origin), and Export forwards the base to the shared util (a proxied export
+    must come from the node that owns the conversation)."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "function postWsVerb(" in shell, "the base-aware verb POST helper must exist"
+    assert '"/v1/api/workstreams/" + encodeURIComponent(wsId) + "/" + verb' in shell
+    # The interactive pane supplies its current base: a LIVE controller's
+    # (exact), else the persisted node hint, else the live Tier-1 node, else null
+    # (a DEAD controller's stale base is special-cased — see the test below).
+    assert "const menuBase = ()" in shell, "the interactive pane must expose a base getter"
+    assert "pane._ctl && pane._ctl.base != null" in shell, (
+        "a built controller's base is authoritative for the menu verbs"
+    )
+    # Fallback verbs exist for the console: refresh-title / title / close / delete.
+    for verb in ('"refresh-title"', '"title"', '"close"', '"delete"'):
+        assert (
+            f"postWsVerb(base, wsId, {verb}" in shell
+            or f"postWsVerb(closeBase, id, {verb}" in shell
+        ), f"the {verb} verb must have a base-aware fallback"
+    # Export rides the base too (3-arg form), and node-verbs are null-gated.
+    assert "exportWorkstreamDownload(wsId, null, base)" in shell
+    assert "base != null" in shell, "node-verbs must be omitted while the base is unresolved"
+    # Destructive fallbacks confirm first (window.confirm is the house precedent).
+    assert shell.count("window.confirm(") >= 2, (
+        "the close + delete fallbacks must confirm before acting"
+    )
+    # No leading separator when the verb section is empty.
+    assert "if (items.length) items.push({ separator: true })" in shell
+    util = (_SHARED / "utils.js").read_text(encoding="utf-8")
+    assert "function exportWorkstreamDownload(wsId, btn, base)" in util, (
+        "the shared export util must accept the transport base"
+    )
+    assert '(base || "") +' in util, "the export URL must be base-prefixed"
+
+
+def test_tab_menu_dead_controller_prefers_live_node() -> None:
+    """Lifecycle round 2 follow-up: a DEAD controller's base is stale — its node
+    may have lost or RE-HOMED the ws — so the tab-menu base getter must not keep
+    aiming verbs at it.  Otherwise the close/delete 404-as-success lanes would
+    silently drop a tab whose session is alive on the node it re-homed to.  When
+    dead, ``menuBase`` mirrors the revive path (the live Tier-1 node leads); the
+    stale controller base is only the gone-cluster-wide fallback.
+    """
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    body = shell[shell.index("const menuBase = ()") :]
+    body = body[: body.index("};") + 2]
+    # The dead-controller guard must come FIRST — before the live-base return —
+    # so a stale base can never authorise the 404-as-success drop.
+    assert "pane._ctl.isDead && pane._ctl.isDead()" in body, (
+        "menuBase must special-case a dead controller"
+    )
+    assert body.index("isDead()") < body.index("pane._ctl.base != null"), (
+        "the dead-controller guard must precede the authoritative live-base return"
+    )
+    # When dead the live Tier-1 node leads (mirrors beginConnect's hint chain),
+    # falling back to the controller's own (stale) base only when no live node.
+    assert 'live ? "/node/" + encodeURIComponent(live) : pane._ctl.base' in body, (
+        "a dead pane aims at the live node, falling back to the stale base only "
+        "when the ws is gone cluster-wide"
+    )
+
+
+def test_attachment_lane_is_base_aware() -> None:
+    """Console regression: an interactive pane is node-proxied, so its attachment
+    upload / list / delete / preview requests must ride the pane's transport base
+    ("/node/{id}").  Without it they hit the console's OWN coord route and 404 as
+    "coordinator not found" (the standalone server, base="", was unaffected —
+    which masked the bug).  Mirrors the base-aware verb lane: the controller
+    resolves a base from ``opts.getBase`` and prefixes every attachment URL;
+    ``buildAttachmentPreview`` takes the base for its thumbnail / content src; the
+    interactive pane wires both."""
+    attach = (_SHARED / "composer_attachments.js").read_text(encoding="utf-8")
+    assert "function _attachUrl(base, wsId, id, suffix)" in attach, (
+        "the per-attachment URL builder must be base-first"
+    )
+    assert "function _base()" in attach and "opts.getBase" in attach, (
+        "the controller must resolve a node base from opts.getBase"
+    )
+    assert "base: _base()" in attach, "committed-chip previews must carry the base"
+    assert "base = opts.base" in attach, "buildAttachmentPreview must consume opts.base"
+    # upload + remove + rehydrate must each base-prefix their collection/row URL.
+    assert attach.count("_base() +") >= 3, (
+        "upload, remove, and rehydrate must each base-prefix their URL"
+    )
+    pane = (_SHARED / "interactive.js").read_text(encoding="utf-8")
+    assert "getBase: () =>" in pane, (
+        "the interactive pane must pass its node base into the attachment controller"
+    )
+    assert "base: attachBase" in pane, "history-pill previews must ride the pane's base too"
+
+
+def test_step7_tab_menu_css_promoted_shared() -> None:
+    """Step 7: the dropdown chrome is promoted to the SHARED shell sheet (so both
+    deployments render it), recovered from the retired .ws-tab-dropdown design but
+    translated onto the DS token vocabulary (--panel/--hair/--ink-*/--err, not the
+    retired ui/static --bg-surface/--border/--fg-*)."""
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    for sel in (".tab-caret", ".tab-menu", ".tab-menu-item", ".tab-menu-sep", ".tab-menu-key"):
+        assert sel in css, f"shell.css must carry the {sel} chrome"
+    assert "@keyframes tab-menu-in" in css, "the dropdown entrance keyframe must be defined"
+    assert "color-mix(in oklab, var(--err)" in css, (
+        "the destructive item must use the DS --err token (the translation happened)"
+    )
+
+
+def test_step7_live_tab_state_glyphs() -> None:
+    """Step 7 #2: conversational tabs show LIVE state glyphs driven by Tier-1 —
+    the SAME source + builder the rail uses (one writer; the pane's Tier-2 stream
+    drives its body, not the tab glyph), so tab and rail agree and the glyph never
+    sits stale at an open-time placeholder.  The coord/int static placeholders are
+    retired for a `stateful` flag."""
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert "export function glyph(" in rail, (
+        "rail must export its state-glyph builder so the tab reuses it (single source)"
+    )
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "setTabGlyph(paneId, el)" in pane and "statefulTabs()" in pane, (
+        "PaneManager must expose the generic glyph setter + the stateful-tab list"
+    )
+    assert "this.stateful" in pane, "ShellPane must carry the stateful flag"
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'import { mountRail, mountManage, glyph, setRowBadge } from "./rail.js"' in shell, (
+        "the shell must import the rail's glyph builder (one source for tab + rail)"
+    )
+    assert "function stateForWs(" in shell and "function paintConvTabs(" in shell
+    assert "window.TS_APP.onRender" in shell and "paintConvTabs(pm)" in shell, (
+        "tab glyphs (and titles) must repaint on every Tier-1 render (live, not stale)"
+    )
+    assert shell.count("stateful: true") == 2, (
+        "the coordinator + interactive panes are stateful (their static placeholders retired)"
+    )
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".tab .tab-glyph" in css, "the tab-glyph spacing rule must apply to static + live glyphs"
+
+
+def test_split_view_controls() -> None:
+    """The revived split-view's affordance surface: Split right / Split down /
+    Unsplit buttons in the tab-bar tail (they REPLACED the redundant [+] — the
+    permanent Dashboard tab is the launcher).  Deliberately NO contextmenu
+    override (the pre-L-shell split UI hijacked right-click); denials surface
+    as a toast with the manager's reason."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'tbBtn("tb-split", "◫", "Split right")' in shell
+    assert 'tbBtn("tb-split tb-split--down", "◫", "Split down")' in shell
+    assert 'pm.splitFocused("right")' in shell and 'pm.splitFocused("down")' in shell
+    assert "pm.unsplit()" in shell, "the Unsplit button must call pm.unsplit"
+    assert "unsplitBtn.hidden = !pm.isSplit()" in shell, (
+        "Unsplit only shows while split (synced via onActiveChange)"
+    )
+    assert "shell.tail.append(splitRightBtn, splitDownBtn, unsplitBtn)" in shell
+    # The [+] is gone with its showHome/focusLauncher plumbing kept out.
+    assert "tab-add" not in shell, "the [+] new-tab button was replaced by the split controls"
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".tb-split" in css and ".tb-split--down .tb-glyph" in css, (
+        "split buttons styled; the down variant rotates the GLYPH (not the button)"
+    )
+    assert "tab-add" not in css, "the dead .tab-add style must not survive"
+
+
+def test_pane_manager_split_engine() -> None:
+    """The split-view engine in PaneManager: an optional binary layout tree
+    (null = the pre-feature single-pane behaviour, bit-for-bit).  Visible panes
+    are positioned by inline % insets — NEVER reparented, so live stream DOM,
+    scroll state and media survive every layout change.  Tabs stay global:
+    active = the focused cell, a backgrounded tab swaps into it, a click inside
+    a visible pane focuses its cell.  Separators resize by drag AND keyboard
+    (role=separator + aria-value*); the tree persists in the working-set blob
+    and rehydrate prunes leaves whose pane did not restore."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    # public surface (splitFocused takes an optional explicit fill — openPaneBeside)
+    assert "splitFocused(dir, fillId)" in pane
+    assert "unsplit()" in pane and "isSplit()" in pane
+    # no reparenting: layout is applied as % insets on the pane elements
+    assert 'p.el.style.left = r.x * 100 + "%"' in pane
+    # the focused-cell swap + pure focus move both live in activate()
+    assert "this._leafFor(paneId)" in pane and "target.paneId = paneId" in pane
+    # close() collapses the cell and prefers the absorbing sibling as fallback
+    assert "_collapseLeaf(leaf)" in pane and "preferFallback" in pane
+    # auto-fill source: most-recently-focused backgrounded pane
+    assert "_nextBackgroundPane()" in pane and "this._mru" in pane
+    # separators: ARIA + keyboard + pointer-capture drag, ratio bounds from the
+    # split node's OWN px region (nested splits clamp against their own space)
+    assert 'setAttribute("role", "separator")' in pane
+    assert "setPointerCapture" in pane and "_ratioBounds(node)" in pane
+    assert '"aria-valuenow"' in pane and "ArrowRight" in pane
+    # the ARIA range mirrors the REAL clamp (_ratioBounds per handle in the
+    # _applyLayout loop) — never a hard-coded constant
+    assert "this._ratioBounds(h.node)" in pane
+    assert '"aria-valuemin"' in pane and '"aria-valuemax"' in pane
+    assert 'setAttribute("aria-valuemin", "10")' not in pane
+    # limits: cell minimums + cap (the old ui/static ceiling, kept)
+    assert "SPLIT_MAX_CELLS = 6" in pane
+    assert "SPLIT_MIN_W = 200" in pane and "SPLIT_MIN_H = 150" in pane
+    # persistence: layout rides the working-set blob; restore prunes dead leaves
+    assert "state.layout = this._serializeLayout(this._layout)" in pane
+    assert "_restoreLayout(data)" in pane and "seen.has(d.paneId)" in pane
+    # the visible-but-unfocused tab marker
+    assert 'classList.toggle("shown"' in pane
+    # Tab dismissal: split mode hides ONE cell keeping the tab (closeCell), EXCEPT
+    # an ephemeral pane which closes outright; single-pane it closes the pane
+    # (withheld from non-closable) — the click decides at click time, the label
+    # tracks the mode.  Dismiss and select are sibling buttons in the tab.
+    # Lifecycle coverage lives in test_pane_js.py; ephemeral guards also live
+    # in test_preview_js.py::TestEphemeralDismiss.
+    assert "closeCell(paneId)" in pane and "_refreshTabDismiss(pane)" in pane
+    assert 'dismiss.className = "tab-dismiss"' in pane
+    assert "group.append(dismiss, tab)" in pane
+    assert '"Close pane"' in pane, "the single-pane dismiss mode"
+    # mode-DISTINCT glyphs (designer P1: identical signifier + locus with a
+    # reversible/destructive divergence is a mode-error trap) — a click that
+    # cannot be a reversible cell-hide shows ✕, else −.
+    assert 'b.textContent = destroys ? "✕" : "−"' in pane
+    assert '"tab-dismiss--close"' in pane
+    # open-beside: the coordinator child-link placement (split right of the
+    # focused cell, degrade to the plain swap on deny)
+    assert "openPaneBeside(type, id, extra)" in pane
+    assert 'this.splitFocused("right", paneId)' in pane
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".panes--split > section.pane" in css, (
+        "split cells must target section.pane ONLY — the interactive pane's inner "
+        "div also carries .pane (the step-5b lesson)"
+    )
+    assert ".split-handle" in css and "col-resize" in css and "row-resize" in css
+    assert ".tab.shown:not(.active)" in css, "the visible-but-unfocused tab marker"
+    # the focused ring rides an ::after OVERLAY — an inset shadow on the
+    # section itself paints UNDER edge-touching children (the status-bar
+    # occlusion bug); the ::before bar sits above the ring line
+    assert ".panes--split > section.pane.split-focused::after" in css
+    assert ".tab-dismiss--close:hover" in css, "destructive mode telegraphs on hover"
+    assert ".tab-dismiss[hidden]" in css, "unavailable controls retain their tab slot"
+    assert ".panes > section.pane.tab-dismiss-target::after" in css
+    # The pane contains its target ring in both modes.
+    assert ".panes > section.pane" in css
+
+
+def test_step7_auth_gated_open_pane() -> None:
+    """Step 7 #4: openPane auth-gates CREATION via a per-type canOpen predicate
+    (deny -> no pane; focusing an already-open pane is never re-gated).  The shell
+    supplies the gate so PaneManager stays generic.  The coordinator type gates on
+    the admin.coordinator scope (the SAME sessionStorage-backed helper the launcher
+    uses — survives refresh, so rehydrate gates correctly), covering the rail /
+    child-link / rehydrate open paths at once."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "this._gates" in pane, "PaneManager must hold a per-type auth-gate map"
+    assert "setAuthGate(type, opts)" in pane, (
+        "PaneManager must expose setAuthGate (kept separate from the 2-arg registerType)"
+    )
+    assert "gate.canOpen" in pane and "gate.onDeny" in pane, (
+        "openPane must consult canOpen on create and call onDeny on deny"
+    )
+    # the legacy factory-call shape (open-time hint threading) is preserved
+    assert "this._types.get(type)(id, extra)" in pane
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "_hasCoordPermission" in shell, (
+        "the coordinator pane must gate on the admin.coordinator scope helper"
+    )
+    assert "canOpen:" in shell and "onDeny:" in shell, (
+        "the coordinator registerType must supply the auth gate"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Workstream-lifecycle round 2: dead-session revive + explicit-reopen seam.
+# ---------------------------------------------------------------------------
+
+
+def test_pane_manager_reopen_seam() -> None:
+    """openPane() on an ALREADY-OPEN pane fires `pane.onReopen(extra)` — the
+    explicit-intent signal (saved-list resume, rail row, child link) that
+    activate() cannot carry: hooks no-op on the already-active pane, and
+    onActivate also fires on plain tab switches.  Fired AFTER activate so the
+    pane is visible when it reacts.  getPane lets the shell reach a pane for
+    cross-cutting lifecycle signals."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "onReopen(extra) {}" in pane, "ShellPane must document the onReopen hook"
+    assert "const existed = !!pane" in pane, "openPane must remember create-vs-focus"
+    assert "pane.onReopen(extra)" in pane, "openPane must fire onReopen on existing panes"
+    # Ordering: the reopen signal comes after activation.
+    assert pane.index("this.activate(paneId)") < pane.index("pane.onReopen(extra)")
+    assert "getPane(type, id)" in pane, "PaneManager must expose getPane for the shell"
+
+
+def test_interactive_pane_dead_session_revive() -> None:
+    """The reported round-2 bug: an interactive session whose stream died
+    (closed / evicted / node restarted) could never reconnect while its tab
+    existed — openPane focused the dead pane, onActivate's connect() is one-shot,
+    and the controller's recovery loop re-dialed the SAME node forever.  The fix:
+    the shell paints a click-to-reconnect banner when the controller reports
+    dead, and an explicit reopen (onReopen) revives — tear down the dead
+    controller, re-resolve the node (POST /open), rebuild."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "const showDeadBanner = ()" in shell, "the dead banner painter must exist"
+    assert "pane-dead-banner" in shell, "the banner carries its own style hook"
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".pane-dead-banner" in css and ".pane-dead-banner:focus-visible" in css, (
+        "the banner is a real <button>; shell.css must reset its native chrome "
+        "and give it a keyboard focus treatment"
+    )
+    assert "Session disconnected" in shell, "the banner states the terminal condition"
+    assert "const revive = (freshNodeId)" in shell, "the revive path must exist"
+    assert "onDead: showDeadBanner" in shell, (
+        "the controller's terminal give-up must surface the banner"
+    )
+    # Revive is full teardown + re-resolve: unsubscribe login, destroy, rebuild.
+    ridx = shell.index("const revive =")
+    rbody = shell[ridx : ridx + 900]
+    assert "TS_LOGIN.unsubscribe" in rbody and "destroy()" in rbody
+    assert "beginConnect(true)" in rbody, "revive must force the resolve path"
+    # onActivate shows the banner for a dead controller instead of connect();
+    # onReopen revives (the resume-with-a-pre-existing-tab path).
+    assert "this._ctl.isDead && this._ctl.isDead()" in shell
+    assert "revive(reExtra && reExtra.nodeId)" in shell, (
+        "onReopen must revive with the caller's fresh node hint"
+    )
+    # The standalone revive path must (re)open the local session — /events 404s
+    # on an unloaded ws; only the forceResolve lane POSTs /open.
+    assert "function ensureInteractiveNode(caps, wsId, hint, openFirst)" in shell
+    eidx = shell.index("function ensureInteractiveNode(")
+    ebody = shell[eidx : eidx + 700]
+    assert '"/open"' in ebody and '{ method: "POST" }' in ebody.replace("\n", " ").replace(
+        "  ", " "
+    ).replace("  ", " "), "standalone openFirst must POST /open"
+    # Revive must skip BOTH fast paths (a stale Tier-1 row must not bypass the
+    # /open), while the live node — when present — stays the resolve HINT so an
+    # origin-first /open reuses a genuinely-live session instead of loading a
+    # duplicate copy on the old meta node.
+    assert "if (!forceResolve && (liveNode || !caps.cluster))" in shell, (
+        "beginConnect's fast paths must both yield to the forced resolve"
+    )
+    assert "liveNode || (pane.meta && pane.meta.nodeId)" in shell, (
+        "the live Tier-1 node must lead the resolve-hint chain"
+    )
+
+
+def test_shell_closes_pane_on_ws_closed() -> None:
+    """Tier-1 ws_closed → the open pane CLOSES outright (tab gone; a split
+    cell collapses onto its sibling) — the coordinator-closes-its-child flow,
+    matching the standalone's pane-auto-close.  The dead-BANNER lane survives
+    for streams that die WITHOUT a ws_closed (node crash / network), where the
+    session may still be revivable."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "const notifySessionClosed = (wsId)" in shell
+    assert 'pm.getPane("interactive", wsId)' in shell
+    assert "if (p) pm.close(p.id)" in shell, "ws_closed closes the pane, not mark-dead"
+    assert "showDeadBanner" in shell, "the banner lane must survive for non-closed deaths"
+    ts_shell = shell[shell.index("window.TS_SHELL = {") :][:200]
+    assert "panes: pm" in ts_shell and "notifySessionClosed" in ts_shell, (
+        "the seam must be exported on TS_SHELL for the console's Tier-1 handler"
+    )
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    closed = app.index('=== "ws_closed"')
+    block = app[closed : closed + 1200]
+    assert "notifySessionClosed" in block, (
+        "the console ws_closed handler must notify the shell's open pane"
+    )
+
+
+def test_coordinator_pane_reconnects_on_reopen() -> None:
+    """The coordinator variant of resume-with-a-pre-existing-tab: the saved-list
+    resume POSTs /open BEFORE openPane, so the dead pane just needs a fresh
+    stream — onReopen calls the controller's reconnect(), which resets backoff
+    and reconnects only when the source is gone or CLOSED (OPEN is healthy;
+    CONNECTING means native retry / a fresh connect is already in flight)."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "this._ctl.reconnect()" in shell, (
+        "the coordinator pane's onReopen must drive the controller's reconnect"
+    )
+    coord = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    assert "function reconnect()" in coord
+    assert "readyState !== EventSource.CLOSED) return" in coord.replace("\n", " "), (
+        "reconnect must only act on a missing/CLOSED stream"
+    )
+    assert "reconnect: reconnect," in coord, "the factory must return reconnect"
+
+
+# ---------------------------------------------------------------------------
+# Polish round: rail collapse + mobile drawer + the shared popup-menu helper.
+# ---------------------------------------------------------------------------
+
+
+def test_rail_collapse_glyph_strip() -> None:
+    """Desktop rail collapse: a persisted preference (localStorage
+    ``turnstone_interface.rail``) shrinks the rail to a 52px glyph-only strip —
+    live state glyphs stay the navigation, the cluster pills keep glyph+count
+    (the label rides a hideable span), Manage gets a single gear stand-in that
+    opens the Admin pane, and the toggle mirrors its state through
+    aria-expanded/aria-controls."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'const RAIL_COLLAPSE_KEY = "turnstone_interface.rail"' in shell, (
+        "the collapse preference must persist under the turnstone_interface key"
+    )
+    assert 'make("button", "rail-collapse")' in shell, "the collapse toggle must exist"
+    assert 'collapseBtn.setAttribute("aria-controls", "shell-rail")' in shell, (
+        "the toggle must reference the rail it controls"
+    )
+    assert 'classList.toggle("rail-collapsed", collapsed)' in shell, (
+        "collapse must be a class flip on .app (CSS owns the layout change)"
+    )
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert '"cpill-label"' in rail, (
+        "cluster pill labels must ride a span so the collapsed strip can hide "
+        "them while keeping glyph + count"
+    )
+    assert "manage-glyph" in rail, (
+        "Manage needs its collapsed-strip gear stand-in (rail.js mountManage)"
+    )
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert "grid-template-columns: 52px 1fr" in css, "the collapsed rail is 52px"
+    assert ".app.rail-collapsed .manage-glyph" in css, (
+        "the gear stand-in must flip on while collapsed"
+    )
+    assert "@media (min-width: 769px)" in css, (
+        "the collapse block must be desktop-scoped (the drawer owns mobile)"
+    )
+
+
+def test_mobile_drawer_off_canvas() -> None:
+    """Mobile drawer: below the breakpoint the rail overlays off-canvas at full
+    width.  Burger in the tab bar opens it (focus moves into the rail);
+    Escape / scrim tap / any pane activation close it; the closed drawer is
+    visibility:hidden so its buttons leave the Tab order."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'make("button", "rail-burger"' in shell, "the drawer toggle must exist"
+    assert 'make("div", "rail-scrim")' in shell, "the backdrop scrim must exist"
+    assert 'classList.toggle("rail-open", open)' in shell, (
+        "drawer state must be a class flip on .app"
+    )
+    assert "pm.onActiveChange(() => setDrawer(false))" in shell, (
+        "opening/focusing a pane must close the drawer that did it"
+    )
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert "@media (max-width: 768px)" in css, "the drawer is mobile-scoped"
+    assert "translateX(-100%)" in css, "the closed drawer parks off-canvas"
+    assert "visibility: hidden" in css, (
+        "the closed drawer must leave the Tab order / a11y tree, not merely translate off-screen"
+    )
+
+
+def _first_party_files(suffix: str) -> list[Path]:
+    """Every ``suffix`` file the pages load from the tree, less the vendored minified ones."""
+    return [
+        path
+        for root in (_SHARED, _ROOT / "turnstone/console/static", _ROOT / "turnstone/ui/static")
+        for path in sorted(root.rglob(f"*{suffix}"))
+        if not path.name.endswith(f".min{suffix}")
+    ]
+
+
+def test_shell_grid_rows_are_definite() -> None:
+    """Typing lag in long sessions: an implicit auto row on the shell grids asks for the content's
+    max-content height, so every layout pass under it (each composer keystroke, each streamed
+    token) re-measured the whole transcript through the pane's nested flex columns — ~54ms per
+    keystroke at 3,000 messages in the perf harness.  Both grids need the definite row; fixing
+    only one leaves the cost in place, and so would a later rule in any stylesheet (a media
+    query, a modifier) handing either grid a content-sized row again."""
+    css = re.sub(r"/\*.*?\*/", "", _SHELL_CSS.read_text(encoding="utf-8"), flags=re.S)
+    for selector in (".app", ".panes"):
+        rule = re.search(rf"(?m)^{re.escape(selector)} \{{([^}}]*)\}}", css)
+        assert rule, f"shell.css must carry the top-level {selector} rule"
+        assert "grid-template-rows: minmax(0, 1fr)" in rule.group(1), (
+            f"{selector} must size its row from the container, never from content"
+        )
+
+    def sizes_a_shell_grid(selectors: str) -> bool:
+        # The rule's subject (its last compound) must be one of the two grids; a
+        # descendant such as `.app.rail-collapsed .cluster` sizes a grid of its own.
+        # `.panes--split` is left out: its cells are absolutely positioned, so its
+        # rows size nothing.
+        return any(
+            re.search(r"\.(?:app|panes)(?![\w-])", re.split(r"[\s>+~]+", sel.strip())[-1])
+            for sel in selectors.split(",")
+        )
+
+    # Any first-party sheet the pages load can override the grids, not just this one.
+    sheets = _first_party_files(".css")
+    assert _SHELL_CSS in sheets
+    for sheet in sheets:
+        text = re.sub(r"/\*.*?\*/", "", sheet.read_text(encoding="utf-8"), flags=re.S)
+        for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", text):
+            if not sizes_a_shell_grid(selectors):
+                continue
+            # The shorthands set the rows too: their rows are the part before the slash.
+            for prop, value in re.findall(
+                r"(?<![\w-])(grid-template-rows|grid-template|grid)\s*:\s*([^;]+);", body
+            ):
+                rows = value if prop == "grid-template-rows" else value.split("/")[0]
+                assert rows.strip() == "minmax(0, 1fr)", (
+                    f"{sheet.name}: {selectors.strip()} must keep a definite row, "
+                    f"not {prop}: {value.strip()}"
+                )
+
+
+def test_no_backdrop_filter() -> None:
+    """Typing lag under overlays: the engine re-runs a backdrop-filter over its whole area on every
+    frame in which anything changes, including each keystroke and caret blink in a field drawn
+    above it.  The login overlay, the dialog backdrop, the shelf scrim and the shortcuts overlay
+    all blurred, so typing in a field over one lagged: with software compositing at 1440x761 @2x
+    a frame took ~130ms (~8 fps) against ~1ms without the blur, and even @1x the frame rate
+    halved.  Moving the blur to its own layer behind the field does not help, and the cost scales
+    with the area, not the radius.  Dim with a translucent background instead, whether the style
+    lives in a stylesheet, a page or a script."""
+    sheets = _first_party_files(".css")
+    pages = _first_party_files(".html")
+    scripts = _first_party_files(".js")
+    assert {_SHARED / "base.css", _SHARED / "hatch.css"} <= set(sheets)
+    assert _ROOT / "turnstone/console/static/coordinator/index.html" in pages
+    assert _SHARED / "auth.js" in scripts
+    for path in [*sheets, *pages, *scripts]:
+        text = path.read_text(encoding="utf-8")
+        if path.suffix == ".js":
+            text = strip_js_comments(text)
+        else:
+            text = re.sub(r"/\*.*?\*/|<!--.*?-->", "", text, flags=re.S)
+        # The property in CSS (prefixed or not) and its scripted spellings: backdropFilter,
+        # WebkitBackdropFilter, setProperty("backdrop-filter", ...).
+        assert not re.search(r"backdrop-?filter", text, re.I), (
+            f"{path.name} must not use backdrop-filter: dim with a translucent background"
+        )
+
+
+def test_popup_menu_shared_helper() -> None:
+    """One popup-menu chrome: pane.js exports openPopupMenu (items,
+    positioning with flip+clamp, dismissal, aria-expanded mirroring, arrow
+    roving) and BOTH consumers ride it — the tab-action dropdown and the
+    shell's footer user menu (which pops up from the viewport-bottom chip)."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "export function openPopupMenu(" in pane, "the shared helper must exist"
+    assert pane.count("openPopupMenu(") >= 2, (
+        "the tab-action dropdown must route through the helper"
+    )
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "openPopupMenu(" in shell, "the user menu must ride the shared helper"
+    assert 'prefer: "up"' in shell, (
+        "the footer chip sits at the viewport bottom — the menu pops upward"
+    )
+
+
+# Comment stripping comes from the shared string-aware helper in
+# tests/_js_harness_helpers (imported at module top) — the old
+# copy-local's "import-independent" house convention is defunct: several
+# harness suites already import the shared module, and per-suite copies
+# are how the strippers diverged into two semantics in the first place.
+# A bare ``"brand-home" in body`` substring test is a FALSE guard — the
+# string also appears in prose comments — so a stripped body is still
+# required for those pins.
+
+
+def test_proxy_shim_selectors_still_exist_in_shell_js() -> None:
+    """The console's proxy shim reaches across a process boundary into this
+    file's DOM: ``turnstone/console/server.py::_JS_PROXY_SHIM`` is injected
+    into a PROXIED node page and selects ``.rail-brand .brand-home`` and
+    ``.brand-sub`` -- classes only shell.js emits.  Nothing links the two,
+    and the shim fails SOFT (``if (!brand) return;``), so renaming a class
+    here silently removes the only way back to the console from a node view.
+
+    That is precisely how the PREVIOUS affordance died: the node picker
+    anchored to ``#ui-header``, the L-shell renovation deleted that element,
+    and every string-presence assertion stayed green for two minor releases.
+    This guard exists so the replacement cannot die the same way.
+
+    The class names are DERIVED from the shim's own querySelector calls, not
+    hardcoded here, so adding a selector there without emitting it here fails.
+    """
+    from turnstone.console.server import _JS_PROXY_SHIM
+
+    selectors = re.findall(r'querySelector\("([^"]+)"\)', _JS_PROXY_SHIM)
+    classes = {c for sel in selectors for c in re.findall(r"\.([A-Za-z0-9_-]+)", sel)}
+
+    # Vacuity floor.  Without this, deleting wireBrandHome entirely would
+    # yield an empty set and make the loop below pass trivially -- a guard
+    # that goes green when the thing it guards is removed is not a guard.
+    assert classes >= {"rail-brand", "brand-home", "brand-sub"}, (
+        "the proxy shim no longer selects the rail-brand trio; derived "
+        f"{sorted(classes)}.  If back-to-console moved to a different anchor, "
+        "update this guard to match the new one -- do not delete it."
+    )
+
+    body = strip_js_comments(_SHELL_JS.read_text(encoding="utf-8"))
+
+    # Names alone are NOT enough.  The shim's selector is a DESCENDANT
+    # selector, so shell.js emitting all three classes while re-parenting
+    # .brand-home out of .rail-brand would leave this guard green and
+    # querySelector returning null -- the picker's death, one refactor later.
+    # Pin the two containment edges, deriving the local variable names from
+    # source so renaming them stays green and re-parenting does not.
+    holder = {}
+    for cls in ("rail-brand", "brand-home"):
+        m = re.search(
+            r"(?:const|let|var)\s+(\w+)\s*=\s*make\(\s*\"[^\"]+\"\s*,\s*\""
+            + re.escape(cls)
+            + r"\"",
+            body,
+        )
+        assert m, (
+            f'shell.js no longer builds "{cls}" via a make(...) assignment; '
+            "re-derive this structural guard against the new shape rather "
+            "than deleting it -- the shim selects .rail-brand .brand-home."
+        )
+        holder[cls] = m.group(1)
+
+    assert f"{holder['rail-brand']}.append({holder['brand-home']})" in body, (
+        'shell.js no longer appends "brand-home" into "rail-brand"; the '
+        "shim's descendant selector .rail-brand .brand-home would return "
+        "null and back-to-console would silently stop working."
+    )
+    assert re.search(
+        re.escape(holder["brand-home"]) + r"\.append\(\s*make\(\s*\"span\"\s*,\s*\"brand-sub\"",
+        body,
+    ), (
+        'shell.js no longer appends "brand-sub" into "brand-home"; the shim '
+        "reads the sub-label via brand.querySelector('.brand-sub') and would "
+        "silently skip the visible 'back to console' cue."
+    )
+
+    for cls in sorted(classes):
+        assert f'"{cls}"' in body, (
+            f'shell.js no longer emits the class "{cls}", which '
+            "turnstone/console/server.py::_JS_PROXY_SHIM selects on when the "
+            "console proxies a node.  The shim fails soft, so this rename "
+            "would silently disable back-to-console.  Update the shim's "
+            "querySelector calls in the same change."
+        )
+
+
+def test_schedule_when_template_names_the_zone_per_pane() -> None:
+    """#1091: the builder fills every ``data-when-zone`` span with the
+    schedule's zone (setState), and the template's own text is the literal
+    "UTC" fallback — so a renamed attribute on either side would silently
+    label every time input UTC while the schedule runs elsewhere.  Pinned as
+    an exact partition: the wall-clock panes (daily, weekly, monthly, cron)
+    carry the span; interval and once do not — an interval's read-out names
+    the zone only for an hours cadence, and a one-shot is entered in the
+    browser's local time and says so in its own hint."""
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    start = index.index('<template id="schedule-when-template">')
+    template = index[start : index.index("</template>", start)]
+    panes = re.findall(r'<div data-when-pane="(\w+)"', template)
+    assert set(panes) == {"daily", "weekly", "monthly", "interval", "once", "cron"}
+    zoned: dict[str, bool] = {}
+    for i, name in enumerate(panes):
+        block_start = template.index(f'<div data-when-pane="{name}"')
+        block_end = (
+            template.index(f'<div data-when-pane="{panes[i + 1]}"')
+            if i + 1 < len(panes)
+            else template.index('<div class="readout">')
+        )
+        zoned[name] = "data-when-zone" in template[block_start:block_end]
+    assert zoned == {
+        "daily": True,
+        "weekly": True,
+        "monthly": True,
+        "interval": False,
+        "once": False,
+        "cron": True,
+    }
+    builder = (_CONSOLE_INDEX.parent / "schedule_builder.js").read_text(encoding="utf-8")
+    assert 'querySelectorAll("[data-when-zone]")' in builder, (
+        "setState must sweep the template's zone spans by the same attribute"
+    )
+
+
+def test_schedule_shelf_reads_completed_from_the_scheduled_instant() -> None:
+    """A disabled one-shot is "completed" only when its last run is at or
+    after its scheduled instant, so a one-shot re-armed to a later time or
+    converted from a cron that had run, then given up, shows as disabled."""
+    admin = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    assert "function _schCompleted(" in admin
+    assert 'Date.parse(s.last_run + "Z")' in admin and "Date.parse(s.at_time)" in admin
+    assert "ran >= due" in admin
+    assert "!enabled && _schCompleted(s)" in admin, "the status badge must use the comparison"
+    assert "!enabled && s.last_run" not in admin, "a bare last_run no longer means completed"
+
+
+@node_skip
+def test_change_avatar_needs_the_write_scope() -> None:
+    """Read means no writes: a viewer's user menu offers no "Change avatar"."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    menu_body = slice_braced_block(shell, shell.index("function toggleUserMenu("))
+    assert menu_body is not None
+    result = run_node_source(
+        """
+import assert from 'node:assert/strict';
+let _userMenu = null;
+const stored = new Map([["ts.user_id", "u1"], ["ts.avatar", '{"color":1}']]);
+const storedItem = (key) => stored.get(key) ?? null;
+let scopes = [];
+const hasScope = (scope) => scopes.includes(scope);
+let shown = null;
+const openPopupMenu = (chip, items) => {
+  shown = items.map((item) => item.label);
+  return { close() {} };
+};
+const openAvatarDialog = () => {};
+function toggleUserMenu(chip, onAvatarChange) """
+        + menu_body
+        + """
+scopes = ["read"];
+toggleUserMenu({}, null);
+assert.deepEqual(shown, ["Log out"]);
+_userMenu = null;
+scopes = ["read", "write"];
+toggleUserMenu({}, null);
+assert.deepEqual(shown, ["Change avatar", "Log out"]);
+// whoami sends no avatar for a service principal's token.
+_userMenu = null;
+stored.delete("ts.avatar");
+toggleUserMenu({}, null);
+assert.deepEqual(shown, ["Log out"]);
+"""
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@node_skip
+def test_the_chip_repaints_only_when_the_stored_avatar_changes() -> None:
+    """auth.js and the avatar dialog store the descriptor, and every Tier-1
+    render asks the chip to repaint from it."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    result = run_node_source(
+        """
+import assert from 'node:assert/strict';
+const stored = new Map([["ts.user_id", "u1"]]);
+const storedItem = (key) => stored.get(key) || "";
+const readStoredAvatar = () => JSON.parse(stored.get("ts.avatar") || "null");
+const paints = [];
+const paintAvatar = (el, avatar, userId) => paints.push([el, avatar, userId]);
+"""
+        + extract_braced(shell, "function repaintChipAvatar(avatarEl, painted) {")
+        + """
+const chip = {};
+let painted = null;
+painted = repaintChipAvatar(chip, painted);
+assert.deepEqual(paints, [[chip, null, "u1"]], "before whoami: the empty circle");
+stored.set("ts.avatar", '{"color":1,"initial":"J"}');
+painted = repaintChipAvatar(chip, painted);
+assert.deepEqual(paints[1], [chip, {color: 1, initial: "J"}, "u1"]);
+painted = repaintChipAvatar(chip, painted);
+assert.equal(paints.length, 2, "an unchanged descriptor is left alone");
+stored.set("ts.avatar", '{"color":1,"initial":"J","picture":"0123456789abcdef"}');
+painted = repaintChipAvatar(chip, painted);
+assert.equal(paints[2][1].picture, "0123456789abcdef");
+stored.delete("ts.avatar");
+painted = repaintChipAvatar(chip, painted);
+assert.deepEqual(paints[3], [chip, null, "u1"], "a cleared descriptor repaints too");
+"""
+    )
+    assert result.returncode == 0, result.stderr

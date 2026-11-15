@@ -1,0 +1,2059 @@
+"""Anthropic provider — native streaming, message translation.
+
+Implements the ``LLMProvider`` protocol for Anthropic's Messages API.
+The ``anthropic`` SDK is imported lazily so it remains an optional dependency.
+"""
+
+from __future__ import annotations
+
+import functools
+import json
+import logging
+import sys
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
+
+from turnstone.core.attachments import safe_attachment_label
+from turnstone.core.providers._protocol import (
+    EFFORT_TEMPLATE_FALLBACK_PARAM,
+    ContextWindowExceededError,
+    ModelCapabilities,
+    ProviderRequestMetrics,
+    StreamChunk,
+    ToolCallDelta,
+    UsageInfo,
+    _join_reasoning_with_cap,
+    _lookup_capabilities,
+    finish_shim_due,
+    merge_reasoning_template_kwargs,
+    refuse_aborted_request,
+    refuse_credential_headers,
+    request_uses_native_tools,
+    serialized_tool_chars,
+    snap_reasoning_effort,
+)
+from turnstone.core.tools import nested_deeper_than
+from turnstone.core.trajectory import materialize_attachments
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
+    import httpx2
+
+log = logging.getLogger(__name__)
+
+
+def _ensure_anthropic() -> Any:
+    """Return the ``anthropic`` SDK module (a core dependency).
+
+    Kept as a thin accessor so ``create_client`` (and tests) can obtain the
+    SDK via a single seam without a module-top import.
+    """
+    import anthropic  # noqa: PLC0415
+
+    return anthropic
+
+
+def send_api_key_as_x_api_key(request: httpx2.Request) -> httpx2.Request:
+    """HTTP-client ``auth`` hook: move a bearer credential to ``X-Api-Key``.
+
+    SDK 2.x sends an API key as ``Authorization: Bearer``, where 1.x sent ``X-Api-Key``.  The
+    Claude API takes either, but Microsoft Foundry doesn't read an API key from a bearer, and a
+    gateway in front of either may read only ``X-Api-Key``.  ``create_client`` installs this hook
+    only on a client whose credential is an API key, so every request it sends, including those
+    of a ``with_options(api_key=...)`` copy carrying a minted token, keeps the 1.x header; a
+    client built with an auth token keeps its bearer.
+
+    The hook moves any bearer the request carries, not only the client's key: a copy made with
+    ``with_options(auth_token=...)``, or an ``Authorization`` header from
+    ``ANTHROPIC_CUSTOM_HEADERS``, would go out as ``X-Api-Key`` too, so a copy carries a minted
+    credential as ``api_key``.  It runs once per request, before redirects, which is why the
+    client it is installed on follows none.
+    """
+    scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
+    if scheme == "Bearer" and credential:
+        del request.headers["Authorization"]
+        request.headers["X-Api-Key"] = credential
+    return request
+
+
+# -- message format helpers --------------------------------------------------
+
+
+def _to_blocks(content: Any) -> list[dict[str, Any]]:
+    """Normalize content to a list of Anthropic content blocks."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, list):
+        return list(content)
+    return [{"type": "text", "text": str(content)}]
+
+
+def _merge_consecutive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge consecutive messages with the same role (Anthropic requirement)."""
+    if not messages:
+        return []
+    merged: list[dict[str, Any]] = [dict(messages[0])]
+    for msg in messages[1:]:
+        if msg["role"] == merged[-1]["role"]:
+            prev = merged[-1]
+            prev["content"] = _to_blocks(prev["content"]) + _to_blocks(msg["content"])
+        else:
+            merged.append(msg)
+    return merged
+
+
+# Placeholder user turn put ahead of an inline system message that would
+# otherwise follow an ordinary assistant turn (see _place_system_messages).
+_ANCHOR_USER_TEXT = "(No new user message.)"
+
+
+def _is_server_tool_result(block: Any) -> bool:
+    """True for a server tool result block (``web_search_tool_result`` and kin).
+
+    The client ``tool_result`` type lacks the leading underscore, so the suffix
+    test never matches it.
+    """
+    return isinstance(block, dict) and str(block.get("type", "")).endswith("_tool_result")
+
+
+def _ends_in_server_tool_result(msg: dict[str, Any]) -> bool:
+    """True for an assistant turn whose last block is a server tool result."""
+    content = msg.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    return _is_server_tool_result(content[-1])
+
+
+def _is_server_tool_block(block: Any) -> bool:
+    """True for a server tool call (``server_tool_use``) or a server tool result."""
+    return _is_server_tool_result(block) or (
+        isinstance(block, dict) and block.get("type") == "server_tool_use"
+    )
+
+
+def _continues_turn(msg: dict[str, Any]) -> bool:
+    """True for a message that leaves the assistant turn before it open.
+
+    That is a system message, or a user message holding nothing but tool results.
+    """
+    if msg["role"] == "system":
+        return True
+    content = msg["content"]
+    return (
+        msg["role"] == "user"
+        and isinstance(content, list)
+        and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    )
+
+
+def _unavailable_result(call: dict[str, Any]) -> dict[str, Any] | None:
+    """The API's own ``unavailable`` error result for a server tool *call*.
+
+    ``None`` for a server tool missing from ``_SERVER_TOOL_RESULT_TYPES``, whose
+    result shape is not known here.
+    """
+    result_type = _SERVER_TOOL_RESULT_TYPES.get(str(call.get("name", "")))
+    if result_type is None:
+        return None
+    return {
+        "type": result_type,
+        "tool_use_id": call.get("id"),
+        "content": {"type": f"{result_type}_error", "error_code": "unavailable"},
+    }
+
+
+@functools.lru_cache(maxsize=4096)
+def _log_repair_once(message: str, *args: str) -> None:
+    """Log one wire repair at INFO, the first time this process makes it.
+
+    History keeps the original blocks, so a repair recurs on every request that
+    replays them; this bounded memo keeps one line per repaired block (an evicted
+    entry is merely logged again).
+    """
+    log.info(message, *args)
+
+
+def _pair_server_tool_blocks(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Give each server tool call on the wire one result, and each result its call.
+
+    When a response mixes client tool calls with a server tool call (native web
+    search or tool search), the API returns the server call unrun.  It runs the
+    call on the next request and opens the next assistant turn with the result,
+    but only while that request still continues the turn: nothing but tool results
+    (and system messages) after it.  Three histories break that pairing, and the
+    API rejects every request that carries them:
+
+    * The continuation never succeeds and user text follows, or a later assistant
+      turn lacks the result, so the call can never run (``... tool use with id ...
+      was found without a corresponding web_search_tool_result block``).  The call
+      stays, answered by the API's own error result (code ``unavailable``,
+      documented as "an internal error occurred" for web search and "the search
+      couldn't run" for tool search): the model sees the search it asked for and
+      that it failed, not a call erased from its history, and not an empty result,
+      which would claim the search ran and matched nothing.  Repeating a search has
+      no effect to reconcile, so this holds even when the search may have run
+      unseen.  The answered calls move ahead of the turn's first client call, as
+      the API wants client calls after every server result in a turn, and go
+      together in their order, then their results: the API's own shape for
+      parallel searches.  Interleaved, the history would read as a search repeated
+      after an error result told the model not to.  A server tool with no known
+      error result has its call dropped instead.
+    * Mid-turn compaction keeps the in-flight turn, which opens with the result,
+      and summarizes away the turn holding the call.  The result is dropped; a
+      summary never carries search results either.
+    * A converter that dropped a tool search's result made the API run the search
+      again, so the next stored reply opens with a second result for the call.
+      Only the first result, in the call's own turn, is kept.
+
+    A turn left empty is dropped whole.  Each block's fate depends only on the
+    history around it: a turn's wire changes once, when the turn ends with a call
+    still unrun, and then stays fixed as later turns are appended.
+
+    Returns the repaired messages and whether any block was dropped: a drop can
+    leave a turn empty or change how it ends, so the caller re-runs placement,
+    merging and this pass.  Unchanged input comes back as the same list.
+    """
+    answered = {
+        block.get("tool_use_id")
+        for msg in messages
+        if msg["role"] == "assistant" and isinstance(msg["content"], list)
+        for block in msg["content"]
+        if _is_server_tool_result(block)
+    }
+    # open_after[i]: everything after message i leaves its turn open, so an unrun
+    # call in message i still runs on this request.
+    open_after = [True] * len(messages)
+    for i in range(len(messages) - 2, -1, -1):
+        open_after[i] = open_after[i + 1] and _continues_turn(messages[i + 1])
+    # Calls seen earlier on the wire whose result has not come yet.
+    awaiting: set[Any] = set()
+    out: list[dict[str, Any]] = []
+    settled: list[str] = []
+    dropped: list[str] = []
+    for i, msg in enumerate(messages):
+        content = msg["content"]
+        if (
+            msg["role"] != "assistant"
+            or not isinstance(content, list)
+            or not any(_is_server_tool_block(b) for b in content)
+        ):
+            out.append(msg)
+            continue
+        blocks: list[Any] = []
+        answered_calls: list[Any] = []
+        unavailable: list[Any] = []
+        # Where the first answered call stood, and where the first client call is.
+        group_at: int | None = None
+        first_client: int | None = None
+        changed = False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "server_tool_use":
+                if block.get("id") not in answered and not open_after[i]:
+                    changed = True
+                    result = _unavailable_result(block)
+                    if result is None:
+                        log.warning(
+                            "Dropped an unrun call of server tool %r, which has no "
+                            "registered result type",
+                            block.get("name"),
+                        )
+                        dropped.append(str(block.get("id")))
+                        continue
+                    settled.append(str(block.get("id")))
+                    _log_repair_once(
+                        "Answered server tool call %s as unavailable: its turn ended "
+                        "before the call could run",
+                        str(block.get("id")),
+                    )
+                    if group_at is None:
+                        group_at = len(blocks)
+                    answered_calls.append(block)
+                    unavailable.append(result)
+                    continue
+                awaiting.add(block.get("id"))
+            elif _is_server_tool_result(block):
+                # No call before it, or its call already has a result.
+                if block.get("tool_use_id") not in awaiting:
+                    changed = True
+                    dropped.append(str(block.get("tool_use_id")))
+                    _log_repair_once(
+                        "Dropped a server tool result for %s: no call before it awaits one",
+                        str(block.get("tool_use_id")),
+                    )
+                    continue
+                awaiting.remove(block.get("tool_use_id"))
+            elif (
+                first_client is None and isinstance(block, dict) and block.get("type") == "tool_use"
+            ):
+                first_client = len(blocks)
+            blocks.append(block)
+        if group_at is not None:
+            at = group_at if first_client is None else min(group_at, first_client)
+            blocks[at:at] = answered_calls + unavailable
+        if not changed:
+            out.append(msg)
+        elif blocks:
+            out.append({**msg, "content": blocks})
+    if not settled and not dropped:
+        return messages, False
+    log.debug(
+        "Server tool pairing: answered unrun call(s) %s as unavailable, dropped %s",
+        settled,
+        dropped,
+    )
+    return out, bool(dropped)
+
+
+def _finish_wire(
+    messages: list[dict[str, Any]], *, server_blocks: int, place_system: bool
+) -> list[dict[str, Any]]:
+    """Place inline system messages, merge same-role turns, then pair server tool blocks.
+
+    Pairing runs on the final shape because a placeholder user turn ends an
+    assistant turn just as user text does.  A drop can change that shape (a turn
+    left empty, or one that no longer ends in a server result), so every step runs
+    again after a drop.  Each block is answered or dropped at most once, so the
+    drops never outnumber ``server_blocks``; the bound guards that argument, not an
+    expected case.
+    """
+    passes = 0
+    while True:
+        if place_system:
+            messages = _place_system_messages(messages)
+        messages = _merge_consecutive(messages)
+        if not server_blocks:
+            return messages
+        if passes > server_blocks:
+            log.warning("Server tool pairing still dropping blocks after %d passes", passes)
+            return messages
+        messages, dropped = _pair_server_tool_blocks(messages)
+        if not dropped:
+            return messages
+        passes += 1
+
+
+def tool_search_references(blocks: Iterable[Any]) -> Iterator[tuple[str, str]]:
+    """Yield ``(tool name, search id)`` for each tool a tool search result in *blocks* loaded.
+
+    The one reader of a native tool search's ``tool_reference`` list, so the session's offer
+    (``ChatSession._natively_loaded_tool_names``) and the provider's stubs see the same
+    names. A failed search loads nothing.
+    """
+    result_type = _SERVER_TOOL_RESULT_TYPES[_TOOL_SEARCH_TOOL_TYPE]
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != result_type:
+            continue
+        result = block.get("content")
+        references = result.get("tool_references") if isinstance(result, dict) else None
+        for reference in references or []:
+            name = reference.get("tool_name") if isinstance(reference, dict) else None
+            if isinstance(name, str):
+                yield name, str(block.get("tool_use_id"))
+
+
+# The definition a replayed tool search's reference resolves to once the request no longer
+# offers the tool (see ``_stubs_for_unoffered_references``).
+_UNOFFERED_TOOL_DESCRIPTION = "This tool is no longer available."
+
+
+def _stubs_for_unoffered_references(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Define each tool that a replayed tool search loaded and this request does not offer.
+
+    The API expands every ``tool_reference`` in history from this request's ``tools`` and
+    rejects a reference with no definition there (live 400, "Tool reference 'X' not found in
+    available tools"). A tool a past search loaded leaves the request when its MCP server goes
+    offline or is removed, or on a shared workstream when it came from another user's catalog;
+    a tool the session still has stays offered, even where its search runs client-side
+    (``ChatSession._natively_loaded_tool_names``). History keeps what the search loaded, and
+    the stub tells the model the tool is gone. Each stub is a plain definition, not a deferred
+    one: the request may offer no other tool, and the API rejects a tool list in which every
+    tool is deferred.
+    """
+    offered = {tool.get("name") for tool in tools if isinstance(tool, dict)}
+    missing: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        for name, search_id in tool_search_references(content):
+            if name in offered:
+                continue
+            _log_repair_once(
+                "Offered tool %s as no longer available: replayed tool search %s loaded it, "
+                "and this request does not offer it",
+                name,
+                search_id,
+            )
+            if name not in missing:
+                missing.append(name)
+    return [
+        {
+            "name": name,
+            "description": _UNOFFERED_TOOL_DESCRIPTION,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        for name in missing
+    ]
+
+
+def _place_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move inline ``system`` messages to positions the Messages API accepts.
+
+    A mid-conversation system message must come right after a ``user`` turn
+    (or an assistant turn ending in a server tool result) and right before an
+    ``assistant`` turn or at the end of the array; any other position is a
+    400.  Operator turns can land elsewhere: approval feedback or a queued
+    message appended after an advisory puts a user turn right after it, and an
+    idle wake, whose empty user turn is dropped, leaves one right after the
+    assistant's turn.  A system message followed by user turns moves after
+    them (``_merge_consecutive`` then joins the user turns, tool results
+    first); one that would follow an ordinary assistant turn gets
+    :data:`_ANCHOR_USER_TEXT` as a user turn ahead of it.  Held system
+    messages are released no later than the next assistant turn, so the wire
+    before each assistant turn depends only on the messages before it and
+    stays fixed as later turns are appended, which preserved thinking relies
+    on.  Only a trailing system message can still move, when a user turn
+    follows it (as after a failed wake).
+    """
+    placed: list[dict[str, Any]] = []
+    held: list[dict[str, Any]] = []
+
+    def release() -> None:
+        if not held:
+            return
+        prev = placed[-1] if placed else None
+        if (
+            prev is not None
+            and prev["role"] == "assistant"
+            and not _ends_in_server_tool_result(prev)
+        ):
+            placed.append({"role": "user", "content": _ANCHOR_USER_TEXT})
+        placed.extend(held)
+        held.clear()
+
+    for msg in messages:
+        if msg["role"] == "system":
+            held.append(msg)
+        elif msg["role"] == "user":
+            placed.append(msg)
+        else:
+            release()
+            placed.append(msg)
+    release()
+    return placed
+
+
+# Tool version for Anthropic's server-side web search (update when new version ships)
+_WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
+
+# Tool search: server-side BM25 tool discovery for deferred tools
+_TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25"
+
+# The result block type of each server tool this lane injects, keyed by the name on
+# its ``server_tool_use``.  The one registry for server tools: the valid block set
+# takes its result types from here, and pairing answers an unrunnable call with
+# this type's ``unavailable`` error.
+_SERVER_TOOL_RESULT_TYPES = {
+    "web_search": "web_search_tool_result",
+    _TOOL_SEARCH_TOOL_TYPE: "tool_search_tool_result",
+}
+
+# Beta value that unlocks ``thinking.block_binding`` (see
+# ``ModelCapabilities.thinking_prefix_bound``).  Sent as an
+# ``anthropic-beta`` request header, comma-joined with any value a caller
+# already put there.
+_THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+
+# extra_params keys consumed internally (``_reasoning_params``) — never
+# forwarded to the wire ``extra_body``.  Keeps real-Anthropic request
+# bodies byte-identical when a caller threads thinking overrides.
+_INTERNAL_EXTRA_PARAMS = frozenset({"thinking_budget_tokens"})
+
+# Manual-mode thinking budgets per effort knob level — monotone over the
+# whole knob domain (a higher knob position must never buy a smaller
+# budget; the request path still clamps below per-request max_tokens).
+# minimal shares the 1024 floor with low: the API rejects budgets under
+# 1024, so there is no smaller tier to express.  Unknown strings (custom
+# configs) fall back to the default budget.  Public: shared with
+# ``effort_ladder`` so UI projections can't drift from the wire.
+EFFORT_BUDGET_MAP = {
+    "minimal": 1024,
+    "low": 1024,
+    "medium": 4096,
+    "high": 16384,
+    "xhigh": 32768,
+    "max": 65536,
+}
+DEFAULT_THINKING_BUDGET = 4096
+
+# -- model capabilities -------------------------------------------------------
+
+# The row a Claude model id gets when no entry in the table below matches it
+# (``_lookup_capabilities``), such as the first model of a new line.  The
+# models the API still serves that take a thinking budget each have a row, so
+# every served model that lands here under its Anthropic id thinks
+# adaptively, and the row sends only what all of them accept: adaptive
+# thinking with ``display: "summarized"`` (newer models return thinking
+# blocks with empty text without it), the ``low``..``high`` effort ladder (a
+# knob of ``xhigh`` or ``max`` rides ``high``; an unset knob still omits
+# ``output_config.effort``), and no temperature (API version 2026-10-21
+# refuses it on every model; the hosted lane never sends one).  A budget model
+# reached under another name, such as a gateway's, lands here too and needs
+# its own row's ``thinking_mode`` and ``supports_effort`` in its definition's
+# capabilities.  Limits stay conservative, and features some models lack stay
+# off: native mid-conversation system messages, the prefix-binding control
+# and tool search.  A model's real limits and features belong in its own row.
+_ANTHROPIC_DEFAULT = ModelCapabilities(
+    context_window=200000,
+    max_output_tokens=64000,
+    token_param="max_tokens",
+    thinking_mode="adaptive",
+    supports_effort=True,
+    effort_levels=("low", "medium", "high"),
+    supports_web_search=True,
+    supports_vision=True,
+    supports_pdf=True,
+    supports_temperature=False,
+    thinking_display="summarized",
+    supports_reasoning_replay=True,
+)
+
+# Anthropic-compatible local servers (vLLM's /v1/messages endpoint):
+# token_param must be "max_tokens" (the only token param the endpoint
+# accepts); the "thinking" request param is not consumed by vLLM — the
+# reasoning levers ride chat_template_kwargs via extra_body instead
+# (``merge_reasoning_template_kwargs``).  thinking_mode defaults to "none" = inject
+# nothing, the server's template default reigns; per-model capabilities
+# opt into the effort-knob-driven toggle with thinking_mode="manual" +
+# thinking_param (plus a graded effort key via effort_param where the
+# template has one).  supports_reasoning_replay stays True even at
+# "none", because the endpoint emits and round-trips thinking blocks
+# whenever the chat template enables reasoning (the request param is
+# simply not the switch); native web_search / tool_search server-tool
+# types 400 on vLLM (tools require input_schema); vision is opt-in per
+# model.  supports_temperature stays True via the dataclass default.
+_ANTHROPIC_COMPAT_DEFAULT = ModelCapabilities(
+    context_window=200000,
+    max_output_tokens=64000,
+    token_param="max_tokens",
+    thinking_mode="none",
+    supports_web_search=False,
+    supports_tool_search=False,
+    supports_vision=False,
+    supports_reasoning_replay=True,
+)
+
+_ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
+    # Fable 5.1: the fable-5 surface (below) plus three documented breaking
+    # changes, of which only the last reaches this lane:
+    #   * forced tool choice (``tool_choice`` any/tool) is a 400 -- this lane
+    #     never sends ``tool_choice`` at all, so unreachable.
+    #   * thinking blocks are bound to the producing model -- a block the
+    #     target model cannot read is dropped server-side, unbilled, before
+    #     the prompt is priced; replay stays verbatim, nothing to strip.
+    #   * thinking blocks are bound to the conversation prefix -- see
+    #     ``thinking_prefix_bound``; the row opts into drop_block.
+    # Same tokenizer, limits, effort ladder (default high) and pricing tier
+    # as fable-5.  ``display: "summarized"`` also returns the model's
+    # between-tool-call progress notes as thinking text.
+    "claude-fable-5-1": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
+    ),
+    # Fable 5: same wire surface as opus-4-8 (adaptive-only thinking, no
+    # sampling params, prefill rejected) with one extra constraint — an
+    # explicit thinking={"type": "disabled"} is a 400 on this model; thinking
+    # must be adaptive or the param omitted entirely.  The adaptive branch in
+    # _build_thinking_and_kwargs never emits "disabled", so this is safe as
+    # long as thinking_mode stays "adaptive".
+    "claude-fable-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+    ),
+    # Opus 5.5: the opus-5 surface (below) plus four documented breaking
+    # changes, of which only the third reaches this lane:
+    #   * thinking cannot be disabled at any effort -- the adaptive branch
+    #     never emits "disabled" or a budget, so unreachable.
+    #   * forced tool choice (``tool_choice`` any/tool) is a 400 -- this lane
+    #     never sends ``tool_choice``.
+    #   * thinking blocks are bound to the producing model and to the
+    #     conversation prefix -- model binding is a server-side unbilled
+    #     drop (replay stays verbatim); prefix binding is the fable-5-1
+    #     posture, so the row opts into drop_block via
+    #     ``thinking_prefix_bound``.
+    #   * the older computer-use tool is a 400 -- this lane sends none.
+    # The API default effort is medium (opus-5: high); an unset knob still
+    # omits ``output_config.effort`` rather than pinning a level.
+    "claude-opus-5-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
+    ),
+    # Opus 5: same wire surface as opus-4-8.  Two of this model's documented
+    # breaking changes are unreachable from this lane, and stay that way only
+    # while thinking_mode is "adaptive":
+    #   * thinking is ON by default when the param is omitted (opus-4-8 omitted
+    #     meant OFF) — we never omit it, the adaptive branch in
+    #     _build_thinking_and_kwargs always writes an explicit {"type":
+    #     "adaptive"}, so the changed default cannot reach us.
+    #   * thinking={"type": "disabled"} is a 400 at effort xhigh/max — that
+    #     branch does not exist here (same reasoning as the fable-5 row above).
+    # Adding a disabled-thinking branch to this lane re-opens both; gate it on
+    # effort <= high if that ever happens.
+    # This model's safety classifiers can also decline a request with
+    # stop_reason="refusal" on an HTTP 200 — normalized in
+    # _normalize_finish_reason, see the note there.
+    "claude-opus-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+    ),
+    "claude-opus-4-8": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+    ),
+    "claude-opus-4-7": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+    ),
+    "claude-opus-4-6": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        supports_reasoning_replay=True,
+    ),
+    # Sonnet 5.5: the sonnet-5 surface (below) plus mid-conversation system
+    # messages, which sonnet-5 does not accept.  Of its five documented
+    # breaking changes only the third reaches this lane:
+    #   * thinking={"type": "disabled"} is a 400 (the off switch is
+    #     "between_tools") -- the adaptive branch emits neither, so
+    #     unreachable.
+    #   * forced tool choice (``tool_choice`` any/tool) is a 400 -- this lane
+    #     never sends ``tool_choice``.
+    #   * thinking blocks are bound to the producing model and to the
+    #     conversation prefix -- model binding is a server-side unbilled
+    #     drop (replay stays verbatim); prefix binding is the fable-5-1
+    #     posture, so the row opts into drop_block via
+    #     ``thinking_prefix_bound``.  The API accepts ``block_binding`` only
+    #     with adaptive thinking, the only mode this row sends.
+    #   * the older computer-use tool is a 400 -- this lane sends none.
+    #   * the advisor tool rejects some advisor models -- this lane sends none.
+    # The API default effort stays high (levels recalibrated from sonnet-5);
+    # an unset knob still omits ``output_config.effort`` rather than pinning
+    # a level.
+    "claude-sonnet-5-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
+    ),
+    # Sonnet 5: adaptive thinking is on by default (explicit adaptive config
+    # accepted; manual budget_tokens is a 400); unlike Fable 5, an explicit
+    # thinking={"type": "disabled"} IS accepted.  Non-default sampling params
+    # (temperature/top_p/top_k) are a 400, same as Opus 4.8 / Fable 5.
+    # Effort: full ladder incl. xhigh + max; API default is high
+    # (platform.claude.com/docs/en/build-with-claude/effort, 2026-07 check).
+    "claude-sonnet-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+    ),
+    # Sonnet 4.6: effort ladder tops at max (no xhigh — that level exists
+    # only on Fable 5 / Sonnet 5 / Opus 4.7+); knob xhigh rides max via the
+    # ordinal snap.
+    "claude-sonnet-4-6": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        supports_reasoning_replay=True,
+    ),
+    # Haiku 5.5: the first Haiku with adaptive thinking and effort.  The API
+    # default effort is medium; an unset knob omits ``output_config.effort``
+    # rather than pinning a level.  Its documented breaking changes against
+    # haiku-4-5, as they meet this lane:
+    #   * a thinking budget (``budget_tokens``) is a 400 -- the adaptive branch
+    #     never sends one.
+    #   * non-default sampling params are a 400 -- temperature is never sent.
+    #   * assistant prefill is a 400, as on every adaptive row.
+    #   * the older computer-use tool is a 400 -- this lane sends none.
+    #   * thinking blocks are bound to the conversation prefix -- the
+    #     fable-5-1 posture, so the row opts into drop_block via
+    #     ``thinking_prefix_bound``.
+    # Thinking turns off with {"type": "disabled"} only at effort high or
+    # below (a 400 at xhigh and max); "between_tools", sonnet-5-5's off
+    # switch, is a 400 here.  The adaptive branch sends neither, so a
+    # thinking-off branch added later must gate on effort <= high and leave
+    # out ``block_binding``, which the API accepts only with adaptive
+    # thinking.  Forced tool choice is accepted (it skips thinking), and this
+    # lane never sends ``tool_choice``.
+    "claude-haiku-5-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
+    ),
+    "claude-haiku-4-5": ModelCapabilities(
+        context_window=200000,
+        max_output_tokens=64000,
+        token_param="max_tokens",
+        thinking_mode="manual",
+        supports_web_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        supports_reasoning_replay=True,
+    ),
+    "claude-sonnet-4-5": ModelCapabilities(
+        context_window=200000,
+        max_output_tokens=64000,
+        token_param="max_tokens",
+        thinking_mode="manual",
+        supports_web_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        supports_reasoning_replay=True,
+    ),
+    "claude-opus-4-5": ModelCapabilities(
+        context_window=200000,
+        max_output_tokens=64000,
+        token_param="max_tokens",
+        thinking_mode="manual",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high"),
+        supports_web_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        supports_reasoning_replay=True,
+    ),
+}
+
+# The commercial endpoint segregates reasoning natively (``thinking`` /
+# ``redacted_thinking`` blocks) — content never carries inline think
+# tags, so the inline tag scan is off for every entry, known or
+# defaulted, as ONE rule applied to the whole table (a per-entry flag
+# would be forgotten on the next model row).  ``_ANTHROPIC_COMPAT_DEFAULT``
+# is deliberately NOT covered: local /v1/messages checkpoints are exactly
+# the passthrough dialect the scan exists for.
+_ANTHROPIC_DEFAULT = replace(_ANTHROPIC_DEFAULT, server_parses_reasoning=True)
+_ANTHROPIC_CAPABILITIES = {
+    name: replace(caps, server_parses_reasoning=True)
+    for name, caps in _ANTHROPIC_CAPABILITIES.items()
+}
+
+
+def _map_reasoning_to_effort(
+    reasoning_effort: str | None,
+    valid_levels: tuple[str, ...],
+) -> str | None:
+    """Map turnstone reasoning_effort to Anthropic effort parameter.
+
+    Declared levels match verbatim; off-list knob values round up onto
+    the declared levels, capped at their ceiling (a knob above the
+    model's top level must ride the top level, not silently drop
+    output_config).  "none"/empty and unrankable strings return None —
+    no effort param.
+    """
+    if not reasoning_effort or reasoning_effort == "none":
+        return None
+    if reasoning_effort in valid_levels:
+        return reasoning_effort
+    return snap_reasoning_effort(reasoning_effort, valid_levels)
+
+
+# Anthropic accepts only a closed set of content-block types on the
+# input boundary.  ``_convert_messages`` runs each block in
+# ``_provider_content`` through this set per-block: foreign-shaped
+# blocks (OpenAI Responses ``type="reasoning"``, Gemini thought parts,
+# the synthetic ``reasoning_text`` from path-3 capture) are dropped
+# individually; valid Anthropic blocks in the same message still ride
+# the verbatim path.  When no valid blocks survive, the converter falls
+# through to the text+tool_calls rebuild path.  Server tool blocks
+# (``server_tool_use`` and the result types in
+# ``_SERVER_TOOL_RESULT_TYPES``) stay in the set because the API wants
+# them passed back unchanged: it rejects a call whose result is
+# missing, and web search results carry the ``encrypted_content`` that
+# round-trip continuity needs.  The per-block filter preserves them even
+# when they share a message with a foreign block (the prior
+# all-or-nothing filter would have silently dropped them in that case).
+ANTHROPIC_VALID_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "image",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_result",
+        "server_tool_use",
+        *_SERVER_TOOL_RESULT_TYPES.values(),
+    }
+)
+
+# Subset of valid block types whose ``content`` is reasoning text.
+# When ``replay_reasoning_to_model=False`` the strip predicate drops
+# these (and only these) before the wire payload is built — narrow by
+# design so ``tool_use`` / web-search blocks survive.
+ANTHROPIC_REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+
+
+# -- provider ----------------------------------------------------------------
+
+
+class AnthropicProvider:
+    """Provider for Anthropic's Messages API with native streaming.
+
+    ``compat=True`` serves Anthropic-compatible local servers (vLLM's
+    ``/v1/messages``): same wire translation, but capabilities come from
+    ``_ANTHROPIC_COMPAT_DEFAULT`` for every model — the static Claude
+    table never applies to local checkpoints.
+    """
+
+    def __init__(self, *, compat: bool = False) -> None:
+        self._compat = compat
+
+    @property
+    def provider_name(self) -> str:
+        return "anthropic-compatible" if self._compat else "anthropic"
+
+    def get_capabilities(self, model: str) -> ModelCapabilities:
+        if self._compat:
+            return _ANTHROPIC_COMPAT_DEFAULT
+        return _lookup_capabilities(model, _ANTHROPIC_CAPABILITIES, _ANTHROPIC_DEFAULT)
+
+    # -- web search tool injection -------------------------------------------
+
+    def _inject_web_search(
+        self,
+        tools: list[dict[str, Any]],
+        caps: ModelCapabilities,
+    ) -> list[dict[str, Any]]:
+        """Replace ``web_search`` function tool with native server-side tool.
+
+        If the tools list contains a ``web_search`` function tool and the model
+        supports native web search, replace it with Anthropic's
+        ``web_search_20250305`` server-side tool.  The server executes the search
+        autonomously — no client-side tool execution loop needed.
+        """
+        if not caps.supports_web_search:
+            return tools
+        has_web_search = any(t.get("name") == "web_search" for t in tools)
+        if not has_web_search:
+            return tools
+        # Remove the function-based web_search and add the native tool
+        filtered = [t for t in tools if t.get("name") != "web_search"]
+        filtered.append({"type": _WEB_SEARCH_TOOL_TYPE, "name": "web_search"})
+        return filtered
+
+    # -- tool search injection -----------------------------------------------
+
+    def _inject_tool_search(
+        self,
+        tools: list[dict[str, Any]],
+        caps: ModelCapabilities,
+        deferred_names: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Mark deferred tools and add native server-side search tool.
+
+        When the model supports tool search and ``deferred_names`` is provided,
+        tools whose name is in the deferred set get ``defer_loading: true``.
+        The BM25 search tool is appended so the model can discover them.
+        """
+        if not caps.supports_tool_search or not deferred_names:
+            return tools
+        result = []
+        for tool in tools:
+            if tool.get("name", "") in deferred_names:
+                result.append({**tool, "defer_loading": True})
+            else:
+                result.append(tool)
+        result.append({"type": _TOOL_SEARCH_TOOL_TYPE, "name": _TOOL_SEARCH_TOOL_TYPE})
+        return result
+
+    # -- shared param logic --------------------------------------------------
+
+    def _build_thinking_and_kwargs(
+        self,
+        caps: ModelCapabilities,
+        reasoning_effort: str | None,
+        extra_params: dict[str, Any] | None,
+        max_tokens: int,
+        temperature: float | None,
+        converted_msgs: list[dict[str, Any]],
+        system_prompt: str,
+        model: str,
+        tools: list[dict[str, Any]] | None,
+        deferred_names: frozenset[str] | None = None,
+    ) -> dict[str, Any]:
+        """Build the full kwargs dict with thinking mode and effort params."""
+        thinking_params: dict[str, Any] = {}
+        if self._compat:
+            # vLLM's /v1/messages has no ``thinking`` field in its request
+            # schema (silently dropped) and must not have temperature forced
+            # to 1.0 — reasoning control rides chat_template_kwargs instead,
+            # folded into extra_params here so the extra_body forwarding
+            # below carries it to the wire.  This lane has no flat effort
+            # param, so the graded value falls back to the conventional
+            # template key when the operator engaged reasoning control
+            # without naming one — the session effort setting always
+            # reaches the wire.
+            extra_params = merge_reasoning_template_kwargs(
+                caps,
+                reasoning_effort,
+                extra_params,
+                fallback_effort_param=EFFORT_TEMPLATE_FALLBACK_PARAM,
+            )
+        elif caps.thinking_mode == "adaptive":
+            thinking_dict: dict[str, Any] = {"type": "adaptive"}
+            if caps.thinking_display:
+                thinking_dict["display"] = caps.thinking_display
+            if caps.thinking_prefix_bound:
+                thinking_dict["block_binding"] = {"prefix_mismatch_behavior": "drop_block"}
+            thinking_params = {"thinking": thinking_dict}
+        elif caps.thinking_mode == "manual":
+            thinking_params = self._reasoning_params(reasoning_effort, extra_params, max_tokens)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": converted_msgs,
+            caps.token_param: max_tokens,
+            # Automatic prompt caching — the API places the cache breakpoint
+            # on the last cacheable block and advances it as conversation grows.
+            # 90% input cost reduction on cache hits; 1.25x write on first turn.
+            "cache_control": {"type": "ephemeral"},
+        }
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        if tools:
+            anthropic_tools = self.convert_tools(tools)
+            anthropic_tools = self._inject_web_search(anthropic_tools, caps)
+            anthropic_tools = self._inject_tool_search(anthropic_tools, caps, deferred_names)
+            kwargs["tools"] = anthropic_tools
+        stubs = _stubs_for_unoffered_references(converted_msgs, kwargs.get("tools", []))
+        if stubs:
+            kwargs["tools"] = [*kwargs.get("tools", []), *stubs]
+        kwargs.update(thinking_params)
+
+        # Effort param for models that support it (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5).
+        # Never on the compat lane: ``output_config`` is not in vLLM's request
+        # schema — graded effort there is ``caps.effort_param`` via
+        # chat_template_kwargs.
+        if not self._compat and caps.supports_effort and reasoning_effort:
+            effort = _map_reasoning_to_effort(reasoning_effort, caps.effort_levels)
+            if effort:
+                kwargs["output_config"] = {"effort": effort}
+
+        # ``extra_body`` is merged into the request JSON on top of the typed
+        # kwargs (an ``extra_body`` key replaces a typed one of the same
+        # name).  Two sources share it:
+        #
+        # * Temperature, on the compat lane only.  The SDK has no sampling
+        #   kwargs (a typed ``temperature=`` is a TypeError), so the
+        #   capability-gated value rides here; None is never written — the
+        #   request omits the field so the server default applies (house
+        #   rule: no code pins).  The hosted lane sends API version
+        #   2026-10-21, which refuses temperature, top_p and top_k on every
+        #   model, even at their defaults, so it never sends one — whatever
+        #   a definition's capabilities claim.
+        # * Operator server_compat overrides (e.g. chat_template_kwargs for
+        #   anthropic-compatible local servers).  Applied last, so an
+        #   operator pin of ``temperature`` beats the resolved knob — the
+        #   precedence the OpenAI lanes already give a server_compat pin.
+        extra_body: dict[str, Any] = {}
+        if self._compat and caps.supports_temperature and temperature is not None:
+            extra_body["temperature"] = temperature
+        if extra_params:
+            extra_body.update(
+                (k, v) for k, v in extra_params.items() if k not in _INTERNAL_EXTRA_PARAMS
+            )
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        if "block_binding" in thinking_params.get("thinking", {}):
+            kwargs["extra_headers"] = {"anthropic-beta": _THINKING_BINDING_BETA}
+
+        return kwargs
+
+    # -- message conversion --------------------------------------------------
+
+    def _convert_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        replay_reasoning_to_model: bool = True,
+        supports_mid_conversation_system: bool = False,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Convert internal (OpenAI-like) messages to Anthropic format.
+
+        Returns ``(system_prompt, converted_messages)``.
+
+        ``replay_reasoning_to_model`` (Phase 2 of the reasoning-
+        persistence feature, mirroring ``ModelConfig.replay_
+        reasoning_to_model``) gates whether stored ``thinking`` blocks
+        survive the verbatim ``_provider_content`` replay path.  When
+        the caller passes ``False`` (the operator-side server_default
+        for the ``model_definitions`` row this kwarg is sourced from),
+        thinking blocks are stripped before the wire payload is built;
+        ``tool_use`` / ``server_tool_use`` / ``web_search_tool_result``
+        blocks (which carry web-search ``encrypted_content``) are
+        intentionally preserved.  The kwarg defaults to ``True`` here
+        purely for back-compat with any direct caller that hasn't been
+        updated to thread the resolver — production call sites
+        (``model_turn`` — every lane, the interactive loop included)
+        always pass the resolved flag explicitly.
+
+        ``supports_mid_conversation_system`` (set on the rows whose
+        model accepts mid-conversation system messages) makes the
+        system-role handling position-aware: leading system/developer
+        messages (the base prompt) still hoist into the top-level
+        ``system`` param, but a system message appearing AFTER a
+        non-system turn is a mid-conversation operator turn (see
+        ``lowering.fold_system_turns``) and is emitted inline as a
+        ``{"role": "system"}`` message at or just after its trajectory
+        position (``_place_system_messages`` moves it to a slot the API
+        accepts).  When False (every other row) all system messages
+        hoist, as before — the fold pass has already removed any
+        mid-conversation operator turns for those models.
+
+        Foreign-shaped blocks (OpenAI ``reasoning``, Gemini thought
+        parts, the synthetic ``reasoning_text`` from path-3 capture) are
+        dropped per-block; valid Anthropic blocks in the same message
+        still ride the verbatim path.  Critical for cross-model
+        resumption: an earlier all-or-nothing filter silently lost
+        web-search ``encrypted_content`` whenever a foreign block
+        shared a message with ``server_tool_use`` /
+        ``web_search_tool_result``.  If the filter leaves nothing, the
+        converter falls through to the text+tool_calls rebuild path.
+
+        A server tool call or result whose pairing is broken on the final wire (an
+        interrupted continuation followed by new user text; a compaction that kept
+        a result but summarized its call away; a second result for one call) is
+        repaired there; see ``_pair_server_tool_blocks``.
+        """
+        system_parts: list[str] = []
+        converted: list[dict[str, Any]] = []
+        # Server tool blocks reaching the wire: zero skips the pairing repair.
+        server_blocks = 0
+        # Leading system/developer messages are the base prompt → hoist into the
+        # top-level ``system`` param; a system message AFTER the first non-system
+        # turn is a mid-conversation operator turn (present only on the native
+        # path — the fold pass strips them for every other model).
+        seen_non_system = False
+
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            role = msg["role"]
+
+            if role in ("system", "developer"):
+                content = msg.get("content")
+                if supports_mid_conversation_system and seen_non_system and converted:
+                    # Mid-conversation operator turn → keep inline;
+                    # ``_place_system_messages`` (below) moves it to a slot the API
+                    # accepts, after any user turns that follow it or behind a
+                    # placeholder user turn, and ``_merge_consecutive`` joins system
+                    # turns that end up adjacent (the API forbids consecutive system
+                    # messages).  Producers place these after a complete tool block,
+                    # never between a tool_use and its tool_result.  The
+                    # ``converted`` guard matters because ``seen_non_system`` is set
+                    # even when the preceding non-system message converted to
+                    # nothing (e.g. an assistant turn with only stripped reasoning).
+                    # Without it, the first real wire entry could be a ``system``
+                    # message — which the API rejects (messages[0] must be
+                    # ``user``).  ``converted`` only ever gains a system entry once
+                    # it already holds a non-system one, so a non-empty
+                    # ``converted`` guarantees ``converted[0]`` is non-system;
+                    # otherwise the turn hoists into ``system`` below.
+                    if content:
+                        converted.append({"role": "system", "content": content})
+                elif content:
+                    system_parts.append(content)
+                i += 1
+                continue
+
+            seen_non_system = True
+
+            if role == "assistant":
+                # Per-block shape filter: drop foreign blocks individually,
+                # apply the replay strip to valid ``thinking`` /
+                # ``redacted_thinking`` blocks.  See ``_convert_messages``
+                # docstring for why this is per-block, not all-or-nothing.
+                provider_content = msg.get("_provider_content")
+                wire_blocks: list[dict[str, Any]] = []
+                valid_blocks: list[dict[str, Any]] = []
+                all_input_valid = True
+                if isinstance(provider_content, list) and provider_content:
+                    dropped_foreign: list[str] = []
+                    for b in provider_content:
+                        if not isinstance(b, dict):
+                            all_input_valid = False
+                            continue
+                        btype = b.get("type")
+                        if btype not in ANTHROPIC_VALID_BLOCK_TYPES:
+                            dropped_foreign.append(str(btype))
+                            all_input_valid = False
+                            continue
+                        valid_blocks.append(b)
+                        if _is_server_tool_block(b):
+                            server_blocks += 1
+                        if (
+                            not replay_reasoning_to_model
+                            and btype in ANTHROPIC_REASONING_BLOCK_TYPES
+                        ):
+                            continue
+                        wire_blocks.append(b)
+                    if dropped_foreign:
+                        log.debug(
+                            "Dropped %d foreign block(s) from _provider_content "
+                            "during Anthropic conversion: %s",
+                            len(dropped_foreign),
+                            dropped_foreign,
+                        )
+                    # Identity-preserving fast path: when nothing was filtered
+                    # or stripped, reuse the source list reference rather than
+                    # the per-block-built copy.  Pinned by the ``is`` assertions
+                    # in test_providers.py (test_convert_messages_uses_provider_
+                    # content + test_thinking_block_multiturn_roundtrip).
+                    if all_input_valid and replay_reasoning_to_model:
+                        wire_blocks = provider_content
+                if valid_blocks and wire_blocks:
+                    converted.append({"role": "assistant", "content": wire_blocks})
+                    # Orphaned native tool_use is repaired upstream by
+                    # ``lowering.repair_wire_messages`` (it reads the mirrored
+                    # top-level ``tool_calls``), so a synthetic ``tool`` turn is
+                    # already in ``messages`` and converts via the tool branch.
+                    i += 1
+                    continue
+                # Fall through to text+tool_calls rebuild when nothing
+                # survived the filter (missing/empty pc, all-foreign, or
+                # strip removed every remaining thinking block).  An empty
+                # rebuild is silently skipped — a turn with only stripped
+                # reasoning has nothing to replay.
+
+                content_blocks: list[dict[str, Any]] = []
+                text = msg.get("content")
+                if text:
+                    content_blocks.append({"type": "text", "text": text})
+                for tc in msg.get("tool_calls", []):
+                    fn = tc.get("function", {})
+                    args_str = fn.get("arguments", "{}")
+                    try:
+                        args_obj = json.loads(args_str)
+                    except (ValueError, TypeError, RecursionError):
+                        args_obj = {}
+                    content_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.get("id", ""),
+                            "name": fn.get("name", ""),
+                            "input": args_obj,
+                        }
+                    )
+                if content_blocks:
+                    converted.append({"role": "assistant", "content": content_blocks})
+
+                i += 1
+                continue
+
+            if role == "tool":
+                # Anthropic: tool results are content blocks in a user message.
+                # Collect valid tool_use IDs from the preceding assistant message
+                # so we can drop orphaned tool_results that have no matching
+                # tool_use (e.g. from compaction boundary, old cancel stripping).
+                prev_tool_use_ids: set[str] = set()
+                if converted and converted[-1].get("role") == "assistant":
+                    prev_content = converted[-1].get("content", [])
+                    if isinstance(prev_content, list):
+                        for block in prev_content:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                bid = block.get("id", "")
+                                if bid:
+                                    prev_tool_use_ids.add(bid)
+
+                tool_results: list[dict[str, Any]] = []
+                while i < len(messages) and messages[i]["role"] == "tool":
+                    tool_msg = messages[i]
+                    tc_id = tool_msg.get("tool_call_id", "")
+                    # Drop orphaned tool_results with no matching tool_use.
+                    # When prev_tool_use_ids is empty (no preceding assistant
+                    # tool_use), let all results through — avoids false drops
+                    # from unexpected message ordering.
+                    if prev_tool_use_ids and tc_id not in prev_tool_use_ids:
+                        log.debug(
+                            "Dropping orphaned tool_result (no matching tool_use): %s",
+                            tc_id,
+                        )
+                        i += 1
+                        continue
+                    content = tool_msg.get("content", "")
+                    # Convert image_url parts to Anthropic image format
+                    if isinstance(content, list):
+                        content = self._convert_content_parts(content)
+                    result_block: dict[str, Any] = {
+                        "type": "tool_result",
+                        "tool_use_id": tc_id,
+                        "content": content,
+                    }
+                    if tool_msg.get("is_error"):
+                        result_block["is_error"] = True
+                    tool_results.append(result_block)
+                    i += 1
+                if tool_results:
+                    converted.append({"role": "user", "content": tool_results})
+                continue
+
+            if role == "user":
+                user_content = msg.get("content", "")
+                # Multipart user messages (attachments) carry list content
+                # with image_url / document parts — translate at the boundary.
+                if isinstance(user_content, list):
+                    user_content = self._convert_content_parts(user_content)
+                converted.append({"role": "user", "content": user_content})
+                i += 1
+                continue
+
+            # Unknown role — pass through as user
+            converted.append({"role": "user", "content": str(msg.get("content", ""))})
+            i += 1
+
+        converted = _finish_wire(
+            converted,
+            server_blocks=server_blocks,
+            place_system=supports_mid_conversation_system,
+        )
+        return "\n\n".join(system_parts), converted
+
+    @staticmethod
+    def _convert_content_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert OpenAI-format content parts to Anthropic format.
+
+        Transforms ``image_url`` parts (with ``data:`` URIs) to Anthropic's
+        ``image`` source blocks and internal ``document`` parts to Anthropic's
+        native ``document`` blocks with a ``text`` source.  Text parts pass
+        through unchanged.
+        """
+        converted: list[dict[str, Any]] = []
+        for part in parts:
+            if part.get("type") == "document":
+                d = part.get("document", {})
+                if d.get("media_type") == "application/pdf":
+                    # Native PDF: base64 document source (Anthropic reads both
+                    # text and page images).  ``data`` is already base64 — see
+                    # storage/_utils.attachment_to_content_part.
+                    pdf_block: dict[str, Any] = {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": d.get("data", ""),
+                        },
+                    }
+                    if d.get("name"):
+                        pdf_block["title"] = safe_attachment_label(d["name"])
+                    converted.append(pdf_block)
+                    continue
+                # Anthropic's text-source documents only accept
+                # ``text/plain``; coerce any other text MIME here and fold
+                # the original type into the human-readable title so the
+                # model still knows it's (e.g.) markdown.
+                original_mime = d.get("media_type", "text/plain")
+                block: dict[str, Any] = {
+                    "type": "document",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": d.get("data", ""),
+                    },
+                }
+                name = d.get("name")
+                if name and original_mime != "text/plain":
+                    block["title"] = f"{name} ({original_mime})"
+                elif name:
+                    block["title"] = name
+                elif original_mime != "text/plain":
+                    block["title"] = original_mime
+                converted.append(block)
+                continue
+            if part.get("type") == "input_audio":
+                # Anthropic has no audio-input API.  The STT-role fallback runs
+                # upstream of this translator (audio → text transcript when a
+                # model lacks supports_audio_input), so by here any remaining
+                # input_audio is a defensive placeholder, not the live path.
+                converted.append(
+                    {"type": "text", "text": "[audio attachment — not supported by this model]"}
+                )
+                continue
+            if part.get("type") == "image_url":
+                url = part.get("image_url", {}).get("url", "")
+                if url.startswith("data:") and "," in url:
+                    # Parse "data:image/png;base64,<data>"
+                    header, _, b64data = url.partition(",")
+                    media_type = header.split(":", 1)[1].split(";", 1)[0]
+                    converted.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64data,
+                            },
+                        }
+                    )
+                else:
+                    # URL-based image — pass as Anthropic URL source
+                    converted.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": url},
+                        }
+                    )
+            else:
+                converted.append(part)
+        return converted
+
+    # -- tool conversion -----------------------------------------------------
+
+    def convert_tools(
+        self,
+        tools: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Convert OpenAI function-calling schema to Anthropic tool format."""
+        result = []
+        for tool in tools:
+            fn = tool.get("function", {})
+            result.append(
+                {
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object"}),
+                }
+            )
+        return result
+
+    # -- reasoning params ----------------------------------------------------
+
+    def _reasoning_params(
+        self,
+        reasoning_effort: str | None,
+        extra_params: dict[str, Any] | None,
+        max_tokens: int = 4096,
+    ) -> dict[str, Any]:
+        """Map reasoning_effort to Anthropic thinking parameters.
+
+        Ensures ``budget_tokens < max_tokens`` so there's room for the
+        actual response.
+        """
+        if not reasoning_effort or reasoning_effort in ("none", ""):
+            return {}
+        budget = EFFORT_BUDGET_MAP.get(reasoning_effort, DEFAULT_THINKING_BUDGET)
+        if extra_params and "thinking_budget_tokens" in extra_params:
+            budget = extra_params["thinking_budget_tokens"]
+        if budget > 0:
+            # Budget must be strictly less than max_tokens (API requirement).
+            # If max_tokens is too small to fit even a minimal thinking
+            # budget alongside the response, disable thinking entirely.
+            if budget >= max_tokens:
+                budget = max_tokens - 1024
+            if budget < 1:
+                return {}
+            return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+        return {}
+
+    # -- streaming -----------------------------------------------------------
+
+    def create_streaming(
+        self,
+        *,
+        client: Any,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int = 4096,
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        extra_params: dict[str, Any] | None = None,
+        deferred_names: frozenset[str] | None = None,
+        cancel_ref: list[Any] | None = None,
+        capabilities: ModelCapabilities | None = None,
+        replay_reasoning_to_model: bool = True,
+        extra_headers: dict[str, str] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+        request_metrics_ref: list[ProviderRequestMetrics] | None = None,
+    ) -> Iterator[StreamChunk]:
+        messages = materialize_attachments(messages, resolve_attachments)
+        caps = capabilities or self.get_capabilities(model)
+        system_prompt, converted_msgs = self._convert_messages(
+            messages,
+            replay_reasoning_to_model=replay_reasoning_to_model,
+            supports_mid_conversation_system=caps.supports_mid_conversation_system,
+        )
+        kwargs = self._build_thinking_and_kwargs(
+            caps,
+            reasoning_effort,
+            extra_params,
+            max_tokens,
+            temperature,
+            converted_msgs,
+            system_prompt,
+            model,
+            tools,
+            deferred_names,
+        )
+        if extra_headers:
+            refuse_credential_headers(extra_headers)
+            kwargs["extra_headers"] = _merge_extra_headers(
+                kwargs.get("extra_headers"), extra_headers
+            )
+
+        refuse_aborted_request(cancel_ref)
+        if request_metrics_ref is not None:
+            request_metrics_ref.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=request_uses_native_tools(
+                        # Anthropic client tools may omit type or use "custom".
+                        kwargs,
+                        client_tool_types=(None, "custom"),
+                    ),
+                )
+            )
+
+        manager = client.messages.stream(**kwargs)
+        refuse_aborted_request(cancel_ref)
+        try:
+            stream = manager.__enter__()
+        except BaseException:
+            manager.__exit__(*sys.exc_info())
+            raise
+        if cancel_ref is not None:
+            cancel_ref.append(stream)
+        return self._iter_with_cleanup(
+            stream, manager, finish_reason_optional=caps.finish_reason_optional
+        )
+
+    def _iter_with_cleanup(
+        self, stream: Any, manager: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
+        """Iterate the Anthropic stream, ensuring the context manager exits."""
+        try:
+            yield from self._iter_anthropic_stream(
+                stream, finish_reason_optional=finish_reason_optional
+            )
+        except BaseException:
+            manager.__exit__(*sys.exc_info())
+            raise
+        else:
+            manager.__exit__(None, None, None)
+
+    def _iter_anthropic_stream(
+        self, stream: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
+        """Convert Anthropic streaming events to normalized StreamChunks.
+
+        *finish_reason_optional* is the model capability of the same name:
+        a lax anthropic-compatible gateway that ends the stream without
+        EITHER terminal signal (no ``message_delta`` stop_reason, no
+        ``message_stop``) gets the end-of-generator shim below — the
+        retired non-streaming path's absent-stop_reason tolerance.
+        """
+        first = True
+        # Map content block index → tool call index for our accumulator
+        tool_block_to_index: dict[int, int] = {}
+        next_tool_index = 0
+        # Track server-side tool blocks (web search) — accumulate query input
+        server_tool_blocks: dict[int, dict[str, str]] = {}
+        # Capture raw content blocks for multi-turn preservation
+        raw_blocks: dict[int, dict[str, Any]] = {}
+        saw_text_block = False
+        emitted_finish = False
+        delivered_output = False
+        window_exceeded = False
+        # The opening ``message_start`` usage: the first sampling pass, as
+        # (input, cache_creation, cache_read).  The closing ``message_delta``
+        # describes the whole message, and when the server ran its own tool
+        # loop (native web search) its cache-read count is the SUM of every
+        # pass's prefix re-read — a billing total, not a context size — so the
+        # closing chunk reports this opening pass as what the request carried
+        # and the growth since it as what the server appended.  ``None`` until
+        # an opening usage with a positive total lands.
+        opening_input: tuple[int, int, int] | None = None
+        # Whether a ``server_tool_use`` block appeared: the only evidence that
+        # the server sampled more than once, and the gate on flagging the
+        # closing counts cumulative.  ``server_tool_blocks`` cannot serve — it
+        # is popped at block stop.
+        saw_server_tool = False
+
+        def _attach_terminal_blocks(chunk: StreamChunk) -> None:
+            # Every terminal path (message_delta stop_reason, message_stop
+            # shim, lax-gateway end-of-stream shim) attaches the full
+            # sorted raw-block list identically — one implementation so
+            # replay fidelity cannot depend on WHICH terminal path a
+            # stream happened to take.
+            if raw_blocks:
+                chunk.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+
+        for event in stream:
+            sc = StreamChunk()
+            event_type = event.type
+
+            if event_type == "content_block_start":
+                block = event.content_block
+                raw_blocks[event.index] = _block_to_dict(block)
+                # Whole-block emission (lax anthropic-compatible gateways):
+                # a block's content may arrive pre-populated inside
+                # content_block_start with no following deltas.  The real
+                # API sends start blocks EMPTY (text ""/input {}) and
+                # streams the content as deltas, so emitting the start
+                # payload never double-counts there — but skipping it made
+                # every drained lane return a clean-looking empty result
+                # where the retired non-streaming path (SDK
+                # get_final_message accumulation) returned the content.
+                # Residual bet, documented: a HYBRID gateway that sends a
+                # populated start AND re-streams the same content as
+                # deltas would double-count.  No known server does this
+                # (it would double on the SDK's own accumulators too), and
+                # the two attested classes — real API (empty starts),
+                # whole-block gateways (no deltas) — are both handled;
+                # disambiguating would mean buffering every start block
+                # until its first delta or block_stop.
+                if block.type == "text":
+                    # Separate consecutive text blocks the way the Messages
+                    # API's non-streaming shape reads when joined — without
+                    # this, a web-search turn's post-results text block fuses
+                    # onto the pre-search sentence.  Emitted as a plain
+                    # content delta so it never lands in the raw block.
+                    if saw_text_block:
+                        sc.content_delta = "\n"
+                    saw_text_block = True
+                    # Type-guarded like _reasoning_text: duck-typed blocks
+                    # must never leak a non-str into the accumulators.
+                    start_text = getattr(block, "text", "")
+                    if isinstance(start_text, str) and start_text:
+                        sc.content_delta = (sc.content_delta or "") + start_text
+                elif block.type == "thinking":
+                    start_thinking = getattr(block, "thinking", "")
+                    if isinstance(start_thinking, str) and start_thinking:
+                        sc.reasoning_delta = start_thinking
+                if block.type == "tool_use":
+                    idx = next_tool_index
+                    tool_block_to_index[event.index] = idx
+                    next_tool_index += 1
+                    tcd = ToolCallDelta(index=idx, id=block.id, name=block.name)
+                    start_input = getattr(block, "input", None)
+                    if isinstance(start_input, dict) and start_input:
+                        # Non-empty start input = the whole call arrived in
+                        # one block; the real API sends {} here and streams
+                        # input_json_delta events instead.
+                        tcd.arguments_delta = json.dumps(start_input)
+                    sc.tool_call_deltas.append(tcd)
+                elif block.type == "server_tool_use":
+                    # Server-side tool (web search) — track for query accumulation
+                    saw_server_tool = True
+                    server_tool_blocks[event.index] = {
+                        "name": getattr(block, "name", ""),
+                        "input_json": "",
+                    }
+                elif block.type == "web_search_tool_result":
+                    # Search results arrived — count results for info display
+                    content = getattr(block, "content", None)
+                    if isinstance(content, list):
+                        n = sum(
+                            1 for r in content if getattr(r, "type", None) == "web_search_result"
+                        )
+                        sc.info_delta = f"[Found {n} result{'s' if n != 1 else ''}]"
+                    elif (
+                        content is not None
+                        and getattr(content, "type", None) == "web_search_tool_result_error"
+                    ):
+                        code = getattr(content, "error_code", "unknown")
+                        sc.info_delta = f"[Web search error: {code}]"
+
+            elif event_type == "content_block_delta":
+                delta = event.delta
+                if delta.type == "text_delta":
+                    sc.content_delta = delta.text
+                    # Accumulate text into raw block for preservation
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["text"] = (
+                            raw_blocks[event.index].get("text", "") + delta.text
+                        )
+                elif delta.type == "thinking_delta":
+                    sc.reasoning_delta = delta.thinking
+                    # Accumulate thinking text into raw block for round-trip
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["thinking"] = (
+                            raw_blocks[event.index].get("thinking", "") + delta.thinking
+                        )
+                elif delta.type == "signature_delta":
+                    # Accumulate signature into raw block for round-trip
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["signature"] = (
+                            raw_blocks[event.index].get("signature", "") + delta.signature
+                        )
+                elif delta.type == "citations_delta":
+                    # Text-block citations (web-search models) arrive one
+                    # citation object per delta.  They must ride the raw
+                    # block for replay — Anthropic requires citations to be
+                    # passed back unmodified alongside their
+                    # web_search_tool_result blocks on later turns.
+                    if event.index in raw_blocks:
+                        citation = getattr(delta, "citation", None)
+                        if citation is not None:
+                            raw_blocks[event.index].setdefault("citations", []).append(
+                                citation.model_dump()
+                                if hasattr(citation, "model_dump")
+                                else citation
+                            )
+                elif delta.type == "input_json_delta":
+                    if event.index in server_tool_blocks:
+                        # Accumulate server tool input (search query)
+                        server_tool_blocks[event.index]["input_json"] += delta.partial_json
+                    else:
+                        tool_idx = tool_block_to_index.get(event.index, event.index)
+                        sc.tool_call_deltas.append(
+                            ToolCallDelta(
+                                index=tool_idx,
+                                arguments_delta=delta.partial_json,
+                            )
+                        )
+                    # Accumulate input JSON into raw block for tool_use/server_tool_use
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["_input_json"] = (
+                            raw_blocks[event.index].get("_input_json", "") + delta.partial_json
+                        )
+
+            elif event_type == "content_block_stop":
+                # Finalize accumulated input JSON into parsed input
+                if event.index in raw_blocks and "_input_json" in raw_blocks[event.index]:
+                    rb = raw_blocks[event.index]
+                    try:
+                        rb["input"] = json.loads(rb.pop("_input_json"))
+                    except (ValueError, TypeError, RecursionError):
+                        rb.pop("_input_json", None)
+
+                # When a server tool block completes, emit search query info
+                if event.index in server_tool_blocks:
+                    info = server_tool_blocks.pop(event.index)
+                    query = ""
+                    try:
+                        parsed = json.loads(info["input_json"])
+                        query = parsed.get("query", "")
+                    except (ValueError, TypeError, RecursionError):
+                        pass  # best-effort query extraction for status
+                    sc.info_delta = f"[Searching: {query}]" if query else "[Searching...]"
+
+            elif event_type == "message_delta":
+                if hasattr(event, "usage") and event.usage:
+                    u = event.usage
+                    inp = getattr(u, "input_tokens", 0) or 0
+                    out = getattr(u, "output_tokens", 0) or 0
+                    cc = getattr(u, "cache_creation_input_tokens", 0) or 0
+                    cr = getattr(u, "cache_read_input_tokens", 0) or 0
+                    # ``prompt_tokens`` carries the provider's total input
+                    # (non-cached + cached) as reported, matching the OpenAI
+                    # lanes; what it means for the context is resolved once,
+                    # downstream, by ``resolve_context_usage``.  A plain
+                    # response repeats the opening counts here.  A
+                    # server-side tool loop (native web search) samples
+                    # several times inside one message: ``input_tokens`` and
+                    # ``cache_creation_input_tokens`` then cover the NEW
+                    # content of every pass (search results are cached
+                    # server-side), while ``cache_read_input_tokens`` sums
+                    # the prefix re-read on every pass.  Taking that sum as
+                    # the context reported over three times the real figure
+                    # on a four-search turn; the session calibrated on it,
+                    # dropped a tool result against it, and compacted for
+                    # it.  So once a server tool block has appeared the
+                    # closing counts are flagged cumulative, the opening
+                    # total rides ``served_prompt_tokens`` (what the request
+                    # carried) and the growth since the opening pass rides
+                    # ``appended_prompt_tokens`` (the results the next request
+                    # replays).  Every other stream reports plain counts,
+                    # whatever its gateway's reporting habits.
+                    total_input = inp + cc + cr
+                    served = total_input
+                    appended = 0
+                    if saw_server_tool and opening_input is not None:
+                        o_inp, o_cc, o_cr = opening_input
+                        served = o_inp + o_cc + o_cr
+                        appended = max(0, inp - o_inp) + max(0, cc - o_cc)
+                    elif saw_server_tool:
+                        # No single-pass figure at all (a gateway reporting usage
+                        # only at the end): the consumer's own estimate of what it
+                        # sent stands in, and the appended results are reported as
+                        # 0 rather than guessed.  Closing cache creation is no floor
+                        # for them — on an uncached prefix it holds the whole prefix
+                        # too (a live run: 54,209 created for a 54,780 context) and
+                        # would restore the over-count this branch removes.  The
+                        # estimate then misses the replayed result blocks until the
+                        # next call re-anchors, the opaque-block gap tracked as
+                        # #1188; compact-and-retry is the backstop meanwhile.
+                        served = 0
+                    sc.usage = UsageInfo(
+                        prompt_tokens=total_input,
+                        completion_tokens=out,
+                        total_tokens=total_input + out,
+                        cache_creation_tokens=cc,
+                        cache_read_tokens=cr,
+                        served_prompt_tokens=served,
+                        appended_prompt_tokens=appended,
+                        prompt_tokens_cumulative=saw_server_tool,
+                    )
+                if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
+                    raw_stop = event.delta.stop_reason
+                    if raw_stop == "model_context_window_exceeded":
+                        # The request filled the model's context window: an
+                        # HTTP 200 whose content stops where the window ended.
+                        # Not a truncation a bigger max_tokens could fix — the
+                        # context window, not the output budget, is what ran
+                        # out — so it surfaces as the same overflow a 400
+                        # rejection produces and the compact-and-retry arms
+                        # recover the turn with a complete answer.  Normalizing
+                        # it onto a finish reason instead would let the drain
+                        # gate bless the cut-off text as a clean completion.
+                        # The chunk built above still carries this event's
+                        # usage, so the raise waits until the loop bottom has
+                        # yielded it: the failed attempt's spend is billed and
+                        # must reach accounting before the turn is retried.
+                        window_exceeded = True
+                    else:
+                        sc.finish_reason = _normalize_finish_reason(raw_stop)
+                        if raw_stop == "refusal":
+                            # Normalization is lossy and this is the only site that
+                            # still holds the provider's own word: a safety-classifier
+                            # decline is indistinguishable from an ordinary content
+                            # filter once collapsed onto "content_filter".  Record it
+                            # here rather than plumb a raw field through StreamChunk
+                            # for a consumer that does not exist yet.  Gate on the RAW
+                            # value, not on (normalized != raw) — normalization
+                            # rewrites end_turn and tool_use too, so an inequality
+                            # test fires on every ordinary turn in every lane.
+                            # ``stop_details`` rides the same event and is populated
+                            # exactly when the stop reason is a refusal; its
+                            # ``category`` is the one distinction an operator acts
+                            # on.  ``getattr`` keeps this floor-safe on SDKs that
+                            # predate the field.
+                            details = getattr(event.delta, "stop_details", None)
+                            log.info(
+                                "anthropic.refusal: classifier declined the turn (category=%s)",
+                                getattr(details, "category", None),
+                            )
+                        emitted_finish = True
+                        # Emit all raw content blocks for multi-turn preservation
+                        _attach_terminal_blocks(sc)
+
+            elif event_type == "message_stop":
+                # Terminal marker: the message completed even if the compat
+                # server's message_delta never carried a stop_reason (the
+                # official API always sends one; the retired non-streaming
+                # path defaulted missing stop_reason to end_turn).  Without
+                # this, the drain's complete-or-error gate fails a stream
+                # whose content actually arrived intact.
+                if not emitted_finish:
+                    sc.finish_reason = "stop"
+                    emitted_finish = True
+                    _attach_terminal_blocks(sc)
+
+            elif event_type == "message_start":
+                u = getattr(event.message, "usage", None)
+                if u:
+                    inp = getattr(u, "input_tokens", 0) or 0
+                    cc = getattr(u, "cache_creation_input_tokens", 0) or 0
+                    cr = getattr(u, "cache_read_input_tokens", 0) or 0
+                    total_input = inp + cc + cr
+                    if total_input > 0:
+                        opening_input = (inp, cc, cr)
+                    sc.usage = UsageInfo(
+                        prompt_tokens=total_input,
+                        completion_tokens=0,
+                        total_tokens=total_input,
+                        cache_creation_tokens=cc,
+                        cache_read_tokens=cr,
+                        served_prompt_tokens=total_input,
+                    )
+
+            has_content = sc.content_delta or sc.reasoning_delta or sc.tool_call_deltas
+            if has_content:
+                delivered_output = True
+                if first:
+                    sc.is_first = True
+                    first = False
+
+            if has_content or sc.finish_reason or sc.usage or sc.info_delta:
+                yield sc
+            if window_exceeded:
+                raise ContextWindowExceededError(
+                    "model stopped: context window exceeded "
+                    "(stop_reason=model_context_window_exceeded)"
+                )
+
+        # Terminal-signal-less lax-gateway tolerance, armed ONLY by the
+        # operator-declared ``finish_reason_optional`` capability: a
+        # stream that ended cleanly after delivering output but carried
+        # NEITHER terminal signal (no message_delta stop_reason, no
+        # message_stop — an anthropic-compatible proxy shape; the real
+        # API always sends both) is a completed generation.  Everywhere
+        # else the drain's complete-or-error gate raises, because a
+        # missing message_stop on a signal-disciplined server means the
+        # generation died mid-response.
+        if finish_shim_due(
+            finish_reason_optional=finish_reason_optional,
+            finish_seen=emitted_finish,
+            delivered_output=delivered_output,
+        ):
+            sc = StreamChunk(finish_reason="stop")
+            _attach_terminal_blocks(sc)
+            yield sc
+
+    # -- retryable errors ----------------------------------------------------
+
+    # Computed once at class creation — the retry predicate consults this
+    # per error, and a per-access literal allocates a fresh frozenset each
+    # time.
+    _RETRYABLE_ERROR_NAMES: frozenset[str] = frozenset(
+        {
+            "RateLimitError",
+            "APITimeoutError",
+            "APIConnectionError",
+            "InternalServerError",
+            "APIError",
+            "OverloadedError",
+            # Transport-level: drained stream ended without a stop reason.
+            "IncompleteStreamError",
+        }
+    )
+
+    @property
+    def retryable_error_names(self) -> frozenset[str]:
+        return self._RETRYABLE_ERROR_NAMES
+
+    # -- reasoning extraction ------------------------------------------------
+
+    def extract_reasoning_text(
+        self,
+        provider_blocks: list[dict[str, Any]] | None,
+    ) -> str:
+        if not isinstance(provider_blocks, list):
+            return ""
+        parts: list[str] = []
+        for block in provider_blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "thinking":
+                continue
+            text = block.get("thinking")
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return _join_reasoning_with_cap(parts)
+
+
+def _merge_extra_headers(wire: dict[str, str] | None, caller: dict[str, str]) -> dict[str, str]:
+    """Overlay caller headers on the wire-built ones.
+
+    Callers win on every header except ``anthropic-beta``, where both
+    sides carry independent beta values and the header is a comma-joined
+    list -- dropping either half would silently disable one feature.
+    """
+    merged = dict(wire or {})
+    for name, value in caller.items():
+        existing = next((k for k in merged if k.lower() == name.lower()), None)
+        if existing is not None and name.lower() == "anthropic-beta" and merged[existing]:
+            merged[existing] = f"{merged[existing]},{value}"
+            continue
+        if existing is not None:
+            del merged[existing]
+        merged[name] = value
+    return merged
+
+
+def _normalize_finish_reason(reason: str) -> str:
+    """Normalize Anthropic stop reasons to OpenAI-compatible strings.
+
+    ``model_context_window_exceeded`` never reaches here: the ``message_delta``
+    handler raises ``ContextWindowExceededError`` before this call, because
+    normalizing it onto any finish reason would bless a cut-off turn (#1162).
+    """
+    if reason == "end_turn":
+        return "stop"
+    if reason == "tool_use":
+        return "tool_calls"
+    if reason == "max_tokens":
+        return "length"
+    if reason == "refusal":
+        # A safety classifier declined the request.  This arrives as a
+        # SUCCESSFUL HTTP 200 with content empty (declined before any
+        # output) or partial (declined mid-stream), so nothing upstream
+        # raises — the drain gate only errors on an ABSENT finish reason.
+        # "content_filter" is the OpenAI-vocabulary equivalent this
+        # function normalizes onto, and both consumers already handle it:
+        # the interactive wrapper's _finalize_stream_result warns the
+        # user, and the sub-agent loop stops early instead of flailing on
+        # an empty turn.  Falling through to the raw "refusal" string
+        # instead would land a truncated answer as a complete result.
+        return "content_filter"
+    return reason
+
+
+def _block_to_dict(block: Any) -> dict[str, Any]:
+    """Convert an Anthropic SDK content block to a plain dict.
+
+    Preserves all fields including ``encrypted_content`` and ``encrypted_index``
+    on ``web_search_tool_result`` blocks, which must be passed back verbatim
+    on subsequent turns for citation resolution.
+    """
+    # Whole-block inputs bypass the SDK's delta parser and its 200-level limit. Apply the same
+    # bound before capturing them for replay, whose recursive copies cannot handle deep input.
+    if getattr(block, "type", "") in ("tool_use", "server_tool_use") and nested_deeper_than(
+        getattr(block, "input", None), 200
+    ):
+        raise ValueError("Tool input nested more than 200 levels deep")
+    if hasattr(block, "model_dump"):
+        return block.model_dump(exclude_none=True)  # type: ignore[no-any-return]
+    # Fallback: extract known attributes
+    d: dict[str, Any] = {"type": getattr(block, "type", "")}
+    for attr in (
+        "id",
+        "name",
+        "input",
+        "text",
+        "thinking",
+        "signature",
+        "content",
+        "encrypted_content",
+        "encrypted_index",
+    ):
+        val = getattr(block, attr, None)
+        if val is not None:
+            if hasattr(val, "model_dump"):
+                d[attr] = val.model_dump()
+            elif isinstance(val, list):
+                d[attr] = [
+                    item.model_dump() if hasattr(item, "model_dump") else item for item in val
+                ]
+            else:
+                d[attr] = val
+    return d

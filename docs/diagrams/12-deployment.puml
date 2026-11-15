@@ -1,0 +1,95 @@
+@startuml
+!theme plain
+title Turnstone — Docker Compose Deployment
+
+skinparam node {
+    BackgroundColor #F5F5F5
+}
+
+cloud "LLM Provider" as llm {
+    component [vLLM / OpenAI API\nport 8000] as llm_api
+}
+
+node "Docker Host" as host {
+
+    frame "turnstone-net (bridge network)" as net {
+
+        node "server" <<turnstone image>> as server_node {
+            component [turnstone-server\nport 8080] as server
+            note bottom of server
+                Command: turnstone-server
+                  --host 0.0.0.0
+                  --port 8080
+                Volume: turnstone-data
+                  (/data)
+            end note
+        }
+
+        node "console" <<turnstone image>> as console_node {
+            component [turnstone-console\nport 8090] as console
+            note bottom of console
+                Command: turnstone-console
+                  --port 8090
+                Depends: server
+                FNV-1a rendezvous router for
+                  multi-node clusters
+            end note
+        }
+
+        node "postgres (profile: production)" <<pgautoupgrade>> as pg_node {
+            component [PostgreSQL\nport 5432] as postgres
+            note bottom of postgres
+                Healthcheck: pg_isready
+                Volume: postgres-data
+                Required for cluster
+                  and production profiles
+            end note
+        }
+
+        node "pgbouncer (optional)" <<bitnami/pgbouncer>> as pgb_node {
+            component [PgBouncer\nport 6432] as pgbouncer
+            note bottom of pgbouncer
+                pool_mode: transaction
+                Recommended for clusters
+                  > 50 nodes
+                See docs/pgbouncer.md
+            end note
+        }
+    }
+}
+
+actor "Browser\nUser" as browser
+actor "SDK /\nAPI Client" as apiclient
+
+' External connections
+browser --> server : HTTP + SSE\nport 8080
+browser --> console : HTTP + SSE\nport 8090
+apiclient --> server : HTTP + SSE\nport 8080
+
+' Internal connections
+server --> llm_api : OpenAI API\n(HTTPS/HTTP)
+
+console --> server : HTTP proxy\n(FNV-1a rendezvous placement,\nproxy /node/{id}/*)
+
+' Database connections (production/cluster profiles)
+server ..> pgbouncer : PostgreSQL\n(pool_size=2)
+console ..> pgbouncer : PostgreSQL\n(auth/admin)
+pgbouncer --> postgres : transaction\npooling
+
+' Environment variables
+note right of host
+    **Environment Variables:**
+    * OPENAI_API_KEY -- API key for definitions without one
+    * TURNSTONE_AUTH_TOKEN -- API auth
+    * TURNSTONE_DB_URL -- PostgreSQL URL
+    * POSTGRES_PASSWORD -- DB password
+end note
+
+' Volumes
+database "turnstone-data" as tv
+database "postgres-data" as pv
+
+server_node --> tv
+pg_node --> pv
+
+@enduml

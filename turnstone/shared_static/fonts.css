@@ -1,0 +1,48 @@
+/* Locally served typography for --font-ui and --font-mono in base.css.
+   Upright and italic subsets retain OpenType features, the supported weights,
+   Latin, Cyrillic, Greek and Vietnamese, plus interface symbols. The UI face's
+   optical size is pinned to 14, matching the previous build. Turnstone Symbols
+   fills gaps in the text families' arrows, geometric shapes and marks.
+
+   Rebuild with scripts/build-vendored-fonts.py using its pinned release sources
+   and dependencies. These directories are cached as immutable: changed bytes
+   always require a new directory name, updated URLs, wheel includes, notices,
+   architecture paths and test_ui_static_assets digests. URLs are root-absolute
+   so a proxied node page uses the console's own /shared mount and cached copy.
+   The license for each source ships in its font directory. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("/shared/inter-4.001.1/inter-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: italic;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("/shared/inter-4.001.1/inter-italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/shared/jetbrains-mono-2.304/jetbrains-mono-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: italic;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/shared/jetbrains-mono-2.304/jetbrains-mono-italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Turnstone Symbols";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/shared/dejavu-sans-2.37/symbols.woff2") format("woff2");
+  unicode-range: U+2190-27FF;
+}

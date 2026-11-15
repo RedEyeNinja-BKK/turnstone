@@ -1,0 +1,1083 @@
+"""Shared session-test helpers.
+
+The minimal ``ChatSession`` factory, the ``SessionUIBase`` no-op/recording
+subclasses, and the tree's standard streaming provider fakes
+(``make_result`` / ``arm_session`` / ``scripted_provider`` /
+``ArmedHandle``, at the bottom): every suite driving the streaming seam
+imports them from here, so the eager-arming contract lives in one place.
+``scripted_session`` drives the real SDK and provider over a finite HTTP reply
+script; ``chat_completion_wire`` and ``native_completion_wire`` build its SSE bodies.
+The one deliberate exception, ``test_model_registry.py``'s
+``_make_session``, takes a different signature (registry / model_alias /
+reasoning_effort + ``_FakeUI``) and is NOT a candidate for sharing.
+
+Module is named with a leading underscore so pytest doesn't try to
+collect it as a test file — it's an importable utility, not a test.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import re
+from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
+
+import anthropic
+import httpx2
+from openai import OpenAI
+
+from turnstone.core.model_turn import ModelTurnResult, resolve_model_binding
+from turnstone.core.providers import (
+    ModelCapabilities,
+    StreamChunk,
+    ToolCallDelta,
+    UsageInfo,
+    create_provider,
+)
+from turnstone.core.providers._protocol import ProviderRequestMetrics, serialized_tool_chars
+from turnstone.core.session import ChatSession
+from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
+from turnstone.core.workstream import WorkstreamKind
+
+if TYPE_CHECKING:
+    import logging
+    from collections.abc import Iterator, Sequence
+
+
+class NullUI(SessionUIBase):
+    """Bare-bones UI satisfying the SessionUIBase contract for tests
+    that don't care about UI side effects."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+
+_UNCHANGED = object()
+
+
+def replace_session_lane(
+    session: Any,
+    *,
+    provider: Any = _UNCHANGED,
+    client: Any = _UNCHANGED,
+    model: Any = _UNCHANGED,
+    alias: Any = _UNCHANGED,
+    capabilities: Any = _UNCHANGED,
+) -> Any:
+    """Atomically replace selected facets of a test session's model lane.
+
+    Production sessions deliberately expose no mutable raw provider/client
+    slots. Tests that install a scripted provider use this one helper so their
+    setup follows the same whole-lane replacement rule as registry rebinding.
+    """
+    binding = session._model_binding
+    old_lane = binding.lane
+    next_provider = old_lane.provider if provider is _UNCHANGED else provider
+    next_model = old_lane.model if model is _UNCHANGED else model
+    if capabilities is _UNCHANGED:
+        next_capabilities = old_lane.capabilities
+        if provider is not _UNCHANGED:
+            next_capabilities = next_provider.get_capabilities(next_model)
+    else:
+        next_capabilities = capabilities
+    lane = dataclasses.replace(
+        old_lane,
+        provider=next_provider,
+        client=old_lane.client if client is _UNCHANGED else client,
+        model=next_model,
+        alias=old_lane.alias if alias is _UNCHANGED else alias,
+        capabilities=next_capabilities,
+    )
+    session._model_binding = dataclasses.replace(binding, lane=lane)
+    return lane
+
+
+def log_has_field(record: logging.LogRecord, key: str, value: str | int | float) -> bool:
+    """Accept either the console or JSON/dict structlog renderer.
+
+    Logging configuration is process-global, so a full-suite predecessor may
+    select a different renderer than a file sees in isolation, including the
+    colored console renderer, whose ANSI escapes would otherwise split
+    ``key=value``.  The event fields are the contract; their presentation
+    (renderer AND styling) is not.
+    """
+    message = re.sub(r"\x1b\[[0-9;]*m", "", record.getMessage())
+    return any(
+        candidate in message
+        for candidate in (
+            f"{key}={value}",
+            f"{key}={value!r}",  # the console renderer quotes a value with spaces
+            f"'{key}': {value!r}",
+            f'"{key}": {json.dumps(value)}',
+        )
+    )
+
+
+def make_session(**kwargs: Any) -> ChatSession:
+    """Build a ChatSession with minimal defaults; tests override
+    individual fields via kwargs.
+
+    This is the ordinary factory. It never publishes a durable workstream;
+    tests that exercise first-provider-request admission opt in through
+    :func:`make_registered_session` after initializing a test storage backend.
+    Storage selection remains ChatSession's normal process-global contract,
+    including its file-backed SQLite fallback when the host has not initialized
+    another backend.
+    """
+    defaults: dict[str, Any] = {
+        "client": MagicMock(),
+        "model": "test-model",
+        "ui": NullUI(),
+        "instructions": None,
+        "temperature": 0.5,
+        "max_tokens": 4096,
+        "tool_timeout": 30,
+    }
+    defaults.update(kwargs)
+    registry = defaults.get("registry")
+    model_alias = defaults.get("model_alias")
+    if registry is not None and model_alias and defaults.get("model_binding") is None:
+        binding = resolve_model_binding(
+            registry,
+            model_alias,
+            config_store=defaults.get("config_store"),
+        )
+        defaults["client"] = binding.lane.client
+        defaults["model"] = binding.lane.model
+        defaults["registry_generation"] = binding.registry_generation
+        defaults["model_binding"] = binding
+        if "context_window" not in kwargs and binding.config is not None:
+            defaults["context_window"] = binding.config.context_window
+    return ChatSession(**defaults)
+
+
+def make_registered_session(**kwargs: Any) -> ChatSession:
+    """Build a session backed by an explicitly initialized storage backend.
+
+    The helper never invokes ``get_storage`` until the singleton has already
+    been initialized, preventing an unrelated test from creating
+    ``.turnstone.db`` in its ambient cwd.  A repeated id is accepted only when
+    the durable identity metadata is exactly the identity this session asks
+    for; collisions are surfaced instead of quietly borrowing another row.
+    """
+    import uuid
+
+    from turnstone.core.storage import get_storage, is_storage_initialized
+
+    if not is_storage_initialized():
+        raise RuntimeError("make_registered_session requires initialized test storage")
+    storage = get_storage()
+    ws_id = str(kwargs.get("ws_id") or uuid.uuid4().hex)
+    user_id = str(kwargs.get("user_id") or "") or None
+    raw_kind = kwargs.get("kind", WorkstreamKind.INTERACTIVE)
+    kind = raw_kind if isinstance(raw_kind, WorkstreamKind) else WorkstreamKind(str(raw_kind))
+    if kind == WorkstreamKind.COORDINATOR and user_id is None:
+        raise ValueError(
+            "coordinator sessions require an authenticated user_id; "
+            f"refusing to construct an anonymous coordinator (ws_id={ws_id!r})"
+        )
+    project_id = str(kwargs.get("project_id") or "").strip() or None
+    persona_snapshot = kwargs.get("persona_snapshot")
+    persona = (
+        str(getattr(persona_snapshot, "name", "") or "").strip() or None
+        if persona_snapshot is not None
+        else None
+    )
+    expected = {
+        "user_id": user_id,
+        "kind": kind.value,
+        "project_id": project_id,
+        "persona": persona,
+    }
+    existing = storage.get_workstream(ws_id)
+    if existing is None:
+        inserted = storage.register_workstream(
+            ws_id,
+            user_id=expected["user_id"],
+            kind=kind,
+            project_id=expected["project_id"],
+            persona=expected["persona"],
+        )
+        existing = storage.get_workstream(ws_id)
+        if inserted is False and existing is None:
+            raise RuntimeError(f"workstream {ws_id!r} registration lost its durable row")
+    actual = (
+        {
+            "user_id": existing.get("user_id") or None,
+            "kind": str(existing.get("kind") or ""),
+            "project_id": existing.get("project_id") or None,
+            "persona": existing.get("persona") or None,
+        }
+        if existing is not None
+        else None
+    )
+    if actual != expected:
+        raise RuntimeError(
+            f"workstream {ws_id!r} is already registered with different metadata: "
+            f"expected {expected!r}, found {actual!r}"
+        )
+    kwargs["ws_id"] = ws_id
+    return make_session(**kwargs)
+
+
+def make_fork_destination(*, user_id: str = "owner") -> ChatSession:
+    """Reserve an unpublished destination for tests of the atomic fork path."""
+    import uuid
+
+    from turnstone.core.storage import get_storage, is_storage_initialized
+
+    if not is_storage_initialized():
+        raise RuntimeError("make_fork_destination requires initialized test storage")
+    ws_id = uuid.uuid4().hex
+    token = uuid.uuid4().hex
+    get_storage().register_workstream(
+        ws_id,
+        user_id=user_id,
+        kind="interactive",
+        state="creating",
+        fork_reservation_token=token,
+    )
+    return make_session(ws_id=ws_id, user_id=user_id, fork_reservation_token=token)
+
+
+def mock_completion_result(
+    content: str = "",
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> MagicMock:
+    """A provider result shaped like ``CompletionResult``.
+
+    Callers that route through ``model_turn`` (judges, task agents, and
+    every lane #827 migrates) hit its re-ingest, which iterates
+    ``tool_calls``/``provider_blocks`` and joins ``reasoning`` — a bare
+    MagicMock attribute would TypeError deep inside the seam, so every
+    field the re-ingest reads is pinned to a real value here.  ONE shared
+    definition: when the re-ingest starts reading a new CompletionResult
+    field, add it here and every suite moves together.
+    """
+    result = MagicMock()
+    result.content = content
+    result.tool_calls = tool_calls
+    result.finish_reason = "stop"
+    result.usage = None
+    result.provider_blocks = []
+    result.reasoning = ""
+    return result
+
+
+def fake_chat_stream(
+    *,
+    content: str | None = None,
+    tool_calls: list[dict[str, str]] | None = None,
+    finish_reason: str = "stop",
+    prompt_tokens: int = 10,
+    completion_tokens: int = 5,
+    reasoning_content: str | None = None,
+    reasoning: str | None = None,
+) -> list[Any]:
+    """Fake OpenAI Chat Completions SSE chunks for driving the REAL
+    ``OpenAIChatCompletionsProvider`` through a fake SDK client::
+
+        client.chat.completions.create = lambda **kw: fake_chat_stream(...)
+
+    Exercises the adapter's ``_iter_stream`` plus ``drain_stream`` end to
+    end (the highest-fidelity fake lane), unlike ``as_stream`` which fakes
+    at the provider boundary.  ``tool_calls`` entries are
+    ``{"id", "name", "arguments"}`` dicts.  ``SimpleNamespace`` (not
+    ``MagicMock``) so absent SDK fields read as real ``None`` — an
+    auto-created mock attribute would leak into ``len()``/string paths.
+
+    Emits the realistic three-phase shape: data chunk(s), a finish-reason
+    chunk, then the ``stream_options.include_usage`` usage-only chunk with
+    empty ``choices``.
+    """
+
+    def _delta(
+        content_val: str | None = None,
+        tcs: list[Any] | None = None,
+        rc: str | None = None,
+        rsn: str | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            content=content_val,
+            tool_calls=tcs,
+            reasoning=rsn,
+            reasoning_content=rc,
+            annotations=None,
+        )
+
+    chunks: list[Any] = []
+    if reasoning_content is not None or reasoning is not None:
+        chunks.append(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason=None, delta=_delta(rc=reasoning_content, rsn=reasoning)
+                    )
+                ],
+                usage=None,
+            )
+        )
+    if content is not None:
+        chunks.append(
+            SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason=None, delta=_delta(content))],
+                usage=None,
+            )
+        )
+    if tool_calls:
+        tcs = [
+            SimpleNamespace(
+                index=i,
+                id=tc.get("id", ""),
+                function=SimpleNamespace(
+                    name=tc.get("name", ""), arguments=tc.get("arguments", "")
+                ),
+            )
+            for i, tc in enumerate(tool_calls)
+        ]
+        chunks.append(
+            SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason=None, delta=_delta(None, tcs))],
+                usage=None,
+            )
+        )
+    chunks.append(
+        SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason=finish_reason, delta=_delta())],
+            usage=None,
+        )
+    )
+    chunks.append(
+        SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=None,
+                input_tokens_details=None,
+            ),
+        )
+    )
+    return chunks
+
+
+class _ScriptedClient:
+    """Callable client-method fake following a script of stream builders.
+
+    Call N returns the stream described by ``scripts[N]``; the last script
+    repeats for any further calls.  Each script is a dict of kwargs for
+    the bound stream builder, or a pre-built return value.  Records every
+    call's kwargs on ``.calls`` — read ``len(fn.calls)`` where a test
+    previously kept its own counter cell, and ``fn.calls[i]["messages"]``
+    where it captured request bodies.
+    """
+
+    def __init__(self, scripts: tuple[Any, ...], to_stream: Any) -> None:
+        self._scripts = scripts
+        self._to_stream = to_stream
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        script = self._scripts[min(len(self.calls) - 1, len(self._scripts) - 1)]
+        return self._to_stream(**script) if isinstance(script, dict) else script
+
+
+def scripted_chat_client(*scripts: Any) -> _ScriptedClient:
+    """A scripted ``client.chat.completions.create`` — dict scripts are
+    :func:`fake_chat_stream` kwargs."""
+    return _ScriptedClient(scripts, fake_chat_stream)
+
+
+def scripted_anthropic_client(*scripts: Any) -> _ScriptedClient:
+    """A scripted ``client.messages.stream`` — dict scripts are
+    :func:`fake_anthropic_stream` kwargs (``blocks`` plus optional
+    ``stop_reason``/``usage``)."""
+    return _ScriptedClient(scripts, fake_anthropic_stream)
+
+
+class FakeAnthropicBlock:
+    """A full-content Anthropic content-block fake for
+    :func:`fake_anthropic_stream` — plain attributes plus the
+    ``model_dump()`` the provider's block capture reads."""
+
+    def __init__(self, **fields: Any) -> None:
+        self._fields = fields
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+    def model_dump(self, **_kw: Any) -> dict[str, Any]:
+        return dict(self._fields)
+
+
+def fake_anthropic_stream(
+    blocks: list[Any],
+    *,
+    stop_reason: str | None = "end_turn",
+    usage: Any = None,
+) -> Any:
+    """Fake Anthropic SDK stream context manager for tests that drive the
+    REAL ``AnthropicProvider`` through a fake client::
+
+        client.messages.stream = lambda **kw: fake_anthropic_stream(...)
+
+    Accepts the same full-content block fakes the pre-#831
+    ``get_final_message`` fixtures used (objects with ``.type`` + fields
+    and ``model_dump()``) and synthesizes the real event grammar the
+    streaming iterator consumes: ``content_block_start`` carries the block
+    with its text/thinking/signature EMPTIED and ``input`` as ``{}`` (the
+    SDK start shape), deltas carry the content, ``content_block_stop``
+    finalizes tool input, and the closing ``message_delta`` carries
+    ``stop_reason`` (+ optional usage object).  Without the stripping, the
+    provider's raw-block accumulator would double every text/thinking
+    field (start capture + delta append).
+
+    ``stop_reason=None`` omits the closing ``message_delta`` entirely —
+    the terminal-signal-less lax-gateway shape ``finish_reason_optional``
+    exists for (content arrives, then the stream just ends).
+    """
+    events: list[Any] = []
+    for idx, block in enumerate(blocks):
+        d = dict(block.model_dump()) if hasattr(block, "model_dump") else dict(vars(block))
+        btype = d.get("type", "")
+        start = dict(d)
+        if btype == "text":
+            start["text"] = ""
+        elif btype == "thinking":
+            start["thinking"] = ""
+            start["signature"] = ""
+        elif btype == "tool_use":
+            start["input"] = {}
+        events.append(
+            SimpleNamespace(
+                type="content_block_start", index=idx, content_block=SimpleNamespace(**start)
+            )
+        )
+        if btype == "text" and d.get("text"):
+            events.append(
+                SimpleNamespace(
+                    type="content_block_delta",
+                    index=idx,
+                    delta=SimpleNamespace(type="text_delta", text=d["text"]),
+                )
+            )
+        elif btype == "thinking":
+            if d.get("thinking"):
+                events.append(
+                    SimpleNamespace(
+                        type="content_block_delta",
+                        index=idx,
+                        delta=SimpleNamespace(type="thinking_delta", thinking=d["thinking"]),
+                    )
+                )
+            if d.get("signature"):
+                events.append(
+                    SimpleNamespace(
+                        type="content_block_delta",
+                        index=idx,
+                        delta=SimpleNamespace(type="signature_delta", signature=d["signature"]),
+                    )
+                )
+        elif btype == "tool_use":
+            events.append(
+                SimpleNamespace(
+                    type="content_block_delta",
+                    index=idx,
+                    delta=SimpleNamespace(
+                        type="input_json_delta",
+                        partial_json=json.dumps(d.get("input", {})),
+                    ),
+                )
+            )
+        events.append(SimpleNamespace(type="content_block_stop", index=idx))
+    if stop_reason is not None or usage is not None:
+        events.append(
+            SimpleNamespace(
+                type="message_delta", usage=usage, delta=SimpleNamespace(stop_reason=stop_reason)
+            )
+        )
+
+    mgr = MagicMock()
+    mgr.__enter__ = MagicMock(return_value=events)
+    mgr.__exit__ = MagicMock(return_value=False)
+    return mgr
+
+
+def as_stream(result: Any) -> list[StreamChunk]:
+    """Adapt a ``CompletionResult``-shaped fake to a ``create_streaming``
+    return value (single terminal chunk).
+
+    The #831 transport collapse routes every single-shot lane through
+    ``drain_stream(provider.create_streaming(...))``, so provider fakes
+    return chunk iterables now.  Tests keep building result-shaped fakes
+    (``mock_completion_result`` or hand-rolled) and wrap them at
+    assignment: ``provider.create_streaming.return_value =
+    as_stream(result)``.  A list re-iterates on every call, so one
+    ``return_value`` serves repeated-call tests; convert AFTER mutating
+    the fake's fields — the chunk snapshots them.
+
+    Multi-chunk accumulation semantics are exercised by the dedicated
+    ``drain_stream`` unit tests, not through this helper.
+    """
+    deltas = [
+        ToolCallDelta(
+            index=i,
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments_delta=tc.get("function", {}).get("arguments", ""),
+        )
+        for i, tc in enumerate(result.tool_calls or [])
+    ]
+    return [
+        StreamChunk(
+            content_delta=result.content or "",
+            reasoning_delta=getattr(result, "reasoning", "") or "",
+            tool_call_deltas=deltas,
+            usage=result.usage,
+            finish_reason=result.finish_reason or "stop",
+            provider_blocks=list(result.provider_blocks or []),
+        )
+    ]
+
+
+def think_tag_stream(utterance: str) -> list[StreamChunk]:
+    """``create_streaming`` return value simulating a passthrough server
+    that emits *utterance* — typically think-tag-bearing — as plain
+    streamed content.
+
+    The per-lane fixture for inline-reasoning dialect pins: lane tests
+    supply their own utterances (the dialect's SEMANTICS are specified
+    once, in ``tests._reasoning_dialect.CASES``, and pinned by the
+    one-shot suites — lane pins assert lane behavior, not tag grammar).
+    Routes through the real ``drain_stream`` seam exactly like
+    ``as_stream``.
+    """
+    return as_stream(mock_completion_result(content=utterance))
+
+
+def seam_provider(utterance: str, *, provider_name: str = "openai-compatible") -> MagicMock:
+    """Provider fake whose ``create_streaming`` replays *utterance* through
+    the REAL drain seam (``think_tag_stream``) — THE lane-suite seam fake.
+
+    One definition so the lane suites cannot drift when the provider
+    surface ``model_turn`` probes grows: real ``ModelCapabilities`` for
+    the clamp math, ``provider_name`` overridable per suite.
+
+    Assign the RETURNED fake to ``session._provider`` — never mutate the
+    provider a session resolved on its own: with a MagicMock client the
+    session resolves the process-wide ``create_provider(...)`` singleton,
+    and writing that shared instance's ``create_streaming`` poisons every
+    later session in the test run (the SSE-recovery e2e servers resolve
+    the same instance).
+    """
+    provider = provider_shell(provider_name)
+    provider.create_streaming = MagicMock(return_value=think_tag_stream(utterance))
+    return provider
+
+
+class RecordingUI:
+    """UI adapter recording the ordered event stream ``send()`` emits."""
+
+    def __init__(self):
+        self.events = []
+
+    def _rec(self, kind, detail=""):
+        self.events.append((kind, detail))
+
+    def on_turn_start(self):
+        self._rec("turn_start")
+
+    def on_turn_committed(self):
+        self._rec("turn_committed")
+
+    def on_stream_discarded(self):
+        self._rec("stream_discarded")
+
+    def on_thinking_start(self):
+        self._rec("thinking_start")
+
+    def on_thinking_stop(self):
+        self._rec("thinking_stop")
+
+    def on_reasoning_token(self, text):
+        self._rec("reasoning", text)
+
+    def on_content_token(self, text):
+        self._rec("content", text)
+
+    def on_stream_end(self):
+        self._rec("stream_end")
+
+    def approve_tools(self, items):
+        return True, None
+
+    def on_tool_result(self, call_id, name, output, **kwargs):
+        pass
+
+    def on_tool_output_chunk(self, call_id, chunk):
+        pass
+
+    def on_status(self, usage, context_window, effort):
+        pass
+
+    def on_info(self, message):
+        self._rec("info", message)
+
+    def on_error(self, message):
+        self._rec("error", message)
+
+    def on_state_change(self, state):
+        self._rec("state", state)
+
+    def on_rename(self, name):
+        pass
+
+    def on_output_warning(self, call_id, assessment):
+        pass
+
+    def record_output_assessment(
+        self,
+        call_id,
+        assessment,
+        *,
+        tier="heuristic",
+        reasoning="",
+        judge_model="",
+        latency_ms=0,
+        confidence=0.0,
+    ):
+        pass
+
+    def kinds(self):
+        return [k for k, _ in self.events]
+
+    def of(self, kind):
+        return [d for k, d in self.events if k == kind]
+
+
+REASONING_SENTINEL = "private reasoning sentinel: inspect the completed child and"
+
+
+class UsageRecordingUI(RecordingUI):
+    """Record status usage as well as the ordered session events."""
+
+    def on_status(self, usage, context_window, effort):
+        self._rec("status", usage)
+
+
+def chat_completion_wire(shape, *, finish="stop", answer="The work is complete."):
+    """Build a chat stream with a selected content shape and finish reason."""
+    delta = {"content": ""}
+    if shape == "separate":
+        delta["reasoning_content"] = REASONING_SENTINEL
+    elif shape == "inline":
+        delta["content"] = f"<think>{REASONING_SENTINEL}</think>"
+    elif shape == "unclosed":
+        delta["content"] = f"<think>{REASONING_SENTINEL}"
+    elif shape == "whitespace":
+        delta["content"] = " \n\t"
+    elif shape == "answer":
+        delta["content"] = answer
+    elif shape == "literal":
+        delta["content"] = "<think>literal text</think>"
+    elif shape == "death":
+        delta["reasoning_content"] = REASONING_SENTINEL
+    elif shape == "tool":
+        delta["tool_calls"] = [
+            {
+                "index": 0,
+                "id": "call-once",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+        ]
+        finish = "tool_calls"
+    elif shape == "refusal":
+        delta["refusal"] = "Cannot help."
+    header = {
+        "id": "scope-response",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "served-model",
+    }
+    chunks = [
+        {**header, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        {
+            **header,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 24038, "completion_tokens": 43, "total_tokens": 24081},
+        },
+    ]
+    if shape == "death":
+        chunks = chunks[:1]
+    return "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+
+def native_completion_wire(family, shape):
+    """Build a completed Responses or Messages stream with the selected content shape."""
+    text = {
+        "answer": "The work is complete.",
+        "separate": REASONING_SENTINEL,
+        "inline": f"<think>{REASONING_SENTINEL}</think>",
+        "unclosed": f"<think>{REASONING_SENTINEL}",
+        "whitespace": " \n\t",
+        "literal": "<think>literal text</think>",
+    }[shape]
+    if family == "openai":
+        output = (
+            {
+                "type": "message",
+                "id": "msg",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+            if shape != "separate"
+            else {
+                "type": "reasoning",
+                "id": "reason",
+                "summary": [{"type": "summary_text", "text": text}],
+            }
+        )
+        events = [
+            {
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": {
+                    "id": "response",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": "served-model",
+                    "status": "completed",
+                    "output": [output],
+                    "usage": {"input_tokens": 24038, "output_tokens": 43, "total_tokens": 24081},
+                },
+            }
+        ]
+    else:
+        kind = "thinking" if shape == "separate" else "text"
+        events = [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "message",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "served-model",
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 24038, "output_tokens": 0},
+                },
+            },
+            {"type": "content_block_start", "index": 0, "content_block": {"type": kind, kind: ""}},
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": kind + "_delta", kind: text},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 43},
+            },
+            {"type": "message_stop"},
+        ]
+    return "".join(
+        "event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n" for event in events
+    )
+
+
+def _scripted_response(
+    reply: str | httpx2.Response | httpx2.SyncByteStream,
+    request: httpx2.Request,
+    *,
+    family: str,
+    finish: str,
+) -> httpx2.Response:
+    if isinstance(reply, httpx2.Response):
+        return reply
+    if isinstance(reply, httpx2.SyncByteStream):
+        return httpx2.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=reply,
+            request=request,
+        )
+    if reply == "connect":
+        raise httpx2.ConnectError("connection unavailable", request=request)
+    if reply in {"overloaded", "rate-limit", "invalid", "http503", "overflow"}:
+        error_type = {
+            "overloaded": "overloaded_error",
+            "rate-limit": "rate_limit_error",
+            "invalid": "invalid_request_error",
+            "http503": "overloaded_error",
+            "overflow": "context_length_exceeded",
+        }[reply]
+        body = {
+            "error": {
+                "type": error_type,
+                "message": "maximum number of tokens allowed per minute"
+                if reply == "rate-limit"
+                else (
+                    "maximum context length exceeded"
+                    if reply == "overflow"
+                    else "backend cannot serve this request"
+                ),
+            }
+        }
+        return httpx2.Response(
+            503 if reply == "http503" else 200,
+            headers={"content-type": "application/json"},
+            stream=httpx2.ByteStream(json.dumps(body).encode()),
+            request=request,
+        )
+    wire = (
+        chat_completion_wire(reply, finish=finish)
+        if family == "openai-compatible"
+        else native_completion_wire(family, reply)
+    )
+    return httpx2.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=httpx2.ByteStream(wire.encode()),
+        request=request,
+    )
+
+
+@contextmanager
+def scripted_session(
+    kind: WorkstreamKind,
+    replies: Sequence[str | httpx2.Response | httpx2.SyncByteStream],
+    *,
+    family: str = "openai-compatible",
+    api_surface: str | None = None,
+    server_parses: bool | None = True,
+    native: bool = False,
+    finish: str = "stop",
+    ui: Any = None,
+    sdk_retries: int = 0,
+    model: str = "served-model",
+    **session_kwargs: Any,
+) -> Iterator[tuple[ChatSession, Any, list[dict[str, Any]]]]:
+    """Drive a registered session through a real SDK over a finite reply script.
+
+    Entries are named completion shapes, JSON errors (overloaded, rate-limit, invalid,
+    http503, overflow), a connect failure, a JSON byte stream, or an explicit response.
+    Explicit responses let callers supply custom SSE bodies without patching a wire builder.
+    Named replies use unread byte streams so the SDK must consume or close each response.
+    ``family`` and ``api_surface`` select the same adapters as ``create_provider``.
+    ``server_parses=None`` preserves the selected adapter's reasoning capability.
+
+    Requires initialized test storage. Yields the session, its UI, and decoded request
+    bodies. SDK and session backoff delays are zero; SDK retries default to disabled.
+    Successful context exit requires the whole script to be consumed. Response closure
+    is checked on every exit while the client is still open, before teardown can mask leaks.
+    """
+    provider = create_provider(family, api_surface=api_surface)
+    wire_family = provider.provider_name
+    endpoint = {
+        "openai-compatible": "chat/completions",
+        "openai": "responses",
+        "anthropic-compatible": "messages",
+    }[wire_family]
+    requests: list[dict[str, Any]] = []
+    responses: list[httpx2.Response] = []
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.path == "/v1/" + endpoint
+        index = len(requests)
+        requests.append(json.loads(request.content))
+        assert index < len(replies), "unexpected additional provider request"
+        response = _scripted_response(replies[index], request, family=wire_family, finish=finish)
+        responses.append(response)
+        return response
+
+    ui = ui if ui is not None else UsageRecordingUI()
+    client_type = anthropic.Anthropic if family == "anthropic-compatible" else OpenAI
+    with (
+        client_type(
+            api_key="test-only",
+            base_url=(
+                "https://provider.example.com"
+                if family == "anthropic-compatible"
+                else "https://provider.example.com/v1"
+            ),
+            http_client=httpx2.Client(transport=httpx2.MockTransport(respond)),
+            max_retries=sdk_retries,
+        ) as client,
+        patch.object(client, "_calculate_retry_timeout", return_value=0),
+    ):
+        session_kwargs.setdefault("user_id", "scripted-session-user")
+        session = make_registered_session(client=client, ui=ui, kind=kind, **session_kwargs)
+        session._title_generated = True
+        session._RETRY_BASE_DELAY = 0
+        capabilities = dataclasses.replace(
+            provider.get_capabilities(model), supports_web_search=native
+        )
+        if server_parses is not None:
+            capabilities = dataclasses.replace(capabilities, server_parses_reasoning=server_parses)
+        replace_session_lane(
+            session, provider=provider, client=client, model=model, capabilities=capabilities
+        )
+        try:
+            yield session, ui, requests
+        finally:
+            assert all(response.is_closed for response in responses), "unclosed scripted response"
+        assert len(requests) == len(replies), "scripted replies were not fully consumed"
+
+
+# ---------------------------------------------------------------------------
+# Streaming provider fakes — the #832 seam contract
+# ---------------------------------------------------------------------------
+
+
+def make_result(
+    content: str = "",
+    *,
+    tool_calls: list[dict[str, Any]] | None = None,
+    finish_reason: str = "stop",
+    usage: UsageInfo | None = None,
+    native_blocks: list[dict[str, Any]] | None = None,
+    producer: str = "openai-compatible",
+    wire_msgs: list[dict[str, Any]] | None = None,
+) -> ModelTurnResult:
+    """A ``ModelTurnResult`` shaped like the streaming wrapper's return,
+    for tests that only need "a turn happened" and patch
+    ``_stream_response`` wholesale.  Turn and ``tool_calls`` mirror are
+    built from the same dicts, preserving the #825 pairing invariant."""
+    calls = list(tool_calls or [])
+    tc_tuple = tuple(
+        ToolCall(
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in calls
+    )
+    native = (
+        ProviderNative(producer=producer, blocks=tuple(native_blocks)) if native_blocks else None
+    )
+    return ModelTurnResult(
+        turn=Turn.assistant(content, tool_calls=tc_tuple, native=native),
+        finish_reason=finish_reason,
+        usage=usage,
+        tool_calls=calls,
+        wire_msgs=wire_msgs,
+        producer=producer,
+    )
+
+
+class ArmedHandle:
+    """Closeable sentinel standing in for the SDK stream handle."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def provider_shell(
+    name: str = "openai-compatible",
+    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
+) -> MagicMock:
+    """The armed-provider fake skeleton every streaming fake builds on:
+    provider_name / capabilities / retryable set.  ONE spelling, so a new
+    attribute the seam starts probing lands in every fake at once."""
+    provider = MagicMock()
+    provider.provider_name = name
+    provider.get_capabilities.return_value = ModelCapabilities()
+    provider.retryable_error_names = retryable
+    return provider
+
+
+def arm_session(
+    session: Any,
+    *streams: Any,
+    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
+    name: str = "openai-compatible",
+) -> MagicMock:
+    """Install a sequential multi-turn armed provider fake on *session*.
+
+    Each ``create_streaming`` call serves the next element of *streams*:
+    an iterable/generator is armed (a closeable sentinel appended to
+    ``cancel_ref`` — the eager append every real adapter performs, which
+    the creation-vs-midstream classifier keys on) and returned to be
+    consumed once; an EXCEPTION instance is raised at create time WITHOUT
+    arming, a creation-phase failure the per-lane ladder owns.  Calls
+    beyond the script fail loudly: the strict finish gate rejects an
+    exhausted iterator rather than absorbing it as a silent empty turn,
+    so an under-scripted test must say so.
+
+    Title generation is latched off — with a provider-LEVEL fake the
+    best-effort title lane would otherwise consume the first script
+    before the main loop ran.
+    """
+    session._title_generated = True
+    provider = provider_shell(name, retryable)
+    # One handle PER CREATE (the real adapters' rule): `handles` records
+    # them all, `_armed_handle` is the latest.
+    provider._armed_handle = None
+    provider.handles = []
+    remaining = list(streams)
+
+    def _create(**kwargs: Any):
+        assert remaining, "arm_session: script exhausted — send looped for more turns than scripted"
+        nxt = remaining.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        metrics = kwargs.get("request_metrics_ref")
+        if metrics is not None:
+            metrics.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=False,
+                )
+            )
+        ref = kwargs.get("cancel_ref")
+        if ref is not None:
+            handle = ArmedHandle()
+            provider.handles.append(handle)
+            provider._armed_handle = handle
+            ref.append(handle)
+        return iter(nxt) if not hasattr(nxt, "__next__") else nxt
+
+    provider.create_streaming = MagicMock(side_effect=_create)
+    replace_session_lane(session, provider=provider)
+    return provider
+
+
+def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
+    """Provider fake replaying *chunks*, arming ``cancel_ref`` eagerly.
+
+    Install with :func:`replace_session_lane` (never mutate a resolved
+    provider — the create_provider singleton rule above). Each call returns a FRESH
+    iterator over the same script so ladder tests re-drive it; the armed
+    handle is appended per call, matching the one-handle-per-create
+    behavior of every real adapter.
+    """
+    provider = provider_shell()
+
+    def _create(**kwargs: Any):
+        metrics = kwargs.get("request_metrics_ref")
+        if metrics is not None:
+            metrics.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=False,
+                )
+            )
+        ref = kwargs.get("cancel_ref")
+        if ref is not None:
+            ref.append(ArmedHandle())
+        return iter(chunks)
+
+    provider.create_streaming = MagicMock(side_effect=_create)
+    return provider

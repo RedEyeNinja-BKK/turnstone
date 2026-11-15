@@ -1,0 +1,90 @@
+# TLS overlay — enables mTLS across the turnstone deployment.
+#
+# Layers on the production stack (it patches the `server`, `console`, and
+# `channel` services that file defines):
+#   docker compose -f turnstone/deploy/compose.yaml -f deploy/docker-compose.tls.yml up
+#
+# The tls-init service bootstraps a CA and issues certs.
+# All turnstone services auto-provision their own certs via the
+# console's ACME endpoint.
+
+services:
+  # Bootstrap: create CA before anything starts.
+  # Runs as root to create directories in the volume, then chowns
+  # to turnstone:turnstone with restrictive perms (keys 0600).
+  tls-init:
+    image: ghcr.io/turnstonelabs/turnstone:${TURNSTONE_IMAGE_TAG:-latest}
+    user: root
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        turnstone-admin tls-bootstrap --out /certs
+        chown -R turnstone:turnstone /certs
+        find /certs -type d -exec chmod 750 {} +
+        find /certs -type f -name '*key.pem' -exec chmod 600 {} +
+        find /certs -type f ! -name '*key.pem' -exec chmod 640 {} +
+    volumes:
+      - tls-certs:/certs
+    networks:
+      - turnstone-net
+    restart: "no"
+
+  # Console: runs the internal CA + ACME server
+  console:
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    volumes:
+      - tls-certs:/certs:ro
+    # The production base keeps :8090 private. The TLS overlay publishes it on
+    # localhost for same-host enrollment; use a trusted LAN/VPN address for a
+    # remote node and firewall it to that node.
+    ports:
+      - "${TURNSTONE_CONSOLE_HTTP_BIND:-127.0.0.1}:8090:8090"
+    environment:
+      TURNSTONE_TLS_ENABLED: "true"
+      TURNSTONE_TLS_SANS: "console"
+      TURNSTONE_CONSOLE_URL: "http://console:8090"
+      # Canonical ACME responder base advertised to enrolling nodes. Set this
+      # when they reach the console through a different host/address.
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
+    command:
+      - turnstone-console
+      - --host=0.0.0.0
+      - --port=8090
+      - --poll-interval=${CONSOLE_POLL_INTERVAL:-10}
+
+  # Server: auto-provisions certs via console ACME, serves HTTPS
+  server:
+    depends_on:
+      console:
+        condition: service_healthy
+    volumes:
+      - tls-certs:/certs:ro
+    environment:
+      TURNSTONE_TLS_ENABLED: "true"
+      TURNSTONE_TLS_SANS: "server"
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
+
+  # Channel: TLS
+  channel:
+    depends_on:
+      console:
+        condition: service_healthy
+    volumes:
+      - tls-certs:/certs:ro
+    environment:
+      TURNSTONE_TLS_ENABLED: "true"
+      TURNSTONE_TLS_SANS: "channel"
+    command:
+      - sh
+      - -c
+      - >-
+        turnstone-channel
+        --http-host=0.0.0.0
+        $${TURNSTONE_DISCORD_GUILD:+--discord-guild $$TURNSTONE_DISCORD_GUILD}
+
+volumes:
+  tls-certs:

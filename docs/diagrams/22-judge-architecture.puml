@@ -1,0 +1,126 @@
+@startuml
+!theme plain
+title Turnstone — Intent Judge, Concurrent Approval Cycles, and Output Guard
+
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceLifeLineBackgroundColor #F5F5F5
+
+participant "ChatSession\ngeneration N" as Session
+participant "SessionUIBase" as UI
+participant "IntentJudge" as Judge
+participant "model_turn()\n(pinned ModelLane)" as Model
+participant "Operator / client" as Operator
+participant "OutputGuardJudge" as Guard
+database "StorageBackend" as Storage
+
+== Intent assessment begins during preparation ==
+
+Session -> Session : prepare each tool item independently\nattach principal + cancel witness
+Session -> Judge : evaluate(items, callback, cancel_ref)
+activate Judge
+Judge -> Judge : synchronous heuristic verdict\nfor each call (first matching rule)
+Judge --> Session : heuristic verdicts + daemon cancel event
+Session -> UI : cache / publish heuristic assessments
+Session -> Storage : persist heuristic intent verdicts
+
+note over Judge, Model
+  The judge owns an immutable resolved binding. Registry/config generations
+  are freshness watermarks: an effective lane change replaces the judge for
+  the next batch, while in-flight work keeps the lane it started with.
+  Dynamic backend auth is resolved for this batch's initiating principal.
+  parallel_evaluations (1-16) sets per-batch worker width; the model alias's
+  admission gate remains the process-wide generation ceiling.
+end note
+
+par LLM judge daemon coordinator
+  Judge -> Judge : start min(batch size, parallel_evaluations,\npositive alias capacity) workers
+  loop each worker claims one independent call
+    Judge -> Model : model_turn(judge lane, canonical Turns,\nread-only evidence tools, cancel_ref)
+    Model --> Judge : ModelTurnResult
+    alt evidence tool requested
+      Judge -> Judge : execute bounded read_file / list_directory
+    else verdict text
+      Judge -> Judge : parse + arbitrate against heuristic
+    end
+    Judge --> UI : on_intent_verdict(verdict, judge generation)
+    UI -> Storage : persist LLM verdict / audit update
+  end
+else approval path continues
+  Session -> UI : approve_tools(items) with one\nSmart Approval config snapshot
+end
+
+== Policy, Smart Approval, and human gate ==
+
+UI -> UI : apply explicit policy / skill / always / blanket bypasses
+opt Smart Approvals enabled
+  UI -> UI : wait within captured deadline for this batch's verdicts
+  UI -> UI : auto-approve only recommendation=approve\nand confidence >= captured threshold
+  UI -> Storage : persist auto-approval reason and decision
+end
+
+alt human-gated items remain
+  UI -> UI : acquire publication lease; register ApprovalCycle\n(cycle_id, call_ids, event, result, witnesses)
+  UI -> Operator : approve_request with cycle_id + item verdicts
+  Operator -> UI : approve / deny by cycle_id or call_id
+  UI -> UI : atomically claim exactly one unresolved cycle
+  UI -> Operator : approval_resolved
+  UI --> Session : decision + optional feedback
+  UI -> Storage : stamp tracked verdicts with operator decision
+else every item bypassed / auto-approved
+  UI -> Operator : tool_info with exact auto_approve_reason
+  UI --> Session : approved
+end
+
+note right of UI
+  Parallel task agents may register several ApprovalCycles. Each cycle owns
+  its own Event and result slot. A legacy selector-less decision targets the
+  oldest cycle; double resolution is a no-op. Cached LLM verdicts carry their
+  judge generation, so reused provider call ids cannot satisfy a new cycle.
+end note
+
+== Cancellation boundary ==
+
+opt Stop / close / force-successor
+  Session -> Judge : abort all judge events owned by the cancelled operation
+  Session -> UI : resolve_all_approvals(False, "cancelled")
+  UI -> UI : block new admission leases; wait for admitted bundles;\nclaim only cycles whose cancellation witness is aborted
+  UI -> Operator : one cancelled resolution per claimed cycle
+  note over Session, UI
+    A Stop can win before cycle registration, during publication, or while a
+    click resolves. The witness + admission sweep makes exactly one terminal
+    outcome visible; a successor generation's new cycle is not swept.
+  end note
+end
+
+note over Judge
+  Normal operator resolution does not necessarily cancel judge inference.
+  With cancel_on_approval=false, the daemon finishes and late verdicts remain
+  auditable. With it enabled, the batch event stops remaining judge work.
+end note
+
+deactivate Judge
+
+== Tool output guard ==
+
+Session -> Session : execute admitted tools; truncate each result
+Session -> Guard : evaluate(result, tool context, cancel event)
+activate Guard
+Guard -> Guard : heuristic checks first
+opt LLM guard enabled and time remains
+  Guard -> Model : model_turn(output-guard lane, bounded prompt, cancel_ref)
+  Model --> Guard : structured verdict
+end
+Guard --> Session : assessment / redaction / warning
+deactivate Guard
+Session -> Session : re-check generation N before folding result
+Session -> UI : output warning (no raw secret payload)
+Session -> Storage : persist assessment + guarded Tool Turn metadata
+
+note over Guard, Storage
+  Output-guard objects also pin model/config lanes. Replacement retires the
+  old object but lets admitted evaluations drain before its private client is
+  closed. A cancelled or superseded evaluation cannot fold into the successor
+  trajectory. Raw pre-redaction secrets are never stored in assessment rows.
+end note
+
+@enduml

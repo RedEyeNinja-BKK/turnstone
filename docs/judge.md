@@ -1,0 +1,804 @@
+# Intent Validation (Judge)
+
+> See also: [Judge Architecture diagram](diagrams/png/22-judge-architecture.png)
+
+Intent validation provides advisory risk assessments for tool calls that require
+human approval. An LLM judge evaluates each tool call and presents a structured
+verdict alongside the approval prompt, helping users make informed decisions.
+
+## Overview
+
+When a tool call requires approval, the intent validation system runs a two-tier
+evaluation:
+
+1. **Heuristic tier** (instant) -- Pattern-based risk classification using a
+   rule table. Zero cost, sub-millisecond latency.
+2. **LLM judge tier** (async) -- Semantic evaluation using an LLM with
+   read-only tool access. Runs on a daemon thread and delivers its verdict
+   progressively.
+
+The verdict is advisory by default. The opt-in Smart Approvals mode can use a
+completed, high-confidence LLM `approve` verdict to make the decision
+automatically under the fail-closed rules below.
+
+The heuristic verdict is attached to the `approve_request` SSE event immediately.
+The LLM verdict arrives later via an `intent_verdict` SSE event, allowing the
+UI to show a spinner that resolves into a richer assessment. Both verdicts are
+persisted to the `intent_verdicts` table for audit and future calibration.
+
+---
+
+## Configuration
+
+### Server and console
+
+Server and console workstreams read database-backed `judge.*` settings from
+the settings registry. Edit them at **Admin → Judge** or through the admin
+settings API; changes take effect for the next judge batch without a restart,
+on open workstreams too. A workstream given its own judge model keeps that one.
+The principal settings are:
+
+```text
+judge.enabled = true
+judge.model = ""                    # empty = same alias as the session
+judge.smart_approvals = false       # opt-in automatic approval
+judge.confidence_threshold = 0.95   # Smart Approvals confidence bar
+judge.max_context_ratio = 0.5       # fraction of judge context used for history
+judge.timeout = 120.0               # per judge turn and Smart Approvals wait
+judge.parallel_evaluations = 1      # concurrent calls within one batch, 1-16
+judge.read_only_tools = true        # permit read_file/list_directory evidence
+judge.cancel_on_approval = false    # stop unfinished calls when the gate resolves
+```
+
+`parallel_evaluations = 1` preserves serial evaluation. Raising it reduces the
+latency of wide tool-call batches. The selected judge model alias's
+`max_concurrency` remains the process-wide generation ceiling, so it can reduce
+the actual overlap across judge batches and other roles using that alias.
+
+### Smart Approvals
+
+With `smart_approvals = true` (off by default), a pending batch is approved
+automatically — no operator prompt — only when **every** call has a completed
+LLM verdict recommending `approve` at or above `confidence_threshold`. The
+decision is batch-atomic: one uncertain sibling sends the entire parallel batch
+to a human rather than executing the safe-looking subset piecemeal.
+
+Every other outcome reaches a human: `review` / `deny` recommendations,
+confidence below the threshold, judge errors or timeouts (`llm_fallback`), a
+judge model that can't be used (no judge runs, so nothing rules), a
+missing/duplicate call ID, an unjudged sibling, and any call the deterministic
+heuristic rules explicitly flagged `deny` or `critical`. That heuristic floor
+blocks only explicit danger verdicts — it is **not** a general "never lower the
+heuristic" rule. The heuristic's default for an unmatched tool is `review`, and
+letting a confident LLM upgrade that default is the feature's purpose.
+
+With `judge.model` empty, the session's own model judges its own tool calls.
+Setting `judge.model` keeps the judge apart from the model it judges only while
+the workstream runs on a different alias.
+
+The Smart Approvals enabled flag, threshold, and bounded verdict wait are
+captured as one immutable snapshot when each gate batch starts. A settings
+reload takes effect on the next batch, while concurrent main-loop and
+task-agent gates cannot mix fields from different reload generations. Stop
+wakes a batch still waiting for verdicts and is linearized against the final
+auto-approval commit: if Stop wins, no `smart_approval` decision or audit row
+is recorded for tools that did not cross the gate.
+
+The verdict wait is capped by the snapshot's `judge.timeout`, and it ends as
+soon as one verdict rules the batch out: the batch then needs a person whatever
+the other verdicts say. A batch with a call the heuristic rules flagged `deny`
+or `critical` skips the wait, since no verdict can clear it. The judge may
+continue evaluating advisory verdicts after the gate falls back to a human;
+they appear on the approval card as they land.
+
+While the wait runs, the workstream is in the `evaluation` state, shown as ⚖
+in the judge colour on the dashboards, the sidebar and a coordinator's child
+tree: the judge may still approve the batch with no person. It moves to
+`attention` when a card is published for a person (a verdict ruled the batch
+out, or the wait timed out), and to `running` when the batch is approved. A
+batch its verdicts have already decided when the gate reaches the wait (a fast
+or failing judge) never enters `evaluation`; it goes straight to its outcome.
+With Smart Approvals off, the judge's verdict is advice and the workstream
+goes straight to `attention`.
+
+Requires the judge to be enabled. Auto-approved calls are tagged
+`smart_approval` in the dashboard and audit trail. Smart Approvals applies to
+the web and coordinator surfaces, not the interactive CLI.
+
+The judge is enabled by default. Disable `judge.enabled` in the admin Judge
+settings, or use `--no-judge` in the interactive CLI.
+
+### CLI flags
+
+```
+--judge / --no-judge           Enable/disable (default: enabled)
+--judge-model ALIAS            Registered model alias for judge
+--judge-timeout SECONDS        LLM judge timeout (default: 120)
+--judge-parallel-evaluations N Concurrent evaluations per batch, 1-16 (default: 1)
+--judge-confidence FLOAT       Confidence threshold, 0-1 (default: 0.95)
+```
+
+The same five values can be placed in the CLI's `config.toml` `[judge]`
+section. Smart Approvals is configured through the server/console admin Judge
+settings, not a CLI flag—the interactive CLI prompts for approval directly.
+
+CLI flags override `config.toml` values.
+
+---
+
+## Judge Model Selection
+
+- **Default (self-consistency)**: When `model` is empty, the session model
+  evaluates its own tool calls. Research shows self-consistency achieves
+  comparable accuracy to multi-agent debate at a fraction of the cost.
+- **Cross-model**: Register the desired model in the Models tab, then set
+  `judge.model` to that alias (or pass `--judge-model ALIAS` to the CLI).
+- **Cross-provider**: A model alias carries its provider, endpoint, and
+  credential configuration together, so a judge alias may use a different
+  provider from the session without separate judge connection settings.
+- **An alias that can't be used**: A set `judge.model` whose alias isn't loaded,
+  or whose client can't be built, is never replaced by another model. That judge
+  doesn't run, as if it were switched off: tool calls get no verdict or risk
+  rating, and each waits for a person unless a policy or blanket approval already
+  covers it. The log says why (`judge.model_unavailable`), and the web UI and the
+  terminal show a one-time note; channel bots don't. The judge tries the alias
+  again after Sync to Nodes, a settings edit, or a timed reload (when
+  `[secrets]` configures a store) that finds a change. A Sync or a settings edit
+  also covers a client that couldn't be built, such as one missing its
+  certificate bundle; a timed reload that finds nothing changed doesn't. The CLI
+  reads its models once, so there it takes a restart. A batch already waiting on
+  a person stays with them when the judge comes back. The Models tab refuses to
+  delete, disable or rename a model that `judge.model` or
+  `judge.output_guard_model` names. Deleting or disabling the last enabled model
+  is allowed and leaves both settings as they are, since an empty setting would
+  hand judging to the session's own model, so a set judge stays off until
+  someone repoints it.
+- **Hiding it from AI agents**: With `model.hide_utility_aliases` on (the default),
+  an alias set for judging isn't listed for a coordinator choosing a child's model
+  or for `task_agent`, unless it is also the default. That limits what they're
+  shown, not what they can do: a model that learned the alias some other way can
+  still name it, and a person can still pick it, so nothing here keeps an alias to
+  judging alone.
+- **Per workstream**: A judge model picked for one workstream (the launcher's
+  judge picker, the create API's `judge_model`) replaces `judge.model` for that
+  workstream while it stays open, and one that can't be used is handled the same
+  way, never replaced by `judge.model`. It isn't saved with the workstream: a
+  reopened workstream, and a coordinator's children, follow `judge.model`.
+- **Google models**: The judge supports `google` aliases, including read-only
+  evidence tools. Provider-native reasoning state such as Gemini
+  `thought_signature` stays attached to the pinned model lane across evidence
+  turns.
+
+The judge creates one fresh HTTP client per active batch worker and closes each
+when that worker finishes, avoiding cross-thread client sharing and stale
+connections across runs.
+
+If the LLM judge fails or returns no verdict, a fallback verdict with tier
+`llm_fallback` is delivered via the callback, ensuring the UI always receives
+a result.
+
+---
+
+## Heuristic Rules
+
+The heuristic tier scans a priority-ordered rule table (critical first, low
+last) and returns the first matching rule. Each rule has:
+
+- **Tool pattern**: fnmatch glob matched against `func_name` and `approval_label`
+- **Argument patterns**: Regex patterns matched against the tool's primary
+  argument text (command string for bash, path for file tools, JSON for others)
+- **Risk level, confidence, and recommendation**: Pre-assigned per rule
+
+### Rule tiers (36 rules)
+
+| Tier     | Confidence | Recommendation | Examples |
+|----------|-----------|----------------|----------|
+| Critical | 0.90      | deny           | `rm -rf /`, `mkfs`, `dd if=`, pipe-to-shell, chmod 777 on root, write/edit to `/etc/` or `.ssh/`, download-then-execute chains (`curl -o file && chmod +x && bash`) |
+| High     | 0.80      | review         | `sudo`, `kill -9`, destructive git, DROP TABLE, write/edit secrets, HTTP mutations, `ssh`/`scp`, credential file access, browser automation + data export, transitive installs (`npx skills add`, `pip install git+`), control plane mutations (`crontab`, `systemctl enable/start/stop`) |
+| Medium   | 0.70      | review         | Content ingestion pipelines (`curl \| python3`), interpreter execution (`python3 script.py`, `node build.js`), cloud CLI mutations (`az/gcloud/aws/kubectl/terraform` with create/delete/destroy verbs), package installs, `write_file`, MCP tools, Docker operations |
+| Low      | 0.85      | approve        | `read_file`, `list_directory`, `search`, `recall`, `use_prompt`, `tool_search`, `read_resource`, `web_search`, read-only bash (`ls`, `cat`, `head`, `grep`, `find`, etc.) |
+
+When no rule matches, the heuristic returns a default verdict: medium risk,
+0.50 confidence, "review" recommendation.
+
+The bash "read-only" rule handles simple pipelines and command chains by
+splitting on `|`, `&&`, `||`, and `;`, then checking each segment individually.
+
+### Rules derived from audit data
+
+Several rules were calibrated using analysis of 25K public agent skill
+security audits across three independent auditors:
+
+- **`download-exec`**: Two-step download-then-execute chains that bypass the
+  existing `pipe-to-shell` rule. 8% of critical-tier skills use this pattern.
+- **`transitive-install`**: Installing packages from URLs or git repos rather
+  than vetted registries. Socket flags this as supply-chain critical in 36%
+  of dangerous skills.
+- **`browser-data-export`**: Browser automation combined with cookie/session/
+  profile export. OpenClaw treats browser profile access as operator-level
+  capability.
+- **`control-plane-mutation`**: Persistent system changes (crontab, systemd)
+  that outlive the session. OpenClaw denies control-plane tools by default.
+- **`content-ingestion`**: Fetch-and-process pipelines where remote content
+  feeds into an interpreter (Snyk W011 pattern — indirect prompt injection
+  surface).
+- **`interpreter-exec`**: Running a script file whose content hasn't been
+  inspected. Opaque to command-level heuristics.
+- **`cloud-infra-mutation`**: Distinguishes destructive cloud CLI verbs
+  (`create`, `delete`, `destroy`) from read-only ones (`show`, `list`, `get`).
+
+---
+
+## LLM Judge
+
+The LLM judge runs on a daemon thread and performs a multi-turn evaluation:
+
+1. **Context preparation**: Recent conversation history is FIFO-truncated to
+   fit within `max_context_ratio` of the judge's context window. The tool call
+   details (name, approval label, full arguments) are appended as a user message.
+2. **Multi-turn loop** (up to 5 turns): The judge can use `read_file` and
+   `list_directory` to gather evidence before rendering its verdict. Each tool
+   result is appended to the conversation and the judge is called again. On
+   the final turn, tools are stripped and a forcing message instructs the
+   judge to render its verdict immediately.
+3. **Verdict parsing**: The judge's final text response is parsed as JSON using
+   a four-stage strategy: direct parse, markdown code block extraction,
+   brace-counting, and regex field extraction as a last resort.
+4. **Arbitration**: If the LLM verdict has higher confidence than the heuristic,
+   it replaces the heuristic via the `intent_verdict` SSE event.
+
+### Read-only tools
+
+When `read_only_tools` is enabled (default), the judge can use two tools:
+
+- **`read_file`**: Read file contents (capped at 32 KB)
+- **`list_directory`**: List directory entries (capped at 200 entries)
+
+Security hardening blocks access to sensitive paths:
+
+| Category | Blocked patterns |
+|----------|-----------------|
+| System directories | `/etc/`, `/root/`, `/proc/`, `/sys/`, `/dev/` |
+| Credential directories | `.ssh`, `.gnupg`, `.aws`, `.config` |
+| Key files | `*.pem`, `*.key`, `*.p12`, `*.pfx` |
+
+### Timeout
+
+The `timeout` setting (default 120 seconds) applies **per turn**, not as a total
+budget across turns — each of the up to 5 turns gets a fresh budget, so a slow
+earlier turn doesn't starve later ones. If a turn's budget expires, the judge
+attempts to parse whatever partial response is available.
+
+---
+
+## Verdict Structure
+
+Each verdict (heuristic or LLM) is an `IntentVerdict` with these fields:
+
+| Field            | Type       | Description |
+|------------------|------------|-------------|
+| `verdict_id`     | string     | Unique identifier (UUID prefix) |
+| `call_id`        | string     | Correlates with the tool call's `call_id` |
+| `func_name`      | string     | Tool function name |
+| `intent_summary` | string     | One-sentence description of what the tool call does |
+| `risk_level`     | string     | `"low"`, `"medium"`, `"high"`, or `"critical"` |
+| `confidence`     | float      | 0.0--1.0, how certain the assessment is |
+| `recommendation` | string     | `"approve"`, `"review"`, or `"deny"` |
+| `reasoning`      | string     | Explanation of the assessment |
+| `evidence`       | list[str]  | Supporting evidence (rule name or file excerpts) |
+| `tier`           | string     | `"heuristic"` or `"llm"` |
+| `judge_model`    | string     | Model used (empty for heuristic tier) |
+| `latency_ms`     | int        | Evaluation time in milliseconds |
+
+---
+
+## Session Integration
+
+The judge is lazy-initialized on first use. When `ChatSession` prepares tool
+calls for approval, it calls `_evaluate_intent()` which:
+
+1. Instantiates `IntentJudge` if not already created
+2. Extracts `func_name`, `func_args`, and `approval_label` from each pending item
+3. Calls `judge.evaluate()` which returns heuristic verdicts immediately
+4. Attaches each heuristic verdict to its item as `_heuristic_verdict`
+5. The daemon thread runs the LLM judge and delivers results via `ui.on_intent_verdict()`
+
+The daemon coordinates up to `parallel_evaluations` independent workers for
+one batch. Completed verdicts stream to the UI as workers finish, and every call
+still receives exactly one LLM or `llm_fallback` verdict. The default of 1 keeps
+the historical serial behavior; a higher value collapses a wide batch toward
+`ceil(batch size / workers)` judge-call intervals. A smaller positive model
+alias capacity also bounds the worker count, avoiding surplus threads queued at
+the same admission gate.
+
+With `cancel_on_approval = false` (the default) the daemon runs every item to
+completion: verdicts that land after the operator decided still stream to the
+UI and persist, stamped with the decision. A newer main-loop batch, session
+close, or explicit Stop retires the old generation; unfinished items degrade
+to `llm_fallback` verdicts. A judge/model binding or parallelism edit prevents
+reuse on the next batch, while already-started calls stay pinned to the binding
+and worker count they began with. With `cancel_on_approval = true`, an ordinary
+gate decision additionally aborts unfinished work, trading verdict completeness
+for inference savings—recommended when the judge shares a single local
+inference backend with the session model. Explicit Stop always cancels every
+live judge generation, regardless of this preference.
+
+Verdicts that arrive after a *newer batch* has replaced the judge generation
+are withheld from the live surfaces (a reused call_id must never ride a stale
+`approve` into Smart Approvals) but still persist with
+`user_decision = "superseded"` so the audit trail records the judge's answer.
+
+Sub-agent (task agent) tool calls are judge-gated too. Each runs the same
+intent pipeline as its own `agent_gate` generation, grounded in that sub-agent's
+own trajectory -- its task prompt is the delegation contract the operator
+approved, so "does this call serve the task" is the right local question.
+Agent-gate generations never occupy the main loop's supersede slot (parallel
+siblings would otherwise make each other's verdicts look stale); per-cycle
+generation checks enforce staleness instead, and `judge.cancel_on_approval`
+fires per gate exactly like the main loop.
+
+Several parallel task agents can therefore leave several approval cycles live
+on one workstream. Each cycle owns its event, result, verdict set, and
+`cycle_id`; a decision targets exactly one cycle by `cycle_id` or member
+`call_id` (selector-less legacy clients resolve the oldest). Workstream Stop or
+close performs a workstream-wide denial sweep over all cycles belonging to the
+cancelled operation. A force-cancel successor's newly registered cycle carries
+a fresh operation witness and is not accidentally denied by the predecessor's
+late sweep.
+
+A task agent's gate moves the workstream state as the main loop's does. With
+several gates open, the workstream is in `attention` while any of them waits
+on a person, else in `evaluation` while any waits on the judge, and back in
+`running` once the last one closes.
+
+---
+
+## Storage and Audit
+
+All verdicts are persisted to the `intent_verdicts` table (migration 012):
+
+- Heuristic verdicts are stored when the `approve_request` event is emitted
+- LLM verdicts are stored when the `intent_verdict` event is delivered
+- The `user_decision` column is updated when the user approves or denies;
+  auto-approved rows carry the bypass reason (`policy`, `blanket`,
+  `auto_approve_tools`, `smart_approval`, `unattended_watch`), and rows whose
+  verdict landed only after a newer batch replaced the judge generation carry
+  `superseded`
+- Every stored verdict — including the benign `risk_level = "none"` majority —
+  is re-attached to its tool call on history replay, so a reloaded workstream
+  shows the same verdict badges the live stream did
+
+The console admin panel exposes verdict history via:
+
+```
+GET /v1/api/admin/verdicts?ws_id=&since=&until=&risk_level=&limit=100&offset=0
+```
+
+This endpoint requires the `admin.judge` permission.
+
+---
+
+## SSE Events
+
+### `approve_request` (extended)
+
+When the judge is active, `approve_request` items include a `verdict` field
+with the heuristic verdict, and the event includes a `judge_pending` flag
+indicating that an LLM verdict is in flight:
+
+```json
+{
+  "type": "approve_request",
+  "judge_pending": true,
+  "items": [
+    {
+      "call_id": "call_abc123",
+      "header": "bash: npm install express",
+      "preview": "",
+      "func_name": "bash",
+      "approval_label": "bash",
+      "needs_approval": true,
+      "error": null,
+      "verdict": {
+        "verdict_id": "a1b2c3d4e5f6",
+        "call_id": "call_abc123",
+        "func_name": "bash",
+        "intent_summary": "Package installation: npm install express",
+        "risk_level": "medium",
+        "confidence": 0.70,
+        "recommendation": "review",
+        "reasoning": "Command installs a software package which may modify the environment.",
+        "evidence": ["Matched rule: package-install"],
+        "tier": "heuristic",
+        "judge_model": "",
+        "latency_ms": 0
+      }
+    }
+  ]
+}
+```
+
+### `intent_verdict`
+
+Delivered asynchronously when the LLM judge completes. The UI replaces the
+heuristic verdict badge with the LLM verdict:
+
+```json
+{
+  "type": "intent_verdict",
+  "verdict_id": "f7e8d9c0b1a2",
+  "call_id": "call_abc123",
+  "func_name": "bash",
+  "intent_summary": "Install Express.js web framework via npm",
+  "risk_level": "medium",
+  "confidence": 0.85,
+  "recommendation": "review",
+  "reasoning": "The command installs express from npm. This is a well-known package but will modify node_modules and package.json.",
+  "evidence": ["Checked package.json — express is not currently a dependency"],
+  "tier": "llm",
+  "judge_model": "gpt-5",
+  "latency_ms": 2340
+}
+```
+
+---
+
+## Skill Scanner
+
+Skills are evaluated by a content scanner at creation and update time. The
+scanner runs the same class of pattern analysis as the heuristic rules but
+operates on SKILL.md content rather than individual tool calls. It evaluates
+four independent risk axes:
+
+1. **Content risk** — command execution scope, external downloads, credential
+   handling, eval/exec, sudo, data exfiltration, browser automation
+2. **Supply chain risk** — pipe-to-shell, transitive installs (`npx skills add`),
+   obfuscation, download-execute chains, executable URLs from untrusted domains
+3. **Vulnerability risk** — prompt injection patterns, insecure credential
+   handling, third-party content exposure (indirect prompt injection surface)
+4. **Declared capability risk** — parsed from `allowed-tools` in the skill's SKILL.md.
+   `Bash(*)` (unrestricted shell) is high risk. `Bash(git:*)` is low.
+   Read-only tools are safe.
+
+Results are stored in `risk_level` (tier: safe/low/medium/high/critical) and
+`scan_report` (JSON breakdown) on the `prompt_templates` table. These fields are
+system-managed and not editable via the admin API.
+
+The scanner is a pure function (a few milliseconds for a typical skill) with no
+I/O, and its time grows linearly with the text. It runs synchronously in the
+storage layer. Scanner failures are silently caught to never block skill
+creation. It reads the stored text whole: install has already removed the
+SKILL.md frontmatter, so nothing more is stripped. A placeholder with no value
+renders as nothing and joins the text around it, so it also reads the text as a
+load without arguments renders it, and with every placeholder removed, as a
+shell runs an unset `$variable`, and keeps the riskiest result.
+
+A skill is principal-load-only when its current text scans as `high` or
+`critical`, or when it grants tool approvals (`auto_approve`, or an
+`allowed_tools` list, which a workstream created with the skill is granted).
+The model cannot activate such a skill through `skills(load)`,
+`spawn_workstream` / `spawn_batch(skill=…)` or `task_agent(skill=…)`; the
+operator loads it with `/skill`. The gate scans the skill's current text rather
+than reading its stored `risk_level`, so a tier stored by an older scanner never
+decides. The operator's `/skill` warning, and the approval card and intent-judge
+view of `skills` `update`, `enable` and `disable`, read the same tier; the
+stored `risk_level` is what lists, filters and `skills(find)` show. Reports that
+are missing, or that an earlier scanner version wrote, are rescanned when a
+process that runs migrations starts, before it serves (about 10 ms a skill). A
+load or spawn checks its skill again just before it runs, and a tool batch that
+writes a skill and activates one is refused.
+
+See [docs/governance.md](governance.md) for the skill governance model.
+
+---
+
+## Output Guard
+
+The output guard evaluates tool execution results *after* execution but *before*
+they enter the conversation context. It catches content-level threats that the
+input heuristic (which evaluates commands) cannot see — prompt injection
+payloads in fetched web pages, credential leakage in command output, encoded
+payloads, and adversarial URLs.
+
+The guard runs as a synchronous heuristic on the tool result text with a
+configurable time budget (default 30 seconds). Pattern checks run in priority
+order: prompt injection first, then credentials, then encoded payloads, then
+lower-priority checks. If the budget is exhausted mid-evaluation, whatever
+flags have been found so far are returned.
+
+The guard **annotates but does not gate** — it surfaces warnings via the
+`on_output_warning` SSE event and optionally redacts detected credentials
+from the output before it enters the conversation.
+
+The child history `inspect_workstream` returns, which the framework encodes as
+JSON around text from elsewhere, is evaluated by the strings it holds: each
+string is read as text on its own, and the keys are not read. Other tools'
+results, `wait_for_workstream`'s included, are still evaluated as text. A
+child's system turn, which the encoding writes as `{"role":"system",...}`, is
+therefore no role injection, and role JSON, a secret or an override phrase
+inside a message is read as written, not through the escapes the encoding adds.
+A string of eight or more characters under a secret-named key (`"token"`,
+`"password"` and the other JSON-secret names) is still redacted, as the
+JSON-secret rule redacts it in text. A redacted document is encoded again; one
+the result fold cut, which no longer parses, is evaluated as text.
+
+Reading by strings has limits. No rule runs from one string into the next, so a
+private key cut off in one message and ended in a later one is not redacted,
+nor is the second line of an env value whose first line an earlier redaction
+replaced. The strings are read in order under the one time budget, each through
+every check, and any left when the budget runs out are neither read nor
+redacted. An inspect that includes provider-native content
+(`include_provider_content`), whose keys the child's model wrote, is evaluated
+as text. So is an earlier inspect result stored in the history being inspected,
+as when a coordinator inspects itself: it is one string there, and its child's
+system turns read as role injection again.
+
+### Detection priorities
+
+| Priority | Category | Risk | Examples |
+|----------|----------|------|----------|
+| 1 | Prompt injection | high | Override phrases, role injection (`{"role":"system"}`), instruction override markers |
+| 2 | Credential leakage | high | API keys, JSON Web Tokens, private key blocks, connection strings, credential-named URL query parameters (`?token=...`, `&api_key=...`, `?password=...`, etc.), `.env` format secrets, JSON secrets (`"api_key": "..."`, `"password": "..."`, etc.) |
+| 3 | Encoded payloads | medium | Script data URIs, hex shellcode sequences |
+| 4 | Adversarial URLs | medium | Cloud metadata endpoints, credential-bearing query parameters |
+| 5 | System info disclosure | low | Private IP addresses, sensitive file paths |
+
+### Credential redaction
+
+When `redact_secrets` is enabled (default), detected credentials in tool output
+are replaced with `[REDACTED:<type>]` markers before the output enters the
+conversation. The original unredacted output is never shown to the model, nor
+to the output guard's LLM stage, which reads the redacted text.
+Redaction types: `api_key`, `private_key`, `password`, `secret`. A value that is
+exactly one of these markers holds no secret, so text redacted once, such as a
+child's tool result that `inspect_workstream` reads back, is not reported as a
+credential leak again.
+
+A URL query or fragment parameter named `token`, `access_token`,
+`refresh_token`, `id_token`, `auth_token`, `api_token`, `session_token`,
+`bearer_token` or `secret_token` (also without the underscore, as in
+`accessToken`), `api_key` (also `apikey`, `api-key`), `secret`, `client_secret`,
+`password` or `passwd` is redacted to the end of its value when the value is at
+least 8 characters, so short placeholders and ordinary parameters stay readable.
+The value is its letters, digits and `. _ ~ + / = % ! * $ @ : -`; any other
+character, such as whitespace, a quote, bracket, parenthesis, comma or
+semicolon, ends it, and so does an encoded `&` or `#` (`%26`, `%23`) after an
+encoded `=` (`%3D`), as in a URL nested inside another. A URL in quotes,
+brackets or a list therefore keeps its surroundings, but text joined to the
+value by one of its own characters, such as `:`, is redacted with it. The
+parameter may follow `?`, `&`, `#`, an escaped `&amp;` or `\u0026`, or their
+percent-encoded forms inside another URL (`%3F`, `%26`, `%23`, with `%3D` for
+`=`). Bare `key` and `auth` are not treated as credential names because they
+name many ordinary parameters. A JSON Web Token is redacted whole where it
+stands on its own, and also right after a percent-escape or a `\u`, `\n`, `\r`
+or `\t` escape, as inside an encoded URL or an escaped string. Both rules run
+before the rules that recognise a key by its prefix, so a value or token that
+starts with such a key is still redacted whole. The browser's display redaction
+applies these rules too.
+
+### Configuration
+
+```text
+judge.output_guard = true    # enable output evaluation (default)
+judge.redact_secrets = true  # auto-redact detected credentials (default)
+```
+
+Configure both at runtime through the admin Judge settings.
+
+The LLM stage (`judge.output_guard_llm`, off by default) runs the model named
+by `judge.output_guard_model`, else the one named by `judge.model`, else the
+session's model. An empty setting defers to the next; a set alias is final, so
+when its model can't be used no guard judge runs and the regex stage judges tool
+output alone until it can be. Only the log says so (`judge.model_unavailable`).
+On `judge.model` the guard shares that alias's `max_concurrency` with the intent
+judge, and long tool output needs a context window to match, so setting
+`judge.output_guard_model` gives the guard a model of its own. A
+workstream's own judge model (the launcher's judge picker, the create API's
+`judge_model`, the CLI's `--judge-model`) is its `judge.model`, so it runs the
+guard too unless `judge.output_guard_model` is set. The judge reads the tool
+output the model receives: the redacted text where the regex stage redacted a
+credential. Its output cap is that model's own `max_tokens`: the alias's value,
+else the `model.max_tokens` setting (32,768 unless changed), never above the
+model's advertised maximum output. The cap is fitted to the context window the
+prompt leaves, because a server such as vLLM refuses a request whose prompt and
+cap together exceed the window. The prompt is counted generously for that: each
+ASCII digit as a token, other ASCII at 3.5 characters per token, other text by
+its UTF-8 length (a Chinese, Japanese or Korean character as about half a
+token), and a run of base64-like characters at 0.6 tokens a character; then up
+to 1.4 times that, the most the count ran short against four tokenizers on
+code, logs, CSV, JSON, Chinese, Japanese, Korean, Russian and base64. A prompt
+that would fill more than 90% of the window when counted that way skips the LLM
+stage with a labelled `llm_error` row. The cap counts the model's reasoning as
+well as its verdict, so a thinking model that spends all of it also yields a
+labelled `llm_error` row, and the heuristic stage stands.
+
+The judge samples at the effort its alias resolves: the alias's own, else
+`model.reasoning_effort`. On a model that takes a fixed thinking budget, as some
+of Anthropic's do, a resolved effort turns thinking on for every judged result.
+The request carries no temperature, whatever the alias sets: the Anthropic API
+version Turnstone uses refuses one. The judge reads untrusted output, so that
+output can push each verdict toward the cap, and each judged result can take up
+to `judge.output_guard_llm_timeout`. The main loop judges up to four results of
+a batch at once; a task agent judges its results one at a time. To bound the
+cost and the wait, give the guard alias a smaller `max_tokens` and a low effort;
+`none` turns thinking off on a model that takes a fixed budget, but an adaptive
+model still thinks under `none`, at its own default effort.
+
+### Merge semantics (heuristic + LLM judge)
+
+The chip is a **merge** of the two detectors (issue #560, "show, annotated"),
+not a winner-take-all:
+
+- `risk_level` = **max**(heuristic, llm) and `flags` = **union**. A positive
+  from either detector surfaces; a negative ("none") or failed/absent LLM
+  **never lowers** a heuristic positive. The judge reads adversarial tool
+  output, so it may raise the alarm but must not be able to hide a
+  deterministic regex finding — defeating the judge can't erase the tripwire.
+- Credential **redaction** is a heuristic-only signal the LLM cannot override.
+- When the judge returned a verdict, its OWN verdict rides along as
+  annotation (`judge_risk` / `confidence` / `reasoning` / `judge_model`) so
+  the operator sees the judge's opinion even when it disagrees with the
+  displayed (merged) risk.
+
+The same merge runs live and on reconnect (both call
+`output_guard.merge_guard_display_payload`), so the chip can't drift between
+the two surfaces.
+
+### What the model is shown
+
+The model reads a finding as an `output_guard` system turn after the tool
+results, built only from text the framework wrote. The judge read the
+attacker-controlled output, and the advisory carries operator-level trust, so
+nothing the judge wrote reaches the model: its reasoning and its flags as
+written stay on the chip and in the audit rows. The advisory carries:
+
+- the merged `risk_level`;
+- the heuristic's flags and annotations, unchanged (an admin-defined pattern's
+  annotation included);
+- for each flag only the judge raised, a symbol from a fixed vocabulary and
+  that symbol's one sentence. The judge's prompt lists the vocabulary
+  (`output_guard.JUDGE_SYMBOLS`). A flag outside it shows as `unclassified`,
+  and so does a judge finding that names no flag when nothing else names it.
+  Judge symbols follow the heuristic flags in vocabulary order, at most four
+  per finding;
+- the lines the judge cited, as numbers only. The judge reads the output with
+  each line numbered and may cite `[first, last]` ranges. A range reaches the
+  model only if every line it names reads the same, at the same number, in the
+  text the model receives: the judge reads the redacted text, but the main loop
+  can re-cut a result and a task agent's guard reads past the cut the agent
+  receives, so a range after such a change is dropped rather than renumbered.
+  Ranges merge where they overlap, at most four per finding, and the sentence
+  says the numbers count from the first line of the result, because tool
+  output such as `read_file` prints line numbers of its own. It points without
+  bounding: the judge picked the lines after reading the output, which can
+  steer it, so the sentence asks the model to treat the whole result with the
+  same caution. A tool's own text inside a list result reaches the model as
+  part of one result, so a finding on it cites no lines (the only list result
+  today, `read_file` on an image, holds no tool text). Numbering every line
+  can grow padded output severalfold, so output whose numbered prompt would
+  not fit the judge's window but whose plain one would is judged unnumbered,
+  and that verdict cites no lines;
+- the redaction notice when credentials were redacted.
+
+All of a step's advisories follow its last tool result, because a turn's
+results must stay together on the wire. When a step returned several, each
+advisory names its own result by position, and by tool when the session offers
+a tool of that name, as in `Output guard (result 1 of 3, read_file): ...`; the
+operator's guard card shows the same label. A result the guard did not flag
+gets no entry: no advisory is never a clearance. Text the framework wrote
+itself is not guarded at all: a denial, which quotes the approver's feedback,
+an unknown-tool or agent-mode gate error, and the header `read_file` puts
+before an image.
+
+The judge's flags and lines count only when its own verdict is above "none",
+and the model is **never** told the judge cleared a finding — a judge fooled
+into "none" must not get to talk the model out of caution. The judge's raw
+ranges are not stored, so the chip shows none.
+
+### SSE event: `output_warning`
+
+When the merged finding is non-clean (or credentials were redacted), an
+`output_warning` SSE event is emitted to the frontend. A regex-only finding:
+
+```json
+{
+  "type": "output_warning",
+  "call_id": "call_abc123",
+  "func_name": "bash",
+  "risk_level": "high",
+  "flags": ["credential_leak"],
+  "annotations": ["API key detected (sk-proj-...)"],
+  "output_length": 1024,
+  "redacted": true,
+  "tier": "heuristic"
+}
+```
+
+When the LLM judge returned a verdict, `tier` is `"llm"` and the event carries
+the judge's own verdict as annotation. Here the regex flagged MEDIUM but the
+judge assessed the output benign — the finding still surfaces (`risk_level`
+stays MEDIUM), annotated with the judge's dissent (`judge_risk: "none"`):
+
+```json
+{
+  "type": "output_warning",
+  "call_id": "call_def456",
+  "func_name": "web_fetch",
+  "risk_level": "medium",
+  "flags": ["camouflaged_injection"],
+  "annotations": ["Authority-framed directive embedded in the document."],
+  "output_length": 8192,
+  "redacted": false,
+  "tier": "llm",
+  "judge_risk": "none",
+  "confidence": 0.92,
+  "reasoning": "Legitimate analyst commentary; no injection.",
+  "judge_model": "gpt-5-mini"
+}
+```
+
+`judge_risk` (the judge's OWN risk verdict, which may differ from the merged
+`risk_level`), `confidence` (0.0–1.0), `reasoning`, and `judge_model` are
+present only on the `"llm"` tier. The identical shape is projected onto
+history replay by `build_merged_output_assessment_payload`, so the inline chip
+renders the same live and on refresh.
+
+The web UI renders this as an inline warning after the tool result — the
+`"llm"` tier adds a `⚖ LLM · NN%` badge (showing the judge's verdict when it
+differs from the displayed risk, e.g. `⚖ LLM: none · 92%`) and the judge's
+rationale. The CLI shows a colored terminal warning. The server forwards it as
+an `OutputWarningEvent` for console subscribers.
+
+Assessments are persisted to the `output_assessments` table (one row per
+`(call_id, tier)`) for calibration. Raw tool output is never stored — only
+metadata: flags, risk level, annotations, output length, redaction status,
+and — for the LLM tier — confidence, reasoning, judge model, and latency.
+
+### Session-level skill scan warning
+
+When a skill whose current text scans as `high` or `critical` is loaded into a
+session, a warning is emitted via `on_info`:
+
+```
+⚠ Skill 'my-skill' has risk level: high.
+Review scan report in admin panel before enabling in production.
+```
+
+If the text cannot be scanned, the warning says so instead:
+
+```
+⚠ Skill 'my-skill' could not be risk-checked.
+Review scan report in admin panel before enabling in production.
+```
+
+This ensures operators see a warning even if they missed the scan badge in
+the admin skills tab.
+
+---
+
+## Data Collection for v2 Calibration
+
+All three evaluation systems persist their assessments for future calibration:
+
+| Table | Source | Key columns |
+|-------|--------|-------------|
+| `intent_verdicts` | Intent judge (heuristic + LLM) | `func_name`, `risk_level`, `confidence`, `user_decision` |
+| `output_assessments` | Output guard | `func_name`, `risk_level`, `flags`, `redacted` |
+| `prompt_templates` | Skill scanner | `risk_level`, `scan_report`, `scan_version` |
+
+Run v1 with all tools requiring manual approval to build a local dataset.
+In v2, calibration tooling will analyze this data to:
+
+- Identify tools that are always approved (candidates for auto-approve policies)
+- Detect false positives in heuristic rules (intent + output guard)
+- Measure LLM judge accuracy against human decisions
+- Recommend policy changes to reduce approval fatigue
+- Tune output guard sensitivity per tool (e.g., `bash` output needs more
+  scrutiny than `read_file`)
+
+Output assessments are queryable via `GET /v1/api/admin/output-assessments`
+(requires `admin.judge` permission). Skills can be re-scanned via
+`POST /v1/api/admin/skills/{id}/rescan` when the scanner is updated.
+
+This data-driven approach means v1 is both useful on its own and a foundation
+for automated policy tuning.

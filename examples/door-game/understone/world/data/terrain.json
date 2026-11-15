@@ -1,0 +1,44 @@
+{
+  ".": {
+    "key": "grass",
+    "glyph": ".",
+    "walkable": true,
+    "encounter_rate": 0.1,
+    "color": "floor"
+  },
+  "T": {
+    "key": "tree",
+    "glyph": "♣",
+    "walkable": false,
+    "encounter_rate": 0.0,
+    "color": "tree"
+  },
+  "~": {
+    "key": "water",
+    "glyph": "≋",
+    "walkable": false,
+    "encounter_rate": 0.0,
+    "color": "water"
+  },
+  "=": {
+    "key": "road",
+    "glyph": "▒",
+    "walkable": true,
+    "encounter_rate": 0.02,
+    "color": "road"
+  },
+  "f": {
+    "key": "forest",
+    "glyph": "↑",
+    "walkable": true,
+    "encounter_rate": 0.25,
+    "color": "forest"
+  },
+  "#": {
+    "key": "wall",
+    "glyph": "█",
+    "walkable": false,
+    "encounter_rate": 0.0,
+    "color": "wall"
+  }
+}

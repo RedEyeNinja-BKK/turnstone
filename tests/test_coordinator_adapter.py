@@ -1,0 +1,1102 @@
+"""Tests for CoordinatorAdapter.
+
+Mirrors test_interactive_adapter.py: focuses on the transport contract
+(what gets sent to the ClusterCollector) and cleanup_ui behavior
+(unblock listener queues, cancel session). The SessionManager-level
+tests in test_session_manager.py cover the lifecycle path.
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from turnstone.console.coordinator_adapter import CoordinatorAdapter
+from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from turnstone.core.session_manager import SessionManager
+from turnstone.core.storage import LeaseFence, LeaseGrant
+from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
+
+
+class _StubCoordUI:
+    """Stub matching the subset of ConsoleCoordinatorUI the adapter touches."""
+
+    def __init__(self) -> None:
+        self._approval_event = threading.Event()
+        self._approval_result: tuple[bool, str | None] = (True, "initial")
+        self._fg_event = threading.Event()
+        self._listeners_lock = threading.Lock()
+        self._listeners: list[queue.Queue[dict[str, Any]]] = []
+
+
+class _StubSession:
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.closed = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _make_adapter(
+    collector: Any = None,
+    *,
+    ui_factory: Any = None,
+    session_factory: Any = None,
+) -> tuple[CoordinatorAdapter, MagicMock]:
+    collector = collector or MagicMock()
+    adapter = CoordinatorAdapter(
+        collector=collector,
+        ui_factory=ui_factory or (lambda ws: _StubCoordUI()),
+        session_factory=session_factory or (lambda *a, **kw: _StubSession()),
+    )
+    return adapter, collector
+
+
+def _make_ws(**overrides: Any) -> Workstream:
+    ws = Workstream(id="coord-1", name="my-coord")
+    ws.kind = WorkstreamKind.COORDINATOR
+    ws.user_id = "u1"
+    ws.ui = _StubCoordUI()
+    ws.session = _StubSession()
+    for k, v in overrides.items():
+        setattr(ws, k, v)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Transport — emit_created / emit_state / emit_closed
+# ---------------------------------------------------------------------------
+
+
+def test_emit_created_calls_collector_with_coord_fields() -> None:
+    adapter, collector = _make_adapter()
+    ws = _make_ws(project_id="p1", persona="executive")
+    adapter.emit_created(ws)
+    collector.emit_console_ws_created.assert_called_once_with(
+        "coord-1",
+        name="my-coord",
+        user_id="u1",
+        kind=WorkstreamKind.COORDINATOR.value,
+        state=WorkstreamState.IDLE.value,
+        parent_ws_id=None,
+        # Tenancy-load-bearing: the console SSE filter gates on this.
+        project_id="p1",
+        # Display carrier: the pseudo-node row + ws_created event wear it.
+        persona="executive",
+    )
+
+
+def test_emit_created_seeds_resolved_display_name(tmp_path: Any) -> None:
+    """The collector seed uses the resolved display name (alias > title >
+    name), not the synthetic ``ws.name``.  A coordinator carrying a
+    persisted LLM auto-title (written by ``update_workstream_title``) then
+    shows that title in the live cluster tree instead of reverting to
+    ``ws-xxxx``.  Regression guard for the adapter half of the
+    coordinator-title-persistence fix — the server-side ``_coordinator_rows``
+    half is pinned in test_coordinator_endpoints.py."""
+    from turnstone.core.storage import init_storage, reset_storage
+
+    reset_storage()
+    backend = init_storage("sqlite", path=str(tmp_path / "adapter.db"), run_migrations=False)
+    try:
+        # Titled coordinator → the title surfaces over the placeholder name.
+        backend.register_workstream(
+            "coord-1",
+            node_id="console",
+            user_id="u1",
+            name="ws-c0c0",
+            kind=WorkstreamKind.COORDINATOR,
+        )
+        backend.update_workstream_title("coord-1", "Investigate the title bug")
+        adapter, collector = _make_adapter()
+        adapter.emit_created(_make_ws(name="ws-c0c0"))
+        assert (
+            collector.emit_console_ws_created.call_args.kwargs["name"]
+            == "Investigate the title bug"
+        )
+
+        # A user alias outranks the auto-title (alias > title > name).
+        assert backend.set_workstream_alias("coord-1", "Pinned name")
+        collector.emit_console_ws_created.reset_mock()
+        adapter._fanout_console_ws_created(_make_ws(name="ws-c0c0"))
+        assert collector.emit_console_ws_created.call_args.kwargs["name"] == "Pinned name"
+    finally:
+        reset_storage()
+
+
+def test_coord_display_name_skips_uninitialized_storage() -> None:
+    """_coord_display_name runs on a lifecycle-event path and must NOT trip
+    get_storage()'s SQLite auto-init (a stray .turnstone.db in the CWD) when
+    storage isn't initialized — it falls back to the placeholder ws.name and
+    leaves storage untouched."""
+    from turnstone.console.coordinator_adapter import _coord_display_name
+    from turnstone.core.storage import is_storage_initialized, reset_storage
+
+    reset_storage()
+    assert not is_storage_initialized()
+    assert _coord_display_name(_make_ws(name="ws-abcd")) == "ws-abcd"
+    # The resolution did not auto-initialize storage as a side effect.
+    assert not is_storage_initialized()
+
+
+def test_emit_state_calls_collector_state() -> None:
+    """Post-rich-payload, emit_state passes tokens / context_ratio /
+    activity / activity_state / content kwargs read from ws.ui's
+    snapshot. Default values (zeros / empty strings) when the UI
+    hasn't recorded any per-ws metrics yet."""
+    adapter, collector = _make_adapter()
+    ws = _make_ws()
+    adapter.emit_state(ws, WorkstreamState.RUNNING)
+    collector.emit_console_ws_state.assert_called_once_with(
+        "coord-1",
+        WorkstreamState.RUNNING.value,
+        tokens=0,
+        context_ratio=0.0,
+        activity="",
+        activity_state="",
+        content="",
+        persistence_state="healthy",
+    )
+
+
+@pytest.mark.parametrize("takeover", ["successor", "close"])
+def test_deferred_stale_state_does_not_consume_coordinator_content(
+    takeover: str,
+) -> None:
+    """Only a still-current state tail may drain the rich content payload."""
+    write_started = threading.Event()
+    release_write = threading.Event()
+    first_idle = True
+    write_lock = threading.Lock()
+    storage = MagicMock()
+    storage.get_workstream.return_value = None
+
+    def update_state(_ws_id: str, state: str, lease: Any = None) -> None:
+        nonlocal first_idle
+        should_block = False
+        with write_lock:
+            if state == WorkstreamState.IDLE.value and first_idle:
+                first_idle = False
+                should_block = True
+        if should_block:
+            write_started.set()
+            if not release_write.wait(2):
+                raise RuntimeError("test predecessor state write was not released")
+
+    storage.update_workstream_state.side_effect = update_state
+    storage.acquire_workstream_lease.side_effect = lambda ws_id, **kwargs: LeaseGrant(
+        LeaseFence(ws_id, kwargs["holder"], 1, kwargs["incarnation_token"])
+    )
+    ui = ConsoleCoordinatorUI(ws_id="coord-content")
+    adapter, collector = _make_adapter(ui_factory=lambda _ws: ui)
+    manager = SessionManager(
+        adapter,
+        storage=storage,
+        max_active=1,
+        event_emitter=adapter,
+    )
+    adapter.attach(manager)
+    ws = manager.create(user_id="u1", ws_id="coord-content")
+    collector.emit_console_ws_state.reset_mock()
+
+    content = "payload belongs to the current state transition"
+    with ui._ws_lock:
+        ui._ws_turn_content = [content]
+        ui._ws_turn_content_size = len(content)
+
+    predecessor_tail: list[Any] = []
+    assert manager.set_state_deferred(
+        ws.id,
+        WorkstreamState.IDLE,
+        deferred_persistence=predecessor_tail,
+    )
+    assert len(predecessor_tail) == 1
+    errors: list[BaseException] = []
+
+    def run_predecessor_tail() -> None:
+        try:
+            predecessor_tail[0]()
+        except BaseException as exc:
+            errors.append(exc)
+
+    predecessor = threading.Thread(target=run_predecessor_tail)
+    predecessor.start()
+    successor_tail: list[Any] = []
+    try:
+        assert write_started.wait(2)
+        if takeover == "successor":
+            assert manager.set_state_deferred(
+                ws.id,
+                WorkstreamState.IDLE,
+                deferred_persistence=successor_tail,
+            )
+            assert len(successor_tail) == 1
+        else:
+            assert manager.close(ws.id) is True
+
+        # Admission/close invalidated the predecessor, but neither path has
+        # consumed the terminal-state payload while its DB write is blocked.
+        with ui._ws_lock:
+            assert ui._ws_turn_content == [content]
+        collector.emit_console_ws_state.assert_not_called()
+        release_write.set()
+    finally:
+        release_write.set()
+        predecessor.join(2)
+
+    assert not predecessor.is_alive()
+    assert errors == []
+    collector.emit_console_ws_state.assert_not_called()
+    with ui._ws_lock:
+        assert ui._ws_turn_content == [content]
+
+    if takeover == "successor":
+        successor_tail[0]()
+        collector.emit_console_ws_state.assert_called_once_with(
+            ws.id,
+            WorkstreamState.IDLE.value,
+            tokens=0,
+            context_ratio=0.0,
+            activity="",
+            activity_state="",
+            content=content,
+            persistence_state="healthy",
+        )
+        with ui._ws_lock:
+            assert ui._ws_turn_content == []
+
+
+def test_emit_closed_calls_collector_closed() -> None:
+    adapter, collector = _make_adapter()
+    adapter.emit_closed("coord-1")
+    collector.emit_console_ws_closed.assert_called_once_with("coord-1")
+
+
+def test_emit_closed_swallows_reason_kwarg() -> None:
+    """The console collector doesn't propagate a 'reason' — the console
+    frontend's evicted special-case only fires for real-node
+    workstreams. Protocol compatibility only."""
+    adapter, collector = _make_adapter()
+    adapter.emit_closed("coord-1", reason="evicted")
+    collector.emit_console_ws_closed.assert_called_once_with("coord-1")
+
+
+def test_emit_tolerates_collector_exception() -> None:
+    collector = MagicMock()
+    collector.emit_console_ws_created.side_effect = RuntimeError("collector dead")
+    collector.emit_console_ws_state.side_effect = RuntimeError("collector dead")
+    collector.emit_console_ws_closed.side_effect = RuntimeError("collector dead")
+    adapter, _ = _make_adapter(collector=collector)
+    ws = _make_ws()
+    # All three must swallow — the session lifecycle must not break
+    # because the collector had a transient failure.
+    adapter.emit_created(ws)
+    adapter.emit_state(ws, WorkstreamState.RUNNING)
+    adapter.emit_closed("coord-1")
+
+
+# ---------------------------------------------------------------------------
+# cleanup_ui
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_ui_sweeps_all_approval_cycles_on_registry_uis() -> None:
+    """The real ConsoleCoordinatorUI carries the approval-cycle
+    registry: cleanup denies + wakes EVERY parked gate via
+    ``resolve_all_approvals`` (parallel task agents can hold several),
+    not the pre-cycle single-slot kick."""
+    adapter, _ = _make_adapter()
+    ws = _make_ws()
+    ws.ui.resolve_all_approvals = MagicMock(return_value=2)  # type: ignore[attr-defined]
+    adapter.cleanup_ui(ws)
+    ws.ui.resolve_all_approvals.assert_called_once_with(  # type: ignore[attr-defined]
+        False, "Workstream closed"
+    )
+    assert ws.ui._fg_event.is_set()  # type: ignore[attr-defined]
+
+
+def test_cleanup_ui_unblocks_events_and_broadcasts_to_listeners() -> None:
+    adapter, _ = _make_adapter()
+    ws = _make_ws()
+    ws.ui._approval_event.clear()  # type: ignore[attr-defined]
+    ws.ui._fg_event.clear()  # type: ignore[attr-defined]
+    lq: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=5)
+    ws.ui._listeners.append(lq)  # type: ignore[attr-defined]
+
+    adapter.cleanup_ui(ws)
+
+    assert ws.ui._approval_event.is_set()  # type: ignore[attr-defined]
+    assert ws.ui._fg_event.is_set()  # type: ignore[attr-defined]
+    assert ws.ui._approval_result == (False, None)  # type: ignore[attr-defined]
+    assert lq.get_nowait() == {"type": "ws_closed"}
+    assert ws.ui._listeners == []  # type: ignore[attr-defined]
+    assert ws.session.cancelled is True  # type: ignore[attr-defined]
+    assert ws.session.closed is True  # type: ignore[attr-defined]
+
+
+def test_cleanup_ui_listener_full_queue_evicts_head() -> None:
+    adapter, _ = _make_adapter()
+    ws = _make_ws()
+    lq: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+    lq.put_nowait({"type": "stale"})
+    ws.ui._listeners.append(lq)  # type: ignore[attr-defined]
+    adapter.cleanup_ui(ws)
+    assert lq.get_nowait() == {"type": "ws_closed"}
+
+
+def test_cleanup_ui_tolerates_missing_session_and_ui() -> None:
+    adapter, _ = _make_adapter()
+    ws = _make_ws()
+    ws.session = None
+    ws.ui = None
+    adapter.cleanup_ui(ws)  # no crash
+    assert ws._closed is True  # still marked dead
+
+
+def test_cleanup_ui_marks_workstream_closed() -> None:
+    """Every teardown path — close, close_idle, EVICTION, delete,
+    discard — funnels through cleanup_ui, which marks the object dead
+    under ``ws._lock`` BEFORE the teardown body runs.  The wake paths
+    that hold OBJECT references (the watch ``wake_fn``,
+    ``session_worker``'s exit backstop) gate on ``_closed``, and
+    ``session_worker.send`` re-checks it under the same lock — without
+    this write here, a wake racing an eviction or delete (which never
+    set the flag) would spawn a full unattended turn on the torn-down
+    session."""
+    adapter, _ = _make_adapter()
+    ws = _make_ws()
+    assert ws._closed is False
+    adapter.cleanup_ui(ws)
+    assert ws._closed is True
+
+
+# ---------------------------------------------------------------------------
+# Construction passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_build_session_forwards_skill_model_kind_parent() -> None:
+    captured: dict[str, Any] = {}
+
+    def _sf(ui: Any, model: str | None, ws_id: str, **kwargs: Any) -> Any:
+        captured["ui"] = ui
+        captured["model"] = model
+        captured["ws_id"] = ws_id
+        captured.update(kwargs)
+        return _StubSession()
+
+    adapter, _ = _make_adapter(session_factory=_sf)
+    ws = _make_ws()
+    ws.parent_ws_id = None
+    adapter.build_session(ws, skill="coordinator", model="gpt-5")
+    assert captured["ui"] is ws.ui
+    assert captured["model"] == "gpt-5"
+    assert captured["skill"] == "coordinator"
+    assert captured["kind"] == WorkstreamKind.COORDINATOR
+    assert captured["parent_ws_id"] is None
+    # client_type intentionally NOT forwarded — coord session_factory
+    # doesn't accept it (fixed as 'console').
+    assert "client_type" not in captured
+
+
+def test_build_ui_delegates_to_ui_factory() -> None:
+    captured_ws: list[Workstream] = []
+
+    def _ui_factory(ws: Workstream) -> Any:
+        captured_ws.append(ws)
+        return _StubCoordUI()
+
+    adapter, _ = _make_adapter(ui_factory=_ui_factory)
+    ws = _make_ws()
+    result = adapter.build_ui(ws)
+    assert captured_ws == [ws]
+    assert isinstance(result, _StubCoordUI)
+
+
+# ---------------------------------------------------------------------------
+# Worker dispatch — _spawn_worker / send
+# ---------------------------------------------------------------------------
+
+
+class _SendSession:
+    """ChatSession stub with send / queue_message accounting."""
+
+    def __init__(
+        self,
+        *,
+        queue_full: bool = False,
+        send_gate: threading.Event | None = None,
+    ) -> None:
+        self.send_calls: list[str] = []
+        self.queue_calls: list[str] = []
+        self.interjector_ids: list[str] = []
+        self._queue_full = queue_full
+        # When set, ``send`` blocks on this event — lets the test pin a
+        # worker inside session.send while a second thread races through
+        # _spawn_worker, proving the lock gate (not Thread.is_alive) is
+        # what serialises them.
+        self._send_gate = send_gate
+        self._send_lock = threading.Lock()
+        self.cancelled = False
+        self.closed = False
+
+    def send(
+        self,
+        message: str,
+        attachments: Any = None,
+        send_id: str | None = None,
+    ) -> None:
+        if self._send_gate is not None:
+            self._send_gate.wait(timeout=2.0)
+        with self._send_lock:
+            self.send_calls.append(message)
+
+    def queue_message(
+        self,
+        message: str,
+        attachment_ids: Any = None,
+        queue_msg_id: str | None = None,
+        interjector_user_id: str = "",
+    ) -> None:
+        if self._queue_full:
+            raise queue.Full
+        self.interjector_ids.append(interjector_user_id)
+        self.queue_calls.append(message)
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ForeignQueueSession(_SendSession):
+    """Session whose queue already holds another participant's input.
+
+    Concrete method, not a mock attribute: the adapter's spawn gate only
+    honours a real hook (see ``concrete_method``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.probed_principals: list[str] = []
+
+    def has_foreign_queued_messages(self, principal_id: str) -> bool:
+        self.probed_principals.append(principal_id)
+        return True
+
+
+class _StubManager:
+    """Minimal SessionManager stub exposing ``get`` for adapter.send."""
+
+    def __init__(self, ws: Workstream | None = None) -> None:
+        self._ws = ws
+
+    def get(self, ws_id: str) -> Workstream | None:
+        if self._ws is not None and self._ws.id == ws_id:
+            return self._ws
+        return None
+
+
+class TestCoordinatorAdapterWorkerDispatch:
+    def test_spawn_worker_reuses_when_worker_running(self) -> None:
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        session = _SendSession()
+        ws.session = session  # type: ignore[assignment]
+        ws._worker_running = True  # pre-existing worker
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        assert adapter.send(ws.id, "hello") is True
+        assert session.queue_calls == ["hello"]
+        assert session.send_calls == []
+        # worker_thread not replaced
+        assert ws.worker_thread is None
+
+    def test_spawn_worker_returns_false_on_queue_full(self) -> None:
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        session = _SendSession(queue_full=True)
+        ws.session = session  # type: ignore[assignment]
+        ws._worker_running = True
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        assert adapter.send(ws.id, "hello") is False
+        assert session.send_calls == []
+
+    def test_spawn_worker_concurrent_calls_produce_one_worker(self) -> None:
+        """Bug-1 reproducer: two simultaneous send() calls under ws._lock
+        must land as exactly one ChatSession.send and one queued message,
+        not two parallel workers on the same ChatSession."""
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        send_gate = threading.Event()
+        session = _SendSession(send_gate=send_gate)
+        ws.session = session  # type: ignore[assignment]
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        results: list[bool] = []
+        start_barrier = threading.Barrier(2)
+        results_lock = threading.Lock()
+
+        def _caller(msg: str) -> None:
+            start_barrier.wait(timeout=1.0)
+            r = adapter.send(ws.id, msg)
+            with results_lock:
+                results.append(r)
+
+        t1 = threading.Thread(target=_caller, args=("first",))
+        t2 = threading.Thread(target=_caller, args=("second",))
+        t1.start()
+        t2.start()
+        # Both callers return quickly: the winner spawns the worker
+        # (returns True immediately) and the loser queues (returns True).
+        t1.join(timeout=3.0)
+        t2.join(timeout=3.0)
+        assert not t1.is_alive() and not t2.is_alive()
+        # At this point session.send is still blocked on send_gate —
+        # the second caller MUST have taken the queue path.
+        assert len(session.queue_calls) == 1
+        # Release the worker and let it finish.
+        send_gate.set()
+        if ws.worker_thread is not None:
+            ws.worker_thread.join(timeout=3.0)
+
+        assert results == [True, True]
+        assert len(session.send_calls) == 1
+        assert set(session.send_calls + session.queue_calls) == {"first", "second"}
+        assert ws._worker_running is False
+
+    def test_worker_finally_clears_running_flag(self) -> None:
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        session = _SendSession()
+        ws.session = session  # type: ignore[assignment]
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        assert adapter.send(ws.id, "hello") is True
+        assert ws.worker_thread is not None
+        ws.worker_thread.join(timeout=2.0)
+        assert ws._worker_running is False
+        assert session.send_calls == ["hello"]
+
+    def test_cross_user_queued_input_refusal_names_its_reason(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The refusal reaches the caller as a bare ``False``.
+
+        ``send`` has no per-refusal return channel (the interactive route's
+        409 ``cross_user_interjection`` has one), so the log is the ONLY place
+        this refusal is distinguishable from a full queue or an unloaded
+        workstream.  Pin the reason token, not just the return value.
+        """
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        session = _ForeignQueueSession()
+        ws.session = session  # type: ignore[assignment]
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        with caplog.at_level(logging.WARNING, logger="turnstone.console.coordinator_adapter"):
+            assert adapter.send(ws.id, "hello", acting_user_id="user-b") is False
+        assert session.probed_principals == ["user-b"]
+        assert session.send_calls == []
+        assert session.queue_calls == []
+        assert ws.worker_thread is None
+        assert any(
+            "coord_adapter.send_refused_cross_user_queued_input" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_unauthenticated_dispatch_skips_the_cross_user_probe(self) -> None:
+        """Internal dispatch carries no principal, so there is nobody to
+        classify against — the probe must not run at all (a blanket refusal
+        would strand the create-time initial message)."""
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        session = _ForeignQueueSession()
+        ws.session = session  # type: ignore[assignment]
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        assert adapter.send(ws.id, "hello") is True
+        assert session.probed_principals == []
+        if ws.worker_thread is not None:
+            ws.worker_thread.join(timeout=2.0)
+        assert session.send_calls == ["hello"]
+
+
+# ---------------------------------------------------------------------------
+# Children registry
+# ---------------------------------------------------------------------------
+
+
+class TestCoordinatorAdapterChildrenRegistry:
+    """Adapter-level integration with :class:`ChildrenRegistry`.
+
+    Pure-registry invariants (forward/reverse consistency, idempotent
+    merge, locking) live in ``test_children_registry.py``. These
+    tests cover the adapter's wiring: that ``emit_*`` paths drive the
+    registry correctly and that the snapshot-priming bridge between
+    a collector snapshot and the registry preserves merge semantics.
+    """
+
+    def test_emit_created_installs_parent(self) -> None:
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        adapter.emit_created(ws)
+        assert adapter._registry.children_of(ws.id) == []
+        assert adapter._registry.ui_for(ws.id) is ws.ui
+
+    def test_emit_rehydrated_calls_rebuild(self) -> None:
+        adapter, _ = _make_adapter()
+        calls: list[str] = []
+        # Monkeypatch the rebuild hook to count invocations without
+        # requiring a real storage backend.
+        adapter._rebuild_children_registry = calls.append  # type: ignore[method-assign, assignment]
+        ws = _make_ws()
+        adapter.emit_created(ws)
+        assert calls == []
+        adapter.emit_rehydrated(ws)
+        assert calls == [ws.id]
+
+    def test_emit_closed_uninstalls_parent_and_clears_children(self) -> None:
+        adapter, _ = _make_adapter()
+        adapter._registry.install("coord-a", object())
+        adapter._registry.install("coord-b", object())
+        adapter._registry.merge_children("coord-a", ["child-a1", "child-a2"])
+        adapter._registry.merge_children("coord-b", ["child-b1"])
+
+        adapter.emit_closed("coord-a")
+
+        assert adapter._registry.ui_for("coord-a") is None
+        assert adapter._registry.children_of("coord-a") == []
+        assert adapter._registry.parent_for("child-a1") is None
+        assert adapter._registry.parent_for("child-a2") is None
+        # coord-b untouched
+        assert adapter._registry.parent_for("child-b1") == "coord-b"
+        assert adapter._registry.ui_for("coord-b") is not None
+
+    def test_lease_retirement_closes_the_row_on_this_consoles_pseudo_node(self) -> None:
+        adapter, collector = _make_adapter()
+        adapter._registry.install("coord-a", object())
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        ws = _make_ws()
+        ws.id = "coord-a"
+
+        adapter.on_lease_retired(ws)
+
+        assert adapter._registry.ui_for("coord-a") is None
+        assert adapter._registry.parent_for("child-a1") is None
+        # The pseudo-node row is per console and nothing else would remove it
+        # from this console's dashboard; another console now runs the
+        # coordinator under its own row.
+        collector.emit_console_ws_closed.assert_called_once_with("coord-a")
+
+    def test_prime_children_from_snapshot_merges_without_overwriting(self) -> None:
+        # Snapshot priming now lives on ClusterChildSource (production
+        # path). The adapter no longer carries its own duplicate copy.
+        from turnstone.core.child_source import ClusterChildSource
+
+        adapter, _ = _make_adapter()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+
+        source = ClusterChildSource(
+            collector=MagicMock(),
+            registry=adapter._registry,
+            parents_provider=lambda: ["coord-a"],
+        )
+
+        snapshot = {
+            "nodes": [
+                {
+                    "workstreams": [
+                        {"id": "child-a2", "parent_ws_id": "coord-a"},
+                        # Unknown parent — skipped
+                        {"id": "child-x", "parent_ws_id": "coord-unknown"},
+                        # Missing fields — skipped
+                        {"id": "", "parent_ws_id": "coord-a"},
+                    ],
+                },
+            ],
+        }
+        source._prime_from_snapshot(snapshot)
+        assert set(adapter._registry.children_of("coord-a")) == {
+            "child-a1",
+            "child-a2",
+        }
+        assert adapter._registry.parent_for("child-a2") == "coord-a"
+        assert adapter._registry.parent_for("child-x") is None
+
+
+# ---------------------------------------------------------------------------
+# Dispatch — _dispatch_child_event
+# ---------------------------------------------------------------------------
+
+
+class _UIRecorder:
+    """UI stub capturing _enqueue payloads for dispatch assertions."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[dict[str, Any]] = []
+
+    def _enqueue(self, payload: dict[str, Any]) -> None:
+        self.enqueued.append(payload)
+
+
+class TestCoordinatorAdapterDispatchChildEvent:
+    def _setup(
+        self, coord_id: str = "coord-a"
+    ) -> tuple[CoordinatorAdapter, _UIRecorder, Workstream]:
+        adapter, _ = _make_adapter()
+        coord_ws = _make_ws()
+        coord_ws.id = coord_id
+        recorder = _UIRecorder()
+        coord_ws.ui = recorder  # type: ignore[assignment]
+        adapter._registry.install(coord_id, recorder)
+        adapter.attach(_StubManager(coord_ws))  # type: ignore[arg-type]
+        return adapter, recorder, coord_ws
+
+    def test_dispatch_unknown_parent_drops_event(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {"type": "ws_created", "ws_id": "orphan", "parent_ws_id": "coord-unknown"}
+        )
+        adapter._dispatch_child_event({"type": "cluster_state", "ws_id": "orphan"})
+        adapter._dispatch_child_event({"type": "ws_closed", "ws_id": "orphan"})
+        assert recorder.enqueued == []
+
+    def test_dispatch_ws_created_routes_to_parent_coord_ui(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {
+                "type": "ws_created",
+                "ws_id": "child-a1",
+                "parent_ws_id": "coord-a",
+                "name": "kid",
+                "node_id": "node-1",
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_created"
+        assert payload["child_ws_id"] == "child-a1"
+        assert payload["parent_ws_id"] == "coord-a"
+        # Reverse index updated for subsequent cluster_state events.
+        assert adapter._registry.parent_for("child-a1") == "coord-a"
+
+    def test_dispatch_cluster_state_routes_via_reverse_index(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "running",
+                "tokens": 42,
+                "node_id": "node-1",
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_state"
+        assert payload["state"] == "running"
+        assert payload["tokens"] == 42
+
+    def test_dispatch_ws_closed_routes_to_parent_coord(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event(
+            {"type": "ws_closed", "ws_id": "child-a1", "reason": "evicted"}
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_closed"
+        assert payload["reason"] == "evicted"
+        assert payload["parent_ws_id"] == "coord-a"
+
+    def test_dispatch_adds_ws_id_in_place(self) -> None:
+        """perf-6: _enqueue_on_ui mutates the payload dict in place with
+        the coord's ws_id so the browser can discriminate child events."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "running",
+            }
+        )
+        assert recorder.enqueued[0]["ws_id"] == "coord-a"
+
+    def test_dispatch_cluster_state_does_not_carry_pending_approval_detail(
+        self,
+    ) -> None:
+        """Stage 3 cleanup — the ``pending_approval_detail`` piggyback
+        on ``cluster_state`` is gone. Approval items now arrive via
+        bulk fetch (triggered by ``activity_state="approval"`` in the
+        browser); verdicts via ``child_ws_intent_verdict``; resolution
+        via ``child_ws_approval_resolved``. The state event carries
+        only state + activity_state — no detail field."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "running",
+                "activity_state": "approval",
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_state"
+        assert payload["activity_state"] == "approval"
+        assert "pending_approval_detail" not in payload
+
+    def test_dispatch_intent_verdict_emits_child_ws_intent_verdict(self) -> None:
+        """Stage 3 Step 6 — explicit verdict events are re-emitted as
+        child_ws_intent_verdict on the parent's SSE so the tree UI
+        renders the risk pill without polling."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        verdict = {
+            "call_id": "c1",
+            "risk_level": "low",
+            "confidence": 0.92,
+            "recommendation": "approve",
+        }
+        adapter._dispatch_child_event(
+            {
+                "type": "intent_verdict",
+                "ws_id": "child-a1",
+                "node_id": "node-1",
+                "verdict": verdict,
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_intent_verdict"
+        assert payload["child_ws_id"] == "child-a1"
+        assert payload["parent_ws_id"] == "coord-a"
+        assert payload["node_id"] == "node-1"
+        assert payload["verdict"] == verdict
+
+    def test_dispatch_intent_verdict_unknown_child_drops(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {
+                "type": "intent_verdict",
+                "ws_id": "ws-orphan",
+                "verdict": {"call_id": "c1"},
+            }
+        )
+        assert recorder.enqueued == []
+
+    def test_dispatch_approval_resolved_emits_child_ws_approval_resolved(
+        self,
+    ) -> None:
+        """Stage 3 Step 6 — paired with intent_verdict; clears the
+        pending-approval pill on the parent's tree UI in lockstep
+        with the actual decision."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "approval_resolved",
+                "ws_id": "child-a1",
+                "node_id": "node-1",
+                "approved": True,
+                "feedback": "lgtm",
+                "always": False,
+            }
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_approval_resolved"
+        assert payload["child_ws_id"] == "child-a1"
+        assert payload["parent_ws_id"] == "coord-a"
+        assert payload["approved"] is True
+        assert payload["feedback"] == "lgtm"
+        assert payload["always"] is False
+
+    def test_dispatch_approval_resolved_coerces_missing_fields(self) -> None:
+        """Older nodes mid-rolling-upgrade may omit approved / always /
+        feedback; dispatch coerces to safe defaults."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        adapter._dispatch_child_event({"type": "approval_resolved", "ws_id": "child-a1"})
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["approved"] is False
+        assert payload["feedback"] == ""
+        assert payload["always"] is False
+
+    def test_dispatch_approval_resolved_unknown_child_drops(self) -> None:
+        """Symmetric to the intent_verdict drop test — events for
+        ws_ids the registry doesn't know about silently drop instead
+        of fanning out to a parent that has no business seeing them."""
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {
+                "type": "approval_resolved",
+                "ws_id": "ws-orphan",
+                "approved": True,
+            },
+        )
+        assert recorder.enqueued == []
+
+    def test_dispatch_approve_request_emits_child_ws_approve_request(
+        self,
+    ) -> None:
+        """Push path for the initial approval items — eliminates the
+        bulk-fetch race that left the coord row stuck on a loading
+        placeholder when the bulk fetch landed in the gap between
+        _emit_state(ATTENTION) and approve_tools setting _pending_approval."""
+        adapter, recorder, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        detail = {
+            "type": "approve_request",
+            "items": [{"call_id": "c1", "header": "tool x"}],
+            "judge_pending": True,
+        }
+        adapter._dispatch_child_event(
+            {
+                "type": "approve_request",
+                "ws_id": "child-a1",
+                "node_id": "node-1",
+                "detail": detail,
+            },
+        )
+        assert len(recorder.enqueued) == 1
+        payload = recorder.enqueued[0]
+        assert payload["type"] == "child_ws_approve_request"
+        assert payload["child_ws_id"] == "child-a1"
+        assert payload["parent_ws_id"] == "coord-a"
+        assert payload["node_id"] == "node-1"
+        assert payload["detail"] == detail
+
+    def test_dispatch_approve_request_unknown_child_drops(self) -> None:
+        adapter, recorder, _ = self._setup()
+        adapter._dispatch_child_event(
+            {
+                "type": "approve_request",
+                "ws_id": "ws-orphan",
+                "detail": {"items": []},
+            },
+        )
+        assert recorder.enqueued == []
+
+    def test_dispatch_notifies_child_event_bus_on_state_event(self) -> None:
+        """Every translated state-class event must call
+        ``ChildEventBus.notify(ws_id)`` so a registered
+        ``wait_for_workstream`` waiter wakes promptly.  Notify fires
+        AFTER the UI enqueue so the SSE fan-out keeps priority — the
+        order assertion here is structural (one notify call, matching
+        ws_id) since the bus side-effect lookup is what guards against
+        regressions, not the relative event ordering.
+        """
+        adapter, _, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        bus = adapter.child_event_bus
+        event = bus.register_waiter(["child-a1"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "idle",
+            }
+        )
+        assert event.is_set(), "bus notify did not fire on cluster_state dispatch"
+
+    def test_dispatch_notifies_for_all_state_class_event_types(self) -> None:
+        """The dispatch sink translates six event types into the
+        ``child_ws_*`` SSE shape; all six must also fire the bus so
+        a wait on any of them wakes.  ``ws_created`` is intentionally
+        NOT in this set — waiters register against ws_ids they already
+        know exist (the wait tool takes a pre-known list)."""
+        for etype, extra in [
+            ("cluster_state", {"state": "running"}),
+            ("ws_closed", {"reason": "evicted"}),
+            ("ws_rename", {"name": "renamed"}),
+            ("intent_verdict", {"verdict": {"call_id": "c1"}}),
+            ("approval_resolved", {"approved": True}),
+            ("approve_request", {"detail": {}}),
+        ]:
+            adapter, _, _ = self._setup()
+            adapter._registry.merge_children("coord-a", ["child-a1"])
+            bus = adapter.child_event_bus
+            event = bus.register_waiter(["child-a1"])
+            adapter._dispatch_child_event(
+                {"type": etype, "ws_id": "child-a1", **extra},
+            )
+            assert event.is_set(), f"bus notify did not fire on {etype} dispatch"
+
+    def test_dispatch_does_not_notify_for_unrelated_ws_id(self) -> None:
+        """Bus is keyed by ws_id — a dispatch for ws X must not wake a
+        waiter registered against ws Y, or every state change anywhere
+        in the system would shake every concurrent wait."""
+        adapter, _, _ = self._setup()
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        bus = adapter.child_event_bus
+        event = bus.register_waiter(["child-other"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "child-a1",
+                "state": "idle",
+            }
+        )
+        assert not event.is_set(), "bus notify spuriously fired on unrelated ws_id"
+
+    def test_dispatch_does_not_notify_for_unknown_child(self) -> None:
+        """Events whose ws_id isn't in any coord's registry are dropped
+        BEFORE the bus notify (early return at ``coord_id is None``).
+        Notify only fires for events the dispatch sink fully translated,
+        keeping the bus side-effect aligned with the UI enqueue."""
+        adapter, _, _ = self._setup()
+        bus = adapter.child_event_bus
+        event = bus.register_waiter(["ws-orphan"])
+        adapter._dispatch_child_event(
+            {
+                "type": "cluster_state",
+                "ws_id": "ws-orphan",
+                "state": "idle",
+            }
+        )
+        assert not event.is_set(), "bus notify fired for ws_id the dispatch dropped"
+
+
+def test_a_failed_children_seed_is_retried_on_rehydrate_not_the_event_fan_out(
+    tmp_path: Any, monkeypatch: Any, sqlite_backend_factory: Any
+) -> None:
+    """A failed UI seed never makes event fan-out read storage. Rehydrating again retries the
+    seed and restores routing for stored children; Stop and close-all discover independently.
+    """
+    from tests._coord_test_helpers import _rehydrate_with_children_down
+
+    storage = sqlite_backend_factory(str(tmp_path / "coord.db"))
+    child = "c" * 32
+    mgr, ws, coord_id, down = _rehydrate_with_children_down(storage, monkeypatch, [child])
+    adapter = mgr._adapter
+    event = {"type": "cluster_state", "ws_id": child, "state": "idle"}
+    assert down["calls"] == 1  # the seed on open
+
+    adapter._dispatch_child_event(event)
+    assert down["calls"] == 1  # the fan-out read nothing
+    assert adapter._registry.parent_for(child) is None
+    down["on"] = False
+    adapter.emit_rehydrated(ws)
+    assert down["calls"] == 2
+    assert adapter.registered_children_snapshot(coord_id) == [child]
+    assert adapter._registry.parent_for(child) == coord_id
+    listener = ws.ui._register_listener()
+    adapter._dispatch_child_event(event)
+    assert listener.get_nowait()["child_ws_id"] == child

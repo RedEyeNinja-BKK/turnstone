@@ -1,0 +1,161 @@
+@startuml
+!theme plain
+title Turnstone — Generation-Fenced Conversation Turn
+
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceLifeLineBackgroundColor #F5F5F5
+
+participant "HTTP / CLI\ncaller" as User
+participant "SessionManager" as Manager
+participant "ChatSession" as Session
+participant "SessionUIBase" as UI
+participant "Accepted-row handoff\n(total live prefix)" as Handoff
+participant "model_turn()\n+ lowering" as Plant
+participant "ModelAdmission\n(per alias)" as Admission
+participant "LLM provider" as Provider
+participant "Tool workers" as Tools
+database "StorageBackend\n(SQLite / PostgreSQL)" as Storage
+
+== Admission and generation claim ==
+
+User -> Manager : dispatch send on one Workstream
+Manager -> Session : bind_acting_user(principal)\nsend(text, attachments, send_id)
+activate Session
+Session -> Session : _claim_generation() → generation N\ninstall fresh cancel event
+Session -> Session : refresh immutable ResolvedModelBinding
+Session -> Session : plan memory / participant context
+Session -> Handoff : admit USER row\ncommit_key + prefix revision
+Session -> Storage : ordered durable batch:\nappend canonical user Turn + metadata
+
+note over Session, Handoff
+  Every accepted conversation row enters this lane before durability:
+  USER, ASSISTANT, TOOL, SYSTEM, compaction checkpoints, and cancellation
+  markers. Admission shares the handoff lock with its live UI transition
+  or history_resync repair event.
+end note
+
+note over Handoff, Storage
+  _commit_for_generation(N) admits bounded live mutations under the
+  generation lock, then executes immutable persistence closures in FIFO
+  ticket order. A force successor either follows the whole commit or
+  prevents it. /history projects durable prefix + pending journal suffix;
+  durable ACK removes the pending copy without changing the prefix revision.
+end note
+
+opt already over the hard context ceiling
+  Session -> Session : compact before first model call\n(preserve the new user turn)
+end
+
+== Model / tool loop ==
+
+loop until final answer and no queued input
+  Session -> UI : on_turn_start()\nreset per-stream replay buffers
+  Session -> UI : state = thinking\non_thinking_start()
+  Session -> Session : _stream_response(N)\nretry policy
+  Session -> Plant : model_turn(active ModelLane, Turns,\n tools, cancel_ref, on_chunk)
+  activate Plant
+  Plant -> Plant : canonical Turns → provider wire\nrestore ids + repair + lane-specific fold
+  Plant -> Plant : materialize attachment refs\n(nested perception before outer slot)
+  Plant -> Admission : acquire(cancel_ref)
+  activate Admission
+  Plant -> Plant : resolve per-call backend credential\nfrom lane's pinned ModelConfig
+  Plant -> Provider : create_streaming(...)
+  activate Provider
+
+  loop normalized stream chunks
+    Provider --> Plant : StreamChunk
+    Plant --> Session : on_chunk(StreamChunk)
+    Session -> Session : check cancel event + generation N
+    Session -> UI : reasoning / content / info token
+  end
+
+  Provider --> Plant : finish + usage + native blocks
+  deactivate Provider
+  Plant -> Plant : drain + re-ingest assistant Turn\nwith serving-lane provenance
+  Plant -> Admission : release before retry backoff
+  deactivate Admission
+  Plant --> Session : ModelTurnResult
+  deactivate Plant
+
+  Session -> UI : on_stream_end()
+  Session -> Session : generation-fenced result commit:\nappend assistant Turn + token accounting
+  Session -> UI : on_turn_committed()
+  Session -> Handoff : admit ASSISTANT row\ncommit_key + prefix revision
+  Session -> Storage : ordered durable assistant row\n(content + tool mirror + native lane)
+
+  alt no tool calls
+    opt over soft threshold
+      Session -> Session : cooperative / end-of-turn compaction
+      Session -> Handoff : admit SYSTEM/source=compaction\ncheckpoint projection
+      Session -> Storage : append checkpoint summary marker\nwith source watermark
+      note right of Storage
+        Full history remains durable. Resume loads
+        [summary] + rows after the checkpoint.
+      end note
+      opt model stopped for compaction
+        Session -> Handoff : admit USER/source=compaction_resume row
+        Session -> Storage : append synthetic compaction_resume Turn
+      end
+    end
+    alt queued messages drained
+      Session -> Handoff : admit combined queued USER row
+      Session -> Storage : append combined queued user Turn
+    else truly complete
+      Session -> UI : state = idle
+    end
+  else tool calls present
+    Session -> UI : state = running
+    Session -> Session : prepare items + previews\nattach cancellation witnesses
+
+    opt one or more items require a human
+      Session -> UI : approve_tools(items)\nregister independent ApprovalCycle
+      note right of UI
+        Parallel agents may own concurrent cycles.
+        cycle_id / call_id routes exactly one decision;
+        Smart Approvals may clear qualifying items.
+      end note
+      User -> UI : approve / deny selected cycle
+      UI --> Session : decision + optional feedback
+    end
+
+    Session -> Tools : execute admitted items in parallel
+    activate Tools
+    Tools --> UI : chunks + result card\nwith effect disposition
+    Tools --> Session : outputs / errors / effect statuses
+    deactivate Tools
+    Session -> Session : output-guard evaluation\nthen generation N re-check
+
+    opt compaction owed before result sizing
+      Session -> Session : compact, preserving assistant tool-call Turn
+      Session -> Handoff : admit SYSTEM/source=compaction checkpoint
+      Session -> Storage : append checkpoint marker
+    end
+
+    Session -> Session : one generation-fenced batch:\nappend all Tool Turns, advisories, feedback
+    Session -> Handoff : admit FIFO TOOL rows\ncommit keys + prefix revisions
+    Session -> Storage : FIFO durable tool rows + metadata
+  end
+end
+
+== Stop / force-successor boundary ==
+
+User -> Session : cancel()
+Session -> Session : atomically set generation event; snapshot\nmain stream, child scopes, judges, subprocesses
+Session -> Provider : close live stream handle
+Session -> Tools : abort child scopes + kill subprocess groups
+Session -> UI : resolve only cancelled operation's\napproval cycles
+opt cancellation produced accepted conversation rows
+  Session -> Handoff : admit partial ASSISTANT and/or\nsynthesized TOOL cancellation markers
+  Session -> Storage : idempotent keyed cancellation rows
+end
+
+note over Session, Storage
+  Every later publish/commit checks generation ownership. An abandoned
+  worker may unwind, but cannot append Turns, overwrite state, resolve a
+  successor approval, or repaint the successor UI. Observed tool effects
+  are preserved as controller-authored cancellation receipts; unreviewed
+  tool bytes are not laundered into model context.
+end note
+
+deactivate Session
+@enduml

@@ -1,0 +1,5643 @@
+"""Tests for MCP server admin API endpoints."""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import threading
+import uuid
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
+
+import httpx2
+import pytest
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.routing import Mount, Route
+from starlette.testclient import TestClient
+
+from turnstone.core.oauth.context import oauth_context
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+from turnstone.console.server import (
+    _collect_mcp_status,
+    _console_mcp_action_outcome,
+    _ensure_console_mcp_client,
+    _notify_nodes_mcp_reconnect_one,
+    _notify_nodes_mcp_refresh_one,
+    _notify_nodes_mcp_reload,
+    _schedule_mcp_reload,
+    admin_create_mcp_server,
+    admin_delete_mcp_server,
+    admin_get_mcp_server,
+    admin_import_mcp_config,
+    admin_list_mcp_servers,
+    admin_mcp_reconnect_one,
+    admin_mcp_refresh_one,
+    admin_mcp_reload,
+    admin_test_mcp_server,
+    admin_update_mcp_server,
+)
+from turnstone.core.auth import AuthResult
+
+# ---------------------------------------------------------------------------
+# Auth middleware variants
+# ---------------------------------------------------------------------------
+
+
+class _InjectAuthMiddleware(BaseHTTPMiddleware):
+    """Inject an admin auth result with admin.mcp permission."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.auth_result = AuthResult(
+            user_id="test-user",
+            scopes=frozenset({"approve"}),
+            token_source="config",
+            permissions=frozenset(
+                {
+                    "read",
+                    "write",
+                    "approve",
+                    "admin.mcp",
+                }
+            ),
+        )
+        resp: Response = await call_next(request)
+        return resp
+
+
+class _InjectAuthNoMcpMiddleware(BaseHTTPMiddleware):
+    """Inject an auth result WITHOUT admin.mcp permission."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.auth_result = AuthResult(
+            user_id="test-user",
+            scopes=frozenset({"approve"}),
+            token_source="jwt",
+            permissions=frozenset(
+                {
+                    "read",
+                    "write",
+                    "approve",
+                }
+            ),
+        )
+        resp: Response = await call_next(request)
+        return resp
+
+
+class _InjectReadTokenWithMcpMiddleware(BaseHTTPMiddleware):
+    """A read-scoped token whose owner holds admin.mcp: a DB token carries its owner's
+    permissions whatever its scopes."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.auth_result = AuthResult(
+            user_id="test-user",
+            scopes=frozenset({"read"}),
+            token_source="database",
+            permissions=frozenset({"read", "write", "approve", "admin.mcp"}),
+        )
+        resp: Response = await call_next(request)
+        return resp
+
+
+class _InjectServiceAuthMiddleware(BaseHTTPMiddleware):
+    """Inject the cluster service identity used for internal cache eviction."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.auth_result = AuthResult(
+            user_id="console-proxy",
+            scopes=frozenset({"read", "approve", "service"}),
+            token_source="console",
+        )
+        resp: Response = await call_next(request)
+        return resp
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+_ROUTES = [
+    Mount(
+        "/v1",
+        routes=[
+            Route("/api/admin/mcp-servers", admin_list_mcp_servers),
+            Route(
+                "/api/admin/mcp-servers",
+                admin_create_mcp_server,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/import",
+                admin_import_mcp_config,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/reload",
+                admin_mcp_reload,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/test",
+                admin_test_mcp_server,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/{name}/refresh",
+                admin_mcp_refresh_one,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/{name}/reconnect",
+                admin_mcp_reconnect_one,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/{server_id}",
+                admin_get_mcp_server,
+            ),
+            Route(
+                "/api/admin/mcp-servers/{server_id}",
+                admin_update_mcp_server,
+                methods=["PUT"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/{server_id}",
+                admin_delete_mcp_server,
+                methods=["DELETE"],
+            ),
+        ],
+    ),
+]
+
+
+def _routes_with_internal() -> list[Mount]:
+    """Routes including the node-side internal endpoints (lazy-imported)."""
+    from turnstone.server import (
+        internal_mcp_reconnect_one,
+        internal_mcp_refresh_one,
+        internal_mcp_reload,
+        internal_mcp_status,
+        internal_model_auth_cache_invalidate,
+    )
+
+    return [
+        Mount(
+            "/v1",
+            routes=[
+                *_ROUTES[0].routes,  # type: ignore[union-attr]
+                Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
+                Route("/api/_internal/mcp-status", internal_mcp_status),
+                Route(
+                    "/api/_internal/mcp-refresh/{name}",
+                    internal_mcp_refresh_one,
+                    methods=["POST"],
+                ),
+                Route(
+                    "/api/_internal/mcp-reconnect/{name}",
+                    internal_mcp_reconnect_one,
+                    methods=["POST"],
+                ),
+                Route(
+                    "/api/_internal/model-auth-cache-invalidate",
+                    internal_model_auth_cache_invalidate,
+                    methods=["POST"],
+                ),
+            ],
+        ),
+    ]
+
+
+@pytest.fixture
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
+
+
+def _install_token_store(app, storage) -> None:
+    """Install an MCPTokenStore on ``app.state`` for tests that exercise
+    the OAuth client-secret write path.  Uses a deterministic test key."""
+    from cryptography.fernet import Fernet
+
+    from turnstone.core.mcp_crypto import MCPTokenStore
+    from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
+
+    raw_key = base64.urlsafe_b64decode(Fernet.generate_key())
+    cipher = TokenCipher(TokenCipherConfig(keys=(raw_key,)))
+    oauth_context(app.state).cipher = cipher
+    oauth_context(app.state).token_store = MCPTokenStore(
+        storage, cipher, node_id="test", audit_storage=storage
+    )
+
+
+def _enabled_oidc(profile: str = "entra") -> SimpleNamespace:
+    """An OIDC config that satisfies the oauth_obo write-time gate.
+
+    oauth_obo mints from the user's captured sign-in, so the write choke point
+    requires OIDC enabled + a valid ``obo_grant_profile``. Tests exercising obo
+    writes install one of these; the finding-C tests install a disabled /
+    bad-profile config instead to assert the rejection.
+    """
+    return SimpleNamespace(
+        enabled=True,
+        issuer="https://idp.example.com",
+        obo_grant_profile=profile,
+        capture_user_credential=True,
+    )
+
+
+@pytest.fixture
+def client(storage):
+    """TestClient wired to console admin MCP endpoints with full permissions."""
+    app = Starlette(
+        routes=_ROUTES,
+        middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    app.state.auth_storage = storage
+    _install_token_store(app, storage)
+    # Default: OIDC enabled under the entra profile so oauth_obo writes pass the
+    # requirement gate. Per-test overrides install rfc8693 / disabled / bad
+    # profile as needed.
+    oauth_context(app.state).oidc_config = _enabled_oidc("entra")
+    return TestClient(app)
+
+
+@pytest.fixture
+def client_no_perm(storage):
+    """TestClient without admin.mcp permission."""
+    app = Starlette(
+        routes=_ROUTES,
+        middleware=[Middleware(_InjectAuthNoMcpMiddleware)],
+    )
+    app.state.auth_storage = storage
+    _install_token_store(app, storage)
+    return TestClient(app)
+
+
+@pytest.fixture
+def client_no_token_store(storage):
+    """TestClient WITHOUT MCPTokenStore — the 503 path for OAuth secret writes."""
+    app = Starlette(
+        routes=_ROUTES,
+        middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    app.state.auth_storage = storage
+    oauth_context(app.state).token_store = None
+    oauth_context(app.state).cipher = None
+    return TestClient(app)
+
+
+def _create_server(
+    client: TestClient,
+    *,
+    name: str = "test-server",
+    transport: str = "stdio",
+    command: str = "npx",
+    args: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+    url: str = "",
+) -> dict[str, Any]:
+    """Helper to create a server via the API and return the response dict."""
+    body: dict[str, Any] = {"name": name, "transport": transport}
+    if transport == "stdio":
+        body["command"] = command
+        body["args"] = args or ["-y", "@modelcontextprotocol/server-test"]
+    else:
+        body["url"] = url or "http://localhost:8080/mcp"
+    if env is not None:
+        body["env"] = env
+    if headers is not None:
+        body["headers"] = headers
+    r = client.post("/v1/api/admin/mcp-servers", json=body)
+    assert r.status_code == 200
+    data: dict[str, Any] = r.json()
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Mock _collect_mcp_status to avoid real HTTP calls
+# ---------------------------------------------------------------------------
+
+_PATCH_MCP_STATUS = patch(
+    "turnstone.console.server._collect_mcp_status",
+    new_callable=AsyncMock,
+    return_value={},
+)
+
+
+# ---------------------------------------------------------------------------
+# List
+# ---------------------------------------------------------------------------
+
+
+class TestListMcpServers:
+    def test_list_empty(self, client):
+        with _PATCH_MCP_STATUS:
+            r = client.get("/v1/api/admin/mcp-servers")
+        assert r.status_code == 200
+        assert r.json()["servers"] == []
+
+    def test_list_returns_created_servers(self, client):
+        _create_server(client, name="server-a")
+        _create_server(client, name="server-b")
+        with _PATCH_MCP_STATUS:
+            r = client.get("/v1/api/admin/mcp-servers")
+        assert r.status_code == 200
+        names = [s["name"] for s in r.json()["servers"]]
+        assert "server-a" in names
+        assert "server-b" in names
+
+
+# ---------------------------------------------------------------------------
+# Create
+# ---------------------------------------------------------------------------
+
+
+class TestCreateMcpServer:
+    def test_create_stdio_server(self, client):
+        data = _create_server(client, name="my-mcp", transport="stdio", command="node")
+        assert data["name"] == "my-mcp"
+        assert data["transport"] == "stdio"
+        assert data["command"] == "node"
+        assert data["server_id"]
+        assert data["enabled"] is True
+
+    def test_create_http_server(self, client):
+        data = _create_server(
+            client,
+            name="remote-mcp",
+            transport="streamable-http",
+            url="http://mcp.example.com/sse",
+        )
+        assert data["name"] == "remote-mcp"
+        assert data["transport"] == "streamable-http"
+        assert data["url"] == "http://mcp.example.com/sse"
+
+    def test_create_invalid_name_spaces(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "bad name!", "transport": "stdio", "command": "x"},
+        )
+        assert r.status_code == 400
+        assert "name" in r.json()["error"].lower()
+
+    def test_create_invalid_name_double_underscore(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "bad__name", "transport": "stdio", "command": "x"},
+        )
+        assert r.status_code == 400
+        assert "__" in r.json()["error"]
+
+    def test_create_rejects_a_name_ending_in_a_newline(self, client, storage):
+        # Cut to 64 characters, the name ends in the newline, before which "$" would match.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "a" * 63 + "\nb", "transport": "stdio", "command": "x"},
+        )
+        assert r.status_code == 400
+        assert storage.get_mcp_server_by_name("a" * 63 + "\n") is None
+
+    def test_create_invalid_transport(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "ok-name", "transport": "grpc"},
+        )
+        assert r.status_code == 400
+        assert "transport" in r.json()["error"].lower()
+
+    @pytest.mark.parametrize(
+        ("url", "error"),
+        [
+            ("http://[::1/mcp", "url: Invalid IPv6 URL"),
+            (
+                "http://[mcp-host]/mcp",
+                "url: 'mcp-host' does not appear to be an IPv4 or IPv6 address",
+            ),
+            ("http://mcp.example:99999/mcp", "url: Port out of range 0-65535"),
+            ("mcp.example/mcp", "url must be an http:// or https:// URL with a host"),
+            ("ftp://mcp.example/mcp", "url must be an http:// or https:// URL with a host"),
+            # urllib would quote the part of the password before the "/" as the port.
+            ("http://user:s3cret/x@mcp.example/mcp", "url has an invalid host or port"),
+            # urllib would quote the whole userinfo.
+            (
+                "http://user:s3cret" + chr(0x2100) + "@mcp.example/mcp",
+                "url has an invalid host or port",
+            ),
+        ],
+        ids=[
+            "unclosed-bracket",
+            "bracketed-name",
+            "bad-port",
+            "no-scheme",
+            "other-scheme",
+            "password-with-a-slash",
+            "userinfo-that-normalizes",
+        ],
+    )
+    def test_create_rejects_a_url_that_cannot_connect(self, client, storage, url, error):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "bad-url", "transport": "streamable-http", "url": url},
+        )
+        assert r.status_code == 400
+        assert r.json() == {"error": error}
+        assert storage.get_mcp_server_by_name("bad-url") is None
+
+    def test_create_rejects_a_header_httpx_would_not_send(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "bad-header",
+                "transport": "streamable-http",
+                "url": "http://mcp.example/mcp",
+                "headers": {"X-Api-Key": "k3y-s3cret "},
+            },
+        )
+        assert r.status_code == 400
+        assert r.json() == {"error": _BAD_VALUE.format("X-Api-Key")}
+        assert "s3cret" not in r.text
+        assert storage.get_mcp_server_by_name("bad-header") is None
+
+    def test_create_duplicate_name(self, client):
+        _create_server(client, name="dup-test")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "dup-test", "transport": "stdio", "command": "x"},
+        )
+        assert r.status_code == 409
+        assert "already exists" in r.json()["error"]
+
+    def test_create_missing_name(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"transport": "stdio", "command": "x"},
+        )
+        assert r.status_code == 400
+        assert "name" in r.json()["error"].lower()
+
+    def test_admin_create_oauth_server(self, client):
+        """Admin can POST a server with auth_type=oauth_user; the seven
+        OAuth text fields round-trip via GET and the plaintext client
+        secret is encrypted-at-rest via the dedicated writer."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-srv",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+                "oauth_scopes": "openid profile",
+                "oauth_audience": "https://mcp.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_authorization_server_url": "https://auth.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "oauth_user"
+        assert data["oauth_client_id"] == "cli_abc"
+        assert data["oauth_scopes"] == "openid profile"
+        assert data["oauth_audience"] == "https://mcp.example.com"
+        assert data["oauth_registration_mode"] == "preregistered"
+        assert data["oauth_authorization_server_url"] == "https://auth.example.com"
+        # Ciphertext is persisted; the response masks it to "***".
+        assert data["oauth_client_secret_ct"] == "***"
+
+    def test_admin_create_oauth_server_without_token_store_returns_503(self, client_no_token_store):
+        """When MCPTokenStore is unconfigured (no Fernet key), the admin
+        form returns 503 with an operator-actionable hint rather than
+        silently dropping the secret."""
+        r = client_no_token_store.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-srv",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 503, r.text
+        assert "mcp_token_encryption_key" in r.json()["error"]
+
+    def test_admin_create_oauth_server_503_does_not_create_orphan_row(
+        self, client_no_token_store, storage
+    ):
+        """bug-1: a 503 from the token-store gate must not leave an orphan
+        ``oauth_user`` row behind.  The validation is pre-mutation."""
+        r = client_no_token_store.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "would-be-orphan",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 503
+        # No row was created — the storage write was gated on the token store.
+        assert storage.get_mcp_server_by_name("would-be-orphan") is None
+        assert storage.list_mcp_servers() == []
+
+    def test_admin_create_oauth_server_rejects_non_string_secret(self, client):
+        """bug-3: ``oauth_client_secret`` must be a string or null in JSON.
+        A boolean / number / list payload should 400 cleanly, not be coerced
+        via ``str(...)``."""
+        for bad in (False, 0, [], {}):
+            r = client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": f"bad-secret-{type(bad).__name__}",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/sse",
+                    "auth_type": "oauth_user",
+                    "oauth_client_secret": bad,
+                },
+            )
+            assert r.status_code == 400, f"payload={bad!r} got {r.status_code}: {r.text}"
+            assert "oauth_client_secret" in r.json()["error"]
+
+    def test_create_invalid_auth_type(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "bad-auth",
+                "transport": "stdio",
+                "command": "x",
+                "auth_type": "magic",
+            },
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
+    def test_admin_create_oauth_user_rejects_http(self, client, storage):
+        """sec-1: an oauth_user row with a plaintext (non-loopback) URL
+        must 400 — pool dispatch would transmit the per-user bearer in
+        the clear."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "insecure-oauth",
+                "transport": "streamable-http",
+                "url": "http://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "https://" in r.json()["error"]
+        # No partial row was persisted.
+        assert storage.get_mcp_server_by_name("insecure-oauth") is None
+
+    def test_admin_create_oauth_user_accepts_loopback_http(self, client):
+        """``http://localhost`` and ``http://127.0.0.1`` must remain
+        usable for dev/test convenience."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "dev-oauth",
+                "transport": "streamable-http",
+                "url": "http://127.0.0.1:9000/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+
+# ---------------------------------------------------------------------------
+# Get single
+# ---------------------------------------------------------------------------
+
+
+class TestGetMcpServer:
+    def test_get_existing(self, client):
+        created = _create_server(client, name="get-test")
+        sid = created["server_id"]
+        with _PATCH_MCP_STATUS:
+            r = client.get(f"/v1/api/admin/mcp-servers/{sid}")
+        assert r.status_code == 200
+        assert r.json()["name"] == "get-test"
+
+    def test_get_not_found(self, client):
+        fake_id = uuid.uuid4().hex
+        with _PATCH_MCP_STATUS:
+            r = client.get(f"/v1/api/admin/mcp-servers/{fake_id}")
+        assert r.status_code == 404
+        assert "not found" in r.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Update
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateMcpServer:
+    def test_update_name(self, client):
+        created = _create_server(client, name="old-name")
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"name": "new-name"},
+        )
+        assert r.status_code == 200
+        assert r.json()["name"] == "new-name"
+
+    def test_update_transport(self, client):
+        created = _create_server(
+            client,
+            name="update-transport",
+            transport="streamable-http",
+            url="http://localhost/mcp",
+        )
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"transport": "stdio", "command": "node"},
+        )
+        assert r.status_code == 200
+        assert r.json()["transport"] == "stdio"
+
+    def test_update_enabled(self, client):
+        created = _create_server(client, name="toggle-enabled")
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"enabled": False},
+        )
+        assert r.status_code == 200
+        assert r.json()["enabled"] is False
+
+    def test_update_not_found(self, client):
+        fake_id = uuid.uuid4().hex
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{fake_id}",
+            json={"name": "x"},
+        )
+        assert r.status_code == 404
+
+    def test_update_invalid_transport(self, client):
+        created = _create_server(client, name="bad-transport-update")
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"transport": "websocket"},
+        )
+        assert r.status_code == 400
+        assert "transport" in r.json()["error"].lower()
+
+    def test_update_rejects_a_changed_url_that_cannot_connect(self, client, storage):
+        created = _create_server(client, name="url-update", transport="streamable-http")
+        sid = created["server_id"]
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": "http://[::1/mcp"})
+        assert r.status_code == 400
+        assert r.json() == {"error": "url: Invalid IPv6 URL"}
+        assert storage.get_mcp_server(sid)["url"] == "http://localhost:8080/mcp"
+
+    def test_update_keeps_a_row_with_an_unchanged_bad_url_editable(self, client, storage):
+        # A row stored before the URL check existed. The admin form re-sends every field, the
+        # unchanged URL included.
+        created = _create_server(client, name="legacy-url", transport="streamable-http")
+        sid = created["server_id"]
+        storage.update_mcp_server(sid, url="http://[::1/mcp")
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "http://[::1/mcp", "enabled": False},
+        )
+        assert r.status_code == 200
+        assert r.json()["enabled"] is False
+
+    def test_update_checks_only_the_headers_it_changes(self, client, storage):
+        created = _create_server(client, name="header-update", transport="streamable-http")
+        sid = created["server_id"]
+        # A row stored before the check existed; the form re-sends its headers unchanged.
+        storage.update_mcp_server(sid, headers=json.dumps({"X-Old": "v1 "}))
+        kept = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"headers": {"X-Old": "v1 ", "X-New": "v2"}, "enabled": False},
+        )
+        refused = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"headers": {"X-Old": "v1 ", "X-New": " v3"}},
+        )
+        assert kept.status_code == 200
+        assert refused.status_code == 400
+        assert refused.json() == {"error": _BAD_VALUE.format("X-New")}
+        assert json.loads(storage.get_mcp_server(sid)["headers"]) == {"X-Old": "v1 ", "X-New": "v2"}
+
+    def test_update_checks_the_url_when_moving_onto_streamable_http(self, client):
+        created = _create_server(client, name="stdio-to-http")
+        sid = created["server_id"]
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"transport": "streamable-http"})
+        assert r.status_code == 400
+        assert r.json() == {"error": "url must be an http:// or https:// URL with a host"}
+
+    def test_admin_update_auth_type_static_to_oauth(self, client):
+        """An existing static row can be flipped to oauth_user with
+        OAuth fields supplied alongside. The row must already use
+        https:// — sec-1 enforces this on update too."""
+        created = _create_server(
+            client,
+            name="flip-to-oauth",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+        )
+        sid = created["server_id"]
+        assert created["auth_type"] == "static"
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_xyz",
+                "oauth_audience": "https://mcp.example.com",
+                "oauth_registration_mode": "dcr",
+            },
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "oauth_user"
+        assert data["oauth_client_id"] == "cli_xyz"
+        assert data["oauth_audience"] == "https://mcp.example.com"
+        assert data["oauth_registration_mode"] == "dcr"
+
+    def test_admin_update_oauth_url_to_http_rejected(self, client):
+        """sec-1: flipping the URL on an existing oauth_user row to
+        plaintext http must 400."""
+        # Create with proper https.
+        r0 = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-flip-url",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "secret-value",
+            },
+        )
+        assert r0.status_code == 200, r0.text
+        sid = r0.json()["server_id"]
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "http://insecure.example.com/sse"},
+        )
+        assert r.status_code == 400, r.text
+        assert "https://" in r.json()["error"]
+
+    def test_admin_update_oauth_url_change_purges_user_tokens(self, client, storage):
+        """sec-1 (pre-push): URL change on an oauth_user row must purge
+        per-user tokens. Bearer tokens are bound (via OAuth resource /
+        audience) to the URL active at consent time; sending them to a
+        new URL is a token-binding violation. A compromised admin who
+        flips the URL to an attacker endpoint would otherwise replay
+        every user's bearer there silently. Re-consent must be forced.
+        """
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import oauth_tokens
+
+        # Seed an oauth_user row at URL_A.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "url-change-purge",
+                "transport": "streamable-http",
+                "url": "https://orig.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        # Plant a per-user token row keyed on the server name.
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(oauth_tokens),
+                {
+                    "user_id": "u1",
+                    "token_key": "url-change-purge",
+                    "access_token_ct": b"\x00ciphertext-a",
+                    "refresh_token_ct": b"\x00ciphertext-r",
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": "openid",
+                    "as_issuer": "https://auth.orig.example.com",
+                    "audience": "https://orig.example.com",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+            count_before = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "url-change-purge")
+            ).scalar()
+        assert count_before == 1
+
+        # Flip the URL to a different (still https) endpoint.
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://new.example.com/sse"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["url"] == "https://new.example.com/sse"
+
+        # Token rows keyed on the OLD server name must be gone — the new
+        # URL is a different OAuth resource, so the bearer is no longer
+        # valid there. Force re-consent.
+        with storage._engine.connect() as conn:
+            count_after = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "url-change-purge")
+            ).scalar()
+        assert count_after == 0, "URL change must purge per-user tokens"
+
+    def test_admin_create_oauth_obo_requires_audience(self, client):
+        """#551: an oauth_obo row without oauth_audience is rejected at the
+        write choke point (the mint engine hard-requires it)."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-aud",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "oauth_audience" in r.json()["error"]
+
+    def test_admin_create_oauth_obo_without_token_store_returns_503(self, client_no_token_store):
+        """#551: creating an oauth_obo row with no encryption key is rejected —
+        accepting it would SystemExit the whole cluster at the next boot."""
+        r = client_no_token_store.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-key",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 503, r.text
+        assert "mcp_token_encryption_key" in r.json()["error"]
+
+    def test_admin_create_oauth_obo_happy_path(self, client):
+        """A well-formed oauth_obo row persists with its audience intact."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-ok",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "oauth_obo"
+        assert data["oauth_audience"] == "api://mcp-a"
+
+    def test_same_type_static_edit_cannot_inject_oauth_columns(self, client, storage):
+        """Review finding (SECURITY): the OAuth columns must be a pure function
+        of the target auth_type on EVERY write, not just a flip. A same-type
+        static edit that injects oauth_authorization_server_url must be scrubbed
+        to NULL — otherwise a later flip to oauth_user (which legitimately uses
+        that column) would inherit the attacker AS URL and redirect every
+        consenting user's OAuth traffic."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "static-inject",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "static",
+            },
+        )
+        sid = r.json()["server_id"]
+        # Same-type static edit trying to smuggle an oauth_user-only column.
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "static",
+                "oauth_authorization_server_url": "https://attacker.example",
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert (row.get("oauth_authorization_server_url") or None) is None
+
+    def test_flip_to_oauth_user_does_not_inherit_stale_as_url(self, client, storage):
+        """Review finding (SECURITY): flipping a non-oauth_user row to oauth_user
+        must recompute the oauth_user-only columns from the request, never
+        inherit a stale/injected authorization_server_url left on the pre-flip
+        row (defence-in-depth for a value that predates the unconditional
+        scrub)."""
+        # Plant a static row that already carries a stale AS URL directly in DB.
+        storage.create_mcp_server(
+            server_id="stale-asurl-id",
+            name="stale-asurl",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="static",
+            oauth_authorization_server_url="https://attacker.example",
+        )
+        # Flip to oauth_user WITHOUT supplying an AS URL in the body.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/stale-asurl-id",
+            json={"auth_type": "oauth_user", "oauth_client_id": "cli_x"},
+        )
+        assert r.status_code == 200, r.text
+        row = storage.get_mcp_server("stale-asurl-id")
+        assert (row.get("oauth_authorization_server_url") or None) is None
+        assert row.get("oauth_client_id") == "cli_x"
+
+    def test_create_obo_rejected_when_capture_disabled(self, client):
+        """Review finding: oauth_obo mints from the user's CAPTURED sign-in
+        credential, so with capture_user_credential off, login persists nothing
+        and every dispatch returns kind='missing' with an unsatisfiable remedy.
+        Reject at write time."""
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
+            enabled=True,
+            issuer="https://idp.example.com",
+            obo_grant_profile="entra",
+            capture_user_credential=False,
+        )
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-capture",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "capture_user_credential" in r.json()["error"]
+
+    def test_create_obo_rejected_when_oidc_disabled(self, client):
+        """Review finding: oauth_obo mints from the user's OIDC sign-in, so an
+        install with OIDC disabled can NEVER mint. Reject at write time (a
+        permanent misconfig otherwise surfaces per-dispatch as a retryable
+        transient that never heals)."""
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
+            enabled=False, obo_grant_profile="entra"
+        )
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-oidc",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "OIDC" in r.json()["error"]
+
+    def test_obo_editable_when_oidc_discovery_transiently_failed(self, client, storage):
+        """Review finding: the console never runs runtime OIDC rediscovery, so a
+        transient discovery failure at console boot (enabled=False,
+        discovery_retryable=True) must NOT make oauth_obo servers un-editable /
+        un-disable-able. OIDC is still CONFIGURED (issuer set) — the write gate
+        accepts a discovery_retryable config; it rejects only a genuinely absent
+        OIDC (neither flag set)."""
+        # Seed an obo row (created while OIDC was healthy).
+        storage.create_mcp_server(
+            server_id="obo-retry-id",
+            name="obo-retry",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        # Console process booted while the IdP was briefly unreachable.
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="https://idp.example.com",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=True,
+        )
+        # Disabling the misbehaving obo server must succeed, not 400.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/obo-retry-id",
+            json={"enabled": False},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["enabled"] is False
+
+        # Even with OIDC fully operator-disabled (neither flag set), a same-type
+        # edit of the EXISTING obo server is still allowed — the deployment
+        # checks only fire on create / flip-into-obo, so an operator is never
+        # locked out of disabling or editing a server (review finding R8-1).
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=False,
+        )
+        r2 = client.put(
+            "/v1/api/admin/mcp-servers/obo-retry-id",
+            json={"enabled": True},
+        )
+        assert r2.status_code == 200, r2.text
+
+    def test_create_new_obo_still_rejected_when_oidc_operator_disabled(self, client):
+        """The deployment gate still fires for a NEW obo enablement: creating a
+        fresh oauth_obo server (or flipping one into obo) while OIDC is fully
+        operator-disabled is rejected — only same-type edits of an existing obo
+        server skip the deployment checks."""
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=False,
+        )
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-new-nooidc",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "OIDC" in r.json()["error"]
+
+    def test_create_obo_rejected_on_invalid_grant_profile(self, client):
+        """Review finding: a typo'd deployment obo_grant_profile leaves the mint
+        leg unresolved (obo_misconfigured per dispatch), so reject it at the
+        write choke point rather than as a runtime transient."""
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("bogus-profile")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-bad-profile",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "obo_grant_profile" in r.json()["error"]
+
+    def test_flip_user_to_obo_via_api_without_audience_is_rejected(self, client, storage):
+        """Review finding: a flip into obo must NOT carry the oauth_user-era
+        oauth_audience (a resource indicator, conventionally the MCP URL) — it
+        would pass the audience-required check and then fail every mint. An API
+        PUT of just {auth_type: oauth_obo} recomputes audience from the body
+        (absent → NULL) and is rejected loudly, not saved with the stale value."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-api-noaud",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_x",
+                "oauth_audience": "https://mcp.example.com/sse",  # resource indicator
+            },
+        )
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo"},  # no audience in body
+        )
+        assert r2.status_code == 400, r2.text
+        assert "oauth_audience" in r2.json()["error"]
+
+    def test_update_flip_oauth_user_to_obo_keeps_audience_and_purges_tokens(self, client, storage):
+        """#551 (findings 10344 + 10326): flipping oauth_user→oauth_obo must NOT
+        null oauth_audience (the mint engine needs it), and MUST purge the old
+        per-user consent-token rows (they carry per-server-AS refresh tokens that
+        the mint cache invariant forbids)."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import oauth_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-to-obo",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_x",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(oauth_tokens),
+                {
+                    "user_id": "u1",
+                    "token_key": "flip-to-obo",
+                    "access_token_ct": b"\x00ct-a",
+                    "refresh_token_ct": b"\x00ct-r",
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": "openid",
+                    "as_issuer": "https://auth.example.com",
+                    "audience": "api://mcp-a",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert r2.status_code == 200, r2.text
+        data = r2.json()
+        assert data["auth_type"] == "oauth_obo"
+        assert data["oauth_audience"] == "api://mcp-a"  # NOT nulled
+        # The oauth_user-only client_id is cleared.
+        assert data["oauth_client_id"] in (None, "")
+        # Old consent-token rows purged.
+        with storage._engine.connect() as conn:
+            remaining = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "flip-to-obo")
+            ).scalar()
+        assert remaining == 0, "oauth_user→oauth_obo flip must purge stale per-user rows"
+
+    def test_flip_to_obo_clears_stale_oauth_user_scopes(self, client):
+        """#551 follow-up: flipping oauth_user→oauth_obo without supplying new
+        scopes must CLEAR the old AS-consent scopes — otherwise the rfc8693 mint
+        leg would send them and loop on invalid_scope."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-scopes",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_scopes": "openid profile offline_access",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] in (None, "")  # stale scopes cleared
+
+    def _create_oauth_user_row_with_scopes(self, client, name: str) -> str:
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_scopes": "openid profile offline_access",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        sid: str = r.json()["server_id"]
+        return sid
+
+    def test_flip_to_obo_under_entra_rejects_explicit_scopes_but_omit_clears(self, client):
+        """Redesign: a flip into obo recomputes scopes from the body (never
+        carries the old row's value across the semantic boundary). Under entra,
+        an EXPLICIT non-empty scopes value is rejected 400 — an honest visible
+        snap rather than a silent drop — while the console-realistic flip (the
+        form clears the semantic field on the auth-type switch, so scopes is
+        omitted/empty) succeeds with scopes NULL."""
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
+        # Explicit non-empty scopes on the flip → 400 (they can't apply on entra).
+        sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-entra")
+        rejected = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "openid profile offline_access",
+            },
+        )
+        assert rejected.status_code == 400
+        assert "entra" in rejected.json()["error"]
+        # The realistic flip (scopes field cleared → omitted) succeeds, NULL scopes.
+        sid2 = self._create_oauth_user_row_with_scopes(client, "flip-omit-entra")
+        ok = client.put(
+            f"/v1/api/admin/mcp-servers/{sid2}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["oauth_scopes"] in (None, "")  # not carried across the flip
+
+    def test_flip_to_obo_resent_scopes_kept_under_rfc8693(self, client):
+        """Review finding: under rfc8693 oauth_scopes IS the token-exchange
+        scope — an operator flipping to obo and keeping the same value (the
+        Keycloak optional-audience scope can legitimately equal the old
+        consent scope string) must NOT have it silently nulled; only an
+        omitted field clears (previous test)."""
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
+        sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-rfc")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "openid profile offline_access",
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] == "openid profile offline_access"
+
+    def test_entra_obo_row_with_scopes_stays_editable(self, client, storage):
+        """Review finding: a pre-existing oauth_obo row carrying scopes under the
+        entra profile must stay editable — an unrelated PUT that doesn't touch
+        scopes must NOT be rejected (the entra-scope reject fires only on a real
+        scopes write)."""
+        # Seed an obo row that already has scopes (e.g. created under rfc8693).
+        storage.create_mcp_server(
+            server_id="entra-edit-id",
+            name="entra-edit",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+            oauth_scopes="custom.scope",
+        )
+        # Now the deployment is on the entra profile.
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
+
+        # An unrelated maintenance edit (disable) — does NOT touch scopes.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/entra-edit-id",
+            json={"enabled": False},
+        )
+        assert r.status_code == 200, r.text  # NOT a 400 lockout
+
+        # But actively SETTING scopes under entra is still rejected.
+        r2 = client.put(
+            "/v1/api/admin/mcp-servers/entra-edit-id",
+            json={"oauth_scopes": "another.scope"},
+        )
+        assert r2.status_code == 400, r2.text
+        assert "oauth_scopes" in r2.json()["error"]
+
+    def test_obo_server_reports_consented_users_count_for_flush_button(self, client, storage):
+        """Review finding: obo rows must report consented_users_count (users with a
+        minted cache row) so the console flush-cache action (gated on count>0)
+        renders — previously only oauth_user rows got the count."""
+        storage.create_mcp_server(
+            server_id="obo-count-id",
+            name="obo-count",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        for i in range(2):
+            storage.create_oauth_token(
+                f"u{i}",
+                "obo-count",
+                access_token_ct=b"\x00ct",
+                refresh_token_ct=None,
+                expires_at="2026-12-31T00:00:00",
+                scopes=None,
+                as_issuer="https://idp.test",
+                audience="api://mcp-a",
+            )
+
+        # The list handler fans out node status; no cluster nodes in this test.
+        client.app.state.collector = SimpleNamespace(get_all_nodes=lambda: [])
+        client.app.state.proxy_client = MagicMock()
+        r = client.get("/v1/api/admin/mcp-servers")
+        assert r.status_code == 200, r.text
+        row = next(s for s in r.json()["servers"] if s["name"] == "obo-count")
+        assert row["consented_users_count"] == 2
+
+    def test_obo_audience_change_purges_cached_tokens(self, client, storage):
+        """#551 follow-up: changing an obo row's oauth_audience purges cached
+        tokens minted for the OLD audience (they are audience-bound)."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import oauth_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "aud-change",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://old-aud",
+            },
+        )
+        sid = r.json()["server_id"]
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(oauth_tokens),
+                {
+                    "user_id": "u1",
+                    "token_key": "aud-change",
+                    "access_token_ct": b"\x00ct",
+                    "refresh_token_ct": None,
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": None,
+                    "as_issuer": "https://idp.test",
+                    "audience": "api://old-aud",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_audience": "api://new-aud"},
+        )
+        assert r2.status_code == 200, r2.text
+        with storage._engine.connect() as conn:
+            remaining = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "aud-change")
+            ).scalar()
+        assert remaining == 0, "audience change must purge old-audience cache rows"
+
+    def _seed_obo_row_with_cache(self, client, storage, *, name: str, scopes: str | None) -> str:
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import oauth_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://aud",
+                **({"oauth_scopes": scopes} if scopes else {}),
+            },
+        )
+        sid: str = r.json()["server_id"]
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(oauth_tokens),
+                {
+                    "user_id": "u1",
+                    "token_key": name,
+                    "access_token_ct": b"\x00ct",
+                    "refresh_token_ct": None,
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": scopes,
+                    "as_issuer": "https://idp.test",
+                    "audience": "api://aud",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+        return sid
+
+    def _count_cache_rows(self, storage, name: str) -> int:
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import oauth_tokens
+
+        with storage._engine.connect() as conn:
+            count = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == name)
+            ).scalar()
+        return int(count or 0)
+
+    def test_obo_scope_change_purges_cached_tokens(self, client, storage):
+        """Review finding: under rfc8693 the exchange scope shapes the minted
+        bearer's privileges exactly like the audience does — narrowing
+        oauth_scopes must purge cached rows or the reduction silently waits
+        out the token TTL (inconsistent with the audience purge)."""
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(
+            client, storage, name="scope-change", scopes="api.read api.write"
+        )
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "api.read"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert self._count_cache_rows(storage, "scope-change") == 0, (
+            "scope change must purge cache rows minted with the old scopes"
+        )
+
+    def test_obo_scope_noop_resend_does_not_purge(self, client, storage):
+        """Review finding companion: the admin form re-submits the pre-filled
+        scopes on every save — an EQUAL value is normalized out of the update
+        and must not flush every user's minted tokens."""
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(client, storage, name="scope-noop", scopes="api.read")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "api.read", "enabled": True},
+        )
+        assert r2.status_code == 200, r2.text
+        assert self._count_cache_rows(storage, "scope-noop") == 1, (
+            "a no-op scopes re-send must not purge the mint cache"
+        )
+
+    def test_flip_obo_to_oauth_user_clears_obo_audience_and_scopes(self, client, storage):
+        """Review finding: the obo-era oauth_audience is an IdP-side app
+        identifier, not the resource indicator oauth_user sends to its AS —
+        carried over, every consent yields a wrong-resource token that 401s
+        with no visible cause. The flip must clear it (and the rfc8693
+        exchange scopes) unless the request explicitly sets new values."""
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(client, storage, name="flip-back", scopes="api.read")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_user", "oauth_client_id": "client-xyz"},
+        )
+        assert r2.status_code == 200, r2.text
+        data = r2.json()
+        assert data["auth_type"] == "oauth_user"
+        assert data["oauth_audience"] in (None, ""), "obo app-id audience must not carry over"
+        assert data["oauth_scopes"] in (None, ""), "rfc8693 exchange scopes must not carry over"
+        # The flip is an auth-model change → mint-cache rows purged too.
+        assert self._count_cache_rows(storage, "flip-back") == 0
+
+    def test_entra_obo_equal_scope_resend_is_accepted(self, client, storage):
+        """Review finding: the admin form always re-submits the pre-filled
+        oauth_scopes, so a same-type edit of an entra-profile obo row carrying
+        legacy scopes must accept an EQUAL value (normalized to a no-op)
+        instead of 400ing — only a genuine scope CHANGE is rejected."""
+        # The legacy-scoped entra row arises from a deployment profile switch:
+        # the row is created while the profile is rfc8693 (scopes accepted),
+        # then the deployment flips to entra.
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(
+            client, storage, name="entra-resend", scopes="legacy.scope"
+        )
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
+        # Equal re-send + unrelated change → accepted, scopes untouched.
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "legacy.scope", "enabled": False},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] == "legacy.scope"
+        # A genuine CHANGE to non-empty scopes still 400s under entra.
+        r3 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "new.scope"},
+        )
+        assert r3.status_code == 400
+        assert "entra" in r3.json()["error"]
+
+    def test_create_obo_rejects_scopes_under_entra_profile(self, client):
+        """#551 follow-up: oauth_scopes is meaningless for the entra grant leg
+        (it mints <audience>/.default), so the write path rejects it rather than
+        silently ignoring it at mint time."""
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-entra-scopes",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "custom.scope",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "oauth_scopes" in r.json()["error"]
+
+    def test_update_invalid_auth_type(self, client):
+        created = _create_server(client, name="bad-auth-update")
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "wat"},
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
+    def test_update_empty_auth_type_rejected(self, client):
+        """Empty-string auth_type is rejected (no silent coercion to 'static')."""
+        created = _create_server(client, name="empty-auth-update")
+        sid = created["server_id"]
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": ""},
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
+    def test_create_empty_auth_type_rejected(self, client):
+        """Empty-string auth_type on create is rejected too."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "empty-auth-create",
+                "transport": "stdio",
+                "command": "x",
+                "auth_type": "",
+            },
+        )
+        assert r.status_code == 400
+        assert "auth_type" in r.json()["error"].lower()
+
+    def test_update_auth_type_oauth_to_static_clears_oauth_fields(self, client):
+        """Flipping auth_type away from oauth_user clears the oauth_* text
+        columns so a stale client_id / audience can't leak back."""
+        # Seed an oauth_user row with all fields populated.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-away",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+                "oauth_scopes": "openid",
+                "oauth_audience": "https://mcp.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_authorization_server_url": "https://auth.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        # Flip to static — server should clear all oauth_* text fields.
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "static"},
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "static"
+        assert data["oauth_client_id"] is None
+        assert data["oauth_scopes"] is None
+        assert data["oauth_audience"] is None
+        assert data["oauth_registration_mode"] is None
+        assert data["oauth_authorization_server_url"] is None
+
+    def test_update_auth_type_oauth_to_none_clears_oauth_fields(self, client):
+        """Same clear behavior when flipping to 'none'."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-to-none",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed2",
+                "oauth_audience": "https://mcp.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "none"},
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "none"
+        assert data["oauth_client_id"] is None
+        assert data["oauth_audience"] is None
+
+    def test_admin_update_oauth_server_503_does_not_partial_write(
+        self, client_no_token_store, storage
+    ):
+        """bug-2: a 503 from the token-store gate during PUT must leave the
+        existing row unchanged — no partial column rewrites persist."""
+        # Seed a static row directly via storage so no token store is needed.
+        storage.create_mcp_server(
+            server_id="srv-pre",
+            name="pre-existing",
+            transport="streamable-http",
+            url="https://orig.example.com/sse",
+            auth_type="static",
+        )
+        before = storage.get_mcp_server("srv-pre")
+        assert before is not None
+
+        # Try to flip to oauth_user with a secret while token store is None.
+        r = client_no_token_store.put(
+            "/v1/api/admin/mcp-servers/srv-pre",
+            json={
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_partial",
+                "oauth_client_secret": "would-be-written",
+                "url": "https://changed.example.com/sse",
+            },
+        )
+        assert r.status_code == 503, r.text
+
+        # Row must be unchanged — no partial column rewrites.
+        after = storage.get_mcp_server("srv-pre")
+        assert after is not None
+        assert after["auth_type"] == "static"
+        assert after["url"] == "https://orig.example.com/sse"
+        assert after.get("oauth_client_id") in (None, "")
+
+    def test_admin_update_rejects_non_string_secret(self, client):
+        """bug-3 (update path): non-string ``oauth_client_secret`` -> 400."""
+        # Seed an oauth_user row.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "oauth-update-bad-secret",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        for bad in (False, 0, [], {}):
+            r = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"oauth_client_secret": bad},
+            )
+            assert r.status_code == 400, f"payload={bad!r} got {r.status_code}: {r.text}"
+            assert "oauth_client_secret" in r.json()["error"]
+
+    def test_auth_type_transition_clears_oauth_client_secret_ct(self, client, storage):
+        """sec-2: flipping auth_type from oauth_user away (to static or none)
+        must clear the encrypted client secret column.  Otherwise the stale
+        ciphertext would resurface if the row were flipped back."""
+        # Seed an oauth_user row WITH a client secret persisted.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "transition-clears-secret",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_xx",
+                "oauth_client_secret": "stays-until-transition",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        # Confirm the ciphertext column is populated before the transition.
+        seeded = storage.get_mcp_server(sid)
+        assert seeded is not None
+        assert seeded.get("oauth_client_secret_ct") is not None
+
+        # Flip to static — column must be cleared.
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "static"},
+        )
+        assert r.status_code == 200, r.text
+        cleared = storage.get_mcp_server(sid)
+        assert cleared is not None
+        assert cleared["auth_type"] == "static"
+        assert cleared.get("oauth_client_secret_ct") is None
+
+    def test_auth_type_transition_clears_secret_without_token_store(
+        self, client_no_token_store, storage
+    ):
+        """sec-2: when no encryption key is configured the transition still
+        clears the column via a direct storage call — the operator's
+        mental model holds even with the cipher disabled at runtime."""
+        # Seed an oauth_user row with raw ciphertext bytes via storage so the
+        # transition has something to clear.
+        storage.create_mcp_server(
+            server_id="srv-direct-clear",
+            name="direct-clear",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_user",
+            oauth_client_id="cli_direct",
+        )
+        # Plant ciphertext via the dedicated writer (no cipher needed).
+        storage.set_mcp_oauth_client_secret_ct("srv-direct-clear", b"opaque-bytes")
+        seeded = storage.get_mcp_server("srv-direct-clear")
+        assert seeded is not None
+        assert seeded.get("oauth_client_secret_ct") is not None
+
+        r = client_no_token_store.put(
+            "/v1/api/admin/mcp-servers/srv-direct-clear",
+            json={"auth_type": "none"},
+        )
+        assert r.status_code == 200, r.text
+        cleared = storage.get_mcp_server("srv-direct-clear")
+        assert cleared is not None
+        assert cleared["auth_type"] == "none"
+        assert cleared.get("oauth_client_secret_ct") is None
+
+
+# ---------------------------------------------------------------------------
+# Delete
+# ---------------------------------------------------------------------------
+
+
+def _plant_grant(storage: Any, name: str) -> None:
+    """A user token and a pending OAuth flow keyed by *name*, as a consent leaves them."""
+    import sqlalchemy as sa
+
+    from turnstone.core.storage._schema import oauth_tokens
+
+    with storage._engine.connect() as conn:
+        conn.execute(
+            sa.insert(oauth_tokens),
+            {
+                "user_id": "u1",
+                "token_key": name,
+                "access_token_ct": b"\x00ciphertext-a",
+                "refresh_token_ct": b"\x00ciphertext-r",
+                "expires_at": "2026-12-31T00:00:00",
+                "scopes": "openid",
+                "as_issuer": "https://as.example.com",
+                "audience": "https://orig.example.com",
+                "created": "2026-05-04T11:00:00",
+                "last_refreshed": None,
+            },
+        )
+        conn.commit()
+    storage.create_mcp_oauth_pending_state(
+        f"state-{name}",
+        "u1",
+        name,
+        "verifier",
+        "/",
+        as_issuer="https://as.example.com",
+        iss_parameter_supported=False,
+        server_id="",
+        server_url="https://orig.example.com/sse",
+        audience="https://orig.example.com",
+    )
+
+
+def _grant_survives(storage: Any, name: str) -> tuple[bool, bool]:
+    """Whether the token row and the pending flow planted under *name* are still there."""
+    import sqlalchemy as sa
+
+    from turnstone.core.storage._schema import mcp_oauth_pending
+
+    with storage._engine.connect() as conn:
+        pending = conn.execute(
+            sa.select(mcp_oauth_pending.c.state).where(mcp_oauth_pending.c.server_name == name)
+        ).fetchone()
+    return storage.get_oauth_token("u1", name) is not None, pending is not None
+
+
+def _failing_statement(storage: Any, prefix: str) -> Any:
+    """Make every statement starting with *prefix* fail as a dropped database connection does."""
+    import contextlib
+
+    import sqlalchemy as sa
+
+    def listener(
+        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
+    ) -> None:
+        if statement.startswith(prefix):
+            raise sa.exc.OperationalError(statement, {}, Exception("server closed the connection"))
+
+    @contextlib.contextmanager
+    def failing() -> Any:
+        sa.event.listen(storage._engine, "before_cursor_execute", listener)
+        try:
+            yield
+        finally:
+            sa.event.remove(storage._engine, "before_cursor_execute", listener)
+
+    return failing()
+
+
+class TestOAuthUrlCanonicalization:
+    """User-scoped rows store the canonical RFC 8707 resource identifier.
+
+    The stored value is what discovery derives its metadata URL from and
+    what every token request sends as ``resource=``, so the row shows the
+    value on the wire. A spelling-only difference is the same resource: it
+    must not purge user tokens or drop the cached issuer, while a real URL
+    or authorization-server change must drop the cached issuer.
+    """
+
+    def _create(self, client, name: str, url: str, auth_type: str = "oauth_user"):
+        return client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": url,
+                "auth_type": auth_type,
+                "oauth_client_id": "cli_seed",
+            },
+        )
+
+    def test_create_stores_canonical_form(self, client, storage):
+        r = self._create(client, "canon-create", "https://MCP.Example.com:443/sse/")
+        assert r.status_code == 200, r.text
+        row = storage.get_mcp_server(r.json()["server_id"])
+        assert row["url"] == "https://mcp.example.com/sse/"
+
+    @pytest.mark.parametrize(
+        "url",
+        ["https://mcp.example.com/sse#v2", "https://u:p@mcp.example.com/sse"],
+        ids=["fragment", "credentials"],
+    )
+    def test_create_rejects_fragment_and_credentials(self, client, url):
+        r = self._create(client, "canon-reject", url)
+        assert r.status_code == 400, r.text
+        assert r.json()["error"].startswith("url:")
+
+    def test_create_keeps_typed_form_for_static_rows(self, client, storage):
+        r = self._create(client, "canon-static", "https://MCP.Example.com/", auth_type="static")
+        assert r.status_code == 200, r.text
+        assert storage.get_mcp_server(r.json()["server_id"])["url"] == "https://MCP.Example.com/"
+
+    def test_spelling_only_update_neither_purges_nor_clears_cache(self, client, storage):
+        r = self._create(client, "canon-spell", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+        _plant_grant(storage, "canon-spell")
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://ORIG.example.com:443/sse"},
+        )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["url"] == "https://orig.example.com/sse"
+        assert row["oauth_as_issuer_cached"] == "https://as.example.com"
+        assert _grant_survives(storage, "canon-spell") == (True, True)
+
+    def test_url_change_purges_and_clears_cached_issuer(self, client, storage):
+        r = self._create(client, "canon-move", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+        _plant_grant(storage, "canon-move")
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://orig.example.com/mcp"},
+        )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["url"] == "https://orig.example.com/mcp"
+        assert row["oauth_as_issuer_cached"] is None
+        assert _grant_survives(storage, "canon-move") == (False, False)
+
+    def test_as_override_change_purges_and_clears_cached_issuer(self, client, storage):
+        # Pointing a row at a different authorization server is a
+        # token-binding change: the stored refresh tokens were issued by the
+        # old one, and the next refresh would present them to the new one.
+        r = self._create(client, "canon-as", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+        _plant_grant(storage, "canon-as")
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://as2.example.com"},
+        )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["oauth_authorization_server_url"] == "https://as2.example.com"
+        assert row["oauth_as_issuer_cached"] is None
+        assert _grant_survives(storage, "canon-as") == (False, False)
+
+    def test_as_override_resent_unchanged_does_not_purge(self, client, storage):
+        # The admin form re-sends every pre-filled field, so an unrelated
+        # save must not read as an authorization-server change.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "canon-as-noop",
+                "transport": "streamable-http",
+                "url": "https://orig.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+                "oauth_authorization_server_url": "https://as.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-as-noop")
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as.example.com",
+                "enabled": False,
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert _grant_survives(storage, "canon-as-noop") == (True, True)
+
+    def test_as_override_change_clears_a_dcr_client_id(self, client, storage):
+        # A client_id registered by DCR was issued BY the old authorization
+        # server and means nothing at the new one; clearing it lets
+        # registration run again. A pre-registered id is the operator's own
+        # value and is left alone.
+        for mode, expected in (("dcr", None), ("preregistered", "cli_seed")):
+            r = client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": f"canon-dcr-{mode}",
+                    "transport": "streamable-http",
+                    "url": "https://orig.example.com/sse",
+                    "auth_type": "oauth_user",
+                    "oauth_client_id": "cli_seed",
+                    "oauth_registration_mode": mode,
+                    "oauth_authorization_server_url": "https://as.example.com",
+                },
+            )
+            assert r.status_code == 200, r.text
+            sid = r.json()["server_id"]
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"oauth_authorization_server_url": "https://as2.example.com"},
+            )
+            assert r2.status_code == 200, r2.text
+            assert storage.get_mcp_server(sid)["oauth_client_id"] == expected, mode
+
+    def test_a_registration_mode_no_flow_runs_is_refused(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "canon-mode",
+                "transport": "streamable-http",
+                "url": "https://orig.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+                "oauth_registration_mode": "dynamic",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert storage.get_mcp_server_by_name("canon-mode") is None
+
+        r = self._create(client, "canon-mode", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}", json={"oauth_registration_mode": "dynamic"}
+        )
+        assert r2.status_code == 400, r2.text
+        assert storage.get_mcp_server(sid)["oauth_registration_mode"] is None
+
+    def test_a_rename_purges_the_old_names_grants(self, client, storage):
+        r = self._create(client, "canon-rename", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-rename")
+
+        r2 = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"name": "canon-renamed"})
+
+        assert r2.status_code == 200, r2.text
+        assert _grant_survives(storage, "canon-rename") == (False, False)
+
+    def test_a_delete_purges_its_grants(self, client, storage):
+        r = self._create(client, "canon-delete", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-delete")
+
+        r2 = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+
+        assert r2.status_code == 200, r2.text
+        assert _grant_survives(storage, "canon-delete") == (False, False)
+
+    def test_a_new_server_never_inherits_grants_left_under_its_name(self, client, storage):
+        _plant_grant(storage, "canon-reuse")
+
+        r = self._create(client, "canon-reuse", "https://elsewhere.example.com/sse")
+
+        assert r.status_code == 200, r.text
+        assert _grant_survives(storage, "canon-reuse") == (False, False)
+
+    def test_an_update_storage_cannot_finish_changes_nothing(self, client, storage):
+        r = self._create(client, "canon-fail", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-fail")
+
+        with (
+            _failing_statement(storage, "DELETE FROM mcp_oauth_pending"),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"url": "https://orig.example.com/mcp"},
+            )
+        notify.assert_not_awaited()
+
+        assert r2.status_code == 503, r2.text
+        assert r2.json()["error"] == (
+            "The change could not be saved, and nothing was changed. Try again."
+        )
+        assert storage.get_mcp_server(sid)["url"] == "https://orig.example.com/sse"
+        assert _grant_survives(storage, "canon-fail") == (True, True)
+        assert storage.list_audit_events(action="mcp_server.update") == []
+
+    def test_a_delete_storage_cannot_finish_changes_nothing(self, client, storage):
+        r = self._create(client, "canon-fail-delete", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-fail-delete")
+
+        with (
+            _failing_statement(storage, "DELETE FROM mcp_servers"),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+        notify.assert_not_awaited()
+
+        assert r2.status_code == 503, r2.text
+        assert storage.get_mcp_server(sid) is not None
+        assert _grant_survives(storage, "canon-fail-delete") == (True, True)
+        assert storage.list_audit_events(action="mcp_server.delete") == []
+
+    _WRITERS = {
+        "create": "create_mcp_server",
+        "update": "update_mcp_server",
+        "delete": "delete_mcp_server",
+    }
+
+    def _send(self, client, action: str, sid: str | None):
+        if action == "create":
+            return self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+        if action == "update":
+            return client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"url": "https://orig.example.com/mcp"}
+            )
+        return client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+
+    @pytest.mark.parametrize("action", ["create", "update", "delete"])
+    def test_a_write_whose_commit_landed_but_was_cut_off_completes(self, client, storage, action):
+        """The acknowledgement of the commit was lost: the row is read again, and the change is
+        audited and reloaded as after a success."""
+        import sqlalchemy as sa
+
+        sid = None
+        if action != "create":
+            r = self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+            assert r.status_code == 200, r.text
+            sid = r.json()["server_id"]
+        real = getattr(storage, self._WRITERS[action])
+
+        def _lost_acknowledgement(*args, **kwargs):
+            real(*args, **kwargs)
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        with (
+            patch.object(storage, self._WRITERS[action], side_effect=_lost_acknowledgement),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = self._send(client, action, sid)
+
+        assert r2.status_code == 200, r2.text
+        notify.assert_awaited()
+        assert len(storage.list_audit_events(action=f"mcp_server.{action}")) == 1
+
+    def test_a_cut_off_update_reads_as_landed_through_a_pin_set_since(self, client, storage):
+        """Discovery may pin the new issuer before the row is read again: the update still reads
+        as landed, since the cleared pin is not what the request set."""
+        import sqlalchemy as sa
+
+        r = self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        real = storage.update_mcp_server
+
+        def _lost_acknowledgement(*args, **kwargs):
+            real(*args, **kwargs)
+            real(sid, oauth_as_issuer_cached="https://as.example.com")
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        with (
+            patch.object(storage, "update_mcp_server", side_effect=_lost_acknowledgement),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"url": "https://orig.example.com/mcp"}
+            )
+
+        assert r2.status_code == 200, r2.text
+        notify.assert_awaited()
+        assert len(storage.list_audit_events(action="mcp_server.update")) == 1
+
+    @pytest.mark.parametrize("action", ["create", "update", "delete"])
+    def test_an_in_doubt_write_that_cannot_be_read_again_may_have_been_saved(
+        self, client, storage, action
+    ):
+        import sqlalchemy as sa
+
+        sid = None
+        if action != "create":
+            r = self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+            assert r.status_code == 200, r.text
+            sid = r.json()["server_id"]
+        real_read = storage.get_mcp_server
+        attempted: list[bool] = []
+
+        def _write_fails(*args, **kwargs):
+            attempted.append(True)
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        def _read(server_id):
+            if attempted:
+                raise sa.exc.OperationalError("SELECT", {}, Exception("connection lost"))
+            return real_read(server_id)
+
+        with (
+            patch.object(storage, self._WRITERS[action], side_effect=_write_fails),
+            patch.object(storage, "get_mcp_server", side_effect=_read),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = self._send(client, action, sid)
+
+        assert r2.status_code == 503, r2.text
+        assert (
+            r2.json()["error"] == "The change may not have been saved. Check before trying again."
+        )
+        notify.assert_not_awaited()
+        assert storage.list_audit_events(action=f"mcp_server.{action}") == []
+
+    @pytest.mark.parametrize("secret_stored", [False, True], ids=["public-client", "with-secret"])
+    def test_dropping_a_registered_client_audits_only_a_secret_it_removed(
+        self, client, storage, secret_stored
+    ):
+        body = {
+            "name": "canon-dcr",
+            "transport": "streamable-http",
+            "url": "https://orig.example.com/sse",
+            "auth_type": "oauth_user",
+            "oauth_registration_mode": "dcr",
+        }
+        if secret_stored:
+            body["oauth_client_secret"] = "registered-secret"
+        r = client.post("/v1/api/admin/mcp-servers", json=body)
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        before = len(storage.list_audit_events(action="mcp_server.oauth.client_secret_set"))
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://new-as.example.net"},
+        )
+
+        assert r2.status_code == 200, r2.text
+        assert storage.get_mcp_oauth_client_secret_ct(sid) is None
+        after = len(storage.list_audit_events(action="mcp_server.oauth.client_secret_set"))
+        assert after - before == (1 if secret_stored else 0)
+
+    def test_update_rejects_fragment(self, client, storage):
+        r = self._create(client, "canon-upd-reject", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://orig.example.com/sse#x"},
+        )
+        assert r2.status_code == 400, r2.text
+        assert storage.get_mcp_server(sid)["url"] == "https://orig.example.com/sse"
+
+    def test_flip_into_oauth_user_without_url_canonicalizes_stored_value(self, client, storage):
+        # A static row keeps its typed spelling; flipping it to oauth_user
+        # without re-sending ``url`` must still store the canonical form.
+        r = self._create(
+            client, "canon-flip", "https://MCP.Example.com:443/sse", auth_type="static"
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_user", "oauth_client_id": "cli_flip"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert storage.get_mcp_server(sid)["url"] == "https://mcp.example.com/sse"
+
+    def test_flip_into_oauth_user_without_url_rejects_fragment(self, client, storage):
+        r = self._create(
+            client, "canon-flip-frag", "https://mcp.example.com/sse#frag", auth_type="static"
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_user", "oauth_client_id": "cli_flip"},
+        )
+        assert r2.status_code == 400, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["auth_type"] == "static"
+        assert row["url"] == "https://mcp.example.com/sse#frag"
+
+
+class TestDeleteMcpServer:
+    def test_delete_existing(self, client):
+        created = _create_server(client, name="del-test")
+        sid = created["server_id"]
+        r = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+
+        # Confirm it's gone
+        with _PATCH_MCP_STATUS:
+            r2 = client.get(f"/v1/api/admin/mcp-servers/{sid}")
+        assert r2.status_code == 404
+
+    def test_delete_not_found(self, client):
+        fake_id = uuid.uuid4().hex
+        r = client.delete(f"/v1/api/admin/mcp-servers/{fake_id}")
+        assert r.status_code == 404
+        assert "not found" in r.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Secret masking
+# ---------------------------------------------------------------------------
+
+
+class TestSecretMasking:
+    def test_list_masks_secrets(self, client):
+        _create_server(
+            client,
+            name="secret-test",
+            env={"API_KEY": "sk-real-secret-123"},
+            headers={"Authorization": "Bearer tok-xyz"},
+            transport="streamable-http",
+            url="http://localhost/mcp",
+        )
+        with _PATCH_MCP_STATUS:
+            r = client.get("/v1/api/admin/mcp-servers")
+        assert r.status_code == 200
+        server = r.json()["servers"][0]
+        env = json.loads(server["env"])
+        headers = json.loads(server["headers"])
+        assert env["API_KEY"] == "***"
+        assert headers["Authorization"] == "***"
+
+    def test_list_reveals_secrets(self, client):
+        _create_server(
+            client,
+            name="reveal-test",
+            env={"API_KEY": "sk-real-secret-123"},
+            headers={"Authorization": "Bearer tok-xyz"},
+            transport="streamable-http",
+            url="http://localhost/mcp",
+        )
+        with _PATCH_MCP_STATUS:
+            r = client.get("/v1/api/admin/mcp-servers?reveal=true")
+        assert r.status_code == 200
+        server = r.json()["servers"][0]
+        env = json.loads(server["env"])
+        headers = json.loads(server["headers"])
+        assert env["API_KEY"] == "sk-real-secret-123"
+        assert headers["Authorization"] == "Bearer tok-xyz"
+
+    def test_get_masks_secrets_by_default(self, client):
+        created = _create_server(
+            client,
+            name="mask-get-test",
+            env={"SECRET": "value"},
+        )
+        sid = created["server_id"]
+        with _PATCH_MCP_STATUS:
+            r = client.get(f"/v1/api/admin/mcp-servers/{sid}")
+        assert r.status_code == 200
+        env = json.loads(r.json()["env"])
+        assert env["SECRET"] == "***"
+
+    def test_get_reveals_secrets(self, client):
+        created = _create_server(
+            client,
+            name="reveal-get-test",
+            env={"SECRET": "real-value"},
+        )
+        sid = created["server_id"]
+        with _PATCH_MCP_STATUS:
+            r = client.get(f"/v1/api/admin/mcp-servers/{sid}?reveal=true")
+        assert r.status_code == 200
+        env = json.loads(r.json()["env"])
+        assert env["SECRET"] == "real-value"
+
+
+# ---------------------------------------------------------------------------
+# Import
+# ---------------------------------------------------------------------------
+
+
+class TestImportMcpConfig:
+    def test_import_inline_config(self, client):
+        config = {
+            "mcpServers": {
+                "filesystem": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                },
+                "remote": {
+                    "url": "http://remote.example.com/mcp",
+                },
+            },
+        }
+        r = client.post(
+            "/v1/api/admin/mcp-servers/import",
+            json={"config": config},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "filesystem" in data["imported"]
+        assert "remote" in data["imported"]
+        assert data["skipped"] == []
+        assert data["errors"] == []
+
+    def test_import_refuses_a_remote_that_cannot_connect(self, client, storage):
+        """Each such server is an error of its own; the others import."""
+        config = {
+            "mcpServers": {
+                "bad-url": {"url": "http://[::1/mcp"},
+                "bad-header": {"url": "http://mcp.example/mcp", "headers": {"X-Key": "k3y "}},
+                "good": {"url": " http://mcp.example/mcp "},
+            },
+        }
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["imported"] == ["good"]
+        assert data["errors"] == [
+            "bad-url: url: Invalid IPv6 URL",
+            f"bad-header: {_BAD_VALUE.format('X-Key')}",
+        ]
+        assert storage.get_mcp_server_by_name("good")["url"] == "http://mcp.example/mcp"
+        assert storage.get_mcp_server_by_name("bad-url") is None
+
+    def test_import_refuses_a_name_ending_in_a_newline(self, client, storage):
+        config = {"mcpServers": {"a" * 63 + "\nb": {"command": "x"}}}
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+        assert r.status_code == 200
+        assert r.json()["imported"] == []
+        assert storage.get_mcp_server_by_name("a" * 63 + "\n") is None
+
+    def test_import_lists_an_entry_that_is_not_an_object_and_imports_the_rest(
+        self, client, storage
+    ):
+        """Such an entry once raised after the entries before it were saved, leaving them with
+        no audit event and no node reload."""
+        config = {
+            "mcpServers": {
+                "kvm": {"url": "https://kvm.example.com/mcp", "tls_skip_verify": True},
+                "text": "x",
+                "nothing": None,
+                "listed": [],
+            },
+        }
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["imported"] == ["kvm"]
+        assert r.json()["errors"] == [
+            f"{name}: entry must be an object" for name in ("text", "nothing", "listed")
+        ]
+        (detail,) = _audit_details(storage, "mcp_server.import").values()
+        assert detail["imported"] == ["kvm"]
+        notify.assert_awaited_once_with(ANY)
+
+    def test_import_lists_an_entry_that_is_not_an_object_when_its_name_is_taken(
+        self, client, storage
+    ):
+        # An error, not a skip: the entry is checked before its name is.
+        client.post("/v1/api/admin/mcp-servers", json=_KVM)
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers/import", json={"config": {"mcpServers": {"kvm": "x"}}}
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "imported": [],
+            "skipped": [],
+            "errors": ["kvm: entry must be an object"],
+        }
+
+    def test_import_not_a_dict(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers/import",
+            json={"config": "not-a-dict"},
+        )
+        assert r.status_code == 400
+
+    def test_import_skips_duplicates(self, client):
+        _create_server(client, name="existing-srv")
+        config = {
+            "mcpServers": {
+                "existing-srv": {"command": "node", "args": []},
+                "new-srv": {"command": "node", "args": []},
+            },
+        }
+        r = client.post(
+            "/v1/api/admin/mcp-servers/import",
+            json={"config": config},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "new-srv" in data["imported"]
+        assert "existing-srv" in data["skipped"]
+
+    def test_import_empty_body(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers/import",
+            json={},
+        )
+        assert r.status_code == 400
+        assert "config" in r.json()["error"].lower()
+
+    def test_import_notifies_nodes_when_rows_change(self, client):
+        """Import creates enabled rows, so it must fan the reload out like
+        its CRUD siblings — a stale-catalog window otherwise opens on
+        every node (and the console's flag+rows-free ensure never fires)."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.post(
+                "/v1/api/admin/mcp-servers/import",
+                json={"config": {"mcpServers": {"imp-new": {"command": "node", "args": []}}}},
+            )
+        assert r.status_code == 200
+        assert "imp-new" in r.json()["imported"]
+        notify.assert_awaited_once_with(ANY)
+
+    def test_import_all_skipped_schedules_nothing(self, client):
+        """A 200 whose every name already existed changed zero rows —
+        matching the audit record's `if imported:` gate, no fan-out."""
+        _create_server(client, name="already-there")
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.post(
+                "/v1/api/admin/mcp-servers/import",
+                json={"config": {"mcpServers": {"already-there": {"command": "node"}}}},
+            )
+        assert r.status_code == 200
+        assert r.json()["imported"] == []
+        notify.assert_not_awaited()
+
+    def test_import_no_mcp_servers_key(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers/import",
+            json={"config": {"other": "data"}},
+        )
+        assert r.status_code == 400
+        assert "mcpServers" in r.json()["error"] or "No" in r.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# tls_skip_verify
+# ---------------------------------------------------------------------------
+
+_KVM = {"name": "kvm", "transport": "streamable-http", "url": "https://kvm.example.com/mcp"}
+_NOT_A_BOOL = "tls_skip_verify must be true or false"
+_NULL = "tls_skip_verify must not be null"
+_NOT_HTTP = "tls_skip_verify applies only to streamable-http servers"
+_PER_USER = "tls_skip_verify cannot be set for auth_type 'oauth_user' or 'oauth_obo'"
+
+
+def _detail(event: dict[str, Any]) -> dict[str, Any]:
+    """An audit event's detail, decoded."""
+    detail = event["detail"]
+    return json.loads(detail) if isinstance(detail, str) else detail
+
+
+def _audit_details(storage: SQLiteBackend, action: str) -> dict[str, dict[str, Any]]:
+    """Each *action* event's detail, by resource id.
+
+    One event per resource, or the test fails: with several, which one the dict keeps would be
+    chance (events order by a one-second timestamp, then a random id).
+    """
+    events = storage.list_audit_events(action=action)
+    ids = [e["resource_id"] for e in events]
+    assert len(set(ids)) == len(ids), f"more than one {action} event for a resource: {ids}"
+    return {e["resource_id"]: _detail(e) for e in events}
+
+
+def _audit_after(
+    storage: SQLiteBackend, action: str, write: Callable[[], Any]
+) -> tuple[Any, dict[str, Any]]:
+    """Run *write*; return its response and the detail of the one *action* event it records."""
+    before = {e["event_id"] for e in storage.list_audit_events(action=action)}
+    response = write()
+    (event,) = (e for e in storage.list_audit_events(action=action) if e["event_id"] not in before)
+    return response, _detail(event)
+
+
+class TestTlsSkipVerify:
+    def test_create_stores_it_and_audits_it(self, client, storage):
+        skipped = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+        verified = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "name": "plain"})
+
+        assert skipped.status_code == 200, skipped.text
+        assert skipped.json()["tls_skip_verify"] is True
+        assert verified.json()["tls_skip_verify"] is False
+        details = _audit_details(storage, "mcp_server.create")
+        assert details[skipped.json()["server_id"]]["tls_skip_verify"] is True
+        assert "tls_skip_verify" not in details[verified.json()["server_id"]]
+
+    @pytest.mark.parametrize("value", ["true", "false", 1, 0, [], {}])
+    def test_only_a_json_boolean_is_accepted(self, client, storage, value):
+        r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": value})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _NOT_A_BOOL}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    def test_null_is_refused_wherever_it_is_read(self, client, storage):
+        # A null could mean clearing the setting as well as keeping it.
+        sid = client.post(
+            "/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True}
+        ).json()["server_id"]
+        nullish = {"url": "https://nullish.example.com/mcp", "tls_skip_verify": None}
+
+        created = client.post(
+            "/v1/api/admin/mcp-servers", json={**_KVM, "name": "nullish", "tls_skip_verify": None}
+        )
+        updated = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"tls_skip_verify": None})
+        imported = client.post(
+            "/v1/api/admin/mcp-servers/import", json={"config": {"mcpServers": {"n": nullish}}}
+        )
+        with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+            tested = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": None},
+            )
+
+        assert created.status_code == 400
+        assert created.json() == {"error": _NULL}
+        assert updated.status_code == 400
+        assert updated.json() == {"error": _NULL}
+        assert imported.json()["errors"] == [f"n: {_NULL}"]
+        assert tested.status_code == 400
+        assert tested.json() == {"error": _NULL}
+        probe.assert_not_called()
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is True
+        assert storage.get_mcp_server_by_name("nullish") is None
+        assert storage.get_mcp_server_by_name("n") is None
+
+    def test_create_refuses_it_for_a_stdio_server(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx", "tls_skip_verify": True},
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _NOT_HTTP}
+        assert storage.get_mcp_server_by_name("local") is None
+
+    @pytest.mark.parametrize("auth_type", ["oauth_user", "oauth_obo"])
+    def test_create_refuses_it_for_per_user_oauth(self, client, storage, auth_type):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={**_KVM, "auth_type": auth_type, "tls_skip_verify": True},
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _PER_USER}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    def test_update_turns_it_on_and_off_and_keeps_it_when_absent(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        def edit(body: dict[str, Any]) -> tuple[Any, Any]:
+            """The response, and what this edit's own audit event records for the setting."""
+            r, detail = _audit_after(
+                storage, "mcp_server.update", lambda: client.put(path, json=body)
+            )
+            return r, detail.get("tls_skip_verify")
+
+        on, on_recorded = edit({"tls_skip_verify": True})
+        kept, kept_recorded = edit({"enabled": False})
+        off, off_recorded = edit({"tls_skip_verify": False})
+
+        assert on.json()["tls_skip_verify"] is True
+        assert kept.json()["tls_skip_verify"] is True
+        assert off.json()["tls_skip_verify"] is False
+        # Every edit of a server that skips verification says so, and turning it off says false.
+        assert (on_recorded, kept_recorded, off_recorded) == (True, True, False)
+
+    def test_an_edit_of_a_server_that_verifies_does_not_lead_with_it(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        _, api_detail = _audit_after(
+            storage, "mcp_server.update", lambda: client.put(path, json={"enabled": False})
+        )
+        _, form_detail = _audit_after(
+            storage,
+            "mcp_server.update",
+            lambda: client.put(path, json={**_KVM, "enabled": True, "tls_skip_verify": False}),
+        )
+
+        assert "tls_skip_verify" not in api_detail
+        # The form sends it with every save; it is stored, but takes no place in the summary.
+        assert next(iter(form_detail)) != "tls_skip_verify"
+        assert form_detail["tls_skip_verify"] is False
+
+    @pytest.mark.parametrize("sent", [False, True], ids=["sends-off", "sends-on"])
+    def test_the_later_of_two_crossing_saves_wins(self, client, storage, sent):
+        # As for auto_approve and enabled. This save read the row before the other one changed
+        # the setting, so what it sends equals what it read; it is stored all the same.
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": sent})
+        sid = created.json()["server_id"]
+        as_read = storage.get_mcp_server(sid)
+        storage.update_mcp_server(sid, tls_skip_verify=not sent)  # the other save
+        real_get = storage.get_mcp_server
+        reads = [as_read]
+
+        def get_mcp_server(server_id: str) -> dict[str, Any] | None:
+            return reads.pop() if reads else real_get(server_id)
+
+        with patch.object(storage, "get_mcp_server", side_effect=get_mcp_server):
+            r, detail = _audit_after(
+                storage,
+                "mcp_server.update",
+                lambda: client.put(
+                    f"/v1/api/admin/mcp-servers/{sid}", json={**_KVM, "tls_skip_verify": sent}
+                ),
+            )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["tls_skip_verify"] is sent
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is sent
+        assert detail["tls_skip_verify"] is sent
+
+    def test_a_new_url_keeps_it_and_the_audit_says_so(self, client, storage):
+        # Like the headers, it stays with the server, and the edit's audit event says it does.
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+        sid = created.json()["server_id"]
+        other = "https://other.example.com/mcp"
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": other})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["tls_skip_verify"] is True
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        assert detail["url"] == "https://other.example.com:443"
+        assert detail["tls_skip_verify"] is True
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            {"name": "local", "transport": "stdio", "command": "npx"},
+            {**_KVM, "auth_type": "oauth_user"},
+        ],
+        ids=["stdio", "per-user-auth"],
+    )
+    def test_a_value_left_where_it_cannot_apply_reads_as_off_and_the_next_edit_clears_it(
+        self, client, storage, row
+    ):
+        sid = client.post("/v1/api/admin/mcp-servers", json=row).json()["server_id"]
+        # What two crossing edits can leave: one moved the row while the other turned it on.
+        storage.update_mcp_server(sid, tls_skip_verify=True)
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        with _PATCH_MCP_STATUS:
+            read = client.get(path)
+        back = client.put(
+            path, json={"transport": "streamable-http", "url": _KVM["url"], "auth_type": "static"}
+        )
+
+        assert read.json()["tls_skip_verify"] is False
+        assert back.status_code == 200, back.text
+        assert back.json()["tls_skip_verify"] is False
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is False
+
+    def test_update_refuses_a_value_that_is_not_a_bool(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"tls_skip_verify": "yes"})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _NOT_A_BOOL}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is False
+
+    def test_update_refuses_it_for_a_per_user_server(self, client, storage):
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "auth_type": "oauth_user"})
+        sid = created.json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"tls_skip_verify": True})
+        flip = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "static", "tls_skip_verify": True},
+        )
+
+        assert created.status_code == 200, created.text
+        assert r.status_code == 400
+        assert r.json() == {"error": _PER_USER}
+        # Leaving per-user auth in the same request makes it allowed.
+        assert flip.status_code == 200, flip.text
+        assert flip.json()["tls_skip_verify"] is True
+
+    @pytest.mark.parametrize(
+        "move",
+        [{"auth_type": "oauth_user"}, {"transport": "stdio", "command": "npx"}],
+        ids=["to-per-user-auth", "to-stdio"],
+    )
+    def test_a_move_where_it_cannot_apply_clears_it_for_good(self, client, storage, move):
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+        sid = created.json()["server_id"]
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        moved = client.put(path, json=move)
+        # The column itself, not only the effective value the API reports.
+        moved_row = storage.get_mcp_server(sid)
+        move_audit = _audit_details(storage, "mcp_server.update")[sid]
+        back = client.put(path, json={"transport": "streamable-http", "auth_type": "static"})
+
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["tls_skip_verify"] is False
+        assert moved_row is not None
+        assert moved_row["tls_skip_verify"] is False
+        assert move_audit["tls_skip_verify"] is False
+        assert back.json()["tls_skip_verify"] is False
+
+    def test_a_move_is_judged_on_the_transport_it_moves_to(self, client, storage):
+        local = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx"},
+        ).json()["server_id"]
+        remote = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        onto_http = client.put(
+            f"/v1/api/admin/mcp-servers/{local}",
+            json={
+                "transport": "streamable-http",
+                "url": "https://local.example.com/mcp",
+                "tls_skip_verify": True,
+            },
+        )
+        onto_stdio = client.put(
+            f"/v1/api/admin/mcp-servers/{remote}",
+            json={"transport": "stdio", "command": "npx", "tls_skip_verify": True},
+        )
+
+        assert onto_http.status_code == 200, onto_http.text
+        assert onto_http.json()["tls_skip_verify"] is True
+        assert onto_stdio.status_code == 400
+        assert onto_stdio.json() == {"error": _NOT_HTTP}
+        stored = storage.get_mcp_server(remote)
+        assert stored is not None
+        assert stored["transport"] == "streamable-http"
+        assert stored["tls_skip_verify"] is False
+
+    def test_import_keeps_it_and_refuses_what_a_save_refuses(self, client, storage):
+        config = {
+            "mcpServers": {
+                "kvm": {
+                    "type": "http",
+                    "url": "https://kvm.example.com/mcp",
+                    "tls_skip_verify": True,
+                },
+                "typo": {"url": "https://typo.example.com/mcp", "tls_skip_verify": "true"},
+                "local": {"command": "npx", "tls_skip_verify": True},
+                "plain": {"url": "https://plain.example.com/mcp"},
+            },
+        }
+
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200
+        assert r.json()["imported"] == ["kvm", "plain"]
+        assert r.json()["errors"] == [f"typo: {_NOT_A_BOOL}", f"local: {_NOT_HTTP}"]
+        kvm = storage.get_mcp_server_by_name("kvm")
+        plain = storage.get_mcp_server_by_name("plain")
+        assert kvm is not None
+        assert kvm["tls_skip_verify"] is True
+        assert plain is not None
+        assert plain["tls_skip_verify"] is False
+        (detail,) = _audit_details(storage, "mcp_server.import").values()
+        assert detail["tls_skip_verify"] == ["kvm"]
+        # Among the three keys the Audit tab shows, ahead of the origins.
+        assert list(detail)[:3] == ["imported", "skipped", "tls_skip_verify"]
+
+    def test_the_refusal_follows_the_shared_rule(self, client, storage):
+        # Were the rule to narrow, a true it no longer allows would be refused, not dropped.
+        with patch("turnstone.core.mcp_client.tls_skip_verify_applies", return_value=False):
+            r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": "tls_skip_verify cannot be set for this server"}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    def test_connection_test_passes_it_to_the_probe_and_audits_it(self, client, storage):
+        from turnstone.core.mcp_client import ConnectionProbe
+
+        with patch(
+            "turnstone.core.mcp_client.probe_http_server", return_value=ConnectionProbe()
+        ) as probe:
+            skipped = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": True},
+            )
+            refused = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": "true"},
+            )
+
+        assert skipped.status_code == 200
+        assert refused.status_code == 400
+        assert refused.json() == {"error": _NOT_A_BOOL}
+        probe.assert_called_once_with(_KVM["url"], {}, name="", tls_skip_verify=True)
+        (detail,) = _audit_details(storage, "mcp_server.test").values()
+        assert detail["tls_skip_verify"] is True
+
+    def test_a_configuration_file_server_is_listed_with_it_off(self, client):
+        # The console reads settings from rows only; a node's file has none to read.
+        statuses = {"node-a": {"kvm-file": {"connected": True}}}
+        with patch(
+            "turnstone.console.server._collect_mcp_status",
+            new_callable=AsyncMock,
+            return_value=statuses,
+        ):
+            r = client.get("/v1/api/admin/mcp-servers")
+
+        (listed,) = r.json()["servers"]
+        assert listed["source"] == "config"
+        assert listed["tls_skip_verify"] is False
+
+    def test_the_marker_leads_each_audit_detail(self, client, storage):
+        # The Audit tab shows only a detail's first three keys, and a full-form save stores many
+        # more (test_auth_markers_render_in_audit_detail_first_keys pins the same for models).
+        from turnstone.core.mcp_client import ConnectionProbe
+
+        headers = {"X-Kvm": "1"}
+        created, create_detail = _audit_after(
+            storage,
+            "mcp_server.create",
+            lambda: client.post(
+                "/v1/api/admin/mcp-servers",
+                json={**_KVM, "headers": headers, "tls_skip_verify": True},
+            ),
+        )
+        path = f"/v1/api/admin/mcp-servers/{created.json()['server_id']}"
+        form = {
+            **_KVM,
+            "headers": headers,
+            "auto_approve": False,
+            "enabled": True,
+            "auth_type": "static",
+            "tls_skip_verify": True,
+        }
+        _, save_detail = _audit_after(
+            storage, "mcp_server.update", lambda: client.put(path, json=form)
+        )
+        _, off_detail = _audit_after(
+            storage, "mcp_server.update", lambda: client.put(path, json={"tls_skip_verify": False})
+        )
+        with patch("turnstone.core.mcp_client.probe_http_server", return_value=ConnectionProbe()):
+            _, test_detail = _audit_after(
+                storage,
+                "mcp_server.test",
+                lambda: client.post(
+                    "/v1/api/admin/mcp-servers/test",
+                    json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": True},
+                ),
+            )
+
+        for detail, value in [
+            (create_detail, True),
+            (save_detail, True),
+            (off_detail, False),
+            (test_detail, True),
+        ]:
+            assert next(iter(detail)) == "tls_skip_verify", detail
+            assert detail["tls_skip_verify"] is value
+
+    @pytest.mark.parametrize("transport", ["stdio", "streamable-http", "sse", "http"])
+    @pytest.mark.parametrize("auth_type", [None, "none", "static", "oauth_user", "oauth_obo"])
+    def test_the_console_judges_by_the_rule_the_nodes_connect_with(self, transport, auth_type):
+        # One rule for all, so it holds for a transport the console does not store today too.
+        from turnstone.console.server import _effective_tls_skip_verify, _tls_skip_verify_for_write
+        from turnstone.core.mcp_client import _db_servers_to_config
+
+        row = {
+            "name": "s",
+            "transport": transport,
+            "auth_type": auth_type,
+            "url": "https://s.example.com/mcp",
+            "tls_skip_verify": True,
+        }
+        on_nodes = _db_servers_to_config([row]).get("s", {}).get("tls_skip_verify", False)
+        _, refusal = _tls_skip_verify_for_write(
+            {"tls_skip_verify": True}, False, transport=transport, auth_type=auth_type
+        )
+
+        assert _effective_tls_skip_verify(row) is on_nodes
+        # A save asking for it is refused exactly where the nodes would not apply it.
+        assert (refusal is None) is on_nodes
+        assert on_nodes is (
+            transport == "streamable-http" and auth_type not in ("oauth_user", "oauth_obo")
+        )
+
+
+class TestStrictMcpBooleans:
+    """``auto_approve`` and ``enabled`` take a JSON boolean, 0 or 1. ``bool()`` reads the string
+    ``"false"`` as true, which let one turn approvals off, and null is refused as on the schedule
+    endpoints."""
+
+    _REFUSED = "{} expects true/false (or 0/1)"
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_create_refuses_a_string(self, client, storage, field):
+        r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, field: "false"})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._REFUSED.format(field)}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_update_refuses_a_string_and_keeps_the_value(self, client, storage, field):
+        created = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{created['server_id']}", json={field: "false"})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._REFUSED.format(field)}
+        stored = storage.get_mcp_server(created["server_id"])
+        assert stored is not None
+        assert stored[field] is created[field]
+
+    def test_zero_and_one_count(self, client):
+        r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "auto_approve": 1, "enabled": 0})
+
+        assert r.json()["auto_approve"] is True
+        assert r.json()["enabled"] is False
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_null_is_refused_on_create_and_update(self, client, storage, field):
+        # A null could mean clearing the flag as well as keeping it; it used to read as false.
+        refused = client.post("/v1/api/admin/mcp-servers", json={**_KVM, field: None})
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "auto_approve": True})
+        sid = created.json()["server_id"]
+
+        updated = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={field: None})
+
+        assert refused.status_code == 400
+        assert refused.json() == {"error": f"{field} must not be null"}
+        assert updated.status_code == 400
+        assert updated.json() == {"error": f"{field} must not be null"}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["auto_approve"] is True
+        assert stored["enabled"] is True
+
+
+class TestUpdateAuditCredentials:
+    """An update's audit event says where a changed URL points, never its path or query, and
+    records a stdio server's arguments only as updated: any of them can carry a credential."""
+
+    def test_a_changed_url_is_recorded_as_its_scheme_host_and_port(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://mcp.example.com:8443/v1/k3y/mcp?key=s3cret"},
+        )
+
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        # One string, so the console's audit list shows it.
+        assert detail["url"] == "https://mcp.example.com:8443"
+        assert "k3y" not in json.dumps(detail)
+        assert "s3cret" not in json.dumps(detail)
+
+    def test_an_unchanged_url_is_left_out(self, client, storage):
+        # The server form re-sends the URL with every save.
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": _KVM["url"], "enabled": False})
+
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        assert "url" not in detail
+        assert detail["enabled"] is False
+
+    @pytest.mark.parametrize(
+        ("url", "recorded"),
+        [
+            ("", ""),
+            ("npx-server", "(updated)"),
+            ("localhost:9000", "(updated)"),
+            ("http://[::1", "(updated)"),
+            ("https://h.example.com:0/x", "https://h.example.com:0"),
+            ("https://[::1]:8443/x", "https://[::1]:8443"),
+        ],
+        ids=["cleared", "bare-word", "schemeless", "unparseable", "port-0", "ipv6"],
+    )
+    def test_a_stdio_rows_url_is_recorded_without_inventing_a_target(
+        self, client, storage, url, recorded
+    ):
+        # A stdio row's URL is stored without a check, so the audit must not assume it parses.
+        sid = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "local",
+                "transport": "stdio",
+                "command": "npx",
+                "url": "https://before.example.com/mcp",
+            },
+        ).json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": url})
+
+        assert r.status_code == 200, r.text
+        assert _audit_details(storage, "mcp_server.update")[sid]["url"] == recorded
+
+    def test_a_stdio_servers_arguments_are_recorded_as_updated(self, client, storage):
+        # An argument can carry a credential (--api-key ...), as headers and env can.
+        sid = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx"},
+        ).json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"args": ["--api-key", "s3cret"]})
+
+        assert r.status_code == 200, r.text
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        assert detail["args"] == "(updated)"
+        assert "s3cret" not in json.dumps(detail)
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert json.loads(stored["args"]) == ["--api-key", "s3cret"]
+
+    def test_oauth_urls_are_recorded_as_their_scheme_host_and_port(self, client, storage):
+        # The form fills an oauth_user audience in from the server URL, and re-sends the
+        # authorization server's URL with every save.
+        url = "https://mcp.example.com/v1/k3y/mcp?key=s3cret"
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "url": url})
+        path = f"/v1/api/admin/mcp-servers/{created.json()['server_id']}"
+        form = {
+            **_KVM,
+            "url": url,
+            "auth_type": "oauth_user",
+            "oauth_registration_mode": "preregistered",
+            "oauth_client_id": "cli_abc",
+            "oauth_audience": url,
+            "oauth_authorization_server_url": "https://as.example.com/realm?tenant=as-s3cret",
+        }
+
+        _, flip = _audit_after(storage, "mcp_server.update", lambda: client.put(path, json=form))
+        _, resave = _audit_after(storage, "mcp_server.update", lambda: client.put(path, json=form))
+
+        assert flip["oauth_audience"] == "https://mcp.example.com:443"
+        for detail in (flip, resave):
+            assert detail["oauth_authorization_server_url"] == "https://as.example.com:443"
+            assert "k3y" not in json.dumps(detail)
+            assert "s3cret" not in json.dumps(detail)
+
+    def test_an_obo_app_identifier_is_recorded_as_sent(self, client, storage):
+        # Only an http(s) value is cut to its origin.
+        created = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={**_KVM, "auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        path = f"/v1/api/admin/mcp-servers/{created.json()['server_id']}"
+
+        _, detail = _audit_after(
+            storage,
+            "mcp_server.update",
+            lambda: client.put(path, json={"oauth_audience": "api://mcp-b"}),
+        )
+
+        assert detail["oauth_audience"] == "api://mcp-b"
+
+
+class TestAuditOrigins:
+    """Creating or importing a Streamable HTTP server records where it points, so the audit keeps
+    the host after the server is deleted; never the URL's path or query."""
+
+    def test_create_records_where_an_http_server_points(self, client, storage):
+        remote = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={**_KVM, "url": "https://kvm.example.com:8443/v1/k3y/mcp?key=s3cret"},
+        ).json()["server_id"]
+        local = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx"},
+        ).json()["server_id"]
+
+        details = _audit_details(storage, "mcp_server.create")
+        assert details[remote]["url"] == "https://kvm.example.com:8443"
+        assert "k3y" not in json.dumps(details[remote])
+        assert "s3cret" not in json.dumps(details[remote])
+        assert "url" not in details[local]
+
+    def test_import_records_where_each_http_server_points(self, client, storage):
+        config = {
+            "mcpServers": {
+                "kvm": {"url": "https://kvm.example.com/v1/k3y/mcp"},
+                "local": {"command": "npx"},
+            }
+        }
+
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.json()["imported"] == ["kvm", "local"]
+        (detail,) = _audit_details(storage, "mcp_server.import").values()
+        assert detail["origins"] == {"kvm": "https://kvm.example.com:443"}
+        assert "k3y" not in json.dumps(detail)
+
+    def test_the_origin_follows_the_client_secret_marker(self, client, storage):
+        # The Audit tab shows only a detail's first three keys, where the marker matters more.
+        _, detail = _audit_after(
+            storage,
+            "mcp_server.create",
+            lambda: client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": "oauthy",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/mcp",
+                    "auth_type": "oauth_user",
+                    "oauth_client_id": "cli_abc",
+                    "oauth_client_secret": "s3cret",
+                },
+            ),
+        )
+
+        assert list(detail)[:3] == ["name", "auth_type", "oauth_client_secret"]
+        assert detail["url"] == "https://mcp.example.com:443"
+        assert "s3cret" not in json.dumps(detail)
+
+
+class TestNameTakenAfterTheCheck:
+    """A create, rename or import whose name another request takes between the name check and the
+    write stores nothing, so it neither reports success nor audits a change it did not save."""
+
+    def test_create_answers_409(self, client, storage):
+        first = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        # As if this request's name check ran before the other request's insert landed.
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+
+        assert r.status_code == 409
+        assert r.json() == {"error": "Server 'kvm' already exists"}
+        assert list(_audit_details(storage, "mcp_server.create")) == [first]
+        stored = storage.get_mcp_server(first)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is False
+
+    def test_a_rename_answers_409(self, client, storage):
+        client.post("/v1/api/admin/mcp-servers", json=_KVM)
+        other = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "name": "other"})
+        sid = other.json()["server_id"]
+
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"name": "kvm", "enabled": False}
+            )
+
+        assert r.status_code == 409
+        assert r.json() == {"error": "Server 'kvm' already exists"}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert (stored["name"], stored["enabled"]) == ("other", True)
+        assert storage.list_audit_events(action="mcp_server.update") == []
+
+    def test_import_lists_the_entry_as_skipped(self, client, storage):
+        client.post("/v1/api/admin/mcp-servers", json=_KVM)
+        config = {"mcpServers": {"kvm": {"url": _KVM["url"], "tls_skip_verify": True}}}
+
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200
+        assert r.json() == {"imported": [], "skipped": ["kvm"], "errors": []}
+        assert storage.list_audit_events(action="mcp_server.import") == []
+
+    def test_an_oauth_create_answers_409_before_it_writes_the_secret(self, client, storage):
+        oauth = {**_KVM, "auth_type": "oauth_user", "oauth_client_id": "cli_abc"}
+        client.post("/v1/api/admin/mcp-servers", json=oauth)
+
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.post(
+                "/v1/api/admin/mcp-servers", json={**oauth, "oauth_client_secret": "s3cret"}
+            )
+
+        assert r.status_code == 409
+        assert r.json() == {"error": "Server 'kvm' already exists"}
+        assert storage.list_audit_events(action="mcp_server.oauth.client_secret_set") == []
+
+
+class TestServerDeletedAfterTheRead:
+    """An update whose server another request deletes after the handler read it stores nothing,
+    so it neither reports success nor audits, reloads or writes a secret for a server that is
+    gone."""
+
+    @pytest.mark.parametrize(
+        ("server", "body"),
+        [
+            (_KVM, {"enabled": False}),
+            (
+                {**_KVM, "auth_type": "oauth_user", "oauth_client_id": "cli_abc"},
+                {"oauth_client_secret": "s3cret"},
+            ),
+        ],
+        ids=["edit", "secret-only"],
+    )
+    def test_update_answers_404(self, client, storage, server, body):
+        from turnstone.console.server import _check_mcp_secret_fields
+
+        sid = client.post("/v1/api/admin/mcp-servers", json=server).json()["server_id"]
+
+        async def delete_then_check(request, headers, env):
+            storage.delete_mcp_server(sid)  # another admin's delete lands at this await
+            return await _check_mcp_secret_fields(request, headers, env)
+
+        with (
+            patch("turnstone.console.server._check_mcp_secret_fields", new=delete_then_check),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json=body)
+
+        assert r.status_code == 404
+        assert r.json() == {"error": "MCP server not found"}
+        assert storage.list_audit_events(action="mcp_server.update") == []
+        assert storage.list_audit_events(action="mcp_server.oauth.client_secret_set") == []
+        notify.assert_not_awaited()
+
+
+class TestOauthClientSecretLength:
+    """A secret over the limit is refused before the row is written, so a refusal never leaves a
+    change behind with no audit event and no node reload."""
+
+    _TOO_LONG = "oauth_client_secret must be 1024 characters or fewer"
+    _OAUTH = {
+        "name": "oauthy",
+        "transport": "streamable-http",
+        "url": "https://mcp.example.com/sse",
+        "auth_type": "oauth_user",
+        "oauth_client_id": "cli_abc",
+    }
+
+    def test_create_writes_nothing(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers", json={**self._OAUTH, "oauth_client_secret": "A" * 1025}
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._TOO_LONG}
+        assert storage.list_mcp_servers() == []
+        assert storage.list_audit_events(action="mcp_server.create") == []
+
+    def test_update_writes_nothing(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+        before = storage.get_mcp_server(sid)
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_user",
+                "url": "https://other.example.com/mcp",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "A" * 1025,
+            },
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._TOO_LONG}
+        assert storage.get_mcp_server(sid) == before
+        assert storage.list_audit_events(action="mcp_server.update") == []
+
+    def test_a_secret_at_the_limit_is_accepted(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers", json={**self._OAUTH, "oauth_client_secret": "A" * 1024}
+        )
+
+        assert r.status_code == 200, r.text
+
+    def test_the_writer_refuses_it_on_its_own(self, client, storage):
+        # The handlers refuse it before the row is written; the step that prepares the stored
+        # value checks it again.
+        from turnstone.console.server import _client_secret_write
+
+        sid = client.post("/v1/api/admin/mcp-servers", json=self._OAUTH).json()["server_id"]
+        request = MagicMock()
+        request.app = client.app
+
+        secret_ct, err = _client_secret_write(
+            request, {"oauth_client_secret": "A" * 1025}, auth_type="oauth_user"
+        )
+
+        assert secret_ct is None
+        assert err is not None
+        assert json.loads(err.body) == {"error": self._TOO_LONG}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["oauth_client_secret_ct"] is None
+
+
+# ---------------------------------------------------------------------------
+# Permission check
+# ---------------------------------------------------------------------------
+
+
+class TestPermission:
+    def test_list_without_permission(self, client_no_perm):
+        with _PATCH_MCP_STATUS:
+            r = client_no_perm.get("/v1/api/admin/mcp-servers")
+        assert r.status_code == 403
+        assert "admin.mcp" in r.json()["error"]
+
+    def test_create_without_permission(self, client_no_perm):
+        r = client_no_perm.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "test", "transport": "stdio", "command": "x"},
+        )
+        assert r.status_code == 403
+
+    def test_delete_without_permission(self, client_no_perm):
+        r = client_no_perm.delete(f"/v1/api/admin/mcp-servers/{uuid.uuid4().hex}")
+        assert r.status_code == 403
+
+    def test_connection_test_without_permission(self, client_no_perm):
+        with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+            r = client_no_perm.post(
+                "/v1/api/admin/mcp-servers/test", json={"url": "http://mcp.example/mcp"}
+            )
+        assert r.status_code == 403
+        probe.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/api/admin/mcp-servers/test (#1328)
+# ---------------------------------------------------------------------------
+
+
+_BAD_VALUE = (
+    "headers: the value of '{}' has a space at either end, a control character, or a character "
+    "outside ASCII"
+)
+
+
+class TestConnectionTestEndpoint:
+    """Input checks and the response shape; the probe itself runs against real servers in
+    test_mcp_connection_probe.py."""
+
+    _URL = "http://mcp.example/mcp"
+
+    @pytest.mark.parametrize(
+        ("body", "error"),
+        [
+            (
+                {"url": _URL, "transport": "stdio"},
+                "Only streamable-http servers can be tested",
+            ),
+            (
+                {"url": _URL, "auth_type": "oauth_user"},
+                "Servers with auth_type 'oauth_user' or 'oauth_obo' cannot be tested",
+            ),
+            (
+                {"url": _URL, "auth_type": "oauth_obo"},
+                "Servers with auth_type 'oauth_user' or 'oauth_obo' cannot be tested",
+            ),
+            (
+                {"url": _URL, "auth_type": "bogus"},
+                "auth_type must be 'none', 'static', 'oauth_user', or 'oauth_obo'",
+            ),
+            ({}, "url must be an http:// or https:// URL with a host"),
+            (
+                {"url": "ftp://mcp.example/mcp"},
+                "url must be an http:// or https:// URL with a host",
+            ),
+            ({"url": "http:///mcp"}, "url must be an http:// or https:// URL with a host"),
+            ({"url": "http://mcp.example:99999/mcp"}, "url: Port out of range 0-65535"),
+            ({"url": "http://[::1/mcp"}, "url: Invalid IPv6 URL"),
+            (
+                {"url": "http://[mcp-host]/mcp"},
+                "url: 'mcp-host' does not appear to be an IPv4 or IPv6 address",
+            ),
+            ({"url": _URL, "headers": ["Authorization: x"]}, "headers must be an object"),
+            (
+                {"url": _URL, "headers": {"X-Count": 3}},
+                "headers: the value of 'X-Count' must be a string",
+            ),
+            (
+                {"url": _URL, "headers": {"Authorization": "Bearer a\r\nX-Injected: 1"}},
+                _BAD_VALUE.format("Authorization"),
+            ),
+            ({"url": _URL, "headers": {"X-Api-Key": "k3y "}}, _BAD_VALUE.format("X-Api-Key")),
+            (
+                {"url": _URL, "headers": {"Authorization: Bearer k3y": ""}},
+                "headers: a header name is not a valid HTTP header name",
+            ),
+            ({"url": _URL, "name": "my server"}, "name must match [a-zA-Z0-9._-]+"),
+            (
+                {"url": _URL, "name": "my__server"},
+                "name must not contain '__' (reserved delimiter)",
+            ),
+        ],
+        ids=[
+            "stdio",
+            "oauth-user",
+            "oauth-obo",
+            "unknown-auth",
+            "no-url",
+            "other-scheme",
+            "no-host",
+            "bad-port",
+            "unclosed-bracket",
+            "bracketed-name",
+            "header-list",
+            "header-number",
+            "header-newline",
+            "header-padded",
+            "header-line-as-name",
+            "name-with-space",
+            "name-with-delimiter",
+        ],
+    )
+    def test_rejects_what_cannot_be_tested(self, client, body, error):
+        with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+            r = client.post("/v1/api/admin/mcp-servers/test", json=body)
+        assert r.status_code == 400
+        assert r.json() == {"error": error}
+        probe.assert_not_called()
+
+    def test_reports_the_catalog_and_saves_nothing(self, client, storage):
+        from turnstone.core.mcp_client import ConnectionProbe, SkippedTool
+
+        reason = (
+            "inputSchema.properties.id.type is not one of "
+            "['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']"
+        )
+        found = ConnectionProbe(
+            tools=["search", "fetch"],
+            skipped_tools=(SkippedTool("lookup", reason),),
+            resources=1,
+            prompts=0,
+        )
+        with patch("turnstone.core.mcp_client.probe_http_server", return_value=found) as probe:
+            r = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={
+                    "name": "docs",
+                    "url": self._URL,
+                    "auth_type": "static",
+                    "headers": {"Authorization": "Bearer abc"},
+                },
+            )
+        assert r.status_code == 200
+        assert r.json() == {
+            "ok": True,
+            "tools": ["search", "fetch"],
+            "skipped_tools": [{"name": "lookup", "reason": reason}],
+            "resources": 1,
+            "prompts": 0,
+            "error": None,
+            "kind": None,
+            "status": None,
+        }
+        probe.assert_called_once_with(
+            self._URL, {"Authorization": "Bearer abc"}, name="docs", tls_skip_verify=False
+        )
+        assert storage.list_mcp_servers() == []
+        (event,) = storage.list_audit_events(action="mcp_server.test")
+        assert event["resource_id"] == "docs"
+        assert "Bearer" not in str(event)
+
+    def test_reports_why_the_connect_failed(self, client):
+        from turnstone.core.mcp_client import ConnectFailure, ConnectionProbe
+
+        failure = ConnectFailure("http", "HTTP 404 Not Found: no MCP endpoint at this URL", 404)
+        with patch(
+            "turnstone.core.mcp_client.probe_http_server",
+            return_value=ConnectionProbe(failure=failure),
+        ):
+            r = client.post(
+                "/v1/api/admin/mcp-servers/test", json={"url": self._URL, "auth_type": "none"}
+            )
+        assert r.status_code == 200
+        assert r.json() == {
+            "ok": False,
+            "tools": [],
+            "skipped_tools": [],
+            "resources": 0,
+            "prompts": 0,
+            "error": "HTTP 404 Not Found: no MCP endpoint at this URL",
+            "kind": "http",
+            "status": 404,
+        }
+
+    def test_tests_beyond_the_running_limit_are_refused(self, client, monkeypatch):
+        """A bounded number run at once, each on a thread of its own; a test past the limit is
+        refused at once, before it takes a thread."""
+        import turnstone.console.server as console_server
+
+        slots = threading.BoundedSemaphore(1)
+        monkeypatch.setattr(console_server, "_MCP_TEST_SLOTS", slots)
+        assert slots.acquire(blocking=False)  # one test already running
+        try:
+            with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+                r = client.post("/v1/api/admin/mcp-servers/test", json={"url": self._URL})
+        finally:
+            slots.release()
+        assert r.status_code == 429
+        assert r.json() == {"error": "Other connection tests are still running; try again shortly"}
+        probe.assert_not_called()
+        assert slots.acquire(blocking=False)  # the refused request took no slot
+        slots.release()
+
+    def test_a_test_that_never_finishes_is_reported(self, client, monkeypatch):
+        """The wait is bounded even if a test thread wedges inside the SDK, and the test's slot
+        comes back when the thread ends."""
+        import turnstone.console.server as console_server
+
+        slots = threading.BoundedSemaphore(1)
+        monkeypatch.setattr(console_server, "_MCP_TEST_SLOTS", slots)
+        monkeypatch.setattr(console_server, "_MCP_TEST_WAIT_HEADROOM_S", 0.05)
+        release = threading.Event()
+
+        def _wedged(*_args: Any, **_kwargs: Any) -> None:
+            release.wait(5)
+
+        try:
+            with (
+                patch("turnstone.core.mcp_client.probe_http_server_max_s", return_value=0.0),
+                patch("turnstone.core.mcp_client.probe_http_server", side_effect=_wedged),
+            ):
+                r = client.post("/v1/api/admin/mcp-servers/test", json={"url": self._URL})
+            assert not slots.acquire(blocking=False)  # the wedged test still holds it
+        finally:
+            release.set()
+        assert r.status_code == 200
+        assert r.json()["kind"] == "timeout"
+        assert r.json()["error"] == "The connection test did not finish in time"
+        assert slots.acquire(timeout=5)
+        slots.release()
+
+    def test_every_kind_is_in_the_typescript_sdk(self) -> None:
+        """types.ts is written by hand, and nothing else ties its union to the kinds; the spec
+        and the Python SDK follow the schema's annotation."""
+        import re
+        from pathlib import Path
+        from typing import get_args
+
+        from turnstone.core.mcp_utils import ConnectFailureKind
+
+        source = (Path(__file__).parent.parent / "sdk/typescript/src/types.ts").read_text()
+        block = source.split("export interface McpConnectionTestResponse", 1)[1].split("}", 1)[0]
+        union = block.split("kind:", 1)[1].split(";", 1)[0]
+        assert set(re.findall(r'"([a-z_]+)"', union)) == set(get_args(ConnectFailureKind))
+
+    def test_the_sdk_outwaits_the_console(self) -> None:
+        """The Python SDK's request outlasts the console's longest wait for a test, so a caller
+        hears the test's outcome rather than a client timeout."""
+        import turnstone.console.server as console_server
+        import turnstone.sdk.console as sdk_console
+        from turnstone.core.mcp_client import probe_http_server_max_s
+
+        console_wait = probe_http_server_max_s() + console_server._MCP_TEST_WAIT_HEADROOM_S
+        assert console_wait < sdk_console._MCP_TEST_TIMEOUT_S
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _collect_mcp_status / _notify_nodes_mcp_reload
+# ---------------------------------------------------------------------------
+
+
+def _fake_request(*nodes: dict[str, Any], proxy_client: Any = None) -> MagicMock:
+    """Build a minimal mock request with collector and proxy_client."""
+    collector = MagicMock()
+    collector.get_nodes.return_value = (list(nodes), len(nodes))
+    collector.get_all_nodes.side_effect = lambda: collector.get_nodes.return_value[0]
+    # Real pseudo-node id + no storage: the reload fan-out also runs the
+    # console's own MCP ensure-helper (#725), which reports under this key
+    # and deterministically skips when auth_storage is absent.
+    collector.CONSOLE_PSEUDO_NODE_ID = "console"
+    req = MagicMock()
+    req.state.auth_result = None
+    req.app.state.collector = collector
+    req.app.state.auth_storage = None
+    # Pinned None (MagicMock would auto-create a truthy attribute): the
+    # action/status console arms key on manager PRESENCE — cells that
+    # want the arm set req.app.state.mcp_client explicitly.
+    req.app.state.mcp_client = None
+    req.app.state.jwt_secret = ""
+    req.app.state.proxy_client = proxy_client or AsyncMock()
+    req.app.state.proxy_token_mgr = None
+    req.app.state.proxy_auth_token = "tok"
+    return req
+
+
+def _mock_resp(status_code: int = 200, json_data: Any = None) -> MagicMock:
+    """Build a mock httpx2 response (sync .json(), like the real thing)."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_data or {}
+    return resp
+
+
+class TestCollectMcpStatus:
+    @pytest.mark.anyio
+    async def test_returns_servers_on_200(self):
+        resp = _mock_resp(200, {"servers": {"s1": {"status": "ok"}}})
+        client = AsyncMock()
+        client.get.return_value = resp
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {"n1": {"s1": {"status": "ok"}}}
+
+    @pytest.mark.anyio
+    async def test_skips_non_200(self):
+        client = AsyncMock()
+        client.get.return_value = _mock_resp(503)
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {}
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            {"node_id": "n2"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {}
+        client.get.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_handles_exception(self):
+        client = AsyncMock()
+        client.get.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {}
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _collect_mcp_status(req)
+        assert result == {}
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        ok_resp = _mock_resp(200, {"servers": {"s1": {"status": "ok"}}})
+        err_resp = _mock_resp(500)
+
+        client = AsyncMock()
+        client.get.side_effect = [ok_resp, ConnectionError("down"), err_resp]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            {"node_id": "n3", "server_url": "http://n3:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {"n1": {"s1": {"status": "ok"}}}
+
+    @pytest.mark.anyio
+    async def test_console_manager_reports_projected(self):
+        """Console arm (#725): the console's rows ride the admin projection
+        node rows give the admin's forwarded request — has_error and the
+        error text present; command/url absent."""
+        req = _fake_request()
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = {
+            "srv": {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                "error": "ConnectError: https://internal.example",
+                "transport": "http",
+                "command": "",
+                "url": "https://internal.example",
+                "circuit_open": True,
+                "consecutive_failures": 2,
+            }
+        }
+        req.app.state.mcp_client = mgr
+        result = await _collect_mcp_status(req)
+        row = result["console"]["srv"]
+        assert row["has_error"] is True
+        assert row["error"] == "ConnectError: https://internal.example"
+        assert "command" not in row
+        assert "url" not in row
+        # Admin path mirror of internal_mcp_status: cross-user aggregate.
+        mgr.get_all_server_status.assert_called_once_with(ANY, aggregate=True)
+
+    @pytest.mark.anyio
+    async def test_console_read_failure_omits_key(self):
+        """Failure mirrors _fetch's None contract: the console key is
+        omitted, never an error payload in a status map."""
+        req = _fake_request()
+        mgr = MagicMock()
+        mgr.get_all_server_status.side_effect = RuntimeError("boom")
+        req.app.state.mcp_client = mgr
+        result = await _collect_mcp_status(req)
+        assert result == {}
+
+
+class TestNotifyNodesMcpReload:
+    @pytest.mark.anyio
+    async def test_returns_json_on_success(self):
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"reloaded": 3})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert result == {
+            "n1": {"reloaded": 3},
+            "console": {"skipped": "storage not initialized"},
+        }
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert result == {"console": {"skipped": "storage not initialized"}}
+        client.post.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_records_error_on_exception(self):
+        client = AsyncMock()
+        client.post.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert "n1" in result
+        assert "error" in result["n1"]
+        assert "refused" in result["n1"]["error"]
+
+    @pytest.mark.anyio
+    async def test_records_error_on_non_2xx(self):
+        """A node replying non-2xx (e.g. 503) is recorded as an error, not
+        counted as a reached node — raise_for_status() routes the status into
+        the error path so a stale node trips the 'did not reach' WARNING, and
+        the (unused) response body is never consulted."""
+        http_req = httpx2.Request("POST", "http://n1:8000/x")
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = httpx2.HTTPStatusError(
+            "503", request=http_req, response=httpx2.Response(503, request=http_req)
+        )
+        client = AsyncMock()
+        client.post.return_value = resp
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert "n1" in result
+        assert "error" in result["n1"]
+        resp.json.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _notify_nodes_mcp_reload(req)
+        # No nodes reached, but the console's own ensure-helper always
+        # reports — the operator reload view shows the console row even
+        # on a node-less install.
+        assert result == {"console": {"skipped": "storage not initialized"}}
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        client = AsyncMock()
+        client.post.side_effect = [
+            _mock_resp(200, {"reloaded": 2}),
+            TimeoutError("timeout"),
+        ]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert result["n1"] == {"reloaded": 2}
+        assert "error" in result["n2"]
+
+    @pytest.mark.anyio
+    async def test_console_ensure_failure_isolated(self):
+        """A console-ensure crash must not abandon collected node results —
+        the exception is caught INSIDE the gathered coroutine (the gather
+        runs return_exceptions=False).  Raise-injection is load-bearing:
+        under _fake_request auth_storage is None, so the real helper
+        returns a skip dict and can never raise — without the patch this
+        except arm is unreachable."""
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"reloaded": 1})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        with patch(
+            "turnstone.console.server._ensure_console_mcp_client",
+            side_effect=Exception("boom"),
+        ):
+            result = await _notify_nodes_mcp_reload(req)
+        assert result["n1"] == {"reloaded": 1}
+        assert "error" in result["console"]
+        assert "boom" in result["console"]["error"]
+
+
+class TestScheduleMcpReloadAccounting:
+    """_schedule_mcp_reload._run's unreached-node accounting: the console's
+    pseudo-node entry must never count as an unreached NODE — not in the
+    warning's list, not in its denominator."""
+
+    @pytest.mark.anyio
+    async def test_console_error_alone_fires_no_node_warning(self, caplog):
+        """A console-only failure (e.g. a node-less install) must not log
+        'did not reach ... node(s)' — its production site already warned
+        with console wording."""
+        req = _fake_request()
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                AsyncMock(return_value={"console": {"error": "ensure blew up"}}),
+            ),
+            caplog.at_level(logging.WARNING, logger="turnstone.console.server"),
+        ):
+            await _schedule_mcp_reload(req)()
+        assert "did not reach" not in caplog.text
+
+    @pytest.mark.anyio
+    async def test_console_excluded_from_list_and_denominator(self, caplog):
+        """Mixed results: the unreached warning covers nodes only — the
+        console error appears in neither the list nor the '%d of %d'
+        denominator (pre-fix this logged '2 of 3 node(s)')."""
+        req = _fake_request()
+        results = {
+            "console": {"error": "console-local"},
+            "n1": {"error": "timeout"},
+            "n2": {"reloaded": 1},
+        }
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                AsyncMock(return_value=results),
+            ),
+            caplog.at_level(logging.WARNING, logger="turnstone.console.server"),
+        ):
+            await _schedule_mcp_reload(req)()
+        [rec] = [r for r in caplog.records if "did not reach" in r.getMessage()]
+        msg = rec.getMessage()
+        assert "1 of 2 node(s)" in msg
+        assert msg.rstrip().endswith("n1")
+
+    @pytest.mark.anyio
+    async def test_systemic_failure_warns_node_remediation(self, caplog):
+        """An infra fault before the gather logs the node-facing
+        remediation prose."""
+        req = _fake_request()
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                AsyncMock(side_effect=RuntimeError("infra down")),
+            ),
+            caplog.at_level(logging.WARNING, logger="turnstone.console.server"),
+        ):
+            await _schedule_mcp_reload(req)()
+        assert "nodes may serve a stale MCP catalog" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Console reload endpoint: POST /v1/api/admin/mcp-servers/reload
+# ---------------------------------------------------------------------------
+
+
+class TestAdminMcpReloadEndpoint:
+    """HTTP-level tests for the console reload endpoint."""
+
+    def test_reload_success(self, client: TestClient) -> None:
+        """Reload endpoint returns status ok and fan-out results."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={"n1": {"reloaded": 3}},
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {"n1": {"reloaded": 3}}
+
+    def test_reload_empty_cluster(self, client: TestClient) -> None:
+        """Reload with no nodes returns empty results."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {}
+
+    def test_reload_permission_denied(self, client_no_perm: TestClient) -> None:
+        """Reload without admin.mcp permission is rejected."""
+        r = client_no_perm.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 403
+        assert "admin.mcp" in r.json()["error"]
+
+    def test_reload_no_storage(self) -> None:
+        """Reload returns 503 when auth_storage is not available."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        # Deliberately omit app.state.auth_storage
+        no_storage_client = TestClient(app, raise_server_exceptions=False)
+        r = no_storage_client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 503
+
+    def test_reload_mixed_node_results(self, client: TestClient) -> None:
+        """Reload propagates per-node errors in results."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={
+                "n1": {"reloaded": 2},
+                "n2": {"error": "Connection refused"},
+            },
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["results"]["n1"] == {"reloaded": 2}
+        assert "error" in data["results"]["n2"]
+
+    def test_reload_fails_loud_without_fanout_infra(self, storage: SQLiteBackend) -> None:
+        """F4 guard: the operator reload drains + reports, so with storage and
+        admin.mcp permission but no collector/proxy_client on app.state it must
+        fail loudly (500) — never silently 200 with empty results (which a
+        re-introduced None-guard would do)."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        # Deliberately omit app.state.collector / proxy_client.
+        c = TestClient(app, raise_server_exceptions=False)
+        r = c.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 500
+
+
+class TestMcpWriteAutoReload:
+    """create / update / delete schedule a node reload (after the 200) so a
+    write reaches nodes — and active per-user pools re-prime — without a
+    separate /reload. The fan-out rides only the success response; an error
+    return schedules nothing. (The error paths tested here return before the
+    row is written; a post-write secret-apply failure is a separate pre-existing
+    partial-write path, not exercised here.)"""
+
+    def test_create_notifies_nodes(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            _create_server(client, name="auto-reload-create")
+        notify.assert_awaited_once_with(ANY)
+
+    def test_update_notifies_nodes(self, client: TestClient) -> None:
+        sid = _create_server(client, name="auto-reload-update")["server_id"]
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"enabled": False})
+        assert r.status_code == 200
+        notify.assert_awaited_once()
+
+    def test_delete_notifies_nodes(self, client: TestClient) -> None:
+        sid = _create_server(client, name="auto-reload-delete")["server_id"]
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+        assert r.status_code == 200
+        notify.assert_awaited_once()
+
+    def test_delete_does_not_notify_on_missing_server(self, client: TestClient) -> None:
+        """A 404 (server not found) returns before the success response, so no
+        node reload is scheduled — the fan-out rides only the success path."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.delete("/v1/api/admin/mcp-servers/does-not-exist")
+        assert r.status_code == 404
+        notify.assert_not_awaited()
+
+    def test_update_does_not_notify_on_missing_server(self, client: TestClient) -> None:
+        """A 404 on update likewise schedules no reload."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.put("/v1/api/admin/mcp-servers/does-not-exist", json={"enabled": False})
+        assert r.status_code == 404
+        notify.assert_not_awaited()
+
+    def test_create_does_not_notify_on_secret_store_503(
+        self, client_no_token_store: TestClient
+    ) -> None:
+        """A create that 503s on the OAuth-secret token-store gate returns an
+        error before any write — so no reload is scheduled."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client_no_token_store.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": "no-notify-503",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/sse",
+                    "auth_type": "oauth_user",
+                    "oauth_client_id": "cli_abc",
+                    "oauth_client_secret": "secret-value",
+                },
+            )
+        assert r.status_code == 503, r.text
+        notify.assert_not_awaited()
+
+    def test_write_warns_when_reload_reaches_no_node(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A background fan-out that leaves nodes unreached is surfaced at
+        WARNING (not swallowed at debug) — operators need a signal the cluster
+        catalog may be stale, since there is no periodic node reconcile."""
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={"n1": {"error": "Connection refused"}},
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            _create_server(client, name="warn-on-stale")
+        assert any("did not reach" in r.getMessage() for r in caplog.records)
+
+    def test_write_warns_when_reload_fan_out_raises(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A systemic fan-out fault (the whole reload raises) is logged at
+        WARNING rather than lost, for the same reason."""
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("collector exploded"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            _create_server(client, name="warn-on-fault")
+        assert any("fan-out failed after admin write" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Node reload endpoint: POST /v1/api/_internal/mcp-reload
+# ---------------------------------------------------------------------------
+
+
+class TestInternalMcpReloadEndpoint:
+    """HTTP-level tests for the node-side MCP reload endpoint."""
+
+    @pytest.fixture()
+    def node_client(self, storage: SQLiteBackend) -> TestClient:
+        """TestClient with an MCP client manager on app.state."""
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        mgr = MagicMock()
+        mgr.reconcile_sync.return_value = {
+            "added": ["new-srv"],
+            "removed": [],
+            "updated": [],
+        }
+        app.state.mcp_client = mgr
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_reload_calls_reconcile(self, node_client: TestClient, storage: SQLiteBackend) -> None:
+        """Reload endpoint calls reconcile_sync and returns its result."""
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            r = node_client.post("/v1/api/_internal/mcp-reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["added"] == ["new-srv"]
+        assert data["removed"] == []
+        assert data["updated"] == []
+
+    def test_reload_passes_storage_to_reconcile(
+        self,
+        storage: SQLiteBackend,
+    ) -> None:
+        """Verify reconcile_sync receives the storage backend."""
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        mgr = MagicMock()
+        mgr.reconcile_sync.return_value = {"added": [], "removed": [], "updated": []}
+        app.state.mcp_client = mgr
+        c = TestClient(app, raise_server_exceptions=False)
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            r = c.post("/v1/api/_internal/mcp-reload")
+        assert r.status_code == 200
+        mgr.reconcile_sync.assert_called_once_with(storage)
+
+    def test_reload_creates_manager_when_missing(self, storage: SQLiteBackend) -> None:
+        """When mcp_client is absent, a new MCPClientManager is created."""
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        # No mcp_client on app.state
+        c = TestClient(app, raise_server_exceptions=False)
+        with (
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
+            patch("turnstone.core.mcp_client.MCPClientManager") as mock_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reconcile_sync.return_value = {
+                "added": [],
+                "removed": [],
+                "updated": [],
+            }
+            mock_cls.return_value = mock_mgr
+            r = c.post("/v1/api/_internal/mcp-reload")
+        assert r.status_code == 200
+        mock_cls.assert_called_once_with({})
+        mock_mgr.start.assert_called_once()
+        mock_mgr.reconcile_sync.assert_called_once_with(storage)
+
+    def test_reload_reconcile_result_in_response(self, storage: SQLiteBackend) -> None:
+        """Full reconcile result fields (added/removed/updated) appear in JSON."""
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        mgr = MagicMock()
+        mgr.reconcile_sync.return_value = {
+            "added": ["a"],
+            "removed": ["b"],
+            "updated": ["c"],
+        }
+        app.state.mcp_client = mgr
+        c = TestClient(app, raise_server_exceptions=False)
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            r = c.post("/v1/api/_internal/mcp-reload")
+        data = r.json()
+        assert data["added"] == ["a"]
+        assert data["removed"] == ["b"]
+        assert data["updated"] == ["c"]
+
+
+class TestInternalModelAuthCacheInvalidateEndpoint:
+    def test_service_identity_evicts_only_delegated_model_memo(self) -> None:
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectServiceAuthMiddleware)],
+        )
+        app.state.model_token_client = MagicMock()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.return_value = 2
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json={"user_id": "user-x"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "evicted": 2}
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_called_once_with(
+            user_id="user-x",
+            server_prefix="__model_obo__:",
+        )
+
+    def test_an_eviction_that_cannot_be_confirmed_is_not_reported_as_done(self) -> None:
+        """The console counts this node as evicted only on a 200."""
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectServiceAuthMiddleware)],
+        )
+        app.state.model_token_client = MagicMock()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.side_effect = TimeoutError()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json={"user_id": "user-x"},
+        )
+
+        assert response.status_code == 503
+        assert "evicted" not in response.json()
+
+    def test_non_service_identity_is_rejected(self) -> None:
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.model_token_client = MagicMock()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json={"user_id": "user-x"},
+        )
+
+        assert response.status_code == 403
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_not_called()
+
+    @pytest.mark.parametrize("body", [{}, {"user_id": ""}, {"user_id": "bad\nid"}])
+    def test_invalid_user_id_is_rejected(self, body: dict[str, str]) -> None:
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectServiceAuthMiddleware)],
+        )
+        app.state.model_token_client = MagicMock()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json=body,
+        )
+
+        assert response.status_code == 400
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _notify_nodes_mcp_refresh_one / _notify_nodes_mcp_reconnect_one
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyNodesMcpRefreshOne:
+    @pytest.mark.anyio
+    async def test_returns_json_on_success(self):
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"status": "ok"})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result == {
+            "n1": {"status": "ok"},
+            "console": {"skipped": "console MCP manager not running"},
+        }
+        # Verify the URL used the safe-encoded name segment
+        call_args = client.post.call_args
+        assert call_args[0][0].endswith("/v1/api/_internal/mcp-refresh/srv")
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result == {"console": {"skipped": "console MCP manager not running"}}
+        client.post.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_records_error_on_exception(self):
+        client = AsyncMock()
+        client.post.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert "n1" in result
+        assert "error" in result["n1"]
+        assert "refused" in result["n1"]["error"]
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        client = AsyncMock()
+        client.post.side_effect = [
+            _mock_resp(200, {"status": "ok"}),
+            TimeoutError("timeout"),
+        ]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result["n1"] == {"status": "ok"}
+        assert "error" in result["n2"]
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result == {"console": {"skipped": "console MCP manager not running"}}
+
+
+class TestNotifyNodesMcpReconnectOne:
+    @pytest.mark.anyio
+    async def test_returns_json_on_success(self):
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"status": "ok"})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result == {
+            "n1": {"status": "ok"},
+            "console": {"skipped": "console MCP manager not running"},
+        }
+        call_args = client.post.call_args
+        assert call_args[0][0].endswith("/v1/api/_internal/mcp-reconnect/srv")
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result == {"console": {"skipped": "console MCP manager not running"}}
+        client.post.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_records_error_on_exception(self):
+        client = AsyncMock()
+        client.post.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert "n1" in result
+        assert "error" in result["n1"]
+        assert "refused" in result["n1"]["error"]
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        client = AsyncMock()
+        client.post.side_effect = [
+            _mock_resp(200, {"status": "ok"}),
+            TimeoutError("timeout"),
+        ]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result["n1"] == {"status": "ok"}
+        assert "error" in result["n2"]
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result == {"console": {"skipped": "console MCP manager not running"}}
+
+
+class TestMcpActionConsoleArm:
+    """The action fan-out's console arm (#725): presence-gated,
+    membership pre-checked via the public status API, self-caught, keyed
+    under the console pseudo-node id."""
+
+    @pytest.mark.anyio
+    async def test_known_name_runs_outcome(self):
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"status": "ok"})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = {"srv": {}}
+        req.app.state.mcp_client = mgr
+        with patch(
+            "turnstone.console.server._console_mcp_action_outcome",
+            return_value={"status": "ok", "server": {"connected": True}},
+        ) as outcome:
+            result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        outcome.assert_called_once_with(mgr, "refresh", "srv")
+        assert result["console"] == {"status": "ok", "server": {"connected": True}}
+        assert result["n1"] == {"status": "ok"}
+
+    @pytest.mark.anyio
+    async def test_unknown_name_skips(self):
+        """Names only nodes know (e.g. a node's config-file servers) must
+        skip, never error through reconnect_sync's unknown-server arm."""
+        req = _fake_request()
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = {"other": {}}
+        req.app.state.mcp_client = mgr
+        result = await _notify_nodes_mcp_reconnect_one(req, "srv")
+        assert result["console"] == {"skipped": "not in console catalog"}
+        mgr.reconnect_sync.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_console_failure_isolated(self):
+        """A console-arm crash must not abandon collected node results —
+        raise-injection is load-bearing: the arm's own paths return
+        dicts, never raise."""
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"status": "ok"})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        mgr = MagicMock()
+        mgr.get_all_server_status.side_effect = RuntimeError("boom")
+        req.app.state.mcp_client = mgr
+        result = await _notify_nodes_mcp_refresh_one(req, "srv")
+        assert result["n1"] == {"status": "ok"}
+        assert "boom" in result["console"]["error"]
+
+
+class TestConsoleActionOutcomeParity:
+    """_console_mcp_action_outcome is a pinned COPY of the node
+    endpoints' outcome classification (internal_mcp_refresh_one /
+    internal_mcp_reconnect_one).  Drive BOTH sides with
+    identically-configured managers across the outcome matrix and assert
+    the payloads are EQUAL — this is the cell that fails if either side
+    drifts."""
+
+    _CLEAN_STATUS: dict[str, Any] = {
+        "connected": True,
+        "tools": 3,
+        "resources": 0,
+        "prompts": 1,
+        "error": "",
+        "transport": "stdio",
+        "command": "secret",
+        "url": "",
+        "circuit_open": False,
+        "consecutive_failures": 0,
+    }
+    _ERROR_STATUS: dict[str, Any] = {
+        **_CLEAN_STATUS,
+        "connected": False,
+        "error": "Refresh failed: connection refused",
+        "circuit_open": True,
+    }
+
+    def _node_json(self, storage: Any, mgr: Any, action: str) -> dict[str, Any]:
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        app.state.mcp_client = mgr
+        c = TestClient(app, raise_server_exceptions=False)
+        return c.post(f"/v1/api/_internal/mcp-{action}/srv").json()
+
+    def _refresh_mgr(self, *, status: dict[str, Any], outcome: Any, raises: Any) -> MagicMock:
+        mgr = MagicMock()
+        if raises is not None:
+            mgr.refresh_sync.side_effect = raises
+        else:
+            mgr.refresh_sync.return_value = {"srv": None}
+        mgr.get_server_status.return_value = dict(status)
+        mgr.last_refresh_outcome.return_value = outcome
+        return mgr
+
+    @pytest.mark.parametrize(
+        ("status", "outcome", "raises"),
+        [
+            pytest.param(_CLEAN_STATUS, None, None, id="ok"),
+            pytest.param(_ERROR_STATUS, None, None, id="per-server-error"),
+            pytest.param(_CLEAN_STATUS, "skipped", None, id="skipped"),
+            pytest.param(_ERROR_STATUS, "skipped", None, id="error-beats-skip"),
+            pytest.param(
+                _CLEAN_STATUS, None, RuntimeError("stdio /etc/shadow blew up"), id="raise"
+            ),
+        ],
+    )
+    def test_refresh_matrix_matches(
+        self, storage: SQLiteBackend, status: dict[str, Any], outcome: Any, raises: Any
+    ) -> None:
+        node = self._node_json(
+            storage, self._refresh_mgr(status=status, outcome=outcome, raises=raises), "refresh"
+        )
+        console = _console_mcp_action_outcome(
+            self._refresh_mgr(status=status, outcome=outcome, raises=raises), "refresh", "srv"
+        )
+        assert node == console
+
+    def _reconnect_mgr(self, *, result: Any, raises: Any) -> MagicMock:
+        mgr = MagicMock()
+        if raises is not None:
+            mgr.reconnect_sync.side_effect = raises
+        else:
+            mgr.reconnect_sync.return_value = result
+        mgr.get_server_status.return_value = dict(self._CLEAN_STATUS)
+        return mgr
+
+    @pytest.mark.parametrize(
+        ("result", "raises"),
+        [
+            pytest.param(
+                {"connected": True, "tools": 3, "resources": 0, "prompts": 1, "error": ""},
+                None,
+                id="ok",
+            ),
+            pytest.param(
+                {
+                    "connected": False,
+                    "tools": 0,
+                    "resources": 0,
+                    "prompts": 0,
+                    "error": "unknown server",
+                },
+                None,
+                id="error-dict",
+            ),
+            pytest.param(None, RuntimeError("boom"), id="raise"),
+        ],
+    )
+    def test_reconnect_matrix_matches(
+        self, storage: SQLiteBackend, result: Any, raises: Any
+    ) -> None:
+        node = self._node_json(
+            storage, self._reconnect_mgr(result=result, raises=raises), "reconnect"
+        )
+        console = _console_mcp_action_outcome(
+            self._reconnect_mgr(result=result, raises=raises), "reconnect", "srv"
+        )
+        assert node == console
+
+
+# ---------------------------------------------------------------------------
+# Console refresh / reconnect endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestAdminMcpRefreshOneEndpoint:
+    """HTTP-level tests for the console refresh-one endpoint."""
+
+    def test_refresh_one_success(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_action",
+            new_callable=AsyncMock,
+            return_value={"n1": {"status": "ok"}},
+        ) as mock_notify:
+            r = client.post("/v1/api/admin/mcp-servers/srv/refresh")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {"n1": {"status": "ok"}}
+        # The shared helper is called with the action verb.
+        mock_notify.assert_awaited_once()
+        args = mock_notify.await_args.args
+        assert args[1] == "refresh"
+        assert args[2] == "srv"
+
+    def test_refresh_one_permission_denied(self, client_no_perm: TestClient) -> None:
+        r = client_no_perm.post("/v1/api/admin/mcp-servers/srv/refresh")
+        assert r.status_code == 403
+        assert "admin.mcp" in r.json()["error"]
+
+    def test_refresh_one_invalid_name(self, client: TestClient) -> None:
+        # Names with '__' (reserved delimiter) are rejected.
+        r = client.post("/v1/api/admin/mcp-servers/bad__name/refresh")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+
+
+class TestAdminMcpReconnectOneEndpoint:
+    """HTTP-level tests for the console reconnect-one endpoint."""
+
+    def test_reconnect_one_success(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_action",
+            new_callable=AsyncMock,
+            return_value={"n1": {"status": "ok"}},
+        ) as mock_notify:
+            r = client.post("/v1/api/admin/mcp-servers/srv/reconnect")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {"n1": {"status": "ok"}}
+        mock_notify.assert_awaited_once()
+        args = mock_notify.await_args.args
+        assert args[1] == "reconnect"
+        assert args[2] == "srv"
+
+    def test_reconnect_one_permission_denied(self, client_no_perm: TestClient) -> None:
+        r = client_no_perm.post("/v1/api/admin/mcp-servers/srv/reconnect")
+        assert r.status_code == 403
+        assert "admin.mcp" in r.json()["error"]
+
+    def test_reconnect_one_invalid_name(self, client: TestClient) -> None:
+        r = client.post("/v1/api/admin/mcp-servers/bad__name/reconnect")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Node refresh-one endpoint: POST /v1/api/_internal/mcp-refresh/{name}
+# ---------------------------------------------------------------------------
+
+
+class TestInternalMcpRefreshOneEndpoint:
+    """HTTP-level tests for the node-side per-server refresh endpoint."""
+
+    @pytest.fixture()
+    def node_app_factory(self, storage: SQLiteBackend):
+        """Build a TestClient with an MCP client manager on app.state."""
+
+        def _make(mgr: Any) -> TestClient:
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(_InjectAuthMiddleware)],
+            )
+            app.state.auth_storage = storage
+            if mgr is not None:
+                app.state.mcp_client = mgr
+            return TestClient(app, raise_server_exceptions=False)
+
+        return _make
+
+    def test_refresh_one_success(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = None
+        mgr.get_server_status.return_value = {
+            "connected": True,
+            "tools": 3,
+            "resources": 0,
+            "prompts": 1,
+            "error": "",
+            "transport": "stdio",
+            "command": "/usr/bin/secret-stdio",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 0,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        # sec-3: command/url stripped from response.
+        assert "command" not in data["server"]
+        assert "url" not in data["server"]
+        assert data["server"]["tools"] == 3
+        mgr.refresh_sync.assert_called_once_with(server_name="srv")
+
+    def test_refresh_one_no_mcp_client_returns_503(self, node_app_factory) -> None:
+        c = node_app_factory(None)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 503
+        assert r.json()["status"] == "error"
+
+    def test_refresh_one_raises_returns_500(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.refresh_sync.side_effect = RuntimeError("internal stdio path /etc/shadow blew up")
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 500
+        # sec-2: raw exception detail must not leak to the caller.
+        body = r.json()
+        assert body["error"] == "refresh failed"
+        assert "shadow" not in body["error"]
+
+    def test_refresh_one_per_server_error_returns_500(self, node_app_factory) -> None:
+        # q-3 / bug-3: refresh_sync swallows per-server errors into _last_error,
+        # so a 200 from refresh_sync is not enough — get_server_status reports.
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = None
+        mgr.get_server_status.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "Refresh failed: connection refused",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": True,
+            "consecutive_failures": 5,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 500
+        data = r.json()
+        assert data["status"] == "error"
+        assert data["error"] == "refresh failed"
+        # Public status echoed but command/url stripped.
+        assert "command" not in data["server"]
+        assert "url" not in data["server"]
+        assert data["server"]["circuit_open"] is True
+
+    def test_refresh_one_skipped_returns_202(self, node_app_factory) -> None:
+        # A busy-lock skip never ran the refresh — it must NOT be reported
+        # as 200 "ok" (the caller would believe the catalog is current).
+        # 202 Accepted + status "skipped": the health-tick retry will run it.
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = {"srv": None}
+        # The endpoint reads the outcome from the manager accessor, not the
+        # stripped status (the public projection whitelists it out).
+        mgr.last_refresh_outcome.return_value = "skipped"
+        mgr.get_server_status.return_value = {
+            "connected": True,
+            "tools": 3,
+            "resources": 0,
+            "prompts": 1,
+            "error": "",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 0,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 202
+        data = r.json()
+        assert data["status"] == "skipped"
+        assert "command" not in data["server"]  # stripped
+        mgr.last_refresh_outcome.assert_called_with("srv")
+
+    def test_refresh_one_error_beats_skip_returns_500(self, node_app_factory) -> None:
+        # A skip on a server that ALSO carries a live error pill must
+        # surface as 500, not a benign 202 — a status-code-keyed caller
+        # would otherwise treat a genuinely erroring server as healthy.
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = {"srv": None}
+        mgr.last_refresh_outcome.return_value = "skipped"
+        mgr.get_server_status.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "Refresh failed: connection refused",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": True,
+            "consecutive_failures": 5,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 500, "a live error must win over the skip"
+        assert r.json()["status"] == "error"
+
+    def test_refresh_one_invalid_name_returns_400(self, node_app_factory) -> None:
+        # sec-4: name validation symmetric with console side.
+        mgr = MagicMock()
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/bad__name")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+        mgr.refresh_sync.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Node reconnect-one endpoint: POST /v1/api/_internal/mcp-reconnect/{name}
+# ---------------------------------------------------------------------------
+
+
+class TestInternalMcpReconnectOneEndpoint:
+    """HTTP-level tests for the node-side per-server reconnect endpoint."""
+
+    @pytest.fixture()
+    def node_app_factory(self, storage: SQLiteBackend):
+        """Build a TestClient with an MCP client manager on app.state."""
+
+        def _make(mgr: Any) -> TestClient:
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(_InjectAuthMiddleware)],
+            )
+            app.state.auth_storage = storage
+            if mgr is not None:
+                app.state.mcp_client = mgr
+            return TestClient(app, raise_server_exceptions=False)
+
+        return _make
+
+    def test_reconnect_one_success(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.reconnect_sync.return_value = {
+            "connected": True,
+            "tools": 2,
+            "resources": 0,
+            "prompts": 0,
+            "error": "",
+        }
+        mgr.get_server_status.return_value = {
+            "connected": True,
+            "tools": 2,
+            "resources": 0,
+            "prompts": 0,
+            "error": "",
+            "transport": "stdio",
+            "command": "secret-cmd",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 0,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        # sec-3: command/url stripped from response.
+        assert "command" not in data["server"]
+        assert "url" not in data["server"]
+        mgr.reconnect_sync.assert_called_once_with("srv")
+
+    def test_reconnect_one_no_mcp_client_returns_503(self, node_app_factory) -> None:
+        c = node_app_factory(None)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 503
+
+    def test_reconnect_one_returns_error_dict_500(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.reconnect_sync.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "secret stdio at /etc/shadow timed out",
+        }
+        mgr.get_server_status.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "secret stdio at /etc/shadow timed out",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 1,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 500
+        body = r.json()
+        # The top-level `error` is generic; the inner `server.error` echoes
+        # whatever ``get_server_status`` returned (still admin-facing).
+        assert body["error"] == "reconnect failed"
+        assert "command" not in body["server"]
+        assert "url" not in body["server"]
+
+    def test_reconnect_one_raises_returns_500(self, node_app_factory) -> None:
+        mgr = MagicMock()
+        mgr.reconnect_sync.side_effect = RuntimeError("internal stdio /etc/shadow blew up")
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/srv")
+        assert r.status_code == 500
+        body = r.json()
+        assert body["error"] == "reconnect failed"
+        assert "shadow" not in body["error"]
+
+    def test_reconnect_one_invalid_name_returns_400(self, node_app_factory) -> None:
+        # sec-4: name validation symmetric with console side.
+        mgr = MagicMock()
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-reconnect/bad__name")
+        assert r.status_code == 400
+        assert "invalid" in r.json()["error"].lower()
+        mgr.reconnect_sync.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Node fan-out status endpoint: GET /v1/api/_internal/mcp-status
+# ---------------------------------------------------------------------------
+
+_SKIP_REASON = (
+    "inputSchema.properties.id.type is not one of "
+    "['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']"
+)
+
+
+class TestInternalMcpStatusEndpoint:
+    """HTTP-level tests for the node-side aggregate status endpoint.
+
+    The endpoint falls through to ``read`` scope (a deliberate choice
+    so dashboards can render status indicators for non-admin
+    operators). Because of that, the response must strip ``command``
+    (stdio argv) and ``url`` (remote MCP endpoint) — both admin-only
+    context — before it leaves the process.
+    """
+
+    @pytest.fixture()
+    def node_app_factory(self, storage: SQLiteBackend):
+        def _make(mgr: Any, middleware_cls: type = _InjectAuthMiddleware) -> TestClient:
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(middleware_cls)],
+            )
+            app.state.auth_storage = storage
+            if mgr is not None:
+                app.state.mcp_client = mgr
+            return TestClient(app, raise_server_exceptions=False)
+
+        return _make
+
+    @staticmethod
+    def _status_with_secrets() -> dict[str, dict[str, Any]]:
+        return {
+            "srv-stdio": {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                # Error text would carry the binary path even after
+                # ``command`` is stripped — read scope must not see it.
+                "error": "FileNotFoundError: [Errno 2] No such file or "
+                "directory: '/usr/local/bin/secret-mcp-bin'",
+                "transport": "stdio",
+                "command": ["/usr/local/bin/secret-mcp-bin", "--token", "abc"],
+                "url": "",
+                "circuit_open": True,
+                "consecutive_failures": 5,
+            },
+            "srv-http": {
+                "connected": True,
+                "tools": 1,
+                "skipped_tools": [{"name": "lookup", "reason": _SKIP_REASON}],
+                "resources": 1,
+                "prompts": 0,
+                "error": "",
+                "transport": "streamable-http",
+                "command": "",
+                "url": "https://internal-mcp.example/mcp",
+                "circuit_open": False,
+                "consecutive_failures": 0,
+            },
+        }
+
+    def test_status_strips_command_url_and_error(self, node_app_factory) -> None:
+        """A read-scope caller without admin.mcp (a dashboard) gets no error text."""
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = self._status_with_secrets()
+        c = node_app_factory(mgr, _InjectAuthNoMcpMiddleware)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        servers = r.json()["servers"]
+        assert set(servers) == {"srv-stdio", "srv-http"}
+        for entry in servers.values():
+            assert "command" not in entry
+            assert "url" not in entry
+            # ``error`` text is replaced by ``has_error`` boolean so a
+            # FileNotFoundError binary path or httpx2 URL cannot leak
+            # through verbose exception messages at read scope.
+            assert "error" not in entry
+            assert "has_error" in entry
+            # The tools a catalog leaves out are for the admins who fix the server.
+            assert "skipped_tools" not in entry
+        # Coarse error indicator preserved.
+        assert servers["srv-stdio"]["has_error"] is True
+        assert servers["srv-http"]["has_error"] is False
+        # Operational fields preserved.
+        assert servers["srv-http"]["tools"] == 1
+        assert servers["srv-http"]["transport"] == "streamable-http"
+        assert servers["srv-stdio"]["circuit_open"] is True
+        # No leaked binary path anywhere in the rendered response.
+        assert "secret-mcp-bin" not in r.text
+
+    def test_status_gives_admins_the_error_text(self, node_app_factory) -> None:
+        """An admin.mcp caller (the console's MCP list) also gets why a server failed; it
+        already sees every server's command and url through the admin API."""
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = self._status_with_secrets()
+        c = node_app_factory(mgr)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        servers = r.json()["servers"]
+        assert servers["srv-stdio"]["error"] == (
+            "FileNotFoundError: [Errno 2] No such file or directory: "
+            "'/usr/local/bin/secret-mcp-bin'"
+        )
+        assert servers["srv-stdio"]["has_error"] is True
+        assert servers["srv-http"]["error"] == ""
+        assert servers["srv-http"]["has_error"] is False
+        assert servers["srv-http"]["skipped_tools"] == [{"name": "lookup", "reason": _SKIP_REASON}]
+        for entry in servers.values():
+            assert "command" not in entry
+            assert "url" not in entry
+
+    def test_status_gives_a_read_scoped_token_no_error_text(self, node_app_factory) -> None:
+        """A read-only monitoring token an admin minted gets the dashboard's view: the error
+        text needs the approve scope as well as admin.mcp."""
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = self._status_with_secrets()
+        c = node_app_factory(mgr, _InjectReadTokenWithMcpMiddleware)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        servers = r.json()["servers"]
+        assert all("error" not in entry for entry in servers.values())
+        assert all("skipped_tools" not in entry for entry in servers.values())
+        assert servers["srv-stdio"]["has_error"] is True
+        assert "secret-mcp-bin" not in r.text
+
+    def test_status_no_mcp_client_returns_empty_servers(self, node_app_factory) -> None:
+        c = node_app_factory(None)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        assert r.json() == {"servers": {}}
+
+    def test_status_aggregate_gated_on_admin_mcp_permission(self, storage: SQLiteBackend) -> None:
+        """oauth_user status is cross-user-aggregated ONLY for callers holding
+        admin.mcp (the console cluster-health view). A read/approve user without
+        it gets aggregate=False — strictly their own pool, the leak guard."""
+
+        def _aggregate_arg(middleware_cls: type) -> Any:
+            mgr = MagicMock()
+            mgr.get_all_server_status.return_value = {}
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(middleware_cls)],
+            )
+            app.state.auth_storage = storage
+            app.state.mcp_client = mgr
+            client = TestClient(app, raise_server_exceptions=False)
+            assert client.get("/v1/api/_internal/mcp-status").status_code == 200
+            return mgr.get_all_server_status.call_args
+
+        admin_call = _aggregate_arg(_InjectAuthMiddleware)
+        assert admin_call.kwargs.get("aggregate") is True
+
+        user_call = _aggregate_arg(_InjectAuthNoMcpMiddleware)
+        assert user_call.kwargs.get("aggregate") is False
+
+
+# ---------------------------------------------------------------------------
+# _ensure_console_mcp_client (#725) — the ONE locked construct/reconcile path
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureConsoleMcpClient:
+    """Matrix for the console's MCP ensure-helper: the ONE post-boot
+    lazy-construct/reconcile path, shared by the reload fan-out (all
+    admin-write producers) and the operator POST /reload."""
+
+    def _app(
+        self,
+        *,
+        manager: Any = None,
+        config_path: Any = None,
+        dynamic_model_auth: bool = False,
+    ) -> Any:
+        import types
+
+        state = types.SimpleNamespace()
+        state.auth_storage = MagicMock()
+        state.coord_registry = MagicMock()
+        state.coord_registry.has_dynamic_auth.return_value = dynamic_model_auth
+        cs = MagicMock()
+        cs.get.side_effect = lambda k, d=None: config_path if k == "mcp.config_path" else d
+        state.config_store = cs
+        if manager is not None:
+            state.mcp_client = manager
+        return types.SimpleNamespace(state=state)
+
+    def test_reconcile_arm_runs_with_existing_manager(self):
+        """Keep-surface semantics: an existing manager keeps receiving
+        catalog updates — running coordinators track admin edits exactly
+        like node sessions do."""
+        mgr = MagicMock()
+        mgr.reconcile_sync.return_value = {"added": [], "removed": ["s"], "updated": []}
+        app = self._app(manager=mgr)
+        out = _ensure_console_mcp_client(app)
+        mgr.reconcile_sync.assert_called_once_with(app.state.auth_storage)
+        assert out == {"added": [], "removed": ["s"], "updated": []}
+
+    def test_construct_arm_uses_create_mcp_client(self):
+        """Node parity pin: construction goes through create_mcp_client —
+        the node's constructor and catalog resolution (DB →
+        mcp.config_path → config.toml) — with the manager stored on
+        app.state and then reconciled."""
+        from unittest.mock import patch
+
+        with patch("turnstone.core.mcp_client.create_mcp_client") as create:
+            app = self._app(config_path="/etc/turnstone/mcp.json")
+            out = _ensure_console_mcp_client(app)
+            create.assert_called_once_with(
+                "/etc/turnstone/mcp.json",
+                storage=app.state.auth_storage,
+            )
+            inst = create.return_value
+            assert app.state.mcp_client is inst
+            inst.set_storage.assert_called_once_with(app.state.auth_storage)
+            inst.set_app_state.assert_called_once_with(app.state)
+            inst.reconcile_sync.assert_called_once_with(app.state.auth_storage)
+            assert out is inst.reconcile_sync.return_value
+
+    def test_dynamic_model_auth_does_not_require_an_mcp_manager(self):
+        from unittest.mock import patch
+
+        from turnstone.core.model_oauth import get_model_token_client
+
+        with patch("turnstone.core.mcp_client.create_mcp_client", return_value=None) as create:
+            app = self._app(dynamic_model_auth=True)
+            client = get_model_token_client(app.state)
+            result = _ensure_console_mcp_client(app)
+
+        create.assert_called_once_with(None, storage=app.state.auth_storage)
+        assert result == {"skipped": "no MCP servers configured"}
+        assert getattr(app.state, "mcp_client", None) is None
+        assert get_model_token_client(app.state) is client
+
+    def test_nothing_configured_skips(self):
+        """create_mcp_client returning None (no DB rows, no file config)
+        is a skip, not an error — and nothing is stored on app.state."""
+        from unittest.mock import patch
+
+        with patch("turnstone.core.mcp_client.create_mcp_client", return_value=None):
+            app = self._app()
+            out = _ensure_console_mcp_client(app)
+        assert out == {"skipped": "no MCP servers configured"}
+        assert getattr(app.state, "mcp_client", None) is None
+
+    def test_concurrent_triggers_construct_exactly_once(self):
+        """Two rapid triggers with no manager built must construct exactly one manager.
+
+        The module lock prevents an orphaned manager from leaking its event-loop thread and
+        connections.
+        """
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+
+        constructed: list[Any] = []
+
+        def _slow_create(
+            config_path: Any = None,
+            *,
+            storage: Any = None,
+            required: bool = False,
+        ) -> Any:
+            time.sleep(0.05)
+            mgr = MagicMock()
+            mgr.reconcile_sync.return_value = {"added": [], "removed": [], "updated": []}
+            constructed.append(mgr)
+            return mgr
+
+        with patch("turnstone.core.mcp_client.create_mcp_client", _slow_create):
+            app = self._app()
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                results = list(ex.map(lambda _: _ensure_console_mcp_client(app), range(2)))
+        assert len(constructed) == 1, "double-construct: the ensure lock failed"
+        assert app.state.mcp_client is constructed[0]
+        assert all(r == {"added": [], "removed": [], "updated": []} for r in results)
+
+
+# ---------------------------------------------------------------------------
+# A dynamically registered client follows the authorization server
+# ---------------------------------------------------------------------------
+
+
+class TestDcrClientFollowsTheAuthorizationServer:
+    """When the server moves to another authorization server, a dynamically registered client
+    goes, id and secret alike, so its secret is never sent to the new one."""
+
+    @staticmethod
+    def _dcr_row(
+        client: Any,
+        storage: Any,
+        name: str,
+        *,
+        override: str | None = "https://as1.example.com",
+        mode: str = "dcr",
+    ) -> tuple[str, Any]:
+        body: dict[str, Any] = {
+            "name": name,
+            "transport": "streamable-http",
+            "url": "https://mcp.example.com/sse",
+            "auth_type": "oauth_user",
+            "oauth_registration_mode": mode,
+        }
+        if override:
+            body["oauth_authorization_server_url"] = override
+        r = client.post("/v1/api/admin/mcp-servers", json=body)
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        token_store = oauth_context(client.app.state).token_store
+        storage.update_mcp_server(sid, oauth_client_id="client-from-as1")
+        token_store.set_oauth_client_secret(sid, "secret-from-as1")
+        return sid, token_store
+
+    @staticmethod
+    def _state(storage: Any, token_store: Any, sid: str) -> tuple[Any, Any, Any]:
+        row = storage.get_mcp_server(sid)
+        return (
+            row["oauth_registration_mode"],
+            row["oauth_client_id"],
+            token_store.get_oauth_client_secret(sid),
+        )
+
+    def test_a_move_to_another_authorization_server_drops_the_client(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-move")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://as2.example.com"},
+        )
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", None, None)
+        # A client id typed afterwards for the new server pairs with no old secret.
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_registration_mode": "preregistered", "oauth_client_id": "typed-for-as2"},
+        )
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("preregistered", "typed-for-as2", None)
+        assert len(storage.list_audit_events(action="mcp_server.oauth.client_secret_set")) == 1
+
+    @pytest.mark.parametrize(
+        ("client_id", "expected_id"),
+        [("client-from-as1", None), ("typed-for-as2", "typed-for-as2")],
+        ids=["the-stored-id-sent-back", "a-new-id"],
+    )
+    def test_one_save_that_moves_and_switches_to_preregistered(
+        self, client, storage, client_id: str, expected_id: str | None
+    ):
+        sid, store = self._dcr_row(client, storage, "dcr-switch")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as2.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_client_id": client_id,
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("preregistered", expected_id, None)
+
+    def test_a_server_url_change_that_rediscovers_drops_the_client(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-url", override=None)
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}", json={"url": "https://mcp-b.example.com/mcp"}
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", None, None)
+
+    def test_a_secret_typed_with_the_move_is_kept(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-typed")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as2.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_client_id": "typed-for-as2",
+                "oauth_client_secret": "typed-secret",
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == (
+            "preregistered",
+            "typed-for-as2",
+            "typed-secret",
+        )
+
+    def test_a_save_that_moves_nothing_keeps_the_client(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-same")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as1.example.com",
+                "oauth_registration_mode": "dcr",
+                "oauth_client_id": "client-from-as1",
+                "url": "https://mcp.example.com/sse",
+                "enabled": False,
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", "client-from-as1", "secret-from-as1")
+
+    def test_a_preregistered_client_is_the_operators_and_stays(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-prereg", mode="preregistered")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://as2.example.com"},
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == (
+            "preregistered",
+            "client-from-as1",
+            "secret-from-as1",
+        )
+
+    def test_a_switch_into_dynamic_registration_with_a_move_drops_the_old_client(
+        self, client, storage
+    ):
+        sid, store = self._dcr_row(client, storage, "dcr-into", mode="preregistered")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as2.example.com",
+                "oauth_registration_mode": "dcr",
+                "oauth_client_id": "client-from-as1",
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", None, None)
+
+
+# ---------------------------------------------------------------------------
+# An update decides from the row it writes
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateDecidesFromTheRowItWrites:
+    """The purge and the client decisions come from the row read before the body; the write
+    applies only while the row still holds those values."""
+
+    @staticmethod
+    def _oauth_server(client: Any, name: str) -> str:
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": "https://legit.example.com/mcp",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli",
+            },
+        )
+        assert r.status_code == 200, r.text
+        return str(r.json()["server_id"])
+
+    def test_a_binding_changed_by_another_request_meanwhile_answers_409(self, client, storage):
+        sid = self._oauth_server(client, "cas-race")
+        _plant_grant(storage, "cas-race")
+
+        async def _other_request_lands(*_args: Any, **_kwargs: Any) -> None:
+            # Another admin points the server elsewhere while this request awaits its checks.
+            storage.update_mcp_server(
+                sid, url="https://elsewhere.example.com/mcp", purge_oauth_rows=True
+            )
+            _plant_grant(storage, "cas-race")
+
+        with (
+            patch(
+                "turnstone.console.server._check_mcp_secret_fields",
+                side_effect=_other_request_lands,
+            ),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"url": "https://legit.example.com/mcp", "enabled": False},
+            )
+
+        assert r.status_code == 409, r.text
+        row = storage.get_mcp_server(sid)
+        assert row["url"] == "https://elsewhere.example.com/mcp"
+        assert row["enabled"] is True
+        assert storage.list_audit_events(action="mcp_server.update") == []
+        notify.assert_not_awaited()
+
+    def test_a_server_deleted_meanwhile_answers_404(self, client, storage):
+        sid = self._oauth_server(client, "cas-gone")
+
+        async def _deleted(*_args: Any, **_kwargs: Any) -> None:
+            storage.delete_mcp_server(sid)
+
+        with patch("turnstone.console.server._check_mcp_secret_fields", side_effect=_deleted):
+            r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"enabled": False})
+
+        assert r.status_code == 404, r.text
+
+    def test_a_stored_registration_mode_sent_back_unchanged_is_kept(self, client, storage):
+        """A row saved with the old 'dynamic' value stays editable by a client that writes the
+        row back; only a change of the value is checked."""
+        sid = self._oauth_server(client, "cas-dynamic")
+        storage.update_mcp_server(sid, oauth_registration_mode="dynamic")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"enabled": False, "oauth_registration_mode": "dynamic"},
+        )
+
+        assert r.status_code == 200, r.text
+        row = storage.get_mcp_server(sid)
+        assert (row["enabled"], row["oauth_registration_mode"]) == (False, "dynamic")
+
+
+# ---------------------------------------------------------------------------
+# Writes storage cannot finish
+# ---------------------------------------------------------------------------
+
+
+class TestServerWritesStorageCannotFinish:
+    @staticmethod
+    def _quiet_reload() -> Any:
+        return patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        )
+
+    def test_a_create_storage_cannot_finish_changes_nothing(self, client, storage):
+        with (
+            _failing_statement(storage, "DELETE FROM oauth_tokens"),
+            self._quiet_reload() as notify,
+        ):
+            r = client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": "create-fail",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/mcp",
+                },
+            )
+
+        assert r.status_code == 503, r.text
+        assert r.json()["error"] == (
+            "The change could not be saved, and nothing was changed. Try again."
+        )
+        assert storage.get_mcp_server_by_name("create-fail") is None
+        assert storage.list_audit_events(action="mcp_server.create") == []
+        notify.assert_not_awaited()
+
+    def test_a_delete_of_a_server_gone_meanwhile_answers_404(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "gone", "transport": "streamable-http", "url": "https://m.example.com"},
+        )
+        sid = r.json()["server_id"]
+        row = storage.get_mcp_server(sid)
+        storage.delete_mcp_server(sid)
+
+        with (
+            patch.object(storage, "get_mcp_server", return_value=row),
+            self._quiet_reload() as notify,
+        ):
+            r2 = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+
+        assert r2.status_code == 404, r2.text
+        assert storage.list_audit_events(action="mcp_server.delete") == []
+        notify.assert_not_awaited()
+
+    def test_a_secret_sent_with_an_update_storage_cannot_finish_is_not_stored(
+        self, client, storage
+    ):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "secret-fail",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/mcp",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli",
+            },
+        )
+        sid = r.json()["server_id"]
+
+        with _failing_statement(storage, "UPDATE mcp_servers"), self._quiet_reload() as notify:
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"oauth_client_secret": "new-secret"}
+            )
+
+        assert r2.status_code == 503, r2.text
+        assert storage.get_mcp_oauth_client_secret_ct(sid) is None
+        notify.assert_not_awaited()
+
+    def test_an_import_storage_cannot_finish_reports_a_fixed_error(self, client, storage):
+        config = {"mcpServers": {"kept-out": {"url": "https://mcp.example.com/mcp"}}}
+
+        with (
+            _failing_statement(storage, "INSERT OR IGNORE INTO mcp_servers"),
+            self._quiet_reload(),
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["errors"] == ["kept-out: could not be saved; nothing was changed"]
+        assert storage.get_mcp_server_by_name("kept-out") is None

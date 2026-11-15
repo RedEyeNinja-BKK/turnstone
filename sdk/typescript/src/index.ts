@@ -1,0 +1,219 @@
+/**
+ * @turnstone/sdk — TypeScript client SDK for the turnstone AI orchestration platform.
+ *
+ * @example
+ * ```ts
+ * import { TurnstoneServer } from "@turnstone/sdk";
+ *
+ * const client = new TurnstoneServer({
+ *   baseUrl: "http://localhost:8080",
+ *   token: "ts_your_api_token",
+ * });
+ *
+ * const ws = await client.createWorkstream({ name: "demo" });
+ * const result = await client.sendAndWait("Hello!", ws.ws_id);
+ * console.log(result.content);
+ * ```
+ */
+
+// Clients
+export { TurnstoneServer } from "./server.js";
+export { TurnstoneConsole } from "./console.js";
+export type { ClientOptions, TlsOptions } from "./base.js";
+
+// Errors
+export { TurnstoneAPIError } from "./errors.js";
+
+// Event types and guards
+export type {
+  ServerEvent,
+  ClusterEvent,
+  ConnectedEvent,
+  HistoryEvent,
+  HistoryResyncEvent,
+  UserTurnEvent,
+  ThinkingStartEvent,
+  ThinkingStopEvent,
+  ContentEvent,
+  ReasoningEvent,
+  StreamEndEvent,
+  AgentContextEvent,
+  StateChangeEvent,
+  ToolInfoEvent,
+  ApproveRequestEvent,
+  ApprovalResolvedEvent,
+  ToolResultEvent,
+  ToolOutputChunkEvent,
+  StatusEvent,
+  InfoEvent,
+  ErrorEvent,
+  BusyErrorEvent,
+  ClearUiEvent,
+  CancelledEvent,
+  WsStateEvent,
+  WsActivityEvent,
+  WsRenameEvent,
+  WsClosedEvent,
+  WsUnloadedEvent,
+  NodeJoinedEvent,
+  NodeLostEvent,
+  ClusterStateEvent,
+  ClusterWsCreatedEvent,
+  ClusterWsClosedEvent,
+  ClusterWsUnloadedEvent,
+  ClusterWsRenameEvent,
+  ClusterSnapshotEvent,
+} from "./events.js";
+
+export {
+  isContentEvent,
+  isReasoningEvent,
+  isErrorEvent,
+  isStreamEndEvent,
+  isAgentContextEvent,
+  isStateChangeEvent,
+  isToolResultEvent,
+  isWsStateEvent,
+  isApproveRequestEvent,
+  isApprovalResolvedEvent,
+  isCancelledEvent,
+  isHistoryResyncEvent,
+  isUserTurnEvent,
+} from "./events.js";
+
+// Request/response types
+export type {
+  ConversationPersistenceState,
+  SendRequest,
+  SendResponse,
+  ApproveRequest,
+  ApproveResponse,
+  CancelRequest,
+  CancelResponse,
+  CommandRequest,
+  CreateWorkstreamRequest,
+  CreateWorkstreamResponse,
+  CloseWorkstreamRequest,
+  WorkstreamInfo,
+  ListWorkstreamsResponse,
+  WorkstreamHistoryResponse,
+  StreamEventsOptions,
+  DashboardWorkstream,
+  DashboardAggregate,
+  DashboardResponse,
+  SavedWorkstreamInfo,
+  ListSavedWorkstreamsOptions,
+  ListSavedWorkstreamsResponse,
+  BackendStatus,
+  McpStatus,
+  WorkstreamCounts,
+  HealthResponse,
+  AuthLoginRequest,
+  AuthLoginResponse,
+  AuthStatusResponse,
+  AuthSetupResponse,
+  UserAvatar,
+  DeleteSettingResponse,
+  StatusResponse,
+  ErrorResponse,
+  ClusterOverviewResponse,
+  ClusterNodeInfo,
+  ClusterNodesResponse,
+  ClusterSnapshotNode,
+  ClusterSnapshotResponse,
+  ClusterWorkstreamInfo,
+  ClusterWorkstreamsResponse,
+  NodeDetailResponse,
+  ConsoleCreateWsRequest,
+  ConsoleCreateWsResponse,
+  RouteCreateRequest,
+  RouteCreateResponse,
+  RouteLiveResponse,
+  ConsoleHealthResponse,
+  CreateScheduleRequest,
+  UpdateScheduleRequest,
+  ScheduleInfo,
+  ScheduleRunInfo,
+  ListSchedulesResponse,
+  ListScheduleRunsResponse,
+  RoleInfo,
+  CreateRoleOptions,
+  UpdateRoleOptions,
+  UserRoleInfo,
+  OrgInfo,
+  UpdateOrgOptions,
+  ToolPolicyInfo,
+  CreatePolicyOptions,
+  UpdatePolicyOptions,
+  SkillSummary,
+  SkillInfo,
+  CreateSkillRequest,
+  UpdateSkillRequest,
+  ListSkillsResponse,
+  SkillResourceInfo,
+  ListSkillResourcesResponse,
+  CreateSkillResourceRequest,
+  UsageBreakdownItem,
+  UsageResponse,
+  UsageQueryOptions,
+  AuditEventInfo,
+  AuditQueryOptions,
+  AuditResponse,
+  TurnResult,
+  SendAndWaitOptions,
+  NodesOptions,
+  WorkstreamsOptions,
+  // Memory types
+  SaveMemoryRequest,
+  MemorySummary,
+  MemoryInfo,
+  ListMemoriesResponse,
+  SearchMemoriesRequest,
+  ListMemoriesOptions,
+  MemoryScopeOptions,
+  GetMemoryOptions,
+  DeleteMemoryOptions,
+  AdminMemorySummary,
+  AdminMemoryInfo,
+  ListAdminMemoriesResponse,
+  AdminListMemoriesOptions,
+  AdminSearchMemoriesOptions,
+  MemoryIndexHealthResponse,
+  // Settings types
+  SettingInfo,
+  ListSettingsResponse,
+  SettingSchemaInfo,
+  ListSettingSchemaResponse,
+  UpdateSettingOptions,
+  // MCP server types
+  McpSkippedTool,
+  McpServerStatus,
+  McpServerDetail,
+  ListMcpServersResponse,
+  CreateMcpServerRequest,
+  UpdateMcpServerRequest,
+  ImportMcpConfigResponse,
+  McpConnectionTestRequest,
+  McpConnectionTestResponse,
+  // MCP registry types
+  RegistryRemoteInfo,
+  RegistryPackageInfo,
+  RegistryServerInfo,
+  RegistrySearchResponse,
+  RegistryInstallRequest,
+  // Skill discovery types
+  SkillDiscoverListing,
+  SkillDiscoverResponse,
+  SkillInstallRequest,
+  SkillInstallResponse,
+  SkillInstallSkipped,
+  // Attachment types
+  AttachmentUpload,
+  AttachmentInfo,
+  UploadAttachmentResponse,
+  ListAttachmentsResponse,
+  AttachmentContent,
+} from "./types.js";
+
+// SSE parser (for advanced usage)
+export { parseSSEStream } from "./sse.js";

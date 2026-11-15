@@ -1,0 +1,23 @@
+{
+  "name": "recall",
+  "description": "Search conversation history for past messages, tool results, and interactions across sessions.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search term or phrase to find in conversation history."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max results to return (default 20, max 50)."
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Skip this many results for pagination. Default 0."
+      }
+    },
+    "required": ["query"]
+  },
+  "primary_key": "query"
+}

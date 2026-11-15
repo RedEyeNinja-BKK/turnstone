@@ -1,0 +1,2035 @@
+"""HTTP endpoint tests for workstream attachments.
+
+Uses Starlette's TestClient against an in-process app with a mocked
+SessionManager.  Exercises: upload happy path, size/mime rejection,
+pending-list, GET /content, DELETE, auth isolation, and the extended
+/api/send handler with both explicit and auto-consumed attachment ids.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import queue
+import threading
+import time
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, call
+
+import httpx2
+import pytest
+from starlette.testclient import TestClient
+
+from tests._helpers import opaque_png, slot_held, wait_until
+from turnstone.core.audio import _TTS_BACKEND_TIMEOUT_S
+from turnstone.core.settings_registry import SETTINGS
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+# Magic-byte-valid 1x1 PNG
+PNG_1x1 = opaque_png()
+
+# Magic-byte-valid minimal WAV (RIFF....WAVE) for audio-kind uploads.
+WAV_12 = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 16
+
+_TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
+
+
+def _make_jwt(user_id: str, scopes: frozenset[str] = frozenset({"read", "write"})) -> str:
+    from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
+
+    return create_jwt(
+        user_id=user_id,
+        scopes=scopes,
+        source="test",
+        secret=_TEST_JWT_SECRET,
+        audience=JWT_AUD_SERVER,
+    )
+
+
+@pytest.fixture
+def app_client(tmp_path):
+    """Spin up an in-process Starlette app with a mocked SessionManager
+    and a fresh SQLite storage."""
+    import sqlalchemy as sa
+
+    import turnstone.server as srv_mod
+    from turnstone.core.memory import register_workstream
+    from turnstone.core.metrics import MetricsCollector
+    from turnstone.core.storage import init_storage, reset_storage
+    from turnstone.core.storage._registry import get_storage
+    from turnstone.core.storage._schema import workstreams as ws_tbl
+
+    # Fresh DB per test
+    db_path = tmp_path / "test.db"
+    reset_storage()
+    init_storage("sqlite", path=str(db_path), run_migrations=False)
+
+    srv_mod._metrics = MetricsCollector()
+    srv_mod._metrics.model = "test-model"
+
+    # Register two workstreams with different owners
+    register_workstream("ws-A", name="A")
+    register_workstream("ws-B", name="B")
+    # Seed user_id on the rows so ownership checks take the scoped path
+    with get_storage()._conn() as conn:
+        conn.execute(sa.update(ws_tbl).where(ws_tbl.c.ws_id == "ws-A").values(user_id="userA"))
+        conn.execute(sa.update(ws_tbl).where(ws_tbl.c.ws_id == "ws-B").values(user_id="userB"))
+        conn.commit()
+
+    # SessionManager mock returns None for get(); send endpoint handles that,
+    # but we bypass send to focus on attachments.  get() returning a mock is
+    # only needed for /api/send; upload/list/content/delete don't use mgr.
+    mock_mgr = MagicMock()
+    mock_mgr.get.return_value = None
+    mock_mgr.list_all.return_value = []
+    mock_mgr.max_active = 10
+
+    app = srv_mod.create_app(
+        workstreams=mock_mgr,
+        global_queue=queue.Queue(),
+        global_listeners=[],
+        global_listeners_lock=threading.Lock(),
+        skip_permissions=False,
+        jwt_secret=_TEST_JWT_SECRET,
+    )
+    # Pending uploads live in the process-global per-node buffer now; clear it
+    # so staged uploads can't leak across tests.
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    get_attachment_buffer().clear()
+
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        yield client, mock_mgr
+    finally:
+        client.close()
+        get_attachment_buffer().clear()
+        reset_storage()
+
+
+def _auth(user: str, scopes: frozenset[str] = frozenset({"read", "write"})) -> dict[str, str]:
+    return {"Authorization": f"Bearer {_make_jwt(user, scopes)}"}
+
+
+def _harden_ws_mock(ws) -> None:
+    """Neutralize every truthy-Mock trap the /send dispatch path reads.
+
+    A bare ``MagicMock()`` auto-creates truthy attributes and callables,
+    which the route misreads: a truthy ``_closed`` makes ``send()``
+    refuse; truthy ``_pending_sends``/``_pending_drain`` (and a truthy
+    ``send_barrier_active()`` result — the route consults the barrier as
+    a METHOD) defer every send behind a phantom order barrier.  Every
+    NEW Workstream field the dispatch path reads gets added HERE, once —
+    not appended to each fixture (missing one copy made that fixture's
+    sends defer/hang with an error pointing nowhere near the cause).
+    Deliberately does NOT set ``_worker_running``: fixtures choose that
+    per scenario (one even relies on the truthy auto-Mock to force the
+    queue path).
+    """
+    ws._closed = False
+    ws._pending_sends = []
+    ws._pending_drain = None
+    ws._worker_principal_id = ""
+    ws.send_barrier_active = lambda: False
+    ws._lock = threading.RLock()
+
+
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+
+
+class TestUploadHappyPath:
+    def test_upload_png(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("tiny.png", PNG_1x1, "image/png")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kind"] == "image"
+        assert body["mime_type"] == "image/png"
+        assert body["size_bytes"] == len(PNG_1x1)
+        assert body["filename"] == "tiny.png"
+        assert body["attachment_id"]
+
+    def test_upload_stores_a_transparent_image_flattened(self, app_client):
+        # #1445: providers each remove transparency their own way, so an image is flattened
+        # once, on upload, and the stored copy is what every model is sent and the id names.
+        import hashlib
+        from io import BytesIO
+
+        from PIL import Image
+
+        client, _ = app_client
+        src = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
+        src.paste((255, 255, 255, 255), (10, 5, 30, 15))
+        uploaded = BytesIO()
+        src.save(uploaded, format="PNG")
+        aid = _upload(client, "ws-A", "userA", "title.png", uploaded.getvalue(), "image/png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert aid == hashlib.sha256(resp.content).hexdigest()
+        stored = Image.open(BytesIO(resp.content))
+        assert stored.mode == "RGB"
+        assert stored.getpixel((0, 0)) == (0, 0, 0)
+        assert stored.getpixel((20, 10)) == (255, 255, 255)
+
+    def test_upload_markdown_text(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("notes.md", b"# hi\n", "text/markdown")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kind"] == "text"
+        assert body["mime_type"] == "text/markdown"
+
+    def test_upload_by_extension_when_mime_missing(self, app_client):
+        client, _ = app_client
+        # Send an application/octet-stream body — only extension should save it.
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("script.py", b"print('hi')\n", "application/octet-stream")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["kind"] == "text"
+
+
+class TestUploadRejections:
+    def test_oversize_image_rejected(self, app_client):
+        client, _ = app_client
+        # 5 MB PNG header followed by junk — triggers the 4 MiB cap
+        big = PNG_1x1 + b"\x00" * (5 * 1024 * 1024)
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("big.png", big, "image/png")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 413
+        assert resp.json().get("code") == "too_large"
+
+    def test_oversize_text_rejected(self, app_client):
+        client, _ = app_client
+        big = b"x" * (600 * 1024)  # 600 KiB > 512 KiB text cap
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("big.md", big, "text/markdown")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 413
+
+    def test_unsupported_mime_rejected(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("blob.bin", b"\x00\x01\x02\x03", "application/octet-stream")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+        assert "code" in resp.json()
+
+    def test_non_utf8_text_rejected(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("bad.txt", b"\xff\xfe\x00\x00", "text/plain")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+        assert "UTF-8" in resp.json()["error"]
+
+    def test_empty_file_rejected(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("empty.md", b"", "text/markdown")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+
+    def test_missing_file_field_400(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            data={"not_file": "x"},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+
+    def test_unknown_workstream_404(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-DOES-NOT-EXIST/attachments",
+            files={"file": ("x.md", b"x", "text/markdown")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 404
+
+    def test_any_caller_can_attach_to_workstream(self, app_client):
+        # Trusted-team model: attaching to any workstream is gated on
+        # scope auth, not ownership.  The attachment is filed under
+        # the ws's persisted owner so existing storage shape holds.
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-B/attachments",
+            files={"file": ("x.md", b"x", "text/markdown")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+
+
+# (The per-user pending-upload cap was removed with the content-addressing
+# cutover — pending uploads live in the per-node buffer, bounded by its own
+# size/TTL ceilings rather than a per-(ws,user) count.  The cap tests that
+# lived here are gone.)
+
+
+# ---------------------------------------------------------------------------
+# List / Get content / Delete
+# ---------------------------------------------------------------------------
+
+
+def _upload(client, ws_id: str, user: str, filename: str, data: bytes, mime: str) -> str:
+    resp = client.post(
+        f"/v1/api/workstreams/{ws_id}/attachments",
+        files={"file": (filename, data, mime)},
+        headers=_auth(user),
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["attachment_id"]
+
+
+class TestListAttachments:
+    def test_list_pending_returns_metadata_only(self, app_client):
+        client, _ = app_client
+        _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
+        _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
+        resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userA"))
+        assert resp.status_code == 200
+        atts = resp.json()["attachments"]
+        assert len(atts) == 2
+        # No content bytes in list payload
+        assert all("content" not in a for a in atts)
+        assert {a["filename"] for a in atts} == {"a.md", "b.md"}
+
+    def test_list_visible_cluster_wide(self, app_client):
+        # Trusted-team visibility: any authenticated caller can list
+        # the attachments on any workstream.  Attachments are filed
+        # under the ws's owner uid so a cross-caller lister still sees
+        # the owner's pending uploads.
+        client, _ = app_client
+        _upload(client, "ws-A", "userA", "mine.md", b"mine", "text/markdown")
+        resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userB"))
+        assert resp.status_code == 200
+        atts = resp.json()["attachments"]
+        assert {a["filename"] for a in atts} == {"mine.md"}
+
+
+class TestGetContent:
+    def test_get_content_returns_bytes_with_mime(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.png", PNG_1x1, "image/png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/png")
+        assert resp.content == PNG_1x1
+        # Defense-in-depth headers
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert "default-src 'none'" in resp.headers.get("content-security-policy", "")
+        assert resp.headers.get("content-disposition", "").startswith("inline;")
+
+    def test_get_content_non_latin1_filename_does_not_500(self, app_client):
+        # Starlette encodes header values as latin-1 and raises on anything
+        # else; an uploaded filename with CJK / em dashes must fold to an
+        # ASCII-safe Content-Disposition rather than 500 the serving route.
+        # Mirrors preview_response_headers' latin-1 fold.
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "文書 — v1.md", b"x", "text/markdown")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"x"
+        # Non-ASCII folded to '?', ASCII kept — pinning the value proves the
+        # fold actually ran and the header is latin-1 clean (all codepoints
+        # < 0x80), not merely that the route didn't crash.
+        assert resp.headers["content-disposition"] == 'inline; filename="?? ? v1.md"'
+
+    def test_get_content_forces_text_plain_for_text_kinds(self, app_client):
+        # Uploading an HTML-ish file as text/html must NOT be served back
+        # with Content-Type: text/html from our origin (XSS vector).
+        client, _ = app_client
+        aid = _upload(
+            client,
+            "ws-A",
+            "userA",
+            "evil.html",
+            b"<script>alert(1)</script>",
+            "text/html",
+        )
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/plain")
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+
+    def test_get_content_visible_cluster_wide(self, app_client):
+        # Trusted-team visibility: any authenticated caller can fetch
+        # the content of an attachment on any workstream.  Attachments
+        # are keyed by the ws's persisted owner uid so userB still
+        # resolves userA's blob via _require_ws_access's owner return.
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userB"),
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"x"
+
+    def test_get_content_cross_workstream_id_404(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
+        # Request via ws-B (owned by userB) with the id from ws-A — must 403 or 404
+        resp = client.get(
+            f"/v1/api/workstreams/ws-B/attachments/{aid}/content",
+            headers=_auth("userB"),
+        )
+        # userB owns ws-B, so the ws-access check passes; the id-mismatch then
+        # returns 404 to avoid leaking existence.
+        assert resp.status_code == 404
+
+    def test_get_content_unowned_ws_user_isolation(self, app_client):
+        # Regression for PR #356 review: in a workstream without an
+        # explicit owner (user_id == ""), one user's attachment must
+        # not be fetchable by another user via id-guessing.
+        client, _ = app_client
+        from turnstone.core.memory import register_workstream
+
+        register_workstream("ws-shared", name="shared")
+        a_aid = _upload(client, "ws-shared", "userA", "secret.md", b"S", "text/markdown")
+        # userB can reach ws-shared (owner blank → no ownership gate)
+        # but must NOT be able to fetch userA's blob.
+        resp = client.get(
+            f"/v1/api/workstreams/ws-shared/attachments/{a_aid}/content",
+            headers=_auth("userB"),
+        )
+        assert resp.status_code == 404
+        # userA still gets their own
+        resp = client.get(
+            f"/v1/api/workstreams/ws-shared/attachments/{a_aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"S"
+
+
+class TestGetThumbnail:
+    """The /thumbnail handler + the shared _resolve_served_blob gate it reuses:
+    200+png for image/pdf, 415 for non-thumbnailable kinds or a failed render,
+    and a 404 (no existence leak) for cross-ws / cross-user id access."""
+
+    def _thumb_url(self, ws_id: str, aid: str) -> str:
+        return f"/v1/api/workstreams/{ws_id}/attachments/{aid}/thumbnail"
+
+    def test_image_thumbnail_200_png_with_hardening_headers(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.png", PNG_1x1, "image/png")
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/png")
+        assert resp.content[:8] == b"\x89PNG\r\n\x1a\n"
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert "default-src 'none'" in resp.headers.get("content-security-policy", "")
+        assert "max-age=300" in resp.headers.get("cache-control", "")
+
+    def test_audio_thumbnail_415(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "a.wav", WAV_12, "audio/wav")
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 415
+
+    def test_text_thumbnail_415(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "n.md", b"# hi\n", "text/markdown")
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 415
+
+    def test_thumbnail_unavailable_returns_415(self, app_client, monkeypatch):
+        # kind is image (reaches make_thumbnail) but the render yields None.
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.png", PNG_1x1, "image/png")
+        monkeypatch.setattr("turnstone.core.thumbnails.make_thumbnail", lambda *a, **k: None)
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 415
+
+    def test_thumbnail_cross_workstream_id_404(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.png", PNG_1x1, "image/png")
+        # userB owns ws-B; the id belongs to ws-A → 404 (no existence leak).
+        resp = client.get(self._thumb_url("ws-B", aid), headers=_auth("userB"))
+        assert resp.status_code == 404
+
+    def test_thumbnail_unowned_ws_user_isolation_404(self, app_client):
+        client, _ = app_client
+        from turnstone.core.memory import register_workstream
+
+        register_workstream("ws-shared-thumb", name="shared")
+        aid = _upload(client, "ws-shared-thumb", "userA", "s.png", PNG_1x1, "image/png")
+        # Blank-owner ws is reachable by userB, but userA's blob must not be.
+        resp = client.get(self._thumb_url("ws-shared-thumb", aid), headers=_auth("userB"))
+        assert resp.status_code == 404
+        resp = client.get(self._thumb_url("ws-shared-thumb", aid), headers=_auth("userA"))
+        assert resp.status_code == 200
+
+
+class TestDelete:
+    def test_delete_pending(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
+        resp = client.delete(f"/v1/api/workstreams/ws-A/attachments/{aid}", headers=_auth("userA"))
+        assert resp.status_code == 200
+        # Gone now
+        resp = client.delete(f"/v1/api/workstreams/ws-A/attachments/{aid}", headers=_auth("userA"))
+        assert resp.status_code == 404
+
+    def test_delete_cluster_wide(self, app_client):
+        # Trusted-team model: any authenticated caller can delete an
+        # attachment on any workstream.  The filed ``user_id`` stays
+        # for audit even after a cross-caller delete.
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
+        resp = client.delete(f"/v1/api/workstreams/ws-A/attachments/{aid}", headers=_auth("userB"))
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /api/send with attachment_ids
+# ---------------------------------------------------------------------------
+
+
+class TestSendMessageAttachments:
+    def _wire_ws(self, mgr, ws_id: str, user_id: str):
+        """Install a mock Workstream that captures session.send kwargs."""
+        from turnstone.core.workstream import WorkstreamState
+
+        session = MagicMock()
+        session._cancel_event = threading.Event()
+        session.queue_message = MagicMock()
+        # A bare Mock's auto-created ``_nudge_queue`` (truthy, has_pending
+        # truthy, no-op deliver) turns the worker-exit wake backstop into an
+        # endless respawn loop; declare this a stub session WITHOUT a queue
+        # so the wake gate's stub-guard bails.
+        session._nudge_queue = None
+        captured: dict = {}
+
+        def fake_send(message, attachments=None, send_id=None, client_send_ids=()):
+            captured["message"] = message
+            captured["attachments"] = attachments
+            captured["send_id"] = send_id
+            captured["client_send_ids"] = client_send_ids
+
+        session.send = fake_send
+
+        ui = MagicMock()
+        ui._ws_lock = threading.Lock()
+        ui._ws_messages = 0
+        ui._ws_turn_tool_calls = 0
+
+        ws = MagicMock()
+        ws.id = ws_id
+        ws.state = WorkstreamState.IDLE
+        ws.ui = ui
+        ws.session = session
+        ws.worker_thread = None
+        ws._worker_running = False
+        _harden_ws_mock(ws)
+        mgr.get.return_value = ws
+        return captured, session
+
+    def _wire_admission_ws(self, mgr, ws_id: str, user_id: str):
+        """Install a real session whose send stops after USER admission.
+
+        The HTTP resolver and ``ChatSession._append_user_turn`` then exercise
+        the production staged-buffer transfer without paying for a model call.
+        The real ``send`` derives the accepted turn's sender from the immutable
+        worker claim; mirror that boundary instead of reading the independently
+        owner-scoped attachment buffer identity.
+        """
+        from turnstone.core.session import ChatSession
+        from turnstone.core.session_worker import current_worker_claim
+        from turnstone.core.workstream import WorkstreamState
+
+        ui = MagicMock()
+        ui._ws_lock = threading.Lock()
+        ui._ws_messages = 0
+        ui._ws_turn_tool_calls = 0
+        session = ChatSession(
+            client=MagicMock(),
+            model="test-model",
+            ui=ui,
+            instructions=None,
+            temperature=0.3,
+            max_tokens=1024,
+            tool_timeout=10,
+            ws_id=ws_id,
+            user_id=user_id,
+        )
+
+        def admit_only(message, attachments=None, send_id=None):
+            claim = current_worker_claim(session)
+            if claim is None:
+                raise RuntimeError("admission test worker is missing its principal claim")
+            session._append_user_turn(
+                message,
+                attachments or (),
+                send_id=send_id,
+                sender_user_id=claim.principal_id,
+            )
+
+        session.send = admit_only  # type: ignore[assignment]
+
+        ws = MagicMock()
+        ws.id = ws_id
+        ws.state = WorkstreamState.IDLE
+        ws.ui = ui
+        ws.session = session
+        ws.worker_thread = None
+        ws._worker_running = False
+        _harden_ws_mock(ws)
+        mgr.get.return_value = ws
+        return ws, session
+
+    def test_send_explicit_attachment_ids_resolves_and_passes(self, app_client):
+        client, mgr = app_client
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+        aid = _upload(client, "ws-A", "userA", "n.md", b"hi", "text/markdown")
+
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "review", "attachment_ids": [aid]},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+
+        # Give the worker thread a moment to run fake_send
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        assert captured.get("message") == "review"
+        atts = captured["attachments"]
+        assert atts is not None and len(atts) == 1
+        assert atts[0].attachment_id == aid
+        assert atts[0].kind == "text"
+
+    def test_send_reads_the_owner_row_off_the_event_loop(self, app_client, monkeypatch):
+        """The send's attachment-owner check reads the workstream's row from
+        storage; it runs in a worker thread, so a slow or failing read can't
+        stall every request on the node."""
+        import asyncio
+
+        from turnstone.core.storage._registry import get_storage
+
+        client, mgr = app_client
+        self._wire_ws(mgr, "ws-A", "userA")
+        storage = get_storage()
+        real = storage.get_workstream
+        on_loop: list[bool] = []
+
+        def _spy(ws_id: str) -> Any:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return real(ws_id)
+
+        monkeypatch.setattr(storage, "get_workstream", _spy)
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send", json={"message": "hi"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200
+        assert on_loop
+        assert not any(on_loop)
+
+    def test_send_validates_and_threads_client_send_id(self, app_client):
+        client, mgr = app_client
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+
+        invalid = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "bad token", "client_send_id": "spaces are invalid"},
+            headers=_auth("userA"),
+        )
+        assert invalid.status_code == 400
+        assert invalid.json()["error"] == ("client_send_id must match [A-Za-z0-9_-]{1,128}")
+
+        accepted = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "correlated", "client_send_id": "browser-send_1"},
+            headers=_auth("userA"),
+        )
+        assert accepted.status_code == 200
+        import time
+
+        for _ in range(50):
+            if captured.get("message"):
+                break
+            time.sleep(0.01)
+        assert captured["client_send_ids"] == ("browser-send_1",)
+
+    def test_send_auto_consumes_pending_when_ids_omitted(self, app_client):
+        client, mgr = app_client
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+        _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
+        _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
+
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "do"},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        assert captured["attachments"] is not None
+        assert len(captured["attachments"]) == 2
+
+    @pytest.mark.parametrize("acting_user", ["userA", "shared-userB"])
+    @pytest.mark.parametrize("explicit_ids", [True, False])
+    def test_owner_scoped_admission_consumes_once_for_shared_sender(
+        self,
+        app_client,
+        acting_user,
+        explicit_ids,
+    ):
+        """Actor identity and staged-byte ownership are separate scopes.
+
+        Trusted-team workstreams file pending uploads under the durable
+        workstream owner.  A different authenticated participant is still the
+        turn sender, but USER admission must transfer that owner-scoped upload
+        exactly once for both explicit-id and auto-consume requests.
+        """
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        ws, session = self._wire_admission_ws(mgr, "ws-A", "userA")
+        aid = _upload(client, "ws-A", acting_user, "shared.md", b"shared", "text/markdown")
+        buffer = get_attachment_buffer()
+        assert buffer.get(aid, ws_id="ws-A", user_id="userA") is not None
+        if acting_user != "userA":
+            assert buffer.get(aid, ws_id="ws-A", user_id=acting_user) is None
+
+        body: dict[str, object] = {"message": "review together"}
+        if explicit_ids:
+            body["attachment_ids"] = [aid]
+        response = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json=body,
+            headers=_auth(acting_user),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["attached_ids"] == [aid]
+        worker = ws.worker_thread
+        assert worker is not None
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert buffer.get(aid, ws_id="ws-A", user_id="userA") is None
+
+        storage = get_storage()
+        rows = storage.load_messages("ws-A", repair=False)
+        user_rows = [row for row in rows if row.get("role") == "user"]
+        assert len(user_rows) == 1
+        assert user_rows[0]["_sender"] == acting_user
+        stored_attachment = storage.get_attachment(aid)
+        assert stored_attachment is not None
+        assert stored_attachment["refcount"] == 1
+        assert session.has_unresolved_conversation_persistence() is False
+
+    def test_send_empty_list_disables_autoconsume(self, app_client):
+        client, mgr = app_client
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+        _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
+
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "plain", "attachment_ids": []},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        assert captured["attachments"] is None  # send got None, no attachments
+
+    def test_send_preserves_explicit_attachment_id_order(self, app_client):
+        client, mgr = app_client
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+        a = _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
+        b = _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
+        c = _upload(client, "ws-A", "userA", "c.md", b"C", "text/markdown")
+
+        # Request order: c, a, b — must be preserved through resolution
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={
+                "message": "ordered",
+                "attachment_ids": [c, a, b],
+            },
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        atts = captured["attachments"]
+        assert [x.attachment_id for x in atts] == [c, a, b]
+
+    def test_send_unknown_ids_resolve_to_nothing(self, app_client):
+        # The old oversized-IN-clause / cap rejection is gone (no DB
+        # reservation, no per-user cap).  Unknown ids simply don't resolve
+        # from the buffer — the send proceeds with no attachments rather
+        # than 400-ing.
+        client, mgr = app_client
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+        many = [f"id-{i}" for i in range(50)]
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "x", "attachment_ids": many},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        assert captured["attachments"] is None
+
+    def test_send_forged_id_from_other_user_ignored(self, app_client):
+        client, mgr = app_client
+        # userB uploads to ws-B
+        _upload(client, "ws-B", "userB", "secret.md", b"secret", "text/markdown")
+        # userA tries to include userB's attachment id in their send on ws-A
+        resp = client.get("/v1/api/workstreams/ws-B/attachments", headers=_auth("userB"))
+        atts = resp.json()["attachments"]
+        assert len(atts) == 1
+        stolen_id = atts[0]["attachment_id"]
+
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={
+                "message": "sneaky",
+                "attachment_ids": [stolen_id],
+            },
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        # Forged id is scope-rejected — no attachments reach session.send
+        assert captured["attachments"] is None
+
+
+class TestQueuedSendWithAttachments:
+    """When the worker is busy, send queues the message + attachment_ids
+    so the multimodal turn isn't silently reduced to text on dequeue."""
+
+    def _wire_busy_ws(self, mgr, ws_id: str):
+        """Mock ws whose worker_thread is always 'alive' (forces queue path).
+        Captures args passed to queue_message so the test can assert on
+        ordered attachment_ids.
+        """
+        from turnstone.core.workstream import WorkstreamState
+
+        captured: dict = {}
+
+        def fake_queue_message(
+            text, attachment_ids=None, queue_msg_id=None, interjector_user_id=""
+        ):
+            captured["text"] = text
+            captured["attachment_ids"] = list(attachment_ids or ())
+            captured["queue_msg_id"] = queue_msg_id
+            captured["interjector_user_id"] = interjector_user_id
+            # Return the supplied id so server-side tracking is coherent
+            return text, "notice", queue_msg_id or "q-msg-1"
+
+        session = MagicMock()
+        session._cancel_event = threading.Event()
+        session.queue_message = fake_queue_message
+        # Stub session without a NudgeQueue — see _wire_ws for why a bare
+        # Mock queue would feed the exit backstop an endless wake loop.
+        session._nudge_queue = None
+
+        ui = MagicMock()
+        ui._ws_lock = threading.Lock()
+        ui._ws_messages = 0
+        ui._ws_turn_tool_calls = 0
+
+        # _worker_running=True forces session_worker.send onto the queue path
+        worker = MagicMock()
+        worker.is_alive = MagicMock(return_value=True)
+
+        ws = MagicMock()
+        ws.id = ws_id
+        ws.state = WorkstreamState.RUNNING
+        ws.ui = ui
+        ws.session = session
+        ws.worker_thread = worker
+        ws._worker_running = True
+        _harden_ws_mock(ws)
+        mgr.get.return_value = ws
+        return captured
+
+    def test_busy_queue_carries_ordered_attachment_ids(self, app_client):
+        client, mgr = app_client
+        captured = self._wire_busy_ws(mgr, "ws-A")
+        a = _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
+        b = _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
+
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={
+                "message": "ping",
+                "attachment_ids": [b, a],  # intentionally reversed
+            },
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "queued"
+        assert captured["text"] == "ping"
+        # Ordered ids must reach queue_message so dequeue flushes them
+        # as a properly-ordered multipart turn.
+        assert captured["attachment_ids"] == [b, a]
+
+
+class TestBusyWorkerAttachments:
+    """An attachment-bearing send to a busy worker can't ride the text-only
+    queue seam — it returns ``attachments_busy`` and the staged bytes stay in
+    the buffer (a peek, not a drain) so the client can retry once idle."""
+
+    def _wire_busy_ws(self, mgr, ws_id: str):
+        """Mock ws whose worker is always alive (forces the queue path)."""
+        from turnstone.core.session import ChatSession
+        from turnstone.core.workstream import WorkstreamState
+
+        session = ChatSession(
+            client=MagicMock(),
+            model="test-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.3,
+            max_tokens=1024,
+            tool_timeout=10,
+            user_id="userA",
+        )
+        session._ws_id = ws_id
+
+        ui = MagicMock()
+        ui._ws_lock = threading.Lock()
+        ui._ws_messages = 0
+        ui._ws_turn_tool_calls = 0
+
+        worker = MagicMock()
+        worker.is_alive = MagicMock(return_value=True)
+
+        ws = MagicMock()
+        ws.id = ws_id
+        ws.state = WorkstreamState.RUNNING
+        ws.ui = ui
+        ws.session = session
+        ws.worker_thread = worker
+        # No explicit _worker_running: the truthy auto-Mock forces the
+        # queue path (deliberate — see _harden_ws_mock's exclusion note).
+        _harden_ws_mock(ws)
+        mgr.get.return_value = ws
+        return ws, session
+
+    def test_send_with_attachments_to_busy_worker_returns_attachments_busy(self, app_client):
+        client, mgr = app_client
+        aid = _upload(client, "ws-A", "userA", "x.md", b"X", "text/markdown")
+        self._wire_busy_ws(mgr, "ws-A")
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "with file", "attachment_ids": [aid]},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "attachments_busy"
+        assert body["attached_ids"] == []
+        assert body["dropped_attachment_ids"] == [aid]
+        # The staged upload was peeked (not drained), so it's still pending
+        # and visible for a retry once the worker idles.
+        resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userA"))
+        ids = [a["attachment_id"] for a in resp.json()["attachments"]]
+        assert aid in ids
+
+
+class TestServiceScopedActorFlow:
+    """Service-scoped tokens bypass ownership checks and file attachments
+    under the workstream owner; send() must consume them using the same
+    owner-resolution helper (not the raw caller id)."""
+
+    def test_service_upload_then_send_consumes(self, app_client):
+        client, mgr = app_client
+
+        # Service token: has the 'service' scope
+        from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
+
+        service_token = create_jwt(
+            user_id="svc-bot",
+            scopes=frozenset({"read", "write", "service"}),
+            source="test",
+            secret=_TEST_JWT_SECRET,
+            audience=JWT_AUD_SERVER,
+        )
+        svc_headers = {"Authorization": f"Bearer {service_token}"}
+
+        # Upload to ws-A (owned by userA) as service — the staged upload is
+        # filed under the owner "userA" (the resolver's uid), not "svc-bot",
+        # so the later owner-resolved send can find it in the buffer.
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("svc.md", b"svc", "text/markdown")},
+            headers=svc_headers,
+        )
+        assert resp.status_code == 200
+        aid = resp.json()["attachment_id"]
+
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        # Staged under the owner uid (userA), not the service caller (svc-bot).
+        assert get_attachment_buffer().get(aid, ws_id="ws-A", user_id="userA") is not None
+        assert get_attachment_buffer().get(aid, ws_id="ws-A", user_id="svc-bot") is None
+
+        # Now drive /api/send as the service token — the resolver uses
+        # the ws owner (userA) to look up attachments, so the upload is
+        # found and passed through.
+        captured, _ = TestSendMessageAttachments._wire_ws(
+            TestSendMessageAttachments(),
+            mgr,
+            "ws-A",
+            "userA",
+        )
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "svc send", "attachment_ids": [aid]},
+            headers=svc_headers,
+        )
+        assert resp.status_code == 200
+
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        atts = captured["attachments"]
+        assert atts is not None and len(atts) == 1
+        assert atts[0].attachment_id == aid
+
+
+# ---------------------------------------------------------------------------
+# Voice I/O (STT / TTS) endpoints
+# ---------------------------------------------------------------------------
+
+
+class _VoiceConfigStore:
+    """A ConfigStore stand-in for the voice endpoints.
+
+    A missing key returns the *registry* default, as the real store does
+    (``core/config_store.py``: ``get`` falls through to ``SETTINGS[key].default``).
+    Returning a bare ``""`` here instead would let a test install a state
+    production cannot reach, and a test written against such a state proves
+    nothing about production.
+    """
+
+    def __init__(self, **values: Any) -> None:
+        self._values = dict(values)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._values:
+            return self._values[key]
+        defn = SETTINGS.get(key)
+        return defn.default if defn is not None else default
+
+
+@pytest.fixture
+def voice_app_client(tmp_path):
+    """App wired with an audio-capable registry alias + a mocked OpenAI client.
+
+    The mock is injected into ``registry._clients`` so the real endpoint →
+    resolve_role_alias → transcribe/synthesize path runs end-to-end with only
+    the SDK network call stubbed.
+    """
+    import sqlalchemy as sa
+
+    import turnstone.server as srv_mod
+    from turnstone.core.memory import register_workstream
+    from turnstone.core.metrics import MetricsCollector
+    from turnstone.core.model_registry import ModelConfig, ModelRegistry
+    from turnstone.core.storage import init_storage, reset_storage
+    from turnstone.core.storage._registry import get_storage
+    from turnstone.core.storage._schema import workstreams as ws_tbl
+
+    db_path = tmp_path / "voice.db"
+    reset_storage()
+    init_storage("sqlite", path=str(db_path), run_migrations=False)
+
+    srv_mod._metrics = MetricsCollector()
+    srv_mod._metrics.model = "test-model"
+
+    register_workstream("ws-A", name="A")
+    with get_storage()._conn() as conn:
+        conn.execute(sa.update(ws_tbl).where(ws_tbl.c.ws_id == "ws-A").values(user_id="userA"))
+        conn.commit()
+
+    registry = ModelRegistry(
+        models={
+            "voice": ModelConfig(
+                "voice",
+                "http://localhost:9/v1",
+                "none",
+                "gpt-4o-mini-tts",
+                capabilities={
+                    "supports_transcription": True,
+                    "supports_speech_synthesis": True,
+                },
+            ),
+        },
+        default="voice",
+    )
+    mock_client = MagicMock()
+    # Every clone (a minted credential, a voice call's bounded attempt) comes back
+    # as this mock, so one surface scripts the backend for every route.
+    # test_audio.py pins that synthesis really sends through its clone.
+    mock_client.with_options.return_value = mock_client
+    transcription_response = MagicMock()
+    transcription_response.parse.return_value = MagicMock(text="hello from speech")
+    transcription_manager = MagicMock()
+    transcription_manager.__enter__.return_value = transcription_response
+    transcription_manager.__exit__.return_value = False
+    mock_client.audio.transcriptions.with_streaming_response.create.return_value = (
+        transcription_manager
+    )
+    speech_response = MagicMock()
+    speech_response.read.return_value = b"RIFF\x00\x00fakeaudio"
+    speech_manager = MagicMock()
+    speech_manager.__enter__.return_value = speech_response
+    speech_manager.__exit__.return_value = False
+    mock_client.audio.speech.with_streaming_response.create.return_value = speech_manager
+    mock_client._voice_transcription_response = transcription_response
+    registry._clients["voice"] = mock_client  # bypass real SDK client construction
+
+    config_store = _VoiceConfigStore(
+        **{
+            "audio.stt_model_alias": "voice",
+            "audio.tts_model_alias": "voice",
+            "audio.tts_voice": "alloy",
+        }
+    )
+
+    mock_mgr = MagicMock()
+    mock_mgr.get.return_value = None
+    mock_mgr.list_all.return_value = []
+    mock_mgr.max_active = 10
+
+    app = srv_mod.create_app(
+        workstreams=mock_mgr,
+        global_queue=queue.Queue(),
+        global_listeners=[],
+        global_listeners_lock=threading.Lock(),
+        skip_permissions=False,
+        jwt_secret=_TEST_JWT_SECRET,
+        registry=registry,
+        config_store=config_store,
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        yield client, mock_client
+    finally:
+        client.close()
+        # The synthesis and dictation threads; the lifespan never ran.
+        app.state.tts.shutdown()
+        app.state.stt.shutdown(wait=True)
+        reset_storage()
+
+
+class TestSpeechToText:
+    def test_unconfigured_returns_503(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 503
+        assert "not configured" in resp.json()["error"]
+
+    def test_happy_path_returns_transcript(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["transcript"] == "hello from speech"
+        assert body["model_alias"] == "voice"
+        assert mock_client.audio.transcriptions.with_streaming_response.create.called
+
+    def test_empty_upload_returns_400(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+
+    def test_silence_returns_422(self, voice_app_client):
+        # A successful transcription with no speech is not a backend failure.
+        client, mock_client = voice_app_client
+        mock_client._voice_transcription_response.parse.return_value = MagicMock(text="   ")
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 422
+        assert "No speech detected" in resp.json()["error"]
+
+    def test_backend_failure_returns_masked_502(self, voice_app_client):
+        # Backend SDK error detail must not leak into the client-facing body.
+        client, mock_client = voice_app_client
+        create = mock_client.audio.transcriptions.with_streaming_response.create
+        create.side_effect = RuntimeError("Error code: 401 - internal-host:9 invalid_api_key")
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["error"] == "Speech transcription backend failed"
+        assert "internal-host" not in body["error"]
+
+    def test_unknown_workstream_404(self, voice_app_client):
+        # Trusted-team semantics: ownership isn't row-enforced, but a
+        # nonexistent workstream is masked as 404 (no enumeration).
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-DOES-NOT-EXIST/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 404
+
+
+class TestSpeechToTextStream:
+    def test_dedicated_endpoint_streams_transcript(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text/stream",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.text == "hello from speech"
+        assert mock_client.audio.transcriptions.with_streaming_response.create.called
+
+    @pytest.mark.parametrize("path", ["speech-to-text", "speech-to-text/stream"])
+    def test_both_dictation_routes_refuse_a_read_only_token(self, voice_app_client, path):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            f"/v1/api/workstreams/ws-A/{path}",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA", frozenset({"read"})),
+        )
+        assert resp.status_code == 403
+        assert "'write' scope" in resp.text
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+
+
+def _call_as_departing_caller(
+    app: Any, path: str, headers: dict[str, str], body: bytes
+) -> list[dict[str, Any]]:
+    """Call *app* as a client that sends *body* and then hangs up; return what it sent back.
+
+    A handler is not cancelled when its caller leaves, so only a raw ASGI call like this one
+    shows what the node's departure watcher does.
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+    body_sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}  # the caller has gone
+
+    messages: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    return messages
+
+
+class TestTextToSpeech:
+    def test_a_caller_that_leaves_stops_the_synthesis_quietly(self, voice_app_client, monkeypatch):
+        """A handler isn't cancelled when its caller leaves.  The watcher closes
+        the captured response, which unblocks the worker, and the handler answers
+        without raising: no 500, no error traceback, and its budget comes back."""
+        import turnstone.server as srv
+
+        monkeypatch.setattr(srv, "_AUDIO_DISCONNECT_POLL_S", 0.01)
+        client, mock_client = voice_app_client
+        manager = mock_client.audio.speech.with_streaming_response.create.return_value
+        closed = threading.Event()
+
+        def _read() -> bytes:
+            # A backend still streaming the clip: the read ends when the
+            # response is closed.
+            if not closed.wait(5):
+                raise AssertionError("the response was never closed")
+            raise RuntimeError("stream closed")
+
+        manager.__enter__.return_value.read.side_effect = _read
+        manager.__enter__.return_value.close.side_effect = closed.set
+
+        headers = {**_auth("userA"), "Content-Type": "application/json"}
+        messages = _call_as_departing_caller(
+            client.app, "/v1/api/tts", headers, b'{"text": "hello"}'
+        )
+
+        assert closed.is_set()
+        assert messages[0]["status"] == 499
+        assert client.app.state.tts.in_flight == 0
+
+    def test_synthesis_runs_with_the_request_log_context(self, voice_app_client):
+        # The tts threads are a pool of their own, which doesn't carry the
+        # request's context the way asyncio.to_thread does unless it's copied.
+        from turnstone.core.log import ctx_user_id
+
+        client, mock_client = voice_app_client
+        create = mock_client.audio.speech.with_streaming_response.create
+        manager = create.return_value
+        seen: dict[str, str] = {}
+
+        def _create(**_kwargs: Any) -> Any:
+            seen["thread"] = threading.current_thread().name
+            seen["user_id"] = ctx_user_id.get()
+            return manager
+
+        create.side_effect = _create
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+
+        assert resp.status_code == 200, resp.text
+        assert seen["thread"].startswith("tts")
+        assert seen["user_id"] == "userA"
+
+    def test_unconfigured_returns_503(self, app_client):
+        client, _ = app_client
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 503
+
+    def test_happy_path_returns_audio(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("audio/")
+        assert resp.content == b"RIFF\x00\x00fakeaudio"
+        assert resp.headers.get("x-model-alias") == "voice"
+        # audio.tts_voice setting supplies the voice when the body omits one.
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["voice"] == "alloy"
+
+    def test_empty_text_returns_400(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post("/v1/api/tts", json={"text": "   "}, headers=_auth("userA"))
+        assert resp.status_code == 400
+
+    def test_too_long_text_returns_400(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post("/v1/api/tts", json={"text": "x" * 9000}, headers=_auth("userA"))
+        assert resp.status_code == 400
+
+    def test_a_full_cap_text_is_accepted(self, voice_app_client):
+        from turnstone.server import _TTS_TEXT_CAP
+
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/tts", json={"text": "x" * _TTS_TEXT_CAP}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_a_play_starts_beside_one_and_is_refused_beside_two(self, voice_app_client):
+        # Refused, not queued: queue time would come out of the console's wait.
+        client, _ = voice_app_client
+        capacity = client.app.state.tts
+        assert capacity.try_admit()  # a play already rendering
+
+        beside_one = client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA"))
+        assert capacity.try_admit()  # and a second
+        beside_two = client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA"))
+
+        assert beside_one.status_code == 200, beside_one.text
+        assert beside_two.status_code == 429
+        assert beside_two.headers["retry-after"] == "5"
+        assert "busy" in beside_two.json()["error"]
+
+    def test_the_slot_is_released_after_a_failed_synthesis(self, voice_app_client):
+        client, mock_client = voice_app_client
+        create = mock_client.audio.speech.with_streaming_response.create
+        create.side_effect = RuntimeError("backend down")
+
+        assert (
+            client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA")).status_code
+            == 502
+        )
+        # A failure must give its slot back, or the node refuses for ever.
+        assert client.app.state.tts.in_flight == 0
+
+    def test_backend_failure_returns_masked_502(self, voice_app_client):
+        client, mock_client = voice_app_client
+        create = mock_client.audio.speech.with_streaming_response.create
+        create.side_effect = RuntimeError("Error code: 500 - internal-host:9 boom")
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["error"] == "Speech synthesis backend failed"
+        assert "internal-host" not in body["error"]
+
+
+def _voice_request(client, route: str, *, user_id: str):
+    if route == "stt":
+        return client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth(user_id),
+        )
+    if route == "stt-stream":
+        return client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text/stream",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth(user_id),
+        )
+    return client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth(user_id))
+
+
+class TestVoiceBackendAuth:
+    @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
+    def test_request_principal_is_used_instead_of_workstream_owner(
+        self,
+        voice_app_client,
+        route,
+    ):
+        from dataclasses import replace
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        cfg = registry._models["voice"]
+        registry._models["voice"] = replace(
+            cfg,
+            api_key="",
+            auth_mode="entra_obo",
+            obo_audience="api://voice",
+        )
+        mint_client = MagicMock()
+        mint_client.mint_model_obo_token_sync.return_value = "minted-token"
+        client.app.state.model_token_client = mint_client
+        mock_client.with_options.return_value = mock_client
+
+        response = _voice_request(client, route, user_id="userB")
+
+        assert response.status_code == 200, response.text
+        mint_kwargs = dict(
+            user_id="userB",
+            alias="voice",
+            audience="api://voice",
+            scopes="",
+            grant_leg="entra",
+        )
+        if route != "tts":
+            deadline = mint_client.mint_model_obo_token_sync.call_args.kwargs["deadline"]
+            assert time.monotonic() < deadline <= time.monotonic() + 25.0
+            mint_kwargs["deadline"] = deadline
+        mint_client.mint_model_obo_token_sync.assert_called_once_with(**mint_kwargs)
+        # The mint must reach the call as a clone, and nothing may replace it;
+        # each voice call then clones once more for its one bounded attempt.
+        expected = [call(api_key="minted-token")]
+        if route == "tts":
+            expected.append(
+                call(
+                    max_retries=0,
+                    timeout=httpx2.Timeout(_TTS_BACKEND_TIMEOUT_S, connect=5.0),
+                )
+            )
+        else:
+            from turnstone.server import _STT_REQUEST_TIMEOUT_S
+
+            timeout = mock_client.with_options.call_args.kwargs["timeout"]
+            assert 0 < timeout.read <= _STT_REQUEST_TIMEOUT_S
+            assert timeout.connect == min(5.0, timeout.read)
+            expected.append(call(max_retries=0, timeout=timeout))
+        assert mock_client.with_options.call_args_list == expected
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
+    def test_auth_failure_is_masked_and_never_dispatches(
+        self,
+        voice_app_client,
+        route,
+    ):
+        from dataclasses import replace
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        cfg = registry._models["voice"]
+        registry._models["voice"] = replace(
+            cfg,
+            api_key="",
+            auth_mode="entra_obo",
+            obo_audience="api://voice",
+        )
+        mint_client = MagicMock()
+        mint_client.mint_model_obo_token_sync.return_value = None
+        client.app.state.model_token_client = mint_client
+
+        response = _voice_request(client, route, user_id="userB")
+
+        assert response.status_code == 503
+        assert response.json() == {"error": "Model backend authentication unavailable"}
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        mock_client.audio.speech.with_streaming_response.create.assert_not_called()
+
+
+class TestVoiceStreamLifecycle:
+    def test_response_call_cancellation_aborts_opened_handle(self, monkeypatch):
+        import asyncio
+
+        from starlette.responses import StreamingResponse
+
+        from turnstone.core.deadline import StreamAbortRef
+        from turnstone.server import _AbortOnExitStreamingResponse
+
+        handle = MagicMock()
+        abort_ref = StreamAbortRef()
+        abort_ref.append(handle)
+
+        async def cancel_before_body(self, scope, receive, send):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(StreamingResponse, "__call__", cancel_before_body)
+        response = _AbortOnExitStreamingResponse([], abort_ref=abort_ref)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(response({}, MagicMock(), MagicMock()))
+
+        assert abort_ref.aborted
+        handle.close.assert_called()
+
+
+@contextlib.contextmanager
+def _voice_alias_full(client) -> Iterator[Any]:
+    """Hold the voice alias's only slot, as a call already running would, for 2 s at most."""
+    gate = client.app.state.registry.get_admission("voice")
+    gate.set_limit(1)
+    with slot_held(gate):
+        yield gate
+
+
+class TestVoiceAdmission:
+    """Voice calls take the voice alias's ``max_concurrency`` slots."""
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream"])
+    @pytest.mark.parametrize("mode", ["entra_app", "entra_obo"])
+    def test_slow_credential_mint_expires_and_releases_dictation_capacity(
+        self, voice_app_client, monkeypatch, route, mode
+    ):
+        from dataclasses import replace
+
+        import turnstone.server as srv
+        from turnstone.core import model_oauth
+        from turnstone.core.model_oauth import OAuthModelTokenClient
+        from turnstone.core.oauth.context import OAuthContext
+        from turnstone.core.oauth.runtime import OAuthRuntime
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        registry._models["voice"] = replace(
+            registry._models["voice"],
+            # A timed-out mint must not dispatch using this otherwise valid fallback.
+            api_key="static-fallback",
+            auth_mode=mode,
+            obo_audience="api://voice",
+        )
+        gate = registry.get_admission("voice")
+        gate.set_limit(1)
+        context = OAuthContext()
+        runtime = OAuthRuntime(context)
+        context.runtime = runtime
+        runtime.start()
+        client.app.state.model_token_client = OAuthModelTokenClient(context)
+        cancelled = threading.Event()
+        started = threading.Event()
+
+        async def mint(**kwargs):
+            started.set()
+            assert gate.snapshot().in_flight == 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        mint_name = "_mint_app_access_token" if mode == "entra_app" else "_mint_obo_access_token"
+        monkeypatch.setattr(model_oauth, mint_name, mint)
+        monkeypatch.setattr(srv, "_STT_REQUEST_TIMEOUT_S", 0.25)
+        try:
+            began = time.monotonic()
+            response = _voice_request(client, route, user_id="userA")
+            elapsed = time.monotonic() - began
+            assert response.status_code == 502, response.text
+            assert started.is_set()
+            assert cancelled.wait(1.0)
+            assert elapsed < 0.6
+            assert gate.snapshot().in_flight == 0
+            mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+
+            async def recovered(**kwargs):
+                return "recovered-token"
+
+            monkeypatch.setattr(model_oauth, mint_name, recovered)
+            assert _voice_request(client, route, user_id="userA").status_code == 200
+            assert gate.snapshot().in_flight == 0
+            assert mock_client.audio.transcriptions.with_streaming_response.create.call_count == 1
+        finally:
+            runtime.shutdown()
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream"])
+    @pytest.mark.parametrize("failure", ["before-headers", "budget-exhausted"])
+    def test_failed_dictation_releases_capacity_for_the_next_request(
+        self, voice_app_client, monkeypatch, route, failure
+    ):
+        import openai
+
+        import turnstone.server as srv
+
+        client, mock_client = voice_app_client
+        gate = client.app.state.registry.get_admission("voice")
+        gate.set_limit(1)
+        create = mock_client.audio.transcriptions.with_streaming_response.create
+        manager = create.return_value
+        budget = srv._STT_REQUEST_TIMEOUT_S
+        if failure == "before-headers":
+            manager.__enter__.side_effect = openai.APITimeoutError(
+                request=httpx2.Request("POST", "http://speech.example.com/v1/audio/transcriptions")
+            )
+        else:
+            monkeypatch.setattr(srv, "_STT_REQUEST_TIMEOUT_S", 0.0)
+
+        response = _voice_request(client, route, user_id="userA")
+
+        assert response.status_code == 502
+        assert response.json() == {"error": "Speech transcription backend failed"}
+        assert gate.snapshot().in_flight == 0
+        assert gate.snapshot().queued == 0
+        if failure == "budget-exhausted":
+            create.assert_not_called()
+
+        manager.__enter__.side_effect = None
+        monkeypatch.setattr(srv, "_STT_REQUEST_TIMEOUT_S", budget)
+        assert _voice_request(client, route, user_id="userA").status_code == 200
+        assert gate.snapshot().in_flight == 0
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream"])
+    def test_a_dictation_that_gets_no_slot_in_time_is_told_the_node_is_busy(
+        self, voice_app_client, monkeypatch, route
+    ):
+        import turnstone.server as srv
+
+        # Long enough that the access check and parse fit, so the refusal comes from
+        # the gate rather than the wait for a thread; under the 2 s the slot is held.
+        monkeypatch.setattr(srv, "_STT_ADMISSION_WAIT_S", 0.5)
+        client, mock_client = voice_app_client
+        with _voice_alias_full(client) as gate:
+            resp = _voice_request(client, route, user_id="userA")
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+        assert "busy" in resp.json()["error"]
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        assert gate.snapshot().queued == 0
+
+    def test_a_play_that_finds_its_alias_full_is_refused_at_once(self, voice_app_client):
+        # Refused, not queued, as when the node's own synthesis threads are taken.
+        client, mock_client = voice_app_client
+        with _voice_alias_full(client) as gate:
+            resp = _voice_request(client, "tts", user_id="userA")
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+        assert "busy" in resp.json()["error"]
+        mock_client.audio.speech.with_streaming_response.create.assert_not_called()
+        assert gate.snapshot().queued == 0
+        assert client.app.state.tts.in_flight == 0
+
+    @pytest.mark.parametrize("path", ["speech-to-text", "speech-to-text/stream"])
+    def test_a_dictation_whose_caller_leaves_gives_up_its_place(
+        self, voice_app_client, monkeypatch, path
+    ):
+        """A handler isn't cancelled when its caller leaves.  The watcher aborts
+        the queued wait, so the dictation neither holds its place nor later
+        transcribes for nobody, and the handler answers quietly."""
+        import turnstone.server as srv
+
+        monkeypatch.setattr(srv, "_AUDIO_DISCONNECT_POLL_S", 0.01)
+        client, mock_client = voice_app_client
+        boundary = "voice-boundary"
+        body = (
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="audio"; filename="speech.webm"\r\n'
+                "Content-Type: audio/webm\r\n\r\n"
+            ).encode()
+            + b"RIFFfake"
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+        headers = {
+            **_auth("userA"),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+        with _voice_alias_full(client) as gate:
+            messages = _call_as_departing_caller(
+                client.app, f"/v1/api/workstreams/ws-A/{path}", headers, body
+            )
+
+        assert messages[0]["status"] == 499
+        assert gate.snapshot().queued == 0
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("route", "call"), [("stt", "transcribe"), ("stt-stream", "transcribe_stream")]
+    )
+    def test_a_dictation_runs_on_its_own_threads_and_its_wait_counts_from_arrival(
+        self, voice_app_client, monkeypatch, route, call
+    ):
+        """A dictation never waits on the shared workers the heartbeat and access checks
+        need, keeps the request's log fields, and has its wait for a slot cut by the time
+        already spent since the request arrived."""
+        import turnstone.core.audio as audio_mod
+        import turnstone.server as srv
+        from turnstone.core.log import ctx_user_id
+
+        client, _ = voice_app_client
+        check = srv._require_ws_access
+
+        def _slow_check(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.2)
+            return check(*args, **kwargs)
+
+        seen: dict[str, Any] = {}
+
+        def _transcription(**kwargs: Any) -> Any:
+            seen["thread"] = threading.current_thread().name
+            seen["user_id"] = ctx_user_id.get()
+            seen["wait"] = kwargs["admission_wait_s"]
+            seen["remaining"] = kwargs["deadline"] - time.monotonic()
+            if call == "transcribe":
+                return audio_mod.TranscriptionResult(
+                    transcript="hi", model_alias="voice", model="m"
+                )
+            return iter(["hi"])
+
+        monkeypatch.setattr(srv, "_require_ws_access", _slow_check)
+        monkeypatch.setattr(audio_mod, call, _transcription)
+        resp = _voice_request(client, route, user_id="userA")
+
+        assert resp.status_code == 200, resp.text
+        assert seen["thread"].startswith("stt")
+        assert seen["user_id"] == "userA"
+        assert seen["wait"] <= srv._STT_ADMISSION_WAIT_S - 0.2
+        assert 0 < seen["remaining"] <= srv._STT_REQUEST_TIMEOUT_S - 0.2
+
+    def test_a_dictation_that_gets_no_thread_in_time_is_told_the_node_is_busy(
+        self, voice_app_client, monkeypatch
+    ):
+        """With every dictation thread held by a long transcription, the next dictation is
+        refused within its budget instead of queueing past the console's wait."""
+        import turnstone.server as srv
+
+        monkeypatch.setattr(srv, "_STT_ADMISSION_WAIT_S", 0.2)
+        client, mock_client = voice_app_client
+        release = threading.Event()
+        long_ones = [
+            client.app.state.stt.submit(release.wait, 5) for _ in range(srv._STT_MAX_THREADS)
+        ]
+        try:
+            wait_until(lambda: all(f.running() for f in long_ones))
+            resp = _voice_request(client, "stt", user_id="userA")
+        finally:
+            release.set()
+            for f in long_ones:
+                f.result(timeout=5)
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+        assert "busy" in resp.json()["error"]
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+
+    def test_a_call_that_outlives_its_budget_reports_no_unhandled_error(self, monkeypatch):
+        """A dictation still in its call when the budget runs out is waited for, and its
+        failure surfaces through the handler only.  Cancelling a shield around it instead
+        makes asyncio report the failure as unhandled, with a traceback per refusal."""
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+
+        import turnstone.server as srv
+        from turnstone.core.audio import AudioBusyError
+
+        monkeypatch.setattr(srv, "_STT_ADMISSION_WAIT_S", 0.05)
+        threads = ThreadPoolExecutor(max_workers=1)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(stt=threads)))
+        reported: list[dict[str, Any]] = []
+
+        def _outlives_the_budget(**_kwargs: Any) -> None:
+            time.sleep(0.2)
+            raise AudioBusyError("no free slot")
+
+        async def _dictate() -> None:
+            asyncio.get_running_loop().set_exception_handler(
+                lambda _loop, context: reported.append(context)
+            )
+            with pytest.raises(AudioBusyError):
+                await srv._run_dictation(request, time.monotonic(), _outlives_the_budget)
+            await asyncio.sleep(0.05)  # let any done-callback report land
+
+        try:
+            asyncio.run(_dictate())
+        finally:
+            threads.shutdown(wait=True)
+        assert reported == []
+
+    def test_dictation_wait_leaves_room_in_the_console_wait(self):
+        """The HTTP budget leaves room for a backend attempt after admission,
+        and for the node's error to reach the console before its read times out."""
+        from turnstone.console.server import _PROXY_CLIENT_TIMEOUT_S
+        from turnstone.server import _STT_ADMISSION_WAIT_S, _STT_REQUEST_TIMEOUT_S
+
+        assert 0 < _STT_ADMISSION_WAIT_S < _STT_REQUEST_TIMEOUT_S < _PROXY_CLIENT_TIMEOUT_S
+
+
+# ---------------------------------------------------------------------------
+# GET /preview — the renderable serving route (preview pane)
+# ---------------------------------------------------------------------------
+
+
+def _seed_committed(ws_id: str, kind: str, mime: str, body: bytes, filename: str) -> str:
+    """Commit a blob the way the open_preview fold does: content-addressed
+    save + a tool row whose ref-list names it (the serving ownership gate)."""
+    import hashlib
+
+    from turnstone.core.memory import save_attachment, save_message
+    from turnstone.core.storage import get_storage
+
+    aid = hashlib.sha256(b"preview:" + body).hexdigest()
+    save_attachment(aid, filename, mime, len(body), kind, body, "tool")
+    row_id = save_message(ws_id, "tool", "Preview shown", "open_preview", tool_call_id="c1")
+    assert row_id is not None
+    get_storage().set_message_attachments(ws_id, row_id, [aid])
+    return aid
+
+
+class TestGetPreview:
+    def test_html_default_serves_locked_down_csp(self, app_client):
+        client, _ = app_client
+        body = b'<html><head><base href="https://acme.com/"></head><body>x</body></html>'
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.content == body
+        # Default (no ?assets): renderable but off the network — sandboxed,
+        # inline styling + data-URI images only, so previewing discloses
+        # nothing to the origin site.
+        assert resp.headers.get("content-security-policy") == (
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"
+        )
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert resp.headers.get("content-disposition", "").startswith("inline;")
+        assert resp.headers.get("cache-control") == "private, no-store"
+
+    def test_html_assets_flag_serves_bare_sandbox(self, app_client):
+        # ?assets=1 is the per-pane opt-in: drop back to the bare sandbox so
+        # the page's own images / CSS load.
+        client, _ = app_client
+        body = b"<html><head></head><body>x</body></html>"
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?assets=1",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("content-security-policy") == "sandbox"
+
+    def test_pdf_served_without_csp(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "preview", "application/pdf", b"%PDF-1.4 x", "d.pdf")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/pdf")
+        # Chromium's viewer refuses sandboxed contexts — the route omits CSP.
+        assert "content-security-policy" not in resp.headers
+
+    def test_image_keeps_full_csp(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "preview", "image/png", PNG_1x1, "chart.png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert "default-src 'none'" in resp.headers.get("content-security-policy", "")
+
+    def test_non_renderable_mime_415(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "audio", "audio/wav", WAV_12, "a.wav")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 415
+
+    def test_uploaded_attachment_also_previews(self, app_client):
+        # An UPLOADED image (committed via the normal user lane) renders
+        # through /preview too — the pane serves attachment: targets.
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "image", "image/png", PNG_1x1, "up.png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/png")
+
+    def test_unreferenced_id_404(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "preview", "text/html", b"<p>x</p>", "p")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-B/attachments/{aid}/preview",
+            headers=_auth("userB"),
+        )
+        assert resp.status_code == 404
+
+    def test_probe_returns_204_with_hardening_headers(self, app_client):
+        # The pane preflights src-loaded kinds with ?probe=1 instead of HEAD:
+        # the console reverse proxy forwards a HEAD as a full GET, so a real
+        # HEAD would drag the whole blob across the hop just to discard it. The
+        # probe runs the ownership + renderable-type gates and returns the real
+        # response's hardening headers with an empty body.
+        client, _ = app_client
+        body = b"<html><head></head><body>x</body></html>"
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?probe=1",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 204
+        assert resp.content == b""
+        # Same hardening headers the real GET would carry (the probe answers
+        # "will the load paint?"): the html CSP is present.
+        assert resp.headers.get("content-security-policy") == (
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"
+        )
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+
+    def test_probe_composes_with_assets_flag(self, app_client):
+        # ?probe=1&assets=1 → 204 whose headers reflect the assets opt-in.
+        client, _ = app_client
+        body = b"<html><head></head><body>x</body></html>"
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?probe=1&assets=1",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 204
+        assert resp.headers.get("content-security-policy") == "sandbox"
+
+    def test_probe_non_renderable_mime_still_415(self, app_client):
+        # A probe must answer "will the real load succeed?" — a non-renderable
+        # blob 415s exactly as the real GET would, before any 204.
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "audio", "audio/wav", WAV_12, "a.wav")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?probe=1",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 415

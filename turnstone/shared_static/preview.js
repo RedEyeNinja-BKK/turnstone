@@ -1,0 +1,947 @@
+// preview.js — the preview pane: rich rendering of tool-selected content
+// (a fetched web page, PDF, image, data table, text/markdown document) in a
+// dedicated pane beside the conversation.
+//
+// One singleton pane per shell (PaneManager type "preview").  Content arrives
+// as a DESCRIPTOR — the structured object the open_preview tool folds onto
+// its tool turn ({kind, title, source, attachment_id, content_type, size}) —
+// plus a transport context {base, wsId} from the ORIGINATING conversation
+// pane, so blob fetches route through the same node proxy that session
+// streams from.  Bytes are never inlined into events; everything loads from
+// the per-workstream preview route on cookie auth (the house pattern:
+// plain same-origin src URLs, no blob:/createObjectURL).
+//
+// Developer-tool posture: keyboard-operable (←/→ walk the session's preview
+// history), sandboxed (web content renders in a fully sandboxed iframe on top
+// of the route's own CSP), and coexistent — it opens BESIDE the conversation
+// via openPaneBeside, never replacing it.
+//
+// House style: ES module, programmatic DOM (createElement / textContent /
+// append), NO innerHTML — the one HTML sink is setSafeHtml over
+// renderMarkdown, the sanctioned renderer.js lane.  All queries root-scoped.
+
+import { ShellPane } from "./pane.js";
+import { authFetch } from "./auth.js";
+import { redactCredentials } from "./redact_credentials.js";
+import {
+  renderMarkdown,
+  postRenderMarkdown,
+  postRenderHljs,
+} from "./renderer.js";
+import { copyTextToClipboard, setSafeHtml } from "./utils.js";
+
+// How many viewed descriptors the ←/→ history keeps.  Session-scoped and
+// in-memory; only the CURRENT one is persisted for reload (pane.meta).
+const HISTORY_CAP = 20;
+// Table renderer row cap — past this the DOM cost buys no decision value;
+// the notice row reports what was withheld.
+const TABLE_ROW_CAP = 5000;
+// Tokenization is synchronous. Keep large source files readable in full while
+// avoiding a long main-thread pause (and an oversized renderer-cache entry).
+const SOURCE_HIGHLIGHT_CAP = 100000;
+const TEXT_PREVIEW_STEP = 256 * 1024;
+const TEXT_PREVIEW_MAX = 2 * 1024 * 1024;
+const MARKDOWN_RENDER_CAP = 512 * 1024;
+
+// Canonical names in the existing vendored highlight.js bundle. Keep this
+// filename classification independent of whether that optional vendor loaded:
+// the Files browser also uses it when choosing its source-file icon.
+const SOURCE_EXTENSIONS = {
+  js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript",
+  ts: "typescript", mts: "typescript", cts: "typescript", tsx: "typescript",
+  py: "python", pyw: "python", pyi: "python", rb: "ruby", rake: "ruby",
+  rs: "rust", go: "go", java: "java", kt: "kotlin", kts: "kotlin",
+  c: "c", h: "c", cc: "cpp", cpp: "cpp", cxx: "cpp", hpp: "cpp", hxx: "cpp",
+  cs: "csharp", m: "objectivec", mm: "objectivec", swift: "swift",
+  php: "php", pl: "perl", pm: "perl", lua: "lua", r: "r", vb: "vbnet",
+  sh: "bash", bash: "bash", zsh: "bash", mk: "makefile",
+  css: "css", scss: "scss", less: "less", html: "xml", htm: "xml",
+  xml: "xml", xsd: "xml", xsl: "xml", svg: "xml", vue: "xml", svelte: "xml",
+  json: "json", jsonl: "json", ndjson: "json", yaml: "yaml", yml: "yaml",
+  toml: "ini", ini: "ini", cfg: "ini", sql: "sql", graphql: "graphql",
+  gql: "graphql", md: "markdown", markdown: "markdown", diff: "diff",
+  patch: "diff", wat: "wasm",
+};
+const SOURCE_FILENAMES = {
+  makefile: "makefile", gnumakefile: "makefile", gemfile: "ruby", rakefile: "ruby",
+  ".bashrc": "bash", ".bash_profile": "bash", ".profile": "bash",
+  ".zshrc": "bash", ".zprofile": "bash", ".env": "ini",
+  ".gitconfig": "ini", ".editorconfig": "ini", ".npmrc": "ini", ".pypirc": "ini",
+};
+
+/** Classify a source filename; unknown formats deliberately get no auto-detect. */
+export function sourceLanguage(path) {
+  if (typeof path !== "string" || !path) return null;
+  if (/^https?:\/\//i.test(path)) {
+    try {
+      path = decodeURIComponent(new URL(path).pathname);
+    } catch (_) {
+      return null;
+    }
+  }
+  const name = path.split(/[\\/]/).pop().toLowerCase();
+  if (Object.hasOwn(SOURCE_FILENAMES, name)) return SOURCE_FILENAMES[name];
+  if (name.startsWith(".env.")) return "ini";
+  const extension = name.includes(".") ? name.split(".").pop() : "";
+  return Object.hasOwn(SOURCE_EXTENSIONS, extension)
+    ? SOURCE_EXTENSIONS[extension]
+    : null;
+}
+// Automatic reloads for the persist race: the live descriptor beats the
+// tool-turn fold that commits its blob whenever a parallel SIBLING tool is
+// still running — the fold waits on the whole batch, so the gap is that
+// sibling's remaining runtime, not milliseconds.  Backoff doubles from
+// RETRY_BASE_MS across MAX_AUTO_RETRIES attempts (0.9s, 1.8s, 3.6s, 7.2s —
+// ~13.5s covered) before the manual Retry card takes over.
+const RETRY_BASE_MS = 900;
+const MAX_AUTO_RETRIES = 4;
+
+function make(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function makeAction(tag, text, label) {
+  const node = make(tag, "preview-action", text);
+  if (tag === "button") node.type = "button";
+  node.title = label;
+  node.setAttribute("aria-label", label);
+  return node;
+}
+
+// The per-workstream serving route for a descriptor, through the originating
+// pane's transport base ("" local, "/node/{id}" console-proxied).
+function previewContentUrl(ctx, descriptor, endpoint = "preview") {
+  const base = (ctx && ctx.base) || "";
+  const ws = (ctx && ctx.wsId) || "";
+  return (
+    base +
+    "/v1/api/workstreams/" +
+    encodeURIComponent(ws) +
+    "/attachments/" +
+    encodeURIComponent(descriptor.attachment_id || "") +
+    "/" +
+    endpoint
+  );
+}
+
+// Append preview query flags to a content URL (which never carries a query of
+// its own).  ``probe`` asks the route for a bodyless 204 "will the real load
+// paint?" preflight — the console reverse proxy forwards a HEAD as a full GET,
+// so a real HEAD would drag the whole blob across the hop just to discard it.
+// ``assets`` opts a sandboxed page back into loading its remote images/styles.
+function withPreviewFlags(url, opts) {
+  const q = [];
+  if (opts && opts.probe) q.push("probe=1");
+  if (opts && opts.assets) q.push("assets=1");
+  return q.length ? url + (url.includes("?") ? "&" : "?") + q.join("&") : url;
+}
+
+// ---------------------------------------------------------------------------
+// Delimited-text parsing (table kind).  Minimal RFC-4180 state machine:
+// quoted fields, "" escapes, \r\n and \n rows.  Returns rows of strings.
+// ---------------------------------------------------------------------------
+function parseDelimited(text, delim) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          quoted = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"' && field === "") {
+      quoted = true;
+    } else if (ch === delim) {
+      row.push(field);
+      field = "";
+    } else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(field);
+      field = "";
+      rows.push(row);
+      row = [];
+    } else {
+      field += ch;
+    }
+  }
+  if (field !== "" || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  // Drop a pure-empty trailing row (text ending in a newline).
+  if (rows.length && rows[rows.length - 1].every((f) => f === "")) rows.pop();
+  return rows;
+}
+
+// JSON payloads → (header, rows).  Array of objects: columns = key union in
+// first-seen order.  Array of scalars/arrays: index-labelled columns.  A bare
+// object: two-column key/value listing.
+function tableFromJson(parsed) {
+  if (Array.isArray(parsed)) {
+    if (
+      parsed.length &&
+      parsed.every((r) => r && typeof r === "object" && !Array.isArray(r))
+    ) {
+      const cols = [];
+      for (const r of parsed) {
+        for (const k of Object.keys(r)) if (!cols.includes(k)) cols.push(k);
+      }
+      const rows = parsed.map((r) =>
+        cols.map((c) => {
+          const v = r[c];
+          if (v == null) return "";
+          return typeof v === "object" ? JSON.stringify(v) : String(v);
+        }),
+      );
+      return { header: cols, rows };
+    }
+    const rows = parsed.map((r) =>
+      Array.isArray(r)
+        ? r.map((v) =>
+            v == null
+              ? ""
+              : typeof v === "object"
+                ? JSON.stringify(v)
+                : String(v),
+          )
+        : [
+            typeof r === "object" && r != null
+              ? JSON.stringify(r)
+              : String(r ?? ""),
+          ],
+    );
+    const width = rows.reduce((w, r) => Math.max(w, r.length), 0);
+    const header = [];
+    for (let i = 0; i < width; i++) header.push(String(i + 1));
+    return { header, rows };
+  }
+  if (parsed && typeof parsed === "object") {
+    return {
+      header: ["key", "value"],
+      rows: Object.entries(parsed).map(([k, v]) => [
+        k,
+        typeof v === "object" && v != null
+          ? JSON.stringify(v)
+          : String(v ?? ""),
+      ]),
+    };
+  }
+  return { header: ["value"], rows: [[String(parsed)]] };
+}
+
+// Numeric-aware comparator for column sorts: numbers order numerically,
+// everything else falls back to locale string compare.
+function compareCells(a, b) {
+  const na = parseFloat(a);
+  const nb = parseFloat(b);
+  const bothNumeric =
+    !Number.isNaN(na) &&
+    !Number.isNaN(nb) &&
+    a.trim() !== "" &&
+    b.trim() !== "";
+  if (bothNumeric && na !== nb) return na < nb ? -1 : 1;
+  if (bothNumeric) return 0;
+  return a.localeCompare(b);
+}
+
+// ---------------------------------------------------------------------------
+// createPreviewPane — the PaneManager factory body.
+//   hostApi: { persistMeta(meta), setTitle(text) } — the two pm-owned verbs
+//   the pane needs, injected by the shell so the pane owns no manager ref.
+//   extra:   the rehydrate hint ({descriptor, ctx}) persisted via pane.meta.
+// Embedded Files viewers may also supply contentUrl(ctx, descriptor, endpoint),
+// history:false, autoRetry:false, copy:true, and emptyText. responseErrors shows
+// the serving route's error text; downloadOnPreviewError preserves a download
+// when only rendering was refused (size/type limits). textPreview requests
+// bounded text prefixes with an explicit control to load more.
+// ---------------------------------------------------------------------------
+export function createPreviewPane(extra, hostApi) {
+  const api = hostApi || {};
+  // The Files pane embeds this viewer with live filesystem URLs. Attachment
+  // previews retain their existing transport, history, and retry behavior.
+  const contentUrl = api.contentUrl || previewContentUrl;
+  const keepHistory = api.history !== false;
+  const pane = new ShellPane({
+    type: "preview",
+    title: "Preview",
+    glyph: "▤",
+    // Dismissing the preview cell CLOSES it (tab and all) instead of parking an
+    // orphan tab — its content is transient tool output and its reopen lives on
+    // the transcript chip, not the tab bar.
+    ephemeral: true,
+  });
+
+  // Viewed-descriptor history (session-scoped): entries are {descriptor, ctx}.
+  pane._stack = [];
+  pane._idx = -1;
+  pane._loadToken = 0;
+  // Remote-assets opt-in: per-pane, sticky across previews, NOT persisted in
+  // pane meta.  Default OFF — a previewed page must not contact its origin
+  // site (an IP/traffic disclosure) until the user asks.
+  pane._assetsOn = false;
+
+  const shortTitle = (d) => {
+    const t = redactCredentials(d.title || d.source || "preview");
+    return t.length > 40 ? t.slice(0, 39) + "…" : t;
+  };
+
+  const setNavState = () => {
+    pane._backBtn.disabled = pane._idx <= 0;
+    pane._fwdBtn.disabled = pane._idx >= pane._stack.length - 1;
+  };
+
+  const setDownloadUrl = (url) => {
+    const link = pane._downloadLink;
+    if (url) {
+      link.setAttribute("href", url);
+      link.removeAttribute("aria-disabled");
+      link.removeAttribute("tabindex");
+    } else {
+      link.removeAttribute("href");
+      link.setAttribute("aria-disabled", "true");
+      link.setAttribute("tabindex", "-1");
+    }
+  };
+
+  const renderEmpty = () => {
+    pane._contentEl.replaceChildren(
+      make(
+        "div",
+        "preview-empty",
+        api.emptyText ||
+          "Nothing previewed yet — ask the assistant to show a page, file, image, or data table.",
+      ),
+    );
+  };
+
+  const renderError = (message, entry) => {
+    const wrap = make("div", "preview-error");
+    wrap.append(make("div", "preview-error-msg", message));
+    const retry = makeAction("button", "Retry", "Retry preview");
+    // A manual retry is a single deliberate attempt — no silent backoff run.
+    retry.addEventListener("click", () => renderEntry(entry, MAX_AUTO_RETRIES));
+    wrap.append(retry);
+    pane._contentEl.replaceChildren(wrap);
+  };
+
+  const renderNote = (text) => make("div", "preview-note", text);
+
+  // ----- per-kind renderers -------------------------------------------------
+
+  const renderWeb = (url) => {
+    const frame = make("iframe", "preview-frame");
+    // Full lockdown: no scripts, no same-origin, no forms/popups.  The route
+    // additionally serves the document under its own CSP sandbox — neither
+    // layer alone is load-bearing.
+    frame.setAttribute("sandbox", "");
+    frame.setAttribute("referrerpolicy", "no-referrer");
+    frame.title = "Web page preview";
+    frame.src = url;
+    pane._contentEl.replaceChildren(frame);
+  };
+
+  const renderPdf = (url, d) => {
+    const frame = make("iframe", "preview-frame");
+    // No sandbox attribute: Chromium's built-in PDF viewer refuses to paint
+    // in a sandboxed context, and the response is inert media (the serving
+    // route omits CSP for application/pdf for the same reason).
+    frame.title = (d.title || "Document") + " (PDF preview)";
+    frame.src = url;
+    pane._contentEl.replaceChildren(frame);
+  };
+
+  const renderImage = (url, d) => {
+    const holder = make("div", "preview-imgwrap");
+    const img = make("img", "preview-img");
+    img.alt = d.title || "Image preview";
+    img.decoding = "async";
+    img.src = url;
+    holder.append(img);
+    pane._contentEl.replaceChildren(holder);
+  };
+
+  const renderText = (text, descriptor = {}, partial = false) => {
+    const language = descriptor.file_path
+      ? sourceLanguage(descriptor.file_path)
+      : sourceLanguage(descriptor.source) || sourceLanguage(descriptor.title);
+    const pre = make("pre", "preview-pre");
+    if (!language) {
+      pre.textContent = text;
+      pane._contentEl.replaceChildren(pre);
+      return;
+    }
+    pre.classList.add("preview-source");
+    const code = make("code", "nohighlight", text);
+    pre.append(code);
+    pane._contentEl.replaceChildren(pre);
+    if (text.length > SOURCE_HIGHLIGHT_CAP) {
+      pane._contentEl.append(
+        renderNote(partial ? "Shown text has no syntax highlighting (large file)." : "Full source shown without syntax highlighting (large file)."),
+      );
+      return;
+    }
+    try {
+      // Never let highlight.js auto-detect an unavailable language. The shared
+      // renderer owns tokenization, caching, and the existing global theme.
+      if (typeof hljs === "undefined" || !hljs.getLanguage(language)) return;
+      code.className = "language-" + language;
+      postRenderHljs(pane._contentEl);
+    } catch (_) {
+      // Restore exact source even if a vendor failure partially changed DOM.
+      code.textContent = text;
+      code.className = "nohighlight";
+      code.removeAttribute("data-highlighted");
+      pre.classList.remove("code-terminal");
+    }
+  };
+
+  const renderMarkdownDoc = (text) => {
+    const doc = make("div", "preview-markdown");
+    // The one sanctioned HTML lane: renderer.js output through setSafeHtml.
+    setSafeHtml(doc, renderMarkdown(text));
+    pane._contentEl.replaceChildren(doc);
+    // Vendor post-pass — hljs token coloring + mermaid diagrams, matching the
+    // conversation pane.  Runs AFTER the attach: the renderer tolerates
+    // detached elements (the async mermaid apply gates on isConnected and
+    // attachment here is synchronous), but attach-first matches the
+    // conversation pane's ordering and leaves no room for doubt.
+    // renderer.js typeof-guards absent vendors, so no try/catch is needed.
+    postRenderMarkdown(doc);
+  };
+
+  const renderTable = (text, d) => {
+    let header;
+    let rows;
+    const bare = String(d.content_type || "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    if (bare === "application/json") {
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (e) {
+        renderText(text, d); // not actually JSON — degrade to plain text
+        return;
+      }
+      ({ header, rows } = tableFromJson(parsed));
+    } else {
+      const delim = bare === "text/tab-separated-values" ? "\t" : ",";
+      const all = parseDelimited(text, delim);
+      if (!all.length) {
+        renderText(text, d);
+        return;
+      }
+      header = all[0];
+      rows = all.slice(1);
+      // Ragged files: a short first row must not silently hide trailing
+      // columns of later rows — pad the header out to the widest row so
+      // every parsed cell renders (and sorts).
+      const width = rows.reduce((w, r) => Math.max(w, r.length), header.length);
+      while (header.length < width) header.push(String(header.length + 1));
+    }
+
+    const wrap = make("div", "preview-tablewrap");
+    const table = make("table", "preview-table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    const state = { col: -1, dir: 1, rows };
+
+    const tbody = document.createElement("tbody");
+    const renderBody = () => {
+      tbody.replaceChildren();
+      const shown = state.rows.slice(0, TABLE_ROW_CAP);
+      for (const r of shown) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < header.length; c++) {
+          const td = document.createElement("td");
+          td.textContent = r[c] != null ? r[c] : "";
+          tr.append(td);
+        }
+        tbody.append(tr);
+      }
+    };
+
+    header.forEach((h, ci) => {
+      const th = document.createElement("th");
+      th.scope = "col";
+      const btn = make("button", "preview-th", h);
+      btn.type = "button";
+      btn.title = "Sort by " + h;
+      btn.addEventListener("click", () => {
+        state.dir = state.col === ci ? -state.dir : 1;
+        state.col = ci;
+        state.rows = state.rows
+          .slice()
+          .sort((a, b) => state.dir * compareCells(a[ci] || "", b[ci] || ""));
+        for (const other of headRow.querySelectorAll("th")) {
+          other.removeAttribute("aria-sort");
+        }
+        th.setAttribute(
+          "aria-sort",
+          state.dir > 0 ? "ascending" : "descending",
+        );
+        renderBody();
+      });
+      th.append(btn);
+      headRow.append(th);
+    });
+    thead.append(headRow);
+    table.append(thead, tbody);
+    renderBody();
+    wrap.append(table);
+    pane._contentEl.replaceChildren(wrap);
+    if (rows.length > TABLE_ROW_CAP) {
+      pane._contentEl.append(
+        renderNote(
+          "Showing " +
+            TABLE_ROW_CAP.toLocaleString() +
+            " of " +
+            rows.length.toLocaleString() +
+            " rows",
+        ),
+      );
+    }
+  };
+
+  // ----- load + dispatch ----------------------------------------------------
+
+  // attempt 0..MAX_AUTO_RETRIES-1 = silent backoff retries for the persist
+  // race; past that (including the manual Retry button, which passes
+  // MAX_AUTO_RETRIES) failures land on the error card immediately.
+  const renderEntry = (entry, attempt) => {
+    const token = ++pane._loadToken;
+    const d = entry.descriptor;
+    const url = contentUrl(entry.ctx, d);
+    pane._copyText = null;
+    pane._copyUrl = null;
+    pane._copyBtn.disabled = true;
+    pane._copyBtn.textContent = "Copy";
+    pane._copyBtn.title = "Copy original file contents";
+    pane._copyBtn.setAttribute("aria-label", pane._copyBtn.title);
+    pane._copyStatus.textContent = "";
+    pane._textPreviewControls.hidden = true;
+    pane._loadMoreText = null;
+    pane._downloadLink.title = "Download preview file";
+    pane._downloadLink.setAttribute("aria-label", pane._downloadLink.title);
+    pane._downloadLink.hidden = false;
+    setDownloadUrl(null);
+    const ready = () => {
+      const downloadUrl = contentUrl(entry.ctx, d, "content");
+      setDownloadUrl(downloadUrl);
+      if (["text", "markdown", "table", "web"].includes(d.kind)) {
+        // HTML is iframe-rendered, so copying must fetch the UTF-8 preview
+        // source. The download preserves bytes in the file's original encoding.
+        pane._copyUrl = url;
+        pane._copyBtn.disabled = false;
+      }
+    };
+    const failed = (why, status) => {
+      if (token !== pane._loadToken) return;
+      if (api.autoRetry !== false && attempt < MAX_AUTO_RETRIES) {
+        setTimeout(
+          () => {
+            if (token === pane._loadToken) renderEntry(entry, attempt + 1);
+          },
+          RETRY_BASE_MS * Math.pow(2, attempt),
+        );
+        return;
+      }
+      // A live file can exceed the preview cap while remaining downloadable.
+      // Access failures and disappeared files must not enable stale actions.
+      if (api.downloadOnPreviewError && (status === 413 || status === 415)) {
+        setDownloadUrl(contentUrl(entry.ctx, d, "content"));
+      }
+      renderError(why, entry);
+    };
+    const failedResponse = async (response) => {
+      let message = response.status === 404
+        ? "This preview's content isn't available yet."
+        : "Could not load the preview (" + response.status + ").";
+      if (api.responseErrors) {
+        try {
+          const body = await response.json();
+          if (typeof body.error === "string" && body.error.trim()) {
+            message = body.error.slice(0, 400);
+          }
+        } catch (_) { /* Keep the safe fallback for non-JSON proxy errors. */ }
+      }
+      failed(message, response.status);
+    };
+
+    pane._kindEl.textContent = d.kind || "";
+    // Display strings can be raw URLs — never print embedded credentials.
+    // The ext link below keeps the RAW url (it must actually navigate).
+    const titleText = redactCredentials(d.title || d.source || "");
+    const sourceText = redactCredentials(d.source || "");
+    pane._titleEl.textContent = titleText;
+    pane._titleEl.title =
+      sourceText && sourceText !== titleText
+        ? titleText + "\n" + sourceText
+        : titleText;
+    const isWeb = d.kind === "web" && /^https?:\/\//.test(d.source || "");
+    pane._extLink.hidden = !isWeb;
+    if (isWeb) pane._extLink.href = d.source;
+    // The remote-assets toggle rides web previews only; its checked state
+    // mirrors the pane's sticky opt-in on every render.
+    pane._assetsLabel.hidden = d.kind !== "web";
+    pane._assetsBox.checked = !!pane._assetsOn;
+    api.setTitle && api.setTitle("Preview · " + shortTitle(d));
+
+    pane._contentEl.replaceChildren(make("div", "preview-loading", "Loading…"));
+
+    // Remote assets are a web-only concern; the flag only reaches web URLs.
+    if (d.kind === "binary") {
+      pane._contentEl.replaceChildren(
+        renderNote("Preview is not available for this file. Download it to open locally."),
+      );
+      ready();
+      return;
+    }
+    const assetsOn = d.kind === "web" && !!pane._assetsOn;
+    const probeUrl = withPreviewFlags(url, { probe: true, assets: assetsOn });
+    const srcUrl = withPreviewFlags(url, { assets: assetsOn });
+
+    if (d.kind === "web" || d.kind === "pdf" || d.kind === "image") {
+      // src-loaded kinds: preflight with a probe request so the persist race
+      // and auth failures surface as a typed error card, not a broken frame.
+      authFetch(probeUrl)
+        .then((r) => {
+          if (token !== pane._loadToken) return;
+          if (!r.ok) {
+            return failedResponse(r);
+          }
+          if (d.kind === "web") renderWeb(srcUrl);
+          else if (d.kind === "pdf") renderPdf(srcUrl, d);
+          else renderImage(srcUrl, d);
+          ready();
+        })
+        .catch(() => failed("Could not load the preview."));
+      return;
+    }
+    if (api.textPreview && (d.kind === "text" || d.kind === "markdown")) {
+      let loadedLimit = 0;
+      let loading = false;
+      let hasMore = false;
+      const sizeLabel = (size) => size >= 1024 * 1024
+        ? (size / (1024 * 1024)).toFixed(1).replace(/\.0$/, "") + " MiB"
+        : size >= 1024 ? Math.round(size / 1024) + " KiB" : size + " B";
+      const loadText = async (limit, more) => {
+        if (loading || token !== pane._loadToken) return;
+        loading = true;
+        pane._textPreviewMore.setAttribute("aria-disabled", "true");
+        if (more) pane._textPreviewStatus.textContent = "Loading more…";
+        try {
+          const response = await authFetch(url + (url.includes("?") ? "&" : "?") + "limit=" + limit);
+          if (token !== pane._loadToken) return;
+          if (!response.ok) {
+            if (!more) {
+              await failedResponse(response);
+              return;
+            }
+            if ([401, 403, 404].includes(response.status)) {
+              setDownloadUrl(null);
+              pane._copyBtn.disabled = true;
+            }
+            throw new Error("Could not load more text (" + response.status + "). Try again.");
+          }
+          const text = await response.text();
+          if (token !== pane._loadToken) return;
+          const truncated = response.headers.get("X-Preview-Truncated") === "true";
+          const bytesHeader = response.headers.get("X-Preview-Bytes");
+          const sizeHeader = response.headers.get("X-File-Size");
+          const bytes = bytesHeader === null ? text.length : Number(bytesHeader);
+          const total = sizeHeader === null ? bytes : Number(sizeHeader);
+          const scrollTop = pane._contentEl.scrollTop;
+          const scrollLeft = pane._contentEl.scrollLeft;
+          const focusedMore = document.activeElement === pane._textPreviewMore;
+          pane._copyText = text;
+          const sourceMarkdown = d.kind === "markdown" && (truncated || text.length > MARKDOWN_RENDER_CAP);
+          if (d.kind === "markdown" && !sourceMarkdown) renderMarkdownDoc(text);
+          else renderText(text, d, truncated);
+          if (sourceMarkdown) {
+            pane._contentEl.append(renderNote("Markdown source shown for this large or partial preview."));
+          }
+          if (more) {
+            pane._contentEl.scrollTop = scrollTop;
+            pane._contentEl.scrollLeft = scrollLeft;
+          }
+          loadedLimit = limit;
+          hasMore = truncated && limit < TEXT_PREVIEW_MAX;
+          pane._copyStatus.textContent = "";
+          ready();
+          const downloadAllowed = !api.downloadLimit || total <= api.downloadLimit;
+          pane._downloadLink.title = downloadAllowed ? "Download preview file"
+            : "Download is limited to " + sizeLabel(api.downloadLimit);
+          pane._downloadLink.setAttribute("aria-label", pane._downloadLink.title);
+          if (!downloadAllowed) setDownloadUrl(null);
+          pane._copyBtn.textContent = truncated ? "Copy shown text" : "Copy";
+          pane._copyBtn.title = truncated ? "Copy shown text" : "Copy original file contents";
+          pane._copyBtn.setAttribute("aria-label", pane._copyBtn.title);
+          const canLoadMore = hasMore;
+          pane._textPreviewMore.hidden = !canLoadMore;
+          pane._textPreviewControls.hidden = !truncated && !more;
+          pane._textPreviewStatus.textContent = truncated
+            ? "Showing first " + sizeLabel(bytes) + " of " + sizeLabel(total) +
+              (downloadAllowed
+                ? (canLoadMore ? "." : ". Download to read the full file.")
+                : (canLoadMore ? "." : ". Preview limit reached.") +
+                  " Download is limited to " + sizeLabel(api.downloadLimit) + ".")
+            : "Full file loaded (" + sizeLabel(total) + ").";
+          if (focusedMore && !canLoadMore) pane._contentEl.focus({ preventScroll: true });
+        } catch (error) {
+          if (token !== pane._loadToken) return;
+          if (more) {
+            pane._textPreviewStatus.textContent = "Could not load more text. Try again.";
+          } else {
+            failed("Could not load the preview.");
+          }
+        } finally {
+          if (token === pane._loadToken) {
+            loading = false;
+            pane._textPreviewMore.removeAttribute("aria-disabled");
+          }
+        }
+      };
+      pane._loadMoreText = () => {
+        if (hasMore) loadText(Math.min(loadedLimit + TEXT_PREVIEW_STEP, TEXT_PREVIEW_MAX), true);
+      };
+      loadText(TEXT_PREVIEW_STEP, false);
+      return;
+    }
+    // text-family kinds render client-side from fetched text.
+    authFetch(url)
+      .then((r) => {
+        if (token !== pane._loadToken) return null;
+        if (!r.ok) {
+          return failedResponse(r).then(() => null);
+        }
+        return r.text();
+      })
+      .then((text) => {
+        if (text == null || token !== pane._loadToken) return;
+        pane._copyText = text;
+        if (d.kind === "table") renderTable(text, d);
+        else if (d.kind === "markdown") renderMarkdownDoc(text);
+        else renderText(text, d);
+        ready();
+      })
+      .catch(() => failed("Could not load the preview."));
+  };
+
+  const showAt = (idx) => {
+    if (idx < 0 || idx >= pane._stack.length) return;
+    pane._idx = idx;
+    setNavState();
+    const entry = pane._stack[idx];
+    renderEntry(entry, 0);
+    // Persist ONLY the current view — reload restores it via the factory's
+    // rehydrate hint (the meta shape is exactly the entry: serializable).
+    api.persistMeta &&
+      api.persistMeta({ descriptor: entry.descriptor, ctx: entry.ctx });
+  };
+
+  /** Public API: show a descriptor (new gesture or chip re-open). */
+  pane.showPreview = (descriptor, ctx) => {
+    if (!descriptor || !(descriptor.attachment_id || descriptor.file_path)) return;
+    const top = pane._stack[pane._idx];
+    if (
+      top &&
+      (top.descriptor.attachment_id || top.descriptor.file_path) ===
+        (descriptor.attachment_id || descriptor.file_path) &&
+      top.descriptor.kind === descriptor.kind &&
+      (top.ctx?.base || "") === (ctx?.base || "") &&
+      (top.ctx?.wsId || "") === (ctx?.wsId || "") &&
+      (top.ctx?.rootId || "") === (ctx?.rootId || "")
+    ) {
+      // Same content re-requested — re-render in place (retry semantics),
+      // updating its title/source without growing duplicate history entries.
+      top.descriptor = descriptor;
+      showAt(pane._idx);
+      return;
+    }
+    // A new view truncates any forward history (browser-history semantics).
+    pane._stack = keepHistory ? pane._stack.slice(0, pane._idx + 1) : [];
+    pane._stack.push({ descriptor, ctx: ctx || null });
+    if (pane._stack.length > HISTORY_CAP) pane._stack.shift();
+    showAt(pane._stack.length - 1);
+  };
+
+  pane.onMount = function () {
+    const root = make("div", "preview-root");
+
+    const bar = make("div", "preview-bar");
+    const identity = make("div", "preview-identity");
+    const history = make("div", "preview-history");
+    const back = makeAction("button", "←", "Previous preview");
+    back.classList.add("preview-nav");
+    back.title = "Previous preview (←)";
+    back.addEventListener("click", () => showAt(pane._idx - 1));
+    const fwd = makeAction("button", "→", "Next preview");
+    fwd.classList.add("preview-nav");
+    fwd.title = "Next preview (→)";
+    fwd.addEventListener("click", () => showAt(pane._idx + 1));
+    history.append(back, fwd);
+    history.hidden = !keepHistory;
+    const kind = make("span", "preview-kindchip", "");
+    const title = make("span", "preview-titletext", "");
+    identity.append(history, kind, title);
+    const actions = make("div", "preview-actions");
+    const download = makeAction("a", "↓ Download", "Download preview file");
+    download.setAttribute("download", "");
+    download.hidden = true;
+    const ext = makeAction("a", "Open source ↗", "Open source in a new tab");
+    ext.target = "_blank";
+    ext.rel = "noopener noreferrer";
+    ext.hidden = true;
+    const copy = makeAction("button", "Copy", "Copy original file contents");
+    copy.hidden = api.copy !== true;
+    copy.disabled = true;
+    const copyStatus = make("span", "preview-copy-status");
+    copyStatus.hidden = api.copy !== true;
+    copyStatus.setAttribute("role", "status");
+    copy.addEventListener("click", async () => {
+      if (copy.disabled || !pane._copyUrl) return;
+      const token = pane._loadToken;
+      copy.disabled = true;
+      copyStatus.textContent = "";
+      try {
+        let text = pane._copyText;
+        if (text == null) {
+          const response = await authFetch(pane._copyUrl);
+          if (!response.ok) throw new Error("File unavailable");
+          text = await response.text();
+        }
+        if (token !== pane._loadToken) return;
+        const ok = await copyTextToClipboard(text);
+        if (token !== pane._loadToken) return;
+        copyStatus.textContent = ok ? "Copied" : "Could not copy";
+      } catch (_) {
+        if (token === pane._loadToken) copyStatus.textContent = "Could not copy";
+      } finally {
+        if (token === pane._loadToken) copy.disabled = false;
+      }
+    });
+    actions.append(copyStatus, copy, download, ext);
+    bar.append(identity, actions);
+    // Web-only options get their own row so the title and actions retain
+    // room in narrow split panes.
+    const assets = make("label", "preview-assets");
+    assets.title = "Off keeps this preview from contacting the site";
+    const assetsBox = make("input", "preview-assets-box");
+    assetsBox.type = "checkbox";
+    assets.append(
+      assetsBox,
+      make("span", "preview-assets-text", "Load remote images & styles"),
+    );
+    assets.hidden = true;
+    assetsBox.addEventListener("change", () => {
+      pane._assetsOn = assetsBox.checked;
+      // Reload the current web preview so its iframe re-fetches in the new
+      // mode.  A toggle is a deliberate act — no silent-backoff run.
+      const cur = pane._stack[pane._idx];
+      if (cur && cur.descriptor.kind === "web")
+        renderEntry(cur, MAX_AUTO_RETRIES);
+    });
+    const content = make("div", "preview-content");
+    // Scroll containers are not keyboard-focusable in every browser.
+    content.tabIndex = 0;
+    content.setAttribute("role", "region");
+    content.setAttribute("aria-label", "Preview content");
+
+    const textControls = make("div", "preview-text-controls");
+    textControls.hidden = true;
+    const textStatus = make("span", "preview-text-status");
+    textStatus.setAttribute("role", "status");
+    const textMore = makeAction("button", "Load more", "Load more text");
+    textMore.addEventListener("click", () => pane._loadMoreText && pane._loadMoreText());
+
+    textControls.append(textStatus, textMore);
+    pane._textPreviewControls = textControls;
+    pane._textPreviewStatus = textStatus;
+    pane._textPreviewMore = textMore;
+    pane._backBtn = back;
+    pane._fwdBtn = fwd;
+    pane._kindEl = kind;
+    pane._titleEl = title;
+    pane._extLink = ext;
+    pane._downloadLink = download;
+    pane._copyBtn = copy;
+    pane._copyStatus = copyStatus;
+    pane._assetsLabel = assets;
+    pane._assetsBox = assetsBox;
+    pane._contentEl = content;
+
+    root.append(bar, assets, content, textControls);
+    this.bodyEl.append(root);
+
+    // ←/→ walk history outside horizontally scrolling content. Source files
+    // and nested code/table scrollers keep their native arrows, even at an
+    // edge, so reaching the end of a line never switches to another file.
+    this.el.addEventListener("keydown", (e) => {
+      if (!keepHistory || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+      const t = e.target;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable)
+      )
+        return;
+      if (pane._contentEl.contains(t)) {
+        for (let node = t; node; node = node.parentNode) {
+          if (node.scrollWidth > node.clientWidth) return;
+          if (node === pane._contentEl) break;
+        }
+      }
+      e.preventDefault();
+      showAt(pane._idx + (e.key === "ArrowLeft" ? -1 : 1));
+    });
+
+    setNavState();
+    // Rehydrate: a reload restores the LAST viewed preview from pane.meta.
+    if (extra && extra.descriptor) {
+      pane.showPreview(extra.descriptor, extra.ctx || null);
+    } else {
+      renderEmpty();
+    }
+  };
+
+  // Invalidate pending work when an embedded viewer changes directory/context.
+  pane.clearPreview = () => {
+    pane._loadToken++;
+    pane._stack = [];
+    pane._idx = -1;
+    pane._copyText = null;
+    pane._copyUrl = null;
+    pane._loadMoreText = null;
+    if (!pane._contentEl) return;
+    pane._textPreviewControls.hidden = true;
+    setDownloadUrl(null);
+    pane._downloadLink.hidden = true;
+    pane._copyBtn.disabled = true;
+    pane._copyStatus.textContent = "";
+    pane._extLink.hidden = true;
+    pane._assetsLabel.hidden = true;
+    pane._titleEl.textContent = "";
+    pane._kindEl.textContent = "";
+    setNavState();
+    renderEmpty();
+  };
+
+  pane.onClose = pane.clearPreview;
+
+  return pane;
+}

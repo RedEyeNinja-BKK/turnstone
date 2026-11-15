@@ -1,0 +1,839 @@
+# Security and Authentication
+
+Turnstone uses a layered authentication system with two token types
+(database-backed API tokens + HMAC-SHA256 JWTs), hierarchical scopes,
+and a split architecture where the console manages credentials while
+individual server nodes validate JWTs locally.  Inter-service traffic
+uses short-lived service JWTs minted by `ServiceTokenManager`.
+
+---
+
+## Token Types
+
+### API tokens
+
+Database-backed tokens prefixed with `ts_`. Created via the admin CLI
+(`turnstone-admin create-token`) or the console admin API. Stored as
+SHA-256 hashes — the raw token is shown exactly once at creation and
+never persisted in plaintext.
+
+```
+$ turnstone-admin create-token --user abc123 --scopes read,write --name "CI bot"
+Token created: ts_a1b2c3d4e5f6...
+(save this — it will not be shown again)
+```
+
+API tokens can be used directly as `Bearer ts_xxx` headers or exchanged
+for a JWT via the login endpoint.
+
+### JWTs
+
+Short-lived session tokens (24 hours by default). Issued after
+authenticating with username/password or by exchanging an API token.
+HS256-signed with a shared secret. Validated locally on every service
+node — no database call per request.
+
+Claims:
+
+| Claim | Description |
+|-------|-------------|
+| `sub` | User ID |
+| `scopes` | Comma-separated scope list (`read,write,approve`) |
+| `src` | Token source (`password`, `database`, `oidc`, or a service origin like `console`, `cli`, or `channel`) |
+| `iss` | Issuer — always `turnstone` |
+| `aud` | Audience — `turnstone-server` or `turnstone-console` |
+| `iat` | Issued-at timestamp |
+| `exp` | Expiry timestamp |
+
+The `aud` claim prevents cross-service token reuse — a JWT issued for the
+console cannot be used to authenticate against a server node, and vice versa.
+Tokens without an `aud` claim are accepted during the rollout window when
+`audience` validation is not specified.
+
+Password and OIDC sessions require at least one current effective role permission. Login and
+renewal refuse an empty permission set with 403; a permission-store outage returns 503 without
+issuing a JWT or changing the existing cookie. Nonempty granular permissions retain the read
+transport floor, and write/approve keep their scope hierarchy.
+
+`POST /v1/api/auth/login` accepts a password or a raw stored `ts_` API token. It rejects JWT input.
+`POST /v1/api/auth/refresh` renews only non-service password/OIDC sessions, resolving their roles
+again. API-derived sessions keep their explicit token scopes and fixed expiry; exchange a
+still-valid raw API token to obtain another session. Proxy, coordinator, service, and other JWT
+sources use their existing credential managers instead of human-session renewal.
+
+Login, setup, refresh, and whoami expose `can_refresh`, derived from the same source/scope rule.
+The browser uses it to gate renewal. A temporary 503 preserves current authority and permits a
+retry before the original expiry; a refused renewal does not schedule that retry. Existing JWTs
+remain usable for their original lifetime. Removing roles does not revoke an explicit raw API
+token or a delegated credential. OIDC retains its explicit default-viewer provisioning, including
+for returning identities whose roles were all removed.
+
+---
+
+## Scope Model
+
+Scopes are hierarchical — higher scopes imply all lower ones.
+
+| Scope | Grants | Implies |
+|-------|--------|---------|
+| `read` | View workstreams, saved workstreams, history | — |
+| `write` | Send messages, create/close workstreams | `read` |
+| `approve` | Approve tool calls, trust a coordinator's sends, admin endpoints | `read`, `write` |
+
+### Path-to-scope mapping
+
+| Method | Path pattern | Required scope | Additional RBAC gate |
+|--------|-------------|----------------|----------------------|
+| GET | Any protected path | `read` | Endpoint-specific where documented |
+| GET, HEAD | `/api/workstreams/{ws_id}/files`, `/files/preview`, `/files/content`, `/files/resolve` | `write` | `files.read`, active local interactive session and project tenancy; also enforced through the node proxy |
+| GET | `/api/workstreams/saved` | `read` | Creator/project visibility; console coordinator rows additionally require `admin.coordinator` |
+| GET | `/api/workstreams/{ws_id}` (detail) | `read`; also `write` to reopen a cold session | Project tenancy and kind-specific permission |
+| POST | `/api/command` | `write` | Project tenancy on the target workstream |
+| POST | `/api/workstreams/new`, `/api/cluster/workstreams/new` | `write` | `workstreams.create` or `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/close` | `write` | `workstreams.close` or `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/approve` | `approve` | `tools.approve` or `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/trust` | `approve` | `admin.coordinator` and `coordinator.trust.send` |
+| POST | `/api/workstreams/{ws_id}/restrict`, `/close_all_children` | `write` | `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/{rewind,retry}` | `write` | `conversation.modify` |
+| POST | `/api/workstreams/{ws_id}/delete` | `write` | Project tenancy; coordinator rows also require `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/speech-to-text`, `/speech-to-text/stream` | `write` | Project tenancy on the target workstream; also enforced through the node proxy |
+| DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` | Project tenancy on the target workstream |
+| Any but GET, HEAD | Other paths under `/api/workstreams/` | `write` | Project tenancy and endpoint-specific gates |
+| PUT | `/api/users/{user_id}/avatar`, `/api/users/{user_id}/avatar/picture` | `write` | The caller's own account only |
+| DELETE | `/api/users/{user_id}/avatar/picture` | `write` | The caller's own account only |
+| Any | `/api/admin/*` | `approve` | Matching `admin.*` permission |
+
+Under `/api/workstreams/` the method sets the floor: every request other than GET or HEAD
+needs at least `write`, so a route added there cannot fall through to `read`. `trust` needs
+`approve` because it lets a coordinator's sends to its own subtree skip approval. Through the
+console's `/node/{node_id}/...` proxy, these paths need the same scope as on the node.
+
+Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
+`/static/*`, `/shared/*`, `/docs`, `/openapi.json`, `/api/auth/login`,
+`/api/auth/logout`, `/api/auth/status`, `/api/auth/setup`,
+`/api/auth/oidc/authorize`, `/api/auth/oidc/callback`.
+
+Saved interactive history is available to project members without `admin.coordinator` or
+`project.read`. The `server.require_project` setting governs creation and does not restrict reads or
+reopening existing history. Read-only callers can inspect saved metadata and use history/export;
+reopening a saved session and deleting history require write scope. The browser uses the effective
+`scopes` returned by login, refresh, and whoami separately from named RBAC permissions when showing
+these actions.
+
+The Files pane exposes node-shared files under the configured workspace (server working
+directory when unset), `/data`, and `/tmp`. It requires `files.read` permission in addition
+to write scope. The permission gates directory listings, previews, downloads, and the
+browser controls. It is included in the built-in admin and operator roles and can be
+revoked through role overrides or granted to custom roles. It controls direct file
+browsing; tool access to the filesystem remains governed by tool policies. Project
+tenancy gates the selected conversation, but does not make the shared disk private to that
+project. Requests are confined to one selected root, do not follow symlinks, reject special
+files, and do not reopen or reroute an inactive session. HTML uses the existing sandboxed
+preview policy; downloads carry attachment disposition and preserve original bytes.
+
+### RBAC (Granular Permissions)
+
+> See also: [Governance documentation](governance.md)
+
+Scopes provide coarse endpoint-level access control. For finer-grained
+enforcement, the governance layer adds named permissions checked
+per-endpoint by `require_permission()`. Permissions are bundled into
+roles; users are assigned roles via the `user_roles` join table.
+
+At human login and renewal, current permissions are resolved strictly from the user's assigned
+roles. `_permissions_to_scopes()` derives transport scopes (for example, an `admin.*` permission
+implies `approve`). An empty permission set grants no scopes. The JWT carries both `scopes` and
+`permissions` claims.
+
+Three built-in roles are seeded by migration 008:
+
+| Role | Permissions |
+|------|-------------|
+| admin | Admin-default baseline (all ordinary admin and lifecycle permissions; explicitly opt-in capabilities remain ungranted) |
+| operator | read, write, workstreams.create, workstreams.close, conversation.modify, files.read |
+| viewer | read |
+
+Custom roles can be created with any subset of the valid permissions.
+Role creation and update validate permissions against a static allowlist.
+Self-assignment is blocked, and assigning a role requires the caller to
+hold a superset of the target role's permissions.
+
+### Workstream lifecycle and project boundaries
+
+The remote `/api/command` endpoint is conversation-local. It refuses
+`/new`, `/workstreams`, `/resume`, and `/delete` because those local-CLI
+helpers enumerate or mutate storage outside the HTTP resource gates. Remote
+clients use the dedicated create, open, close, and delete endpoints instead;
+`/rewind` and `/retry` have their own path-keyed, `conversation.modify`-gated
+endpoints.
+
+Passing `resume_ws` to create is an atomic **fork**, not an in-place resume.
+It requires the ordinary create capability and source visibility. A private
+project source is visible only to its workstream creator, project owner/member,
+or authorized service-to-service cluster plumbing; denials use a not-found
+response so guessed IDs do not become an existence oracle. The caller must also
+be allowed to attach a new workstream to the source's current project. The
+destination always inherits that effective project — a caller-supplied
+`project_id` cannot re-file or declassify the conversation.
+
+The canonical preflight atomically captures (and, for a legacy row, installs) a
+private source-incarnation fence. The storage transaction compares that source
+fence, rejects provisional sources, repeats the ACL/project check, and verifies
+the persona/project construction snapshot, destination ownership and
+incarnation, emptiness, and every referenced attachment before committing. A
+source replacement, membership, project, persona, or destination-incarnation
+race aborts the whole fork. Concurrent source-history writes serialize wholly
+before or after the snapshot; no mixed or partially authorized history or
+attachment reference becomes visible.
+
+---
+
+## Login Flows
+
+### Username and password
+
+```
+POST /v1/api/auth/login
+Content-Type: application/json
+
+{"username": "admin", "password": "s3cret"}
+```
+
+Returns a JWT in the response body and sets an `HttpOnly` session cookie.
+
+### API token exchange
+
+```
+POST /v1/api/auth/login
+Content-Type: application/json
+
+{"token": "ts_a1b2c3d4e5f6..."}
+```
+
+The API token is hashed, looked up in the database, and exchanged for a
+JWT with the token's scopes. This is the recommended flow for SDKs and
+automated clients that need cookie-based sessions.
+
+### First-time setup
+
+When no users exist in the database:
+
+1. `GET /v1/api/auth/status` returns `{"setup_required": true}`
+2. The UI presents a setup wizard
+3. `POST /v1/api/auth/setup` creates the first admin user and returns a
+   JWT in one atomic step (no auth required — this is a public endpoint)
+4. The endpoint returns `409 Conflict` if setup has already been completed
+   (i.e. users already exist in the database)
+5. Subsequent admin requests require `approve` scope
+
+The `/api/auth/setup` endpoint is available on both the server and
+console. It validates input before creating the user:
+
+- **username**: 1-64 ASCII characters
+- **display_name**: required (non-empty)
+- **password**: minimum 8 characters
+
+```
+POST /v1/api/auth/setup
+Content-Type: application/json
+
+{"username": "admin", "display_name": "Admin", "password": "strongpass"}
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "user_id": "u_abc123",
+  "username": "admin",
+  "role": "full",
+  "scopes": "approve,read,write",
+  "jwt": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+The response also sets an `HttpOnly` session cookie containing the JWT,
+so the browser is immediately authenticated after setup completes.
+
+### OIDC SSO (Single Sign-On)
+
+Turnstone supports OIDC Authorization Code Flow with PKCE for
+single sign-on with external identity providers (Okta, Azure AD,
+Google, etc.). SSO is opt-in. Users are auto-provisioned on first login;
+create a local admin before enabling SSO.
+
+#### Configuration
+
+Set `issuer`, `client_id`, `client_secret`, and `redirect_base` in the
+`[oidc]` section of the private TOML config shared by the console and nodes.
+Environment variables remain supported and take precedence over TOML.
+See [OIDC configuration](oidc.md#configuration) for the complete reference,
+provider registration, role mapping, and optional credential delegation.
+Docker deployments use the
+[shared config overlay](docker.md#shared-bootstrap-config).
+
+#### Login flow
+
+1. User clicks "Continue with [Provider]" on the login page
+2. `GET /v1/api/auth/oidc/authorize` generates state, nonce, and PKCE
+   challenge, stores them in the database, and redirects to the IdP
+3. User authenticates at the identity provider
+4. IdP redirects to `/v1/api/auth/oidc/callback` with `code` + `state`
+5. Server validates state, exchanges the authorization code (with PKCE
+   verifier), and validates the ID token (JWKS signature, issuer,
+   audience, nonce)
+6. Provisions or matches the user by `(issuer, sub)` — never by
+   username or email
+7. Issues a JWT (`src: oidc`), sets a session cookie, and redirects to
+   the application
+
+#### Security measures
+
+- **PKCE (S256)** — prevents authorization code interception
+- **State parameter** — one-time use, 5-minute TTL, database-backed
+  (multi-node safe)
+- **Nonce** — prevents ID token replay
+- **JWKS validation** — asymmetric algorithm allowlist (RS/ES/PS
+  256-512), HMAC excluded
+- **Algorithm allowlist enforced** — the signing key is resolved from
+  the JWKS by ``kid``; PyJWK infers the key's algorithm from the JWKS
+  ``alg``/``kty`` fields; the token header's ``alg`` must be in the
+  allowlist AND match the key type, preventing algorithm confusion
+- **Identity matching by (issuer, sub) only** — prevents account
+  takeover via email or username reuse
+- **`password_enabled=false` enforced server-side** — not just a UI
+  toggle
+- **Rate limiting** on both authorize and callback endpoints
+- **OIDC-provisioned users cannot password-login** — the password hash
+  is set to the `!oidc` sentinel, which never matches bcrypt verify
+
+#### Role mapping
+
+When `TURNSTONE_OIDC_ROLE_CLAIM` is set (e.g., `groups`), the server
+reads that claim from the ID token and maps values to Turnstone roles
+via `TURNSTONE_OIDC_ROLE_MAP`. Roles are synced on every login:
+matching claim values are added, and stale OIDC-assigned roles are
+revoked. Roles assigned manually (not by OIDC) are never touched.
+
+If no role mapping is configured, OIDC users are provisioned with the
+`builtin-viewer` role by default.
+
+#### OIDC-only mode
+
+Setting `TURNSTONE_OIDC_PASSWORD_ENABLED=false` hides the password
+form on the login page and blocks password-based login at the API
+level. The setup wizard always works regardless of this setting — the
+first admin user is created with a password before OIDC is relevant.
+API tokens are unaffected by this setting.
+
+#### Known limitations
+
+- **No session revocation** — deprovisioned IdP users retain their JWT
+  until the 24-hour expiry
+- **Single IdP** — configuration supports one issuer (the database
+  schema supports multiple for future expansion)
+- **Redirect URI** — defaults to request Host header; deployments behind
+  reverse proxies should set `TURNSTONE_OIDC_REDIRECT_BASE` to the
+  externally-reachable origin to pin the redirect URI
+
+---
+
+## Token Detection Order
+
+The auth middleware inspects the `Authorization: Bearer <token>` header
+and classifies the token:
+
+1. **Contains `.`** → JWT → validate HS256 signature and expiry
+2. **Starts with `ts_`** → API token → SHA-256 hash, database lookup
+
+If a session cookie is present and no `Authorization` header is sent,
+the cookie value is treated as a JWT (step 1).
+
+---
+
+## Password Storage
+
+Passwords are hashed with **bcrypt** using a random salt per password.
+Plaintext passwords are only accepted over HTTPS in production
+deployments.
+
+---
+
+## Cookie Security
+
+| Attribute | Value | Purpose |
+|-----------|-------|---------|
+| `HttpOnly` | `true` | Prevents JavaScript access |
+| `SameSite` | `Lax` | CSRF protection |
+| `Path` | `/` | Available to all routes |
+| `Max-Age` | 24 hours | Matches JWT expiry |
+| `Secure` | `true` (default) | Always set unless explicitly disabled for dev |
+
+---
+
+## JWT Configuration
+
+| Setting | Config key | Env var | Default |
+|---------|-----------|---------|---------|
+| Signing secret | `[auth] jwt_secret` | `TURNSTONE_JWT_SECRET` | required |
+| Expiry | `[auth] jwt_expiry_hours` | — | 24 hours |
+| Algorithm | — | — | HS256 (not configurable) |
+| Minimum secret length | — | — | 32 characters (exits if shorter) |
+
+The server and the console require a signing secret (`TURNSTONE_JWT_SECRET` or
+`[auth] jwt_secret`) and exit at startup if it is missing or shorter than 32
+characters (of the resolved value, when it is a `secret://` reference); the
+channel gateway rejects every notify request instead when its copy is missing.
+
+---
+
+## Admin API Endpoints
+
+All admin endpoints require `approve` scope.
+
+### Users
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/api/admin/users` | Create user (username, display_name, password) |
+| GET | `/v1/api/admin/users` | List all users |
+| DELETE | `/v1/api/admin/users/{user_id}` | Delete user and cascade tokens |
+
+### API tokens
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/api/admin/users/{user_id}/tokens` | Create API token (returns raw value once) |
+| GET | `/v1/api/admin/users/{user_id}/tokens` | List tokens (prefix only, no hashes) |
+| DELETE | `/v1/api/admin/tokens/{token_id}` | Revoke token |
+
+---
+
+## CLI Administration
+
+The `turnstone-admin` command provides offline user and token management:
+
+```
+turnstone-admin create-admin --username admin --name "Admin" [--password]
+turnstone-admin create-user --username reader --name "Reader" [--password] [--token]
+turnstone-admin create-token --user <user_id> --scopes read,write --name "CI bot"
+turnstone-admin list-users
+turnstone-admin list-tokens
+turnstone-admin revoke-token <token_id>
+```
+
+When `--password` is omitted, the CLI prompts interactively. `create-user` explicitly assigns the
+viewer role before reporting success or issuing an optional API token; failed role provisioning
+rolls back the new user. Historical accounts without roles receive no automatic grant and require
+an administrator to assign one. `create-admin` can create or promote an account. When `--token` is
+passed to `create-user`, the API token is printed to stdout.
+
+---
+
+## Database Schema
+
+```sql
+CREATE TABLE users (
+    user_id    TEXT PRIMARY KEY,
+    username   TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created    TEXT NOT NULL
+);
+
+CREATE TABLE api_tokens (
+    token_id     TEXT PRIMARY KEY,
+    token_hash   TEXT NOT NULL,       -- SHA-256 of raw token
+    token_prefix TEXT NOT NULL,       -- first 8 chars for display
+    user_id      TEXT NOT NULL REFERENCES users(user_id),
+    name         TEXT NOT NULL,
+    scopes       TEXT NOT NULL,       -- comma-separated
+    created      TEXT NOT NULL,
+    expires      TEXT                 -- nullable, ISO 8601
+);
+
+CREATE UNIQUE INDEX ix_api_tokens_hash ON api_tokens(token_hash);
+
+CREATE TABLE channel_users (
+    channel_type    TEXT NOT NULL,
+    channel_user_id TEXT NOT NULL,
+    user_id         TEXT NOT NULL REFERENCES users(user_id),
+    created         TEXT NOT NULL,
+    PRIMARY KEY (channel_type, channel_user_id)
+);
+```
+
+The `sessions` and `workstreams` tables have a nullable `user_id`
+column for attribution when auth is enabled.
+
+---
+
+## Revocation
+
+- **API tokens**: Deleting a token via the admin API or CLI prevents new
+  JWTs from being issued with that token. Existing JWTs derived from the
+  token remain valid until they expire (at most 24 hours).
+- **Config-file tokens**: Remove the token from `config.toml` and
+  restart the service. No JWTs are involved, so revocation is immediate.
+- **JWTs**: Cannot be individually revoked. Rely on short expiry (24h)
+  and revoke the underlying credential to prevent renewal.
+
+---
+
+## Architecture
+
+```
+Console (cluster-wide)              Server (per-node)
+┌──────────────────────┐           ┌──────────────────────┐
+│ User/Token CRUD (DB) │           │ JWT validation only  │
+│ Login: creds → JWT   │           │ (shared signing key) │
+│ Admin API endpoints  │           │ No auth DB needed    │
+│ Storage: users,      │           │                      │
+│   api_tokens tables  │           │                      │
+└──────────────────────┘           └──────────────────────┘
+```
+
+The console owns the credential database and handles all user/token
+CRUD.  Individual server nodes only need the JWT signing secret to
+validate session tokens.
+
+### Proxy auth forwarding
+
+When the console proxies requests to server nodes (via `/node/{id}/...`
+routes), it mints a **short-lived user-scoped JWT** with
+`aud: turnstone-server` carrying the real user's `user_id`, `scopes`,
+and `permissions`.  The user's console JWT (which has
+`aud: turnstone-console`) is **not** forwarded directly — it would be
+rejected by the server's audience validation.  Instead, the console
+re-signs a new JWT targeted at the server audience.
+
+Each proxied request gets a fresh JWT (5-minute expiry).  This ensures:
+
+- **Audit attribution** — the upstream server records the real user in
+  `ctx_user_id` and audit events, not a generic service identity.
+- **Scope narrowing** — a read-only console user's proxied request
+  carries only `read` scope, not the full `{read, write, approve}` set.
+  The server enforces this as defense in depth.
+- **Permission forwarding** — granular RBAC permissions from the
+  console JWT are carried through to the server.
+
+For ordinary users the JWT `src` claim is set to `"console-proxy"`, allowing
+servers to distinguish proxied requests from direct logins in audit logs.
+Coordinator tokens retain `src="coordinator"` and their signed `coord_ws_id`;
+the console service identity retains `src="console"` only when its validated
+token also carries the unassignable `service` scope.
+
+When no user context is available (auth disabled, or internal requests),
+the proxy falls back to a `ServiceTokenManager` with identity `console-proxy`,
+`src="console"`, and `{read, write, approve, service}` scopes.
+
+### Service-to-service authentication
+
+The console collector uses `ServiceTokenManager` for auto-rotating
+JWTs when communicating with server nodes:
+
+| Service | Identity | Scope | Audience | Purpose |
+|---------|----------|-------|----------|---------|
+| Console collector | `console-collector` | `read`, `service` | `turnstone-server` | Node health polling and global event collection |
+| Console proxy (fallback) | `console-proxy` | `read`, `write`, `approve`, `service` | `turnstone-server` | Proxied API calls when no user context |
+| Channel notify | `system` | `write` | `turnstone-channel` | Notification delivery to channel gateway |
+
+Service tokens use 1-hour expiry with automatic refresh via
+`ServiceTokenManager`.
+
+### User identity in MQ-dispatched workstreams
+
+When the console creates a workstream (the normal path), the
+authenticated user's `user_id` is forwarded in the HTTP payload when
+calling the server's `POST /v1/api/workstreams/new`.  The server
+accepts a `user_id` from the request body **only when the caller is a
+trusted service** — identified by `token_source="console"` together with the
+unassignable `service` scope. `console-proxy`, coordinator, and regular API callers cannot
+override `user_id`; the server always uses their JWT identity.
+
+Note that the channel gateway uses a distinct JWT audience
+(`turnstone-channel`) from the server (`turnstone-server`) and console
+(`turnstone-console`).  A server-scoped JWT cannot authenticate to the
+channel gateway endpoint, and vice versa.
+
+---
+
+## Secret References
+
+A model definition's `api_key` and an MCP server's static headers can hold a
+reference to a secret store instead of the value itself:
+
+```
+secret://<backend>/<path>[#<field>]
+```
+
+The reference is not a secret. The console shows it verbatim where a literal
+value would be masked, and the value it names is fetched when it is needed and
+kept only in memory: the database never holds it. References work in the
+Models tab, in the MCP Servers tab (headers of a `streamable-http` server,
+including those installed from the registry or imported), and in config.toml
+`[models.*]` entries. They do not work for MCP stdio `env` values, for
+`[database] url` or for the `[security]` keyring. Two bootstrap secrets take
+one: `[auth] jwt_secret` and `[oidc] client_secret`, in config.toml or in their
+environment variables (`TURNSTONE_JWT_SECRET`, `TURNSTONE_OIDC_CLIENT_SECRET`).
+Each is resolved once at startup; the server, the console and the channel
+gateway stop if it cannot be, so the store must answer at boot (the service
+manager's restart policy is the retry), while a tool logs a warning and goes on
+without it. The store's own credentials still arrive as files or config. The
+value is not refreshed afterwards: one rotated in the store reaches a process
+at its next start, and the JWT secret must match on the console, every node
+and the channel gateway, so restart them together. The gateway resolves a
+reference in `TURNSTONE_JWT_SECRET` too, and then needs the same `[secrets]`
+table, selected with `TURNSTONE_CONFIG`. The value rule below applies to these
+values as well: a referenced JWT secret or client secret must be printable
+ASCII. Every Turnstone process refuses a model key or MCP header reference that
+resolves to either value as that process has it configured: the server and the
+console register the two while loading them, and the CLI, the admin commands
+and the doctor register the values their own environment and config.toml name
+before their first resolve, skipping with a warning one they cannot resolve.
+Run the tools with the services' configuration where the guard should hold for
+their secrets. A bootstrap secret kept in the store thus stays out of reach of
+everyone allowed to write a reference, as the rule on the file root intends.
+
+A reference must be the whole value: store `Bearer xyz` in the secret and
+reference it, rather than writing `Bearer secret://...`. `${VAR}` is never
+expanded inside a reference (an unset variable would quietly select a
+different secret). Outside one, only config.toml `[models.*]` entries expand
+`${VAR}`: a model definition saved in the console never does, so the console
+refuses one on save, and the loader skips a definition saved with one earlier
+and names it.
+
+### Backends
+
+Backends are configured under `[secrets]` in config.toml, and the table must be
+the same on the console and every node that shares the database. A malformed
+table stops the process at startup. With the Helm chart, `config.file` (or
+`config.existingSecret`) and `config.secretMounts` in `values.yaml` put the
+same file and Secret mounts in both pods; see `deploy/helm/turnstone/README.md`.
+
+```toml
+[secrets]
+cache_ttl_seconds = 300          # how long a fetched value is reused
+
+[secrets.file]
+root = "/run/turnstone/secrets"  # secret://file/run/turnstone/secrets/openai
+
+[secrets.vault]                  # Vault or OpenBao, KV v2
+address = "https://vault.example.com:8200"
+auth = "approle"                 # or "jwt"
+role_id = "..."
+secret_id_file = "/etc/turnstone/vault-secret-id"   # outside the file root
+mount = "secret"                 # secret://vault/turnstone/openai#api_key
+# namespace = "team-a"           # sent only when set (OpenBao enforces it)
+# ca_cert = "/etc/ssl/private-ca.pem"
+# timeout_seconds = 5
+```
+
+- **file** reads a whole file (minus one trailing newline) whose absolute path,
+  as written and after symlinks are followed, lies under `root`. Container and
+  Kubernetes secret mounts fit this shape. The root must be a dedicated
+  directory: it may not contain config.toml, the Vault login credential
+  (`secret_id_file`, `jwt_path`) or the pod's service-account token where
+  Kubernetes mounts one, all refused at startup.
+- **vault** reads one field of a KV v2 secret at `<mount>/<path>`. The process
+  logs in with `jwt` (`role` plus `jwt_path`, the file holding the workload's
+  token; a Kubernetes workload sets `auth_mount = "kubernetes"` and points
+  `jwt_path` at its projected service-account token) or `approle` (`role_id`
+  plus `secret_id` or `secret_id_file`), logs in again when the token's lease
+  ends or once after the store rejects the token (revoking the token it
+  replaces), and trusts the operating system's certificate store unless
+  `ca_cert` names a bundle (one that cannot be loaded stops the process at
+  startup). The address comes from config.toml only; proxy and `SSL_CERT_*`
+  environment variables are ignored. Point `address` at the active node or a
+  load balancer: redirects are not followed.
+
+Both backends drop one trailing line break from a value: a mounted file usually
+ends with one, and a Vault field written from a file (`vault kv put` with
+`field=@file`) keeps the file's. What remains goes out in an HTTP header (a
+model's API key, an MCP server's header), so it must be printable ASCII, with
+spaces and tabs only between other characters. Any other value is refused as a
+secret that does not exist is, and the message names the reference, never the
+value.
+
+A literal model key follows the same rule: one in a model definition, in a
+config.toml `[models.*]` entry (after `${VAR}` expansion), the CLI's own key
+(`--api-key`, `[api] api_key` or the provider key variable), and the provider
+SDK's own variable (`OPENAI_API_KEY`, or `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN`) that a model with an empty key uses. One trailing line
+break is dropped. A key that still cannot go in a header is refused, and so is
+one that was only a line break or, in a `[models.*]` entry, one whose `${VAR}`
+expands to nothing (the empty key would select the provider variable instead).
+The message names where the key came from, never the key: a model definition or
+`[models.*]` entry leaves its model out, which the console names with the
+reason; the CLI's own key stops the CLI at startup; a provider variable fails
+the models that use it when their client is built (Detect reports it). A running
+model whose saved key is refused keeps running as it is through the timed
+reloads, as one whose reference the store refuses does (below); Sync to Nodes
+applies the refusal.
+
+### When values are fetched
+
+A model definition's reference is resolved when the registry loads: at startup,
+on **Sync to Nodes**, when the console saves a definition, and, while
+`[secrets]` configures a store, every `cache_ttl_seconds` (at least every 60
+seconds) on each node and on the console, which then reload their models as
+Sync to Nodes does. A value rotated in the store therefore reaches every model
+within that interval, and so does a model definition saved since the last Sync;
+Sync to Nodes applies both at once, and the Models tab stops marking it pending
+once the interval has passed. A timed reload also reads the settings when they
+changed, so the cluster's stored default model reaches a node together with the
+model definitions it names. A timed reload asks an endpoint for its context
+window only for a definition whose window has not been detected yet (a new
+definition, or one whose endpoint changed); Sync to Nodes asks again for all of
+them. An MCP header reference is resolved when the server connects or
+reconnects, so open MCP connections keep the old value until **Reconnect**.
+Inside `cache_ttl_seconds` a fetched value is reused, which keeps a reload at
+one round trip per distinct reference.
+
+When the store is unreachable, sealed or refuses the login, the value fetched
+last is served with a warning until the store answers; a Sync, a timed reload
+or a Reconnect during the outage keeps the values already in use, and further
+references to the store are answered from that cache for a few seconds rather
+than each waiting for the store to time out. When the store answers that the
+secret does not exist, access is denied or the field is missing, the value is
+no longer served to anything new: a save, a **Detect** probe, a definition that
+was not running, and an MCP connect all get the refusal at once. A model that
+a node or the console is running keeps running as it is through the timed
+reloads, which log the refusal, so a policy mistake neither takes models away
+nor moves the default model; **Sync to Nodes** applies the refusal and leaves
+the definition out (the reply names it, with the reason). To stop using a
+value, remove or deny it in the store and press Sync to Nodes (models) or
+Reconnect (MCP servers), or disable or delete what references it.
+
+A reference that never resolved leaves its model definition out of the
+registry (the node logs it and names it in its reply to Sync to Nodes; the
+console's warning names the ones the console leaves out) or fails that MCP
+server's connect, until the store answers; the other definitions and servers
+are unaffected. If the store is unreachable while a process starts, the
+definitions that reference it load at the next timed reload or Sync after it
+comes back. An MCP server whose header the store refuses is retried every five
+minutes instead of on the usual reconnect backoff. A `[models.*]` entry in
+config.toml whose key is refused, for any of the reasons above, takes the same
+alias's database definition with it: the file has the last word on an alias it
+names. Other problems with a `[models.*]` entry leave the database definition in
+force.
+
+### Permissions and scoping
+
+Introducing or changing a reference, probing a typed one with **Detect**, or
+testing an MCP server's connection with one requires the `admin.mcp` permission
+held explicitly (a service token does not pass), as dynamic model auth does,
+because a reference chooses which entry of the store Turnstone reads on its
+author's behalf. Where a saved reference's value goes is decided as it is for a
+literal key: `admin.models` can change a definition's endpoint, or Detect
+another endpoint with its saved key, and `admin.mcp` can change an MCP server's
+URL. Scope the store accordingly: give Turnstone a dedicated Vault role whose
+policy covers only the secrets it references, runtime and bootstrap (a runtime
+reference to a bootstrap value is refused), and a dedicated file root. The
+console validates a reference when it is saved (syntax, a configured backend,
+and one resolution), so a typo never reaches the database, and the audit row
+of the save, or of a connection test, records the reference. Sending a
+definition back unchanged, reference included, needs neither the gate nor the
+store.
+
+`admin.models` also decides the cluster's default model in one case: adding or
+enabling the cluster's first chat model stores it as `model.default_alias` when
+no default is stored, and that setting outranks every node's config.toml
+default. Setting the default directly needs `admin.settings`, but this grants
+nothing new: `admin.models` can always change the endpoint of the model that is
+the default.
+
+The Terraform deployment passes configuration through the environment and
+mounts no config.toml, so `[secrets]` cannot be set there yet; references are
+for deployments that ship a config.toml (systemd, compose, and the Helm chart
+through `config.file` or `config.existingSecret`; see
+`deploy/helm/turnstone/README.md`).
+
+---
+
+## Configuration Reference
+
+### config.toml
+
+```toml
+[auth]
+jwt_secret = "your-secret-key-here"
+jwt_expiry_hours = 24
+```
+
+### Environment variables
+
+Auth is always enabled. `TURNSTONE_JWT_SECRET` is required.
+
+| Variable | Description |
+|----------|-------------|
+| `TURNSTONE_JWT_SECRET=xxx` | JWT signing secret (required, must match across nodes) |
+| `TURNSTONE_CORS_ORIGINS=` | CORS allowed origins (comma-separated; empty = same-origin only) |
+
+---
+
+## Login Rate Limiting
+
+The `/api/auth/login` endpoint is protected by a dedicated
+`LoginRateLimiter` (separate from the general API rate limiter).
+Limits are enforced per-IP and per-username with a sliding window:
+
+- **5 attempts** per **5-minute window** per key
+- Failed logins record against both `ip:{client_ip}` and `user:{username}`
+- Returns `429 Too Many Requests` with `Retry-After` header when exceeded
+- Successful logins do not consume the budget
+
+---
+
+## CORS Policy
+
+By default, no CORS headers are sent (same-origin only). To allow
+cross-origin requests, set `TURNSTONE_CORS_ORIGINS`:
+
+```bash
+# Allow specific origins
+TURNSTONE_CORS_ORIGINS=https://app.example.com,https://admin.example.com
+
+# Allow all origins (development only)
+TURNSTONE_CORS_ORIGINS=*
+```
+
+When the variable is empty or unset, the CORS middleware is not added
+and browsers enforce same-origin policy.
+
+---
+
+## Security Properties
+
+- **Hash-based lookup** for API tokens — the database stores only
+  SHA-256 hashes, eliminating timing attacks on token comparison.
+- **Local JWT validation** — no network call or database query needed
+  per request on server nodes.
+- **One-time display** of raw API tokens at creation. The plaintext is
+  never stored; `token_hash` never appears in API responses or logs.
+- **Structured logging audit trail** — `ctx_user_id` is set on every
+  authenticated request and injected into all log events.
+- **Scope enforcement** at the middleware layer before any handler
+  executes. Path-to-scope mapping is defined statically.
+- **JWT audience isolation** — server and console JWTs have distinct
+  `aud` claims, preventing cross-service token reuse.
+- **Login brute-force protection** — per-IP and per-username rate
+  limiting on the login endpoint.
+- **Secure cookies by default** — `Secure` flag set unconditionally;
+  24-hour max-age matches JWT expiry.
+- **CORS restriction** — no CORS headers by default (same-origin only).
+- **Service JWT auto-rotation** — 1-hour expiry with transparent
+  refresh, eliminating long-lived static tokens for inter-service auth.
+- **Secret strength validation** — warning logged when JWT secret is
+  shorter than 32 characters.
+- **OIDC PKCE enforcement** — S256 code challenge on every
+  authorization request prevents code interception in transit.
+- **OIDC state/nonce in database** — one-time-use, TTL-bounded tokens
+  stored in the database, safe for multi-node deployments.
+- **OIDC JWKS-only validation** — ID tokens are verified using the
+  provider's published JWKS keys with asymmetric algorithms only;
+  HMAC-based algorithms are rejected to prevent algorithm confusion.
+- **OIDC identity binding by (issuer, sub)** — user matching uses the
+  immutable subject identifier, not email or username, preventing
+  account takeover via IdP attribute changes.

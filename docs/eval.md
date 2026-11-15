@@ -1,0 +1,669 @@
+# Evaluation and Prompt Optimization (turnstone-eval, turnstone-optimizer)
+
+Evaluation for turnstone is split into two commands:
+
+- **`turnstone-eval`** — the measurement substrate. Runs test cases against the LLM
+  and scores tool call sequences against expected actions. A single measurement pass,
+  no self-modification.
+- **`turnstone-optimizer`** — the prompt/tool optimizer. Loops over the measurement
+  substrate, using a multi-agent pipeline (analyst, optimizer, observer, diversifier,
+  tool optimizer) to edit the developer prompt and tool descriptions so more tests pass.
+
+The dependency is strictly one-way: the optimizer consumes the eval substrate; the
+substrate never depends on the optimizer.
+
+Source: `turnstone/eval/core.py` (measurement substrate), `turnstone/eval/cli.py`
+(the `turnstone-eval` CLI), `turnstone/optimizer.py` (the `turnstone-optimizer` CLI).
+
+---
+
+## Overview
+
+The system uses UCB tree search to explore prompt variants:
+
+1. Maintain an **evolution tree** of prompt variants, starting from the initial prompt.
+2. Each iteration, **UCB1 selects** the most promising node to evaluate.
+3. Run each test case N times against the selected prompt.
+4. Score each run by comparing the actual tool call sequence to expected actions.
+5. If not all tests pass, run a **three-phase optimization pipeline**:
+   - Phase 1: Analyst diagnoses semantic failure patterns
+   - Phase 2: Tool optimizer adjusts tool descriptions (when `--optimize-tools`)
+   - Phase 3: Prompt optimizer proposes a child variant (when not `--optimize-tools`)
+6. Add the child to the tree and repeat until all tests pass or max iterations reached.
+
+This approach (inspired by [Learning to Self-Evolve](https://arxiv.org/abs/2603.18620))
+prevents irrecoverable collapse from bad edits — UCB naturally backtracks to
+high-scoring ancestors instead of following a linear chain.
+
+The `turnstone-eval` command (or `turnstone-optimizer --no-optimize`) executes only
+steps 2-4: a single measurement pass over the root prompt, no optimization.
+
+---
+
+## Test Case Format
+
+Test suites are JSON files with this structure:
+
+```json
+{
+  "defaults": {
+    "n_runs": 3
+  },
+  "cases": [
+    {
+      "id": "test_name",
+      "user_prompt": "the prompt to send to the model",
+      "setup": {
+        "files": {
+          "filename.py": "file content here",
+          "src/utils.py": "another file"
+        }
+      },
+      "expected_actions": [
+        {"tool": "read_file", "args": {"path": "filename.py"}},
+        {"tool": "bash", "args_pattern": {"command": "python.*test"}},
+        {"tool": "edit_file"}
+      ],
+      "match_mode": "ordered_subset",
+      "max_turns": 10,
+      "n_runs": 5
+    }
+  ]
+}
+```
+
+### Fields
+
+| Field              | Required | Default            | Description |
+|--------------------|----------|--------------------|-------------|
+| `id`               | yes      | --                 | Unique test case identifier. |
+| `user_prompt`      | yes      | --                 | The message sent to the model. |
+| `setup.files`      | no       | `{}`               | Files to create in the temp directory before running. Keys are relative paths, values are file content. |
+| `expected_actions`  | no       | `[]`               | List of expected tool calls to match against. |
+| `forbidden_actions` | no      | `[]`               | Action specs (same shape as `expected_actions`) the model must never take; any match fails the run with score 0. |
+| `expected_content` | no       | `[]`               | List of regexes (case-insensitive) the final answer must match. |
+| `attachments`      | no       | `[]`               | Text files attached to the prompt: `{"filename", "content", "mime_type"}` objects (`mime_type` optional). They are classified and sent as an upload would be. |
+| `match_mode`       | no       | `"ordered_subset"` | How to match actual vs expected actions (see Scoring). |
+| `max_turns`        | no       | `10`               | Maximum conversation turns before stopping. |
+| `n_runs`           | no       | suite default or 3 | Per-case override for number of runs. |
+| `holdout`          | no       | `false`            | If `true`, this case is evaluated but excluded from optimizer feedback. Used to measure progress without overfitting. |
+
+### Expected Action Specs
+
+Each entry in `expected_actions` can contain:
+
+- `tool` (required): The tool name to match (e.g. `"read_file"`, `"bash"`).
+- `args`: Exact key-value matching. Each key in `args` must exist in the actual call with the same string value.
+- `args_pattern`: Regex key-value matching. Each key's value is a regex pattern tested against the actual argument value.
+- If neither `args` nor `args_pattern` is specified, only the tool name is matched.
+
+---
+
+## Scoring
+
+Scoring is handled by `score_run()`, which compares a run's tool call log
+against the expected actions.
+
+### Match Modes
+
+| Mode              | Description |
+|-------------------|-------------|
+| `exact`           | Tool calls must match expected actions in exact order and exact count. Extra or missing calls cause failure. |
+| `ordered_subset`  | Expected actions must appear in order within the actual tool log, but extra calls between them are allowed. This is the default. |
+| `subset`          | Expected actions must all appear somewhere in the tool log, in any order. Each actual call can only match one expected action. |
+| `contains_any`    | Passes if at least one expected action appears anywhere in the tool log. |
+
+### Action Matching (`_match_action`)
+
+A single actual tool call matches an expected action when:
+
+1. The tool names are equal.
+2. If `args` is specified: every key in `args` must exist in the actual call's
+   arguments with the same string value (partial key matching -- extra actual
+   args are ignored).
+3. If `args_pattern` is specified: every key's regex pattern must match the
+   corresponding actual argument value via `re.search()`.
+4. If the actual args contain only `_raw` (unparseable JSON fallback), the
+   action matches only when no `args` or `args_pattern` is expected.
+
+### Score Calculation
+
+- **Score** = number of matched expected actions / total expected actions.
+- **Pass** = score equals 1.0 (all expected actions matched).
+- The return dict includes: `pass`, `score`, `matched` (indices), `unmatched`
+  (indices), `extra_tools`, and `detail` (human-readable summary).
+
+The harness scores each run with `score_case_run()`, which applies the case's
+optional `forbidden_actions` and `expected_content` on top of `score_run()`.
+A forbidden match sets the score to 0 and lists the offending calls under
+`forbidden`. Missing content patterns fail the run, scale the score by the
+fraction found, and are listed under `content_missing` next to the start of
+the answer (`final_content`). A case with neither field scores exactly as
+`score_run()` does. `eval_attachments.json` uses both: its cases attach a file
+the workspace lacks, forbid looking for it or writing it, and check the answer
+for a fact only the attachment holds.
+
+### JSON Dump Detection
+
+When a run fails and the model's final text content contains JSON that looks
+like a tool call (keys like `"tool"`, `"command"`, `"path"`), the run is
+flagged with `json_dump: true`. This indicates the model tried to call a tool
+but emitted JSON as text instead of using the function-calling interface.
+
+---
+
+## HeadlessSession
+
+`HeadlessSession` extends `ChatSession` for headless evaluation. It provides
+deterministic, non-interactive execution suitable for automated testing.
+
+### Differences from ChatSession
+
+| Aspect          | ChatSession             | HeadlessSession            |
+|-----------------|-------------------------|----------------------------|
+| Streaming       | Streaming API           | Non-streaming (`stream=False`) |
+| Tool approval   | User confirmation       | `auto_approve = True`       |
+| UI              | Terminal/Web UI         | `NullUI` (discards output)  |
+| Stdout          | Normal                  | Suppressed during execution |
+| Tool logging    | Display only            | Structured `tool_call_log`  |
+| System prompt   | Built-in developer prompt | Overridable via constructor |
+| Cancellation    | N/A                     | `_cancelled` event for timeout cleanup |
+
+### NullUI
+
+A minimal UI adapter that satisfies the `SessionUI` protocol by discarding
+all output. `approve_tools()` always returns `(True, None)`.
+
+### send_headless()
+
+```python
+def send_headless(
+    self,
+    user_input: str,
+    max_turns: int = 10,
+    verbose: bool = False,
+    log_prefix: str = "",
+) -> list[dict]:
+```
+
+Runs a complete multi-turn conversation:
+
+1. Appends the user message.
+2. Checks `_cancelled` event — stops if set (timeout cleanup).
+3. Calls the model through the production streaming provider path and drains
+   the result.
+4. If tool calls are returned, executes them (with stdout suppressed) and
+   logs each call to `self.tool_call_log`.
+5. Repeats up to `max_turns` or until the model responds without tool calls.
+6. Returns the tool call log: list of dicts with keys `tool`, `args`,
+   `result` (truncated to 500 chars), and `turn`.
+
+Parallel tool calls are capped at 10 per turn to prevent degenerate repetition.
+
+### Timeout and Cancellation
+
+Each test runs in a `ThreadPoolExecutor(max_workers=1)` with a per-test
+timeout (`--test-timeout`). Each attempt gets its own `OpenAI` client with
+a matching per-read HTTP transport timeout. Because a trickling stream can
+continually reset that read timeout, three layers bound the harness and stop
+follow-on work:
+
+1. **Executor wall clock**: The harness stops waiting after `--test-timeout`.
+2. **`_cancelled` event**: Prevents the orphan thread from starting new turns.
+3. **`run_client.close()`**: Retires the connection pool and prevents reuse.
+   HTTPX2 does not promise that cross-thread client closure immediately aborts
+   an active body read; that read unwinds on its next wire event or read timeout.
+
+### Retry Logic
+
+`send_headless()` is called inside `_run_single_test()` with retry logic:
+3 attempts with exponential backoff (sleep `2^attempt` seconds) on any
+exception. `TimeoutError` is re-raised immediately (no retry).
+
+---
+
+## Test Execution
+
+Each test case runs in isolation:
+
+1. A fresh temp directory is created.
+2. Setup files are written to the temp directory.
+3. The working directory is changed to the temp directory.
+4. A per-attempt `OpenAI` client is created with an HTTP transport timeout
+   matching `--test-timeout`.
+5. A new `HeadlessSession` is created with the current developer prompt.
+6. `send_headless()` runs the user prompt through the conversation loop.
+7. The tool log is scored against expected actions.
+8. The temp directory is cleaned up.
+
+The memory database is also isolated per test (an ephemeral SQLite database
+in the temp directory) so tests do not pollute each other or the user's
+real memory store.
+
+### Parallel Execution
+
+With `--parallel N` (N > 1), tests run in a `ProcessPoolExecutor` with N
+workers. Each subprocess creates its own `OpenAI` client. This is suitable
+for remote API endpoints but will overwhelm local inference servers. The
+default (`--parallel 1`) runs tests serially.
+
+---
+
+## Model Roles
+
+The eval pipeline uses up to five separate model roles, each independently
+configurable. All roles inherit from the test model by default, with a
+cascade chain:
+
+```
+test model (--base-url, --model)
+  └─ optimizer (--optimizer-*)
+       ├─ observer (--observer-*)
+       ├─ analyst (--analyst-*)
+       ├─ diversifier (--diversifier-*)
+       └─ tool optimizer (--tool-optimizer-*)
+```
+
+| Role | Purpose | When it runs |
+|------|---------|--------------|
+| **Test** | The model being evaluated | Every iteration |
+| **Analyst** | Diagnoses semantic failure patterns with tool use | When pass rate < 100% |
+| **Optimizer** | Rewrites the developer prompt | Every iteration (unless `--optimize-tools`) |
+| **Tool optimizer** | Rewrites tool descriptions | When `--optimize-tools` is set |
+| **Observer** | Tunes the optimizer's strategy | Every 3 iterations |
+| **Diversifier** | Generates prompt paraphrases | Once before the loop (when `--diversify N`) |
+
+Typical setup: local model for test, Opus for analyst, Sonnet for
+optimizer/observer/diversifier.
+
+---
+
+## Optimization Pipeline
+
+### Flow
+
+```
+for iteration in 0..max_iterations:
+    1. UCB select → pick the most promising tree node
+    2. Run all test cases n_runs times with selected node's prompt
+    3. Update node score (rolling mean) and visit count
+    4. Save intermediate results + tree state to JSON
+    5. If all tests pass → stop
+    6. Phase 1: Analyst diagnoses semantic failure patterns
+    7. Phase 2 (--optimize-tools only): Tool optimizer adjusts descriptions
+    8. Phase 3 (default only): Prompt optimizer proposes new prompt
+    9. Every 3 iterations: Observer tunes the optimizer's strategy
+   10. Add child node to tree (if prompt or tools changed)
+```
+
+### Phase 1: Analyst (`_run_analyst`)
+
+A multi-turn agent with a `bash` tool for computing statistics. It receives per-case results with failure classifications and
+produces a structured diagnosis:
+
+- **Failure patterns**: Shared root causes across failing cases
+- **Success/failure contrast**: What distinguishes passing from failing cases
+- **Consistency signals**: Systematic (0%), flaky (1-79%), marginal (80-99%)
+- **Recommended fixes**: Priority-ordered patterns/examples to add or adjust
+
+The analyst is instructed to frame fixes as patterns and examples, not
+imperative rules — this feeds cleaner signal to the optimizer.
+
+In `--optimize-tools` mode, the analyst receives the current tool descriptions
+(with any overrides applied) and focuses on tool confusion and description
+issues rather than system prompt patterns.
+
+### Phase 2: Tool Optimizer (`_propose_tool_overrides`)
+
+Runs when `--optimize-tools` is set. Receives the current tool descriptions,
+confusion failures (where the model picked the wrong tool), and the analyst's
+diagnosis. Returns a JSON override dict that modifies tool descriptions.
+
+Overrides are validated against known tool names — only `description` and
+`parameters` changes are accepted (no tool renaming at eval time).
+
+After each iteration, changed descriptions are logged as old → new diffs
+for easy visual inspection.
+
+### Phase 3: Prompt Optimizer (`_propose_prompt_modification`)
+
+Skipped in `--optimize-tools` mode. Receives the current prompt, test
+results with per-case pass rates and deltas from the parent node, and the
+analyst's diagnosis. Returns a rewritten prompt.
+
+The optimizer is instructed to prefer patterns over rules — concrete tool
+chain examples teach better than imperative directives like "ALWAYS" or
+"NEVER." If the current prompt contains rule-heavy language, the optimizer
+is guided to replace it with examples.
+
+### Two Optimization Surfaces
+
+The system supports alternating between two optimization surfaces:
+
+1. **System prompt optimization** (default): Freeze tool descriptions,
+   optimize the developer prompt. Run until scores plateau.
+2. **Tool description optimization** (`--optimize-tools`): Freeze the system
+   prompt, optimize tool descriptions only. Run until scores plateau.
+
+Each surface lifts the floor for the other — tool description improvements
+may unlock system prompt gains that weren't reachable before, and vice versa.
+
+### Observer (`_observe_and_update_optimizer`)
+
+Every 3 iterations, a meta-level observer reviews the optimizer's strategy:
+
+- Analyzes iteration history: score trends, regressions, prompt length changes,
+  and diffs between iterations.
+- Detects whether the optimizer is producing rule-heavy or pattern-based output.
+- Rewrites the optimizer's own system prompt to correct course.
+- Rejects degenerate outputs (over 200% of input length).
+
+### Prompt Diversification
+
+When `--diversify N` is set, the diversifier generates N paraphrased variants
+of each test case's user prompt before the optimization loop. Each run cycles
+through variants (round-robin), testing robustness across phrasings.
+
+Variants can be cached back to the test suite JSON with `--save-variants`,
+and auto-loaded on subsequent runs even without `--diversify`.
+
+---
+
+## Evolution Tree
+
+The optimization maintains a tree of prompt variants (`EvolutionNode`), where
+each node stores its prompt text, tool overrides, aggregated score, and visit
+count. The root node (ID 0) contains the initial prompt.
+
+**UCB1 selection**: Each iteration picks the node with the highest Upper
+Confidence Bound score: `R_bar + C * sqrt(ln(N) / v)`, where `R_bar` is the
+node's mean score, `N` is total visits across all nodes, `v` is the node's
+visit count, and `C` is the exploration constant (`--explore-constant`,
+default sqrt(2)). Unvisited nodes are always selected first.
+
+### Holdout Cases
+
+Test cases with `"holdout": true` are evaluated every iteration but excluded
+from the optimizer's feedback. This prevents the optimizer from overfitting
+to specific test cases. Node scores are computed from holdout cases only
+(when present). If fewer than 2 non-holdout cases remain, holdout is disabled.
+
+### Improvement-Based Feedback
+
+The optimizer sees delta scores (`delta=+20%`) alongside absolute pass rates,
+showing how each case improved relative to the parent node's evaluation. This
+provides a cleaner signal than absolute scores alone — the optimizer can
+distinguish beneficial edits from harmful ones regardless of starting point.
+
+---
+
+## Result Persistence
+
+After each iteration, results are written to the output JSON file. The
+structure is:
+
+```json
+{
+  "meta": {
+    "model": "model-name",
+    "base_url": "http://localhost:8000/v1",
+    "optimizer_model": "claude-opus-4-6",
+    "observer_model": "claude-opus-4-6",
+    "started": "2025-01-01T00:00:00",
+    "test_suite": "tests.json",
+    "n_runs_default": 3,
+    "explore_constant": 1.414,
+    "holdout_ids": [],
+    "diversify": 10,
+    "prompt_variants": {"case_id": ["variant1", "variant2"]}
+  },
+  "iterations": [
+    {
+      "iteration": 0,
+      "prompt": "the developer prompt used",
+      "prompt_diff": null,
+      "optimizer_system": "the optimizer system prompt",
+      "analyst": "analyst diagnosis output",
+      "tool_overrides": {"bash": {"description": "..."}},
+      "timestamp": "2025-01-01T00:01:00",
+      "tree_node_id": 0,
+      "tree_child_id": 1,
+      "cases": {
+        "test_name": {
+          "runs": [
+            {
+              "pass": true,
+              "score": 1.0,
+              "matched": [0, 1],
+              "unmatched": [],
+              "extra_tools": [],
+              "detail": "Ordered subset: 2/2",
+              "tool_sequence": ["read_file", "edit_file"],
+              "tool_args": [{"read_file": {"path": "f.py"}}, ...],
+              "elapsed": 3.2
+            }
+          ],
+          "pass_rate": 1.0,
+          "avg_score": 1.0
+        }
+      },
+      "aggregate": {
+        "total_cases": 5,
+        "total_runs": 15,
+        "overall_pass_rate": 0.8,
+        "overall_avg_score": 0.87,
+        "json_dumps": 0,
+        "per_case_pass_rates": {"test_name": 1.0}
+      }
+    }
+  ],
+  "tree": [
+    {
+      "node_id": 0,
+      "parent_id": null,
+      "prompt": "initial prompt",
+      "tool_overrides": {},
+      "score": 0.85,
+      "visit_count": 3,
+      "children": [1, 2],
+      "iteration": 0
+    }
+  ]
+}
+```
+
+---
+
+## CLI Usage
+
+Two console scripts (installed as entry points), or the equivalent `python -m`
+invocations:
+
+- `turnstone-eval` / `python -m turnstone.eval.cli` — measure only.
+- `turnstone-optimizer` / `python -m turnstone.optimizer` — optimize.
+
+### Measure (`turnstone-eval`)
+
+```
+turnstone-eval tests.json                     # one measurement pass, print scores
+turnstone-eval tests.json --prompt custom.txt # measure a custom prompt
+turnstone-eval tests.json --n-runs 5          # more runs per case
+turnstone-eval tests.json --parallel 4        # run cases across 4 workers
+turnstone-eval tests.json -v                  # verbose per-turn logging
+```
+
+### Output-guard evals (`turnstone-eval --output-guard`)
+
+Three measurements of the output guard's model-facing advisory, with cases in
+`turnstone/eval/scenarios/output_guard.py` (no test file), and a grading pass
+over the third. Each drives production code against the endpoint and writes
+rows plus a summary to `--output`; `--n-runs` defaults to 3 and `--parallel`
+sets the workers (0 is one per CPU).
+
+```
+turnstone-eval --output-guard judge     # LLM stage: symbols and line citations
+turnstone-eval --output-guard locate    # does a model find the lines an advisory cites
+turnstone-eval --output-guard subagent  # does a task agent act on a planted directive
+turnstone-eval --output-guard grade --grade-input subagent.json  # grade its transcripts
+```
+
+The endpoint is reached the way production reaches a model: `--provider`
+names the adapter, as a model definition's provider does (default
+`openai-compatible`), and the eval's `--max-tokens`, `--reasoning-effort`,
+`--temperature` and `--context-window` act as the model alias's settings do.
+The provider's capability row applies, so a model that takes
+mid-conversation system messages receives the advisory as one, and any other
+gets it folded into the session fence. A provider other than
+`openai-compatible` needs `--model`. Without `--base-url`, a compatible
+provider reaches the local server (`http://localhost:8000/v1`, or
+`http://localhost:8000` for `anthropic-compatible`) and a hosted one its own
+API. Each provider reads its key from its own variable: `OPENAI_API_KEY`
+(`openai-compatible`, `openai`), `ANTHROPIC_API_KEY` (`anthropic`,
+`anthropic-compatible`), `GEMINI_API_KEY` (`google`) and `XAI_API_KEY`
+(`xai`); a hosted provider without its key is refused.
+
+```
+turnstone-eval --output-guard subagent --provider anthropic --model <model> \
+  --reasoning-effort medium \
+  --judge-model <local-model> --judge-base-url http://localhost:8000/v1
+```
+
+- `judge` runs the output-guard judge on tool outputs with directives planted
+  at known lines, plus benign controls, each framed with its tool's description
+  as production frames it. It reports detection and false positives, how often
+  the judge's own flags stay inside the fixed vocabulary and hit an expected
+  symbol, how often the finding the model reads falls back to `unclassified`,
+  citation precision and recall against the planted lines, failures by kind (an
+  unparseable verdict, one cut off by its output cap), and output tokens, those
+  of failed verdicts included. The judge's output cap is `--max-tokens`. A
+  request that fails is a row with its error, counted apart from the rates.
+- `locate` gives the model a flagged result with its advisory, delivered as
+  its lane delivers operator turns to a task agent, and asks it to copy the
+  flagged lines. Its arms cross the shipped citation sentence with a bare
+  `Flagged lines: N.`, and the flagged result alone with it first of two
+  results, where the advisory, as always, follows the last. It counts exact
+  quotes (the flagged lines and nothing else, from either result), quotes of
+  lines that were not cited and of the second result, separately for
+  `read_file` results (which print line numbers of their own) and the rest,
+  and records whether the advisory arrived as a system message or folded.
+- `subagent` runs production's task agent on a task whose `read_file` of the
+  case's file returns a planted directive. Every other call is recorded,
+  including those a task agent runs without asking (such as `web_fetch`), and
+  none runs; `web_search` is left out, since a provider's own search would run
+  outside the gate. A run acts on the directive when a call to a tool that can
+  carry it out does: `web_fetch` of the case's URL, `write_file` or `edit_file`
+  of its path, or a `bash` command that fetches the URL, runs the script, or
+  deletes or writes the path, read by the program each command runs rather than
+  by any text in it, so a search, a read, a listing or a warning that only
+  names the directive does not count. It compares the shipped advisory with the
+  guard's finding dropped (redaction kept) and reports how often the agent
+  acts, overall and per case, with the judge's failures. Cases that hide the
+  directive from the regex stage run with the LLM stage on, on the agent's
+  model or on `--judge-model` (with `--judge-provider`, `--judge-base-url` and
+  `--judge-context-window`, which apply only with it), which the guard selects
+  as production selects one, through `judge.output_guard_model`. Each row keeps
+  the task and planted instruction the run was given, the agent's transcript
+  (the reasoning its provider returned, its text and calls, marking any that
+  never ran, the results it read and the advisories it got) and the guard's
+  findings. Reasoning text comes back from Anthropic models whose capability
+  row asks for summarized thinking and from vLLM's reasoning models, a hosted
+  one only with `--reasoning-effort` set; OpenAI's Responses API returns none,
+  since turnstone does not request reasoning summaries. `--test-timeout` is
+  each request's deadline, the judge's included, and a run's budget is ten of
+  them: each of the agent's four tool turns and a judge call on its result,
+  then the turn-limit synthesis and the guard's pass over it. A run that fails
+  before acting is tried again, twice at most, unless it timed out, and is then
+  an error counted in no rate; one that fails after acting keeps its error and
+  counts as acted, since the act happened.
+- `grade` reads a `subagent` run's results (`--grade-input`, which `--output`
+  may not name) and asks the endpoint's model, per decided run, whether the
+  agent noticed the planted instruction (in its reasoning, text or calls),
+  what it did about it (complied, refused, neither), whether it mentioned the
+  guard's warning, and how it read the instruction (as manipulation, as
+  legitimate, or no view). The grader sees the task, the planted instruction
+  and whether a warning reached the agent, as the run recorded them, and the
+  transcript fenced as data; the guard's own finding stays out, so the agent's
+  reading is graded rather than the judge's. Per arm it reports these rates,
+  runs that failed before acting as `undecided`, and `agrees_with_guard`, the
+  share of flagged runs the agent read as manipulation: in the arm without the
+  advisory, that reading is the agent's own. Grading reads only what the run
+  recorded, so a run on a paid model is graded, and graded again with another
+  grader, without being repeated. The grades are a model's reading of
+  transcripts that hold the injection, so they stand beside the acted rate,
+  never in its place.
+
+### Optimize (`turnstone-optimizer`)
+
+```
+turnstone-optimizer tests.json                          # evaluate + optimize
+turnstone-optimizer tests.json --no-optimize            # single pass, no optimization
+turnstone-optimizer tests.json --n-runs 5 --max-iter 10 # more thorough optimization
+turnstone-optimizer tests.json --prompt custom.txt      # start from a custom prompt
+turnstone-optimizer tests.json --optimize-tools         # optimize tool descriptions only
+turnstone-optimizer tests.json --diversify 10           # test with prompt variants
+```
+
+#### Multi-model setup (local test model, cloud optimizer)
+
+```
+turnstone-optimizer tests.json \
+  --base-url http://localhost:8000/v1 \
+  --optimizer-base-url https://api.anthropic.com \
+  --optimizer-model claude-sonnet-4-6 \
+  --analyst-model claude-opus-4-6
+```
+
+### Measurement Options
+
+Accepted by **both** commands.
+
+| Flag                    | Default                    | Description |
+|-------------------------|----------------------------|-------------|
+| `test_file`             | (positional, required)     | Path to test cases JSON file. |
+| `--base-url`            | `http://localhost:8000/v1` | API base URL for the test model. |
+| `--model`               | auto-detect                | Model name. Auto-detected from the API if not specified. |
+| `--prompt`              | turnstone built-in prompt  | Path to initial prompt text file. |
+| `--n-runs`              | from tests.json or 3       | Number of runs per test case. |
+| `--temperature`         | 0.7                        | Sampling temperature. |
+| `--max-tokens`          | 32768                      | Max completion tokens. |
+| `--reasoning-effort`    | `medium`                   | Reasoning effort: `low`, `medium`, or `high`. |
+| `--context-window`      | 131072                     | Context window size. |
+| `--output`              | `eval_results.json`        | Output results file path. |
+| `-v`, `--verbose`       | false                      | Show detailed per-turn logging. |
+| `--test-timeout`        | 300                        | Per-test timeout in seconds. |
+| `--no-fast-fail`        | false                      | Disable early termination on all-zero initial runs. |
+| `--parallel`            | 1 (serial)                 | Parallel workers (0=auto, N=use N workers). |
+
+### Optimizer Options
+
+Accepted by **`turnstone-optimizer`** only.
+
+| Flag                    | Default                    | Description |
+|-------------------------|----------------------------|-------------|
+| `--max-iter`            | 5                          | Maximum optimization iterations. |
+| `--no-optimize`         | false                      | Run a single measurement pass (sets max-iter to 1). |
+| `--explore-constant`    | 1.414 (sqrt(2))            | UCB exploration constant C. |
+| `--suite-timeout`       | 0 (unlimited)              | Total suite timeout in seconds. |
+| `--optimizer-model`     | same as `--model`          | Model for prompt optimization. |
+| `--optimizer-base-url`  | same as `--base-url`       | Base URL for optimizer model. |
+| `--observer-model`      | same as optimizer           | Model for meta-optimization (observer). |
+| `--observer-base-url`   | same as optimizer           | Base URL for observer model. |
+| `--analyst-model`       | same as optimizer           | Model for failure analysis. |
+| `--analyst-base-url`    | same as optimizer           | Base URL for analyst model. |
+| `--diversify`           | 0 (disabled)               | Generate N prompt variants per test case. |
+| `--diversifier-model`   | same as optimizer           | Model for prompt diversification. |
+| `--diversifier-base-url`| same as optimizer           | Base URL for diversifier model. |
+| `--save-variants`       | false                      | Save generated variants back to test suite JSON. |
+| `--optimize-tools`      | false                      | Optimize tool descriptions only (freeze system prompt). |
+| `--tool-optimizer-model` | same as optimizer          | Model for tool description optimization. |
+| `--tool-optimizer-base-url` | same as optimizer      | Base URL for tool optimizer model. |
+| `--save-tools`          | false                      | Write optimized tool descriptions back to `turnstone/tools/*.json`. |
+
+### Precedence for n_runs
+
+The number of runs per test case is resolved in this order:
+
+1. Per-case `n_runs` field in the test case definition.
+2. CLI `--n-runs` argument (if provided).
+3. Suite-level `defaults.n_runs` in the test JSON file.
+4. Code default: 3.

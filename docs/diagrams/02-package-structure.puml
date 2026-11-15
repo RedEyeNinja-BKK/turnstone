@@ -1,0 +1,208 @@
+@startuml
+!theme plain
+title Turnstone — Package & Module Structure
+
+' Color definitions
+skinparam component {
+    BackgroundColor<<entry>> #B8D4E3
+    BackgroundColor<<core>> #C8E6C9
+    BackgroundColor<<console>> #B2EBF2
+    BackgroundColor<<ui>> #F0F4C3
+    BackgroundColor<<artifact>> #ECEFF1
+    BackgroundColor<<sdk>> #FFCDD2
+    BackgroundColor<<api>> #D1C4E9
+    BackgroundColor<<channel>> #FFE0B2
+}
+
+' Entry points
+package "Entry Points" <<Rectangle>> {
+    component [cli.py\nturnstone] as cli <<entry>>
+    component [server.py\nturnstone-server] as server <<entry>>
+    component [console/server.py\nturnstone-console] as consoleentry <<entry>>
+    component [eval.py\nturnstone-eval] as eval <<entry>>
+    component [admin.py\nturnstone-admin] as admin <<entry>>
+    component [bootstrap.py\nturnstone-bootstrap] as bootstrap <<entry>>
+}
+
+' Core engine
+package "turnstone/core/" <<Rectangle>> {
+    component [session.py\nChatSession, SessionUI\ngeneration-fenced turn loop] as session <<core>>
+    component [session_manager.py\nSessionManager\nshared lifecycle invariants] as sessionmanager <<core>>
+    component [adapters/\ninteractive + coordinator\nconstruction/event policies] as adapters <<core>>
+    component [model_turn.py\nModelLane, model_turn()\nlower / sample / re-ingest] as modelturn <<core>>
+    component [trajectory.py\ncanonical Turn IR] as trajectory <<core>>
+    component [lowering.py\nprovider-wire lowering] as lowering <<core>>
+    component [state_writer.py\nordered durable state tail] as statewriter <<core>>
+    component [model_backend_auth.py\nper-call backend credentials] as modelauth <<core>>
+    component [model_oauth.py\nModel mint orchestration] as modeloauth <<core>>
+    component [oauth/\nShared grants, HTTP, OIDC, coordination] as oauth <<core>>
+    component [token_store/\nEncrypted tokens + captured credentials] as tokenstore <<core>>
+    component [providers/\nLLMProvider, OpenAI, Anthropic, Google] as providers <<core>>
+    component [workstream.py\nWorkstream types + state] as workstream <<core>>
+    component [tools.py\nTool loader] as tools <<core>>
+    component [memory.py\nPersistence facade] as memory <<core>>
+    component [storage/\nStorageBackend protocol\nSQLite + PostgreSQL] as storage <<core>>
+    component [metrics.py\nPrometheus metrics] as metrics <<core>>
+    component [config.py\nTOML config] as config <<core>>
+    component [safety.py\nPath validation] as safety <<core>>
+    component [edit.py\nFile editing] as edit <<core>>
+    component [web.py\nWeb helpers] as web <<core>>
+    component [auth.py\nAuthentication] as auth <<core>>
+    component [healthcheck.py\nBackendHealthMonitor] as healthcheck <<core>>
+    component [ratelimit.py\nRateLimiter] as ratelimit <<core>>
+    component [mcp_client.py\nMCPClientManager\n(push + manual refresh)] as mcp <<core>>
+    component [mcp_oauth.py + mcp_crypto.py\nMCP consent, secrets, audit policy] as mcpauth <<core>>
+    component [tool_search.py\nToolSearchManager, BM25] as toolsearch <<core>>
+    component [model_registry.py\nModelRegistry] as registry <<core>>
+}
+
+' Channels
+package "turnstone/channels/" <<Rectangle>> {
+    component [_routing.py\nChannelRouter] as router <<channel>>
+    component [discord/bot.py\nDiscordBot] as discordbot <<channel>>
+    component [slack/bot.py\nSlackBot (Socket Mode)] as slackbot <<channel>>
+    component [cli.py\nturnstone-channel] as gateway <<channel>>
+}
+
+' Console
+package "turnstone/console/" <<Rectangle>> {
+    component [collector.py\nClusterCollector] as collector <<console>>
+    component [console/server.py\nDashboard HTTP+SSE] as consoleserver <<console>>
+}
+
+' UI
+package "turnstone/ui/" <<Rectangle>> {
+    component [colors.py\nANSI colors] as colors <<ui>>
+    component [markdown.py\nMD rendering] as markdown <<ui>>
+    component [spinner.py\nTerminal spinner] as spinner <<ui>>
+    component [renderer.js\nBrowser MD + LaTeX] as renderer <<ui>>
+}
+
+' API schemas
+package "turnstone/api/" <<Rectangle>> {
+    component [schemas.py\nShared Pydantic models] as apischemas <<api>>
+    component [server_spec.py\nServer OpenAPI spec] as serverspec <<api>>
+    component [console_spec.py\nConsole OpenAPI spec] as consolespec <<api>>
+    component [openapi.py\nSpec builder] as openapi <<api>>
+    component [docs.py\nSwagger UI handler] as apidocs <<api>>
+}
+
+' SDK
+package "turnstone/sdk/" <<Rectangle>> {
+    component [server.py\nTurnstoneServer (sync+async)] as sdkserver <<sdk>>
+    component [console.py\nTurnstoneConsole (sync+async)] as sdkconsole <<sdk>>
+    component [events.py\nTyped SSE event stream] as sdkevents <<sdk>>
+    component [_base.py\nhttpx2 client base] as sdkbase <<sdk>>
+}
+
+' Tool schemas
+package "turnstone/tools/" <<Rectangle>> {
+    component [*.json\nBuilt-in tool schemas] as schemas <<artifact>>
+}
+
+' Entry point dependencies
+cli --> session
+cli --> sessionmanager
+cli --> config
+cli --> memory
+cli --> colors
+cli --> markdown
+cli --> spinner
+cli --> tools
+
+server --> session
+server --> sessionmanager
+server --> adapters
+server --> config
+server --> memory
+server --> metrics
+server --> auth
+server --> healthcheck
+server --> ratelimit
+server --> tools
+
+eval --> session
+eval --> memory
+eval --> config
+eval --> tools
+
+consoleentry --> sessionmanager
+consoleentry --> adapters
+consoleentry --> consoleserver
+
+admin --> auth
+bootstrap --> providers
+
+' Core internal deps
+sessionmanager --> workstream
+sessionmanager --> adapters
+sessionmanager --> storage
+adapters --> session : constructs
+session --> modelturn
+session --> trajectory
+session --> lowering
+session --> statewriter
+session --> modelauth
+modelturn --> providers
+modelturn --> trajectory
+modelturn --> lowering
+session --> tools
+session --> memory
+memory --> storage
+session --> safety
+session --> edit
+session --> web
+session --> healthcheck
+session --> mcp : optional
+session --> toolsearch : optional
+session --> registry : optional
+registry --> providers
+modelturn --> registry : coherent snapshot
+healthcheck --> metrics
+mcp --> config
+mcp --> mcpauth
+mcp --> modeloauth : mint bridge
+mcpauth --> oauth
+mcpauth --> tokenstore
+modeloauth --> oauth
+modeloauth --> tokenstore
+oauth --> tokenstore
+tokenstore --> storage
+registry --> config
+tools --> schemas
+
+' Channel dependencies
+gateway --> discordbot
+gateway --> slackbot
+gateway --> router
+discordbot --> sdkserver : direct HTTP + node SSE
+slackbot --> sdkserver : direct HTTP + node SSE
+router --> sdkserver : single-node/direct mode
+router --> sdkconsole : multi-node route/create/live
+router --> storage : channel_routes
+
+' Console dependencies
+consoleserver --> collector
+consoleserver --> config
+consoleserver --> auth
+collector --> server : discovery HTTP + cluster SSE aggregation
+
+' API dependencies
+serverspec --> openapi
+consolespec --> openapi
+serverspec --> apischemas
+consolespec --> apischemas
+server --> apidocs
+server --> serverspec
+consoleserver --> apidocs
+consoleserver --> consolespec
+
+' SDK dependencies
+sdkserver --> sdkbase
+sdkconsole --> sdkbase
+sdkserver --> sdkevents
+sdkconsole --> sdkevents
+sdkserver --> apischemas : returns models
+sdkconsole --> apischemas : returns models
+
+@enduml

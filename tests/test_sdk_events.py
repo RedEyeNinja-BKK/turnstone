@@ -1,0 +1,558 @@
+"""Tests for turnstone.sdk.events — SSE event deserialization."""
+
+from turnstone.sdk.events import (
+    AgentContextEvent,
+    ApprovalResolvedEvent,
+    ApproveRequestEvent,
+    BusyErrorEvent,
+    ClearUiEvent,
+    ClusterEvent,
+    ClusterStateEvent,
+    ClusterWsClosedEvent,
+    ClusterWsCreatedEvent,
+    ClusterWsRenameEvent,
+    ClusterWsUnloadedEvent,
+    CompactionEvent,
+    ConnectedEvent,
+    ContentEvent,
+    ErrorEvent,
+    HealthChangedEvent,
+    HistoryEvent,
+    HistoryResyncEvent,
+    InfoEvent,
+    NodeJoinedEvent,
+    NodeLostEvent,
+    OutputWarningEvent,
+    ReasoningEvent,
+    ServerEvent,
+    StatusEvent,
+    StreamEndEvent,
+    ThinkingStartEvent,
+    ThinkingStopEvent,
+    ToolInfoEvent,
+    ToolOutputChunkEvent,
+    ToolResultEvent,
+    UserTurnEvent,
+    WsActivityEvent,
+    WsClosedEvent,
+    WsRenameEvent,
+    WsStateEvent,
+    WsUnloadedEvent,
+)
+
+# ---------------------------------------------------------------------------
+# Per-workstream events
+# ---------------------------------------------------------------------------
+
+
+def test_connected_event():
+    e = ServerEvent.from_dict(
+        {"type": "connected", "model": "gpt-5", "model_alias": "fast", "skip_permissions": True}
+    )
+    assert isinstance(e, ConnectedEvent)
+    assert e.model == "gpt-5"
+    assert e.model_alias == "fast"
+    assert e.skip_permissions is True
+
+
+def test_history_event():
+    msgs = [{"role": "user", "content": "hi"}]
+    e = ServerEvent.from_dict({"type": "history", "messages": msgs})
+    assert isinstance(e, HistoryEvent)
+    assert e.messages == msgs
+
+
+def test_history_resync_event_preserves_repair_reason():
+    e = ServerEvent.from_dict(
+        {
+            "type": "history_resync",
+            "ws_id": "ws1",
+            "reason": "handoff_mismatch",
+        }
+    )
+    assert isinstance(e, HistoryResyncEvent)
+    assert e.ws_id == "ws1"
+    assert e.reason == "handoff_mismatch"
+
+
+def test_user_turn_event_preserves_correlation_and_attribution():
+    e = ServerEvent.from_dict(
+        {
+            "type": "user_turn",
+            "ws_id": "ws1",
+            "content": "hello",
+            "attachments": [
+                {
+                    "attachment_id": "a1",
+                    "kind": "text",
+                    "filename": "note.txt",
+                    "mime_type": "text/plain",
+                }
+            ],
+            "sender": "user-1",
+            "client_send_ids": ["browser-send"],
+            "_event_id": 17,
+        }
+    )
+    assert isinstance(e, UserTurnEvent)
+    assert e.client_send_ids == ["browser-send"]
+    assert e.sender == "user-1"
+    assert e.attachments[0]["attachment_id"] == "a1"
+    assert e._event_id == 17
+
+
+def test_thinking_start_stop():
+    e1 = ServerEvent.from_dict({"type": "thinking_start"})
+    e2 = ServerEvent.from_dict({"type": "thinking_stop"})
+    assert isinstance(e1, ThinkingStartEvent)
+    assert isinstance(e2, ThinkingStopEvent)
+
+
+def test_content_event():
+    e = ServerEvent.from_dict({"type": "content", "text": "hello"})
+    assert isinstance(e, ContentEvent)
+    assert e.text == "hello"
+
+
+def test_reasoning_event():
+    e = ServerEvent.from_dict({"type": "reasoning", "text": "step 1"})
+    assert isinstance(e, ReasoningEvent)
+    assert e.text == "step 1"
+
+
+def test_stream_end_event():
+    e = ServerEvent.from_dict({"type": "stream_end"})
+    assert isinstance(e, StreamEndEvent)
+
+
+def test_tool_info_event():
+    items = [{"name": "search", "call_id": "c1"}]
+    e = ServerEvent.from_dict({"type": "tool_info", "items": items})
+    assert isinstance(e, ToolInfoEvent)
+    assert e.items == items
+
+
+def test_approve_request_event():
+    items = [{"name": "bash", "call_id": "c2", "arguments": "ls"}]
+    e = ServerEvent.from_dict({"type": "approve_request", "items": items})
+    assert isinstance(e, ApproveRequestEvent)
+    assert len(e.items) == 1
+
+
+def test_approval_resolved_event():
+    e = ServerEvent.from_dict(
+        {"type": "approval_resolved", "approved": False, "feedback": "Approval timed out"}
+    )
+    assert isinstance(e, ApprovalResolvedEvent)
+    assert e.approved is False
+    assert e.feedback == "Approval timed out"
+
+
+def test_tool_result_event():
+    e = ServerEvent.from_dict(
+        {"type": "tool_result", "call_id": "c1", "name": "search", "output": "found it"}
+    )
+    assert isinstance(e, ToolResultEvent)
+    assert e.call_id == "c1"
+    assert e.name == "search"
+    assert e.output == "found it"
+
+
+def test_accepted_tool_result_event_carries_final_projection_metadata():
+    preview = {"kind": "html", "attachment_id": "preview-1"}
+    e = ServerEvent.from_dict(
+        {
+            "type": "tool_result",
+            "call_id": "c-final",
+            "name": "open_preview",
+            "output": "guarded\nscalar",
+            "is_error": True,
+            "preview": preview,
+            "accepted": True,
+            "effect_status": "unknown",
+            "_event_id": 42,
+        }
+    )
+
+    assert isinstance(e, ToolResultEvent)
+    assert e.output == "guarded\nscalar"
+    assert e.is_error is True
+    assert e.preview == preview
+    assert e.accepted is True
+    assert e.effect_status == "unknown"
+    assert e._event_id == 42
+
+
+def test_tool_output_chunk_event():
+    e = ServerEvent.from_dict({"type": "tool_output_chunk", "call_id": "c1", "chunk": "line1\n"})
+    assert isinstance(e, ToolOutputChunkEvent)
+    assert e.chunk == "line1\n"
+
+
+def test_output_warning_event_llm_tier():
+    """LLM-tier finding carries confidence + reasoning + judge_model so SDK
+    consumers see the same attribution the UI chip renders."""
+    e = ServerEvent.from_dict(
+        {
+            "type": "output_warning",
+            "call_id": "c1",
+            "func_name": "web_fetch",
+            "risk_level": "medium",
+            "flags": ["camouflaged_injection"],
+            "redacted": False,
+            "tier": "llm",
+            "judge_risk": "none",
+            "confidence": 0.82,
+            "reasoning": "Authority-framed directive embedded in the doc.",
+            "judge_model": "gpt-5-mini",
+        }
+    )
+    assert isinstance(e, OutputWarningEvent)
+    assert e.tier == "llm"
+    assert e.judge_risk == "none"  # the judge's OWN verdict (may differ from risk_level)
+    assert e.confidence == 0.82
+    assert e.flags == ["camouflaged_injection"]
+    assert e.reasoning == "Authority-framed directive embedded in the doc."
+    assert e.judge_model == "gpt-5-mini"
+
+
+def test_output_warning_event_heuristic_defaults():
+    """A regex-only finding defaults tier=heuristic with no confidence."""
+    e = ServerEvent.from_dict(
+        {"type": "output_warning", "call_id": "c1", "risk_level": "high", "redacted": True}
+    )
+    assert isinstance(e, OutputWarningEvent)
+    assert e.tier == "heuristic"
+    assert e.confidence == 0.0
+    assert e.redacted is True
+
+
+def test_output_warning_event_covers_every_merge_payload_key():
+    """Drift guard: every key the server-side merge can emit must be a declared
+    OutputWarningEvent field, else from_dict silently drops it (the bug that let
+    `annotations` go stale). Builds the maximal payload and checks the field-set."""
+    import dataclasses
+
+    from turnstone.core.output_guard import merge_guard_display_payload
+
+    # Maximal payload — every optional field populated.
+    payload = merge_guard_display_payload(
+        heuristic_risk="high",
+        heuristic_flags=["credential_leak"],
+        heuristic_annotations=["API key detected."],
+        redacted=True,
+        llm_succeeded=True,
+        llm_risk="none",
+        llm_flags=["camouflaged_injection"],
+        llm_reasoning="Benign.",
+        llm_confidence=0.9,
+        llm_model="gpt-5-mini",
+    )
+    assert payload is not None
+    declared = {f.name for f in dataclasses.fields(OutputWarningEvent)}
+    missing = set(payload) - declared
+    assert not missing, f"OutputWarningEvent is missing merge-payload fields: {missing}"
+
+
+def test_status_event():
+    e = ServerEvent.from_dict(
+        {
+            "type": "status",
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+            "context_window": 128000,
+            "pct": 0.12,
+            "effort": "medium",
+        }
+    )
+    assert isinstance(e, StatusEvent)
+    assert e.prompt_tokens == 100
+    assert e.total_tokens == 150
+    assert e.pct == 0.12
+    assert e.effort == "medium"
+
+
+def test_info_event():
+    e = ServerEvent.from_dict({"type": "info", "message": "[compacted]"})
+    assert isinstance(e, InfoEvent)
+    assert e.message == "[compacted]"
+
+
+def test_error_event():
+    e = ServerEvent.from_dict({"type": "error", "message": "Something broke"})
+    assert isinstance(e, ErrorEvent)
+    assert e.message == "Something broke"
+
+
+def test_busy_error_event():
+    e = ServerEvent.from_dict({"type": "busy_error", "message": "Already processing a request."})
+    assert isinstance(e, BusyErrorEvent)
+    assert "Already" in e.message
+
+
+def test_clear_ui_event():
+    e = ServerEvent.from_dict({"type": "clear_ui"})
+    assert isinstance(e, ClearUiEvent)
+
+
+# ---------------------------------------------------------------------------
+# Global events
+# ---------------------------------------------------------------------------
+
+
+def test_ws_state_event():
+    e = ServerEvent.from_dict(
+        {
+            "type": "ws_state",
+            "ws_id": "ws1",
+            "state": "thinking",
+            "tokens": 500,
+            "context_ratio": 0.3,
+            "activity": "Writing code",
+            "activity_state": "thinking",
+            "persistence_state": "retrying",
+        }
+    )
+    assert isinstance(e, WsStateEvent)
+    assert e.ws_id == "ws1"
+    assert e.state == "thinking"
+    assert e.tokens == 500
+    assert e.persistence_state == "retrying"
+
+
+def test_ws_state_event_defaults_persistence_for_older_nodes():
+    e = ServerEvent.from_dict({"type": "ws_state", "ws_id": "ws1"})
+    assert isinstance(e, WsStateEvent)
+    assert e.persistence_state == "healthy"
+
+
+def test_ws_activity_event():
+    e = ServerEvent.from_dict(
+        {"type": "ws_activity", "ws_id": "ws1", "activity": "reading", "activity_state": "tool"}
+    )
+    assert isinstance(e, WsActivityEvent)
+    assert e.activity == "reading"
+
+
+def test_ws_rename_event():
+    e = ServerEvent.from_dict({"type": "ws_rename", "ws_id": "ws1", "name": "My Chat"})
+    assert isinstance(e, WsRenameEvent)
+    assert e.name == "My Chat"
+
+
+def test_ws_closed_event():
+    e = ServerEvent.from_dict({"type": "ws_closed", "ws_id": "ws1", "name": "old"})
+    assert isinstance(e, WsClosedEvent)
+    assert e.name == "old"
+
+
+# ---------------------------------------------------------------------------
+# Cluster events
+# ---------------------------------------------------------------------------
+
+
+def test_node_joined_event():
+    e = ClusterEvent.from_dict({"type": "node_joined", "node_id": "host1_abc"})
+    assert isinstance(e, NodeJoinedEvent)
+    assert e.node_id == "host1_abc"
+
+
+def test_node_lost_event():
+    e = ClusterEvent.from_dict({"type": "node_lost", "node_id": "host2_def"})
+    assert isinstance(e, NodeLostEvent)
+    assert e.node_id == "host2_def"
+
+
+def test_health_changed_event_carries_the_node_verdict():
+    e = ClusterEvent.from_dict(
+        {
+            "type": "health_changed",
+            "status": "degraded",
+            "backend": {"status": "up"},
+            "default_model": {"alias": "gone", "loaded": False},
+        }
+    )
+    assert isinstance(e, HealthChangedEvent)
+    assert e.backend_status == ""  # a reload, not a backend transition
+    assert e.status == "degraded"
+    assert e.backend == {"status": "up"}
+    assert e.default_model == {"alias": "gone", "loaded": False}
+
+
+def test_cluster_state_event():
+    e = ClusterEvent.from_dict(
+        {
+            "type": "cluster_state",
+            "ws_id": "ws1",
+            "node_id": "n1",
+            "state": "running",
+            "tokens": 1000,
+            "context_ratio": 0.5,
+            "activity": "executing tool",
+            "activity_state": "tool",
+            "persistence_state": "conflict",
+        }
+    )
+    assert isinstance(e, ClusterStateEvent)
+    assert e.node_id == "n1"
+    assert e.state == "running"
+    assert e.tokens == 1000
+    assert e.persistence_state == "conflict"
+
+
+def test_cluster_ws_created_event():
+    e = ClusterEvent.from_dict(
+        {
+            "type": "ws_created",
+            "ws_id": "ws2",
+            "node_id": "n1",
+            "name": "New WS",
+            "persistence_state": "pending",
+        }
+    )
+    assert isinstance(e, ClusterWsCreatedEvent)
+    assert e.ws_id == "ws2"
+    assert e.name == "New WS"
+    assert e.persistence_state == "pending"
+
+
+def test_cluster_ws_closed_event():
+    e = ClusterEvent.from_dict({"type": "ws_closed", "ws_id": "ws2"})
+    assert isinstance(e, ClusterWsClosedEvent)
+    assert e.ws_id == "ws2"
+
+
+def test_cluster_ws_unloaded_event():
+    e = ClusterEvent.from_dict({"type": "ws_unloaded", "ws_id": "ws2", "node_id": "node-a"})
+    assert isinstance(e, ClusterWsUnloadedEvent)
+    assert (e.ws_id, e.node_id) == ("ws2", "node-a")
+
+
+def test_ws_unloaded_event():
+    e = ServerEvent.from_dict({"type": "ws_unloaded", "ws_id": "ws2"})
+    assert isinstance(e, WsUnloadedEvent)
+    assert e.ws_id == "ws2"
+
+
+def test_cluster_ws_rename_event():
+    e = ClusterEvent.from_dict({"type": "ws_rename", "ws_id": "ws2", "name": "Renamed"})
+    assert isinstance(e, ClusterWsRenameEvent)
+    assert e.name == "Renamed"
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_server_event_falls_back():
+    e = ServerEvent.from_dict({"type": "future_event", "ws_id": "ws1"})
+    assert type(e) is ServerEvent
+    assert e.type == "future_event"
+    assert e.ws_id == "ws1"
+
+
+def test_unknown_cluster_event_falls_back():
+    e = ClusterEvent.from_dict({"type": "future_cluster_event"})
+    assert type(e) is ClusterEvent
+    assert e.type == "future_cluster_event"
+
+
+def test_extra_fields_ignored():
+    e = ServerEvent.from_dict({"type": "content", "text": "hi", "extra_field": 999})
+    assert isinstance(e, ContentEvent)
+    assert e.text == "hi"
+
+
+def test_in_progress_snapshot_event_round_trip():
+    from turnstone.sdk.events import InProgressSnapshotEvent
+
+    payload = {
+        "type": "in_progress_snapshot",
+        "ws_id": "ws1",
+        "content": "Partial content...",
+        "reasoning": "Partial reasoning...",
+    }
+    e = ServerEvent.from_dict(payload)
+    assert isinstance(e, InProgressSnapshotEvent)
+    assert e.ws_id == "ws1"
+    assert e.content == "Partial content..."
+    assert e.reasoning == "Partial reasoning..."
+
+
+def test_in_progress_snapshot_event_strips_internal_seq():
+    """``_seq`` is server-internal plumbing — even if a stray copy
+    leaks through, ``from_dict`` must drop it (not a declared field)."""
+    from turnstone.sdk.events import InProgressSnapshotEvent
+
+    e = ServerEvent.from_dict(
+        {
+            "type": "in_progress_snapshot",
+            "ws_id": "ws1",
+            "content": "x",
+            "reasoning": "",
+            "_seq": 42,
+        }
+    )
+    assert isinstance(e, InProgressSnapshotEvent)
+    assert not hasattr(e, "_seq")
+
+
+def test_agent_context_event_round_trip():
+    e = ServerEvent.from_dict(
+        {
+            "type": "agent_context",
+            "ws_id": "ws1",
+            "parent_call_id": "task-A",
+            "prompt_tokens": 41_000,
+            "context_window": 128_000,
+        }
+    )
+    assert isinstance(e, AgentContextEvent)
+    assert e.ws_id == "ws1"
+    assert e.parent_call_id == "task-A"
+    assert e.prompt_tokens == 41_000
+    assert e.context_window == 128_000
+
+
+def test_task_agent_compaction_event_round_trip():
+    e = ServerEvent.from_dict(
+        {
+            "type": "compaction",
+            "phase": "progress",
+            "target": "task_agent",
+            "parent_call_id": "task-A",
+            "compaction_id": 17,
+            "part": 2,
+            "total": 4,
+        }
+    )
+    assert isinstance(e, CompactionEvent)
+    assert e.target == "task_agent"
+    assert e.parent_call_id == "task-A"
+    assert e.compaction_id == 17
+    assert e.part == 2
+
+
+def test_compaction_event_without_target_means_workstream():
+    e = ServerEvent.from_dict({"type": "compaction", "phase": "start", "compaction_id": 3})
+    assert isinstance(e, CompactionEvent)
+    assert e.target == "workstream"
+    assert e.parent_call_id == ""
+
+
+def test_state_change_event_round_trip():
+    from turnstone.sdk.events import StateChangeEvent
+
+    e = ServerEvent.from_dict({"type": "state_change", "ws_id": "ws1", "state": "thinking"})
+    assert isinstance(e, StateChangeEvent)
+    assert e.state == "thinking"
+    assert e.ws_id == "ws1"
+
+
+def test_missing_type_defaults_to_base():
+    e = ServerEvent.from_dict({"ws_id": "ws1"})
+    assert type(e) is ServerEvent
+    assert e.ws_id == "ws1"
+    assert e.type == ""

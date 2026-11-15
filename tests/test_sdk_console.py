@@ -1,0 +1,907 @@
+"""Tests for turnstone.sdk.console — console client with mocked HTTP transport."""
+
+from __future__ import annotations
+
+import json
+
+import httpx2
+import pytest
+
+from turnstone.sdk._types import TurnstoneAPIError
+from turnstone.sdk.console import AsyncTurnstoneConsole
+
+
+def _json_response(data: dict, status: int = 200) -> httpx2.Response:
+    return httpx2.Response(status, json=data)
+
+
+def _mock_transport(
+    responses: dict[str, httpx2.Response] | None = None,
+) -> httpx2.MockTransport:
+    table = responses or {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        key = f"{request.method} {request.url.path}"
+        if key in table:
+            return table[key]
+        return httpx2.Response(404, json={"error": "not found"})
+
+    return httpx2.MockTransport(handler)
+
+
+# ---------------------------------------------------------------------------
+# Memory index maintenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_memory_description_update_and_index_health():
+    captured: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured.append(request)
+        if request.url.path.endswith("/index-health"):
+            return _json_response(
+                {
+                    "budget_chars": 65_536,
+                    "over_budget": False,
+                    "max_char_count": 120,
+                    "max_entry_count": 2,
+                    "over_by_chars": 0,
+                    "invalid_description_count": 0,
+                    "envelope_count": 1,
+                }
+            )
+        description = json.loads(request.content)["description"]
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "deployment_process",
+                "description": description,
+                "type": "general",
+                "scope": "global",
+                "scope_id": "",
+                "content": "Deploy from main",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+                "last_accessed": "",
+                "access_count": 0,
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        updated = await client.update_memory_description(
+            "m1",
+            "  Production\n deployment workflow  ",
+        )
+        health = await client.memory_index_health()
+
+    assert updated.description == "Production deployment workflow"
+    assert health.budget_chars == 65_536
+    assert captured[0].method == "PATCH"
+    assert captured[1].url.path == "/v1/api/admin/memories/index-health"
+
+
+# ---------------------------------------------------------------------------
+# MCP connection test (#1328)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("client_read", "read"),
+    [(10.0, 75.0), (120.0, 120.0), (None, None)],
+    ids=["raised", "already-longer", "unbounded"],
+)
+@pytest.mark.anyio
+async def test_mcp_server_connection_test_sends_the_unsaved_values(client_read, read):
+    captured: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured.append(request)
+        return _json_response(
+            {
+                "ok": True,
+                "tools": ["search", "fetch"],
+                "resources": 0,
+                "prompts": 1,
+                "error": None,
+                "kind": None,
+                "status": None,
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    limits = httpx2.Timeout(10.0, read=client_read, write=20.0)
+    async with httpx2.AsyncClient(
+        transport=transport, base_url="http://test", timeout=limits
+    ) as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        result = await client.test_mcp_server(
+            "https://mcp.example/mcp", headers={"Authorization": "Bearer abc"}, name="docs"
+        )
+
+    assert captured[0].method == "POST"
+    assert captured[0].url.path == "/v1/api/admin/mcp-servers/test"
+    assert json.loads(captured[0].content) == {
+        "url": "https://mcp.example/mcp",
+        "auth_type": "static",
+        "headers": {"Authorization": "Bearer abc"},
+        "name": "docs",
+    }
+    # At least long enough for the console's wait for a test, which outlasts the client's
+    # default; a longer or unbounded read, and the client's other limits, stay.
+    assert captured[0].extensions["timeout"] == {
+        "connect": 10.0,
+        "read": read,
+        "write": 20.0,
+        "pool": 10.0,
+    }
+    assert result.ok is True
+    assert result.tools == ["search", "fetch"]
+
+
+# ---------------------------------------------------------------------------
+# Routing proxy — rewind / retry (#549)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_route_rewind_sends_turns_body():
+    """``route_rewind`` forwards ``{"turns": N}`` through the proxy."""
+    captured_path: list[str] = []
+    captured_body: list[dict] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_path.append(request.url.path)
+        captured_body.append(json.loads(request.content) if request.content else {})
+        return _json_response({"status": "ok", "removed": 3})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_rewind("ws1", turns=3)
+        assert captured_path[0] == "/v1/api/route/workstreams/ws1/rewind"
+        assert captured_body[0] == {"turns": 3}
+
+
+@pytest.mark.anyio
+async def test_route_retry_posts_to_path_keyed_endpoint():
+    transport = _mock_transport(
+        {
+            "POST /v1/api/route/workstreams/ws1/retry": _json_response(
+                {"status": "ok", "retried": True}
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_retry("ws1")
+        assert resp["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Cluster overview
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_overview():
+    transport = _mock_transport(
+        {
+            "GET /v1/api/cluster/overview": _json_response(
+                {
+                    "nodes": 2,
+                    "workstreams": 5,
+                    "states": {"running": 1, "idle": 4},
+                    "aggregate": {"total_tokens": 1000, "total_tool_calls": 20},
+                    "version_drift": False,
+                    "versions": ["0.3.0"],
+                }
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.overview()
+        assert resp.nodes == 2
+        assert resp.workstreams == 5
+
+
+@pytest.mark.anyio
+async def test_nodes():
+    transport = _mock_transport(
+        {
+            "GET /v1/api/cluster/nodes": _json_response(
+                {
+                    "nodes": [
+                        {
+                            "node_id": "n1",
+                            "server_url": "http://localhost:8080",
+                            "ws_total": 3,
+                            "ws_running": 1,
+                            "ws_thinking": 0,
+                            "ws_attention": 0,
+                            "ws_idle": 2,
+                            "ws_error": 0,
+                            "total_tokens": 500,
+                            "started": 1700000000.0,
+                            "reachable": True,
+                            "health": {"status": "ok"},
+                            "version": "0.3.0",
+                        }
+                    ],
+                    "total": 1,
+                }
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.nodes(sort="tokens", limit=50)
+        assert resp.total == 1
+        assert resp.nodes[0].node_id == "n1"
+
+
+@pytest.mark.anyio
+async def test_workstreams():
+    transport = _mock_transport(
+        {
+            "GET /v1/api/cluster/workstreams": _json_response(
+                {
+                    "workstreams": [
+                        {
+                            "id": "ws1",
+                            "name": "test",
+                            "state": "running",
+                            "node": "n1",
+                        }
+                    ],
+                    "total": 1,
+                    "page": 1,
+                    "per_page": 50,
+                    "pages": 1,
+                }
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.workstreams(state="running", page=1)
+        assert resp.total == 1
+
+
+@pytest.mark.anyio
+async def test_node_detail():
+    transport = _mock_transport(
+        {
+            "GET /v1/api/cluster/node/n1": _json_response(
+                {
+                    "node_id": "n1",
+                    "server_url": "http://localhost:8080",
+                    "health": {"status": "ok"},
+                    "workstreams": [],
+                    "aggregate": {"total_tokens": 0, "total_tool_calls": 0},
+                }
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.node_detail("n1")
+        assert resp.node_id == "n1"
+
+
+@pytest.mark.anyio
+async def test_create_workstream():
+    transport = _mock_transport(
+        {
+            "POST /v1/api/cluster/workstreams/new": _json_response(
+                {"status": "dispatched", "correlation_id": "abc123", "target_node": "n1"}
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.create_workstream(node_id="n1", name="test")
+        assert resp.correlation_id == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_login():
+    transport = _mock_transport(
+        {"POST /v1/api/auth/login": _json_response({"status": "ok", "role": "read"})}
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.login("tok_test")
+        assert resp.role == "read"
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_health():
+    transport = _mock_transport(
+        {
+            "GET /health": _json_response(
+                {
+                    "status": "ok",
+                    "service": "turnstone-console",
+                    "nodes": 2,
+                    "workstreams": 5,
+                    "version_drift": False,
+                    "versions": ["0.3.0"],
+                }
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.health()
+        assert resp.status == "ok"
+        assert resp.nodes == 2
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_node_not_found():
+    transport = _mock_transport(
+        {"GET /v1/api/cluster/node/bad": httpx2.Response(404, json={"error": "Node not found"})}
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        with pytest.raises(TurnstoneAPIError) as exc_info:
+            await client.node_detail("bad")
+        assert exc_info.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_query_params_passed():
+    """Verify query params are sent correctly for paginated endpoints."""
+    captured_url: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_url.append(str(request.url))
+        return httpx2.Response(
+            200,
+            json={
+                "workstreams": [],
+                "total": 0,
+                "page": 2,
+                "per_page": 25,
+                "pages": 0,
+            },
+        )
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.workstreams(state="running", page=2, per_page=25)
+        assert "state=running" in captured_url[0]
+        assert "page=2" in captured_url[0]
+        assert "per_page=25" in captured_url[0]
+
+
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+_SCHEDULE_FIXTURE = {
+    "task_id": "t1",
+    "name": "nightly",
+    "description": "",
+    "schedule_type": "cron",
+    "cron_expr": "0 2 * * *",
+    "at_time": "",
+    "target_mode": "auto",
+    "model": "",
+    "initial_message": "Run nightly checks",
+    "auto_approve": False,
+    "auto_approve_tools": [],
+    "enabled": True,
+    "created_by": "u1",
+    "last_run": None,
+    "next_run": "2026-03-06T02:00:00Z",
+    "created": "2026-03-05T12:00:00Z",
+    "updated": "2026-03-05T12:00:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_list_schedules():
+    transport = _mock_transport(
+        {"GET /v1/api/admin/schedules": _json_response({"schedules": [_SCHEDULE_FIXTURE]})}
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.list_schedules()
+        assert len(resp.schedules) == 1
+        assert resp.schedules[0].task_id == "t1"
+        assert resp.schedules[0].name == "nightly"
+
+
+@pytest.mark.anyio
+async def test_create_schedule():
+    captured_body: list[dict] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.append(json.loads(request.content))
+        return _json_response(_SCHEDULE_FIXTURE)
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.create_schedule(
+            name="nightly",
+            schedule_type="cron",
+            initial_message="Run nightly checks",
+            cron_expr="0 2 * * *",
+            persona="researcher",
+            project_id="proj_1",
+        )
+        assert resp.task_id == "t1"
+        body = captured_body[0]
+        assert body["name"] == "nightly"
+        assert body["schedule_type"] == "cron"
+        assert body["cron_expr"] == "0 2 * * *"
+        assert body["initial_message"] == "Run nightly checks"
+        assert body["persona"] == "researcher"
+        assert body["project_id"] == "proj_1"
+        # Optional fields with defaults should not appear when not set
+        assert "description" not in body
+        assert "model" not in body
+        assert "timezone" not in body
+
+
+@pytest.mark.anyio
+async def test_create_schedule_sends_timezone():
+    captured_body: list[dict] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.append(json.loads(request.content))
+        return _json_response({**_SCHEDULE_FIXTURE, "timezone": "America/New_York"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.create_schedule(
+            name="nightly",
+            schedule_type="cron",
+            initial_message="Run nightly checks",
+            cron_expr="0 2 * * *",
+            timezone="America/New_York",
+        )
+        assert resp.timezone == "America/New_York"
+        assert captured_body[0]["timezone"] == "America/New_York"
+
+
+@pytest.mark.anyio
+async def test_get_schedule():
+    transport = _mock_transport(
+        {"GET /v1/api/admin/schedules/t1": _json_response(_SCHEDULE_FIXTURE)}
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.get_schedule("t1")
+        assert resp.task_id == "t1"
+        assert resp.schedule_type == "cron"
+
+
+@pytest.mark.anyio
+async def test_update_schedule_partial():
+    """Only explicitly-passed fields should appear in the request body."""
+    captured_body: list[dict] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.append(json.loads(request.content))
+        return _json_response({**_SCHEDULE_FIXTURE, "enabled": False})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.update_schedule("t1", enabled=False)
+        assert resp.enabled is False
+        body = captured_body[0]
+        assert body == {"enabled": False}
+
+
+@pytest.mark.anyio
+async def test_update_schedule_timezone():
+    """The zone rides the same unset-sentinel path as every other field."""
+    captured_body: list[dict] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.append(json.loads(request.content))
+        return _json_response({**_SCHEDULE_FIXTURE, "timezone": "Europe/Berlin"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.update_schedule("t1", timezone="Europe/Berlin")
+        assert resp.timezone == "Europe/Berlin"
+        assert captured_body[0] == {"timezone": "Europe/Berlin"}
+
+
+@pytest.mark.anyio
+async def test_delete_schedule():
+    transport = _mock_transport(
+        {"DELETE /v1/api/admin/schedules/t1": _json_response({"status": "ok"})}
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.delete_schedule("t1")
+        assert resp.status == "ok"
+
+
+@pytest.mark.anyio
+async def test_list_schedule_runs():
+    transport = _mock_transport(
+        {
+            "GET /v1/api/admin/schedules/t1/runs": _json_response(
+                {
+                    "runs": [
+                        {
+                            "run_id": "r1",
+                            "task_id": "t1",
+                            "node_id": "n1",
+                            "ws_id": "ws1",
+                            "correlation_id": "c1",
+                            "started": "2026-03-05T02:00:00Z",
+                            "status": "dispatched",
+                            "error": "",
+                        }
+                    ]
+                }
+            )
+        }
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.list_schedule_runs("t1", limit=10)
+        assert len(resp.runs) == 1
+        assert resp.runs[0].run_id == "r1"
+        assert resp.runs[0].status == "dispatched"
+
+
+# ---------------------------------------------------------------------------
+# create_workstream extended params
+# ---------------------------------------------------------------------------
+
+
+def test_cluster_create_sdk_signatures_match_live_schema():
+    """The console SDK must not advertise fields the handler silently ignores."""
+    import inspect
+
+    from turnstone.api.console_schemas import ConsoleCreateWsRequest
+    from turnstone.sdk.console import TurnstoneConsole
+
+    expected = set(ConsoleCreateWsRequest.model_fields)
+    async_params = set(inspect.signature(AsyncTurnstoneConsole.create_workstream).parameters)
+    sync_params = set(inspect.signature(TurnstoneConsole.create_workstream).parameters)
+    assert async_params - {"self"} == expected
+    assert sync_params - {"self"} == expected
+
+
+@pytest.mark.anyio
+async def test_create_workstream_contract_params():
+    """Cluster create exposes every optional field accepted by its schema."""
+    captured_body: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.update(json.loads(request.content))
+        return _json_response(
+            {"status": "dispatched", "correlation_id": "abc", "target_node": "n1"}
+        )
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.create_workstream(
+            node_id="n1",
+            name="ext",
+            project_id="project-42",
+            judge_model="judge-fast",
+        )
+        assert captured_body["node_id"] == "n1"
+        assert captured_body["name"] == "ext"
+        assert captured_body["project_id"] == "project-42"
+        assert captured_body["judge_model"] == "judge-fast"
+
+
+@pytest.mark.anyio
+async def test_create_workstream_omits_empty_new_params():
+    """Default-valued new params should not appear in JSON body."""
+    captured_body: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.update(json.loads(request.content))
+        return _json_response(
+            {"status": "dispatched", "correlation_id": "abc", "target_node": "n1"}
+        )
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.create_workstream(name="min")
+        assert captured_body == {"name": "min"}
+        assert "project_id" not in captured_body
+        assert "judge_model" not in captured_body
+
+
+# ---------------------------------------------------------------------------
+# Route methods
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_route_create_workstream():
+    captured_body: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.update(json.loads(request.content))
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "name": "routed",
+                "node_url": "http://n1:8080",
+                "node_id": "n1",
+                "routing_strategy": "target_node",
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_create_workstream(
+            name="routed",
+            model="gpt-5",
+            auto_approve=True,
+            project_id="project-42",
+            judge_model="judge-fast",
+            target_node="n1",
+            user_id="u1",
+            client_type="scheduled",
+            notify_targets=[{"channel_type": "slack", "channel_id": "C123"}],
+        )
+        assert resp.ws_id == "ws1"
+        assert resp.node_url == "http://n1:8080"
+        assert resp.routing_strategy == "target_node"
+        assert captured_body["name"] == "routed"
+        assert captured_body["model"] == "gpt-5"
+        assert captured_body["auto_approve"] is True
+        assert captured_body["project_id"] == "project-42"
+        assert captured_body["judge_model"] == "judge-fast"
+        assert captured_body["target_node"] == "n1"
+        assert captured_body["user_id"] == "u1"
+        assert captured_body["client_type"] == "scheduled"
+        assert captured_body["notify_targets"] == [{"channel_type": "slack", "channel_id": "C123"}]
+
+
+@pytest.mark.anyio
+async def test_route_create_workstream_attachments_with_target_node():
+    """Multipart preserves the explicit requirement alongside the chosen ID."""
+    from turnstone.sdk._types import AttachmentUpload
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        assert b'"target_node": "n1"' in request.content
+        assert b'"required_node_id": "n1"' in request.content
+        assert b'filename="a.txt"' in request.content
+        return _json_response(
+            {
+                "ws_id": request.url.params["ws_id"],
+                "name": "x",
+                "node_id": "n1",
+                "node_url": "http://n1:8080",
+                "routing_strategy": "target_node",
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        result = await client.route_create_workstream(
+            name="x",
+            target_node="n1",
+            required_node_id="n1",
+            attachments=[AttachmentUpload(filename="a.txt", data=b"hi")],
+        )
+        assert result.node_id == "n1"
+
+
+@pytest.mark.anyio
+async def test_route_create_workstream_omits_defaults():
+    captured_body: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured_body.update(json.loads(request.content))
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "name": "bare",
+                "node_url": "http://n1:8080",
+                "node_id": "n1",
+                "routing_strategy": "rendezvous",
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_create_workstream(name="bare")
+        assert captured_body == {"name": "bare"}
+
+
+@pytest.mark.anyio
+async def test_route_send():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return _json_response({"status": "ok"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_send("Hello", "ws1")
+        assert resp["status"] == "ok"
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/send"
+        assert captured["body"] == {"message": "Hello"}
+
+
+@pytest.mark.anyio
+async def test_route_approve():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return _json_response({"status": "ok"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_approve(ws_id="ws1", approved=False, feedback="no", always=True)
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/approve"
+        assert captured["body"] == {
+            "approved": False,
+            "feedback": "no",
+            "always": True,
+        }
+
+
+@pytest.mark.anyio
+async def test_route_approve_omits_defaults():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return _json_response({"status": "ok"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_approve(ws_id="ws1", approved=True)
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/approve"
+        assert captured["body"] == {"approved": True}
+
+
+@pytest.mark.anyio
+async def test_route_close():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return _json_response({"status": "ok"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_close("ws1")
+        assert resp["status"] == "ok"
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/close"
+        assert captured["body"] == {}
+
+
+@pytest.mark.anyio
+async def test_route_cancel():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return _json_response({"status": "ok"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_cancel("ws1", force=True)
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/cancel"
+        assert captured["body"] == {"force": True}
+
+
+@pytest.mark.anyio
+async def test_route_cancel_omits_force_when_false():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return _json_response({"status": "ok"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_cancel("ws1")
+        assert captured["path"] == "/v1/api/route/workstreams/ws1/cancel"
+        assert captured["body"] == {}
+
+
+@pytest.mark.anyio
+async def test_route_command():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return _json_response({"status": "ok"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        await client.route_command(ws_id="ws1", command="/clear")
+        assert captured["path"] == "/v1/api/route/command"
+        assert captured["body"] == {"ws_id": "ws1", "command": "/clear"}
+
+
+@pytest.mark.anyio
+async def test_route_lookup():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        captured["url"] = str(request.url)
+        return _json_response({"node_url": "http://n1:8080", "node_id": "n1"})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_lookup("ws1")
+        assert resp["node_url"] == "http://n1:8080"
+        assert resp["node_id"] == "n1"
+        assert captured["path"] == "/v1/api/route"
+        assert "ws_id=ws1" in captured["url"]
+
+
+@pytest.mark.anyio
+async def test_route_workstream_live():
+    captured: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["path"] = request.url.path
+        return _json_response({"ws_id": "ws1", "live": True})
+
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_workstream_live("ws1")
+
+    assert resp.ws_id == "ws1"
+    assert resp.live is True
+    assert captured["path"] == "/v1/api/route/workstreams/ws1/live"

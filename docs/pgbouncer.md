@@ -1,0 +1,262 @@
+# PgBouncer Connection Pooling
+
+Turnstone cluster deployments share a single PostgreSQL instance across
+all server nodes and the console. Each process
+maintains a small connection pool (2 base + 3 overflow = 5 max). At
+scale this adds up — a 100-node cluster opens up to 500 connections,
+and a 1000-node cluster up to 5,000.
+
+PostgreSQL's default `max_connections` is 100, and each real connection
+allocates ~5–10 MB of backend memory. PgBouncer sits between turnstone
+and PostgreSQL, multiplexing thousands of lightweight client connections
+down to a small number of real database connections.
+
+---
+
+## Why PgBouncer works well with turnstone
+
+Most turnstone database operations are short-burst queries: acquire a
+connection, execute a small transaction, commit, release. Workstream forks are
+the deliberate exception: they clone the source's checkpoint-bounded history
+and configuration and retain its attachment references in one transaction.
+PostgreSQL runs that clone at `SERIALIZABLE` isolation and retries serialization
+or deadlock conflicts as a whole. A large fork can therefore hold its assigned
+server connection longer than an ordinary message write.
+
+This still makes **transaction pooling mode** the right fit — no operation
+depends on server-session state, and PgBouncer returns the connection as soon
+as the transaction finishes. Size and monitor the server pool with concurrent
+fork traffic in mind rather than assuming every transaction completes in a few
+milliseconds.
+
+| Cluster size | Client connections (max) | PgBouncer server connections needed |
+|--------------|------------------------|-------------------------------------|
+| 10 nodes     | 50                     | 10–20                               |
+| 100 nodes    | 500                    | 20–40                               |
+| 500 nodes    | 2,500                  | 30–60                               |
+| 1,000 nodes  | 5,000                  | 40–80                               |
+
+The server connection count stays low because most client connections
+are idle at any given moment.
+
+---
+
+## Docker Compose
+
+Add PgBouncer between turnstone services and PostgreSQL:
+
+```yaml
+services:
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-turnstone}
+      DB_USER: ${POSTGRES_USER:-turnstone}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?}
+      LISTEN_PORT: "6432"
+      AUTH_TYPE: ${POSTGRES_AUTH_TYPE:-scram-sha-256}
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: "40"
+      MAX_CLIENT_CONN: "5000"
+      MAX_DB_CONNECTIONS: "80"
+      SERVER_IDLE_TIMEOUT: "300"
+    ports:
+      - "6432:6432"
+    networks:
+      - turnstone-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+```
+
+Then point turnstone services at PgBouncer instead of PostgreSQL
+directly by changing `TURNSTONE_DB_URL`:
+
+```bash
+# Before (direct)
+TURNSTONE_DB_URL=postgresql://turnstone:secret@postgres:5432/turnstone
+
+# After (via PgBouncer)
+TURNSTONE_DB_URL=postgresql://turnstone:secret@pgbouncer:6432/turnstone
+```
+
+---
+
+## Helm / Kubernetes
+
+Add a PgBouncer deployment or use a Helm chart like
+[edoburu/pgbouncer](https://github.com/edoburu/docker-pgbouncer/tree/master/examples/kubernetes).
+
+In `values.yaml`, point the database at PgBouncer:
+
+```yaml
+database:
+  backend: postgresql
+  external:
+    host: pgbouncer
+    port: 6432
+    database: turnstone
+    username: turnstone
+    existingSecret: turnstone-db-secret
+```
+
+PgBouncer configuration:
+
+```yaml
+pgbouncer:
+  poolMode: transaction
+  defaultPoolSize: 40
+  maxClientConn: 5000
+  maxDbConnections: 80
+```
+
+---
+
+## Configuration reference
+
+| PgBouncer setting | Recommended | Notes |
+|-------------------|-------------|-------|
+| `pool_mode` | `transaction` | Required — turnstone uses short-burst queries with no session state |
+| `default_pool_size` | 40 | Real PostgreSQL connections per database. Start here, increase if you see `no more connections allowed` |
+| `max_client_conn` | 5000 | Upper bound on client connections. Set to `cluster_nodes × 5` |
+| `max_db_connections` | 80 | Hard cap on real connections to PostgreSQL. Keep below PG `max_connections` minus headroom for admin/monitoring |
+| `server_idle_timeout` | 300 | Close idle server connections after 5 minutes |
+| `server_lifetime` | 3600 | Recycle server connections after 1 hour |
+
+On the PostgreSQL side:
+
+| PostgreSQL setting | Recommended | Notes |
+|--------------------|-------------|-------|
+| `max_connections` | 100 | Default is fine — PgBouncer is the only client. Set higher than `max_db_connections` to leave room for admin connections |
+| `shared_buffers` | 25% of RAM | Standard PostgreSQL tuning |
+
+---
+
+## Turnstone pool settings
+
+Each turnstone process maintains its own SQLAlchemy connection pool to
+PgBouncer (which then multiplexes to PostgreSQL):
+
+| Environment variable | Default | Description |
+|---------------------|---------|-------------|
+| `TURNSTONE_DB_POOL_SIZE` | 2 | Base pool size per process |
+| `TURNSTONE_DB_BACKEND` | sqlite | Set to `postgresql` for cluster deployments |
+| `TURNSTONE_DB_URL` | — | Connection URL (point at PgBouncer, not PostgreSQL directly) |
+
+The default pool of 2 + 3 overflow = 5 connections per process is
+intentionally small to support large clusters. Most deployments should not
+need to increase it. If operators create many large forks concurrently, watch
+PgBouncer's `cl_waiting` and PostgreSQL transaction latency before changing
+the per-process pool; adding client-side connections cannot help once the
+PgBouncer server pool is saturated.
+
+SQLAlchemy `pool_pre_ping` is enabled, so stale connections (e.g. after
+PgBouncer restarts) are automatically detected and replaced.
+
+---
+
+## Monitoring
+
+PgBouncer exposes stats via its admin console (connect to
+PgBouncer port with user `pgbouncer`):
+
+```sql
+-- Active and waiting clients
+SHOW POOLS;
+
+-- Per-database stats
+SHOW STATS;
+
+-- Current client connections
+SHOW CLIENTS;
+```
+
+Key metrics to watch:
+
+- **`cl_active`** — clients with a server connection assigned. Should be
+  well below `max_db_connections`.
+- **`cl_waiting`** — clients waiting for a server connection. Sustained
+  non-zero values mean you need more `default_pool_size`.
+- **`sv_active`** — active server (PostgreSQL) connections. Should stay
+  below PostgreSQL `max_connections`.
+
+Short `cl_waiting` spikes during large workstream forks can be normal. Sustained
+waiters accompanied by long serializable transactions indicate fork/storage
+load, not an SSE or HTTP client-pool problem.
+
+---
+
+## Upgrade note: deferred workstream creation
+
+The workstream lifecycle now uses durable, hidden `state='creating'`
+reservations while session construction, upload validation, and optional fork
+cloning complete. Older server processes do not understand that private state:
+against the same database they may resolve, list, open, or prune a reservation
+before its new owner publishes it.
+
+For the upgrade that introduces deferred creation, drain create traffic and
+upgrade all server processes sharing the database as one cohort. Do not resume
+creates until no older server process remains. The change needs no manual
+schema migration, but it is not safe to treat mixed lifecycle implementations
+as an ordinary rolling-upgrade state.
+
+A `creating` row should be transient and absent from normal APIs and cluster
+events. If one persists after a process crash, inspect the corresponding
+`ws.create.*` and `session_mgr.commit_create.*` logs before cleanup. Do not
+promote it to `idle` manually: its history, configuration, attachment
+references, or lifecycle publication may be incomplete.
+
+---
+
+## Troubleshooting
+
+**"no more connections allowed (max_client_conn)"** — PgBouncer is
+rejecting new client connections. Increase `max_client_conn` to match
+your cluster size × 5.
+
+**"no more connections allowed (max_db_connections)"** — PgBouncer
+cannot open more connections to PostgreSQL. Increase
+`max_db_connections` and ensure PostgreSQL `max_connections` is higher.
+
+**Connections timing out on startup** — If all nodes start
+simultaneously, the burst of initial connections (migrations, health
+checks) can temporarily exceed the pool. PgBouncer queues excess
+clients by default — this resolves itself within seconds.
+
+**Prepared statements not supported** — PgBouncer in `transaction` mode
+does not support prepared statements. Turnstone's SQLAlchemy layer does
+not use server-side prepared statements by default, so this is not an
+issue.
+
+**LISTEN / NOTIFY not supported in transaction mode** — PgBouncer's
+transaction pooling assigns a real server connection only for the
+duration of each transaction, then returns it to the pool. PostgreSQL
+`LISTEN` is session state — a transaction-pooled client can't hold the
+multi-statement session a long-lived `LISTEN` needs. The console's
+`NotifyDispatcher` (reactive node discovery via the `services` channel)
+therefore opens a **dedicated, direct-to-Postgres** connection that
+bypasses PgBouncer.
+
+Configure via `config.toml` `[database] listen_url` (preferred —
+co-located with the main `url`) or the `TURNSTONE_DB_LISTEN_URL` env var
+(config.toml wins when both are set). Defaults to the main DB URL when
+unset.
+
+| Setting | Behaviour |
+|---|---|
+| unset | Listener uses `TURNSTONE_DB_URL` as-is. Fine when PgBouncer is in **session** mode, or when there's no pooler in front of Postgres. With transaction-mode PgBouncer the listener's `LISTEN` will fail and the dispatcher retries with exponential backoff (1 s → 30 s cap) without ever succeeding. Reactive NOTIFY-driven node discovery is silently lost; the cluster collector's 60 s `_discovery_loop` is the only remaining backstop. |
+| set to direct-to-PG URL (e.g. `postgresql://…/turnstone`) | Listener bypasses PgBouncer for its one dedicated connection. Reactive discovery latency drops from up-to-60 s to ~500 ms. The rest of the storage layer continues to go through PgBouncer in transaction mode. |
+
+Set this whenever PgBouncer is in transaction mode (the recommended
+setting per this doc). The override only adds one long-lived PG
+connection per console process — sized into the cluster's
+`max_connections` budget alongside the pool.
+
+See also: [Docker deployment](docker.md) · [Security](security.md)

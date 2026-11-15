@@ -1,0 +1,190 @@
+{
+  "description": "attached-file handling — the model answers from an uploaded or pasted attachment instead of looking for it on disk or creating it",
+  "defaults": {
+    "n_runs": 10,
+    "max_turns": 6
+  },
+  "cases": [
+    {
+      "id": "attached-file-named",
+      "description": "The prompt names an attached markdown file that is not in the workspace",
+      "user_prompt": "Can you summarize planning-notes.md for me?",
+      "user_prompts": [
+        "Can you summarize planning-notes.md for me?",
+        "Take a look at planning-notes.md and give me the key points.",
+        "Summarize planning-notes.md",
+        "I attached planning-notes.md, what are the main takeaways?",
+        "Read planning-notes.md and tell me what it says."
+      ],
+      "attachments": [
+        {
+          "filename": "planning-notes.md",
+          "mime_type": "text/markdown",
+          "content": "# Q3 planning notes\n\n## Launch\n- Codename: BLUE HERON\n- Owner: Priya Raman\n- Target ship date: 14 November\n- Scope: self-serve billing portal, invoice export, usage alerts\n\n## Risks\n- The billing migration has not been load-tested yet.\n- Two contractors roll off at the end of October.\n\n## Decisions\n- Usage alerts ship behind a feature flag.\n- The legacy invoice PDF generator is retired after launch.\n\n## Open questions\n- Do enterprise accounts get the portal at launch or in Q1?\n- Who owns on-call for the portal in the first month?\n"
+        }
+      ],
+      "setup": {
+        "files": {
+          "README.md": "# Acme portal\n\nCustomer-facing billing portal.\n",
+          "app.py": "from flask import Flask\n\napp = Flask(__name__)\n\n\n@app.get('/health')\ndef health():\n    return {'ok': True}\n"
+        }
+      },
+      "expected_actions": [],
+      "forbidden_actions": [
+        {"tool": "read_file"},
+        {"tool": "search"},
+        {"tool": "write_file"},
+        {"tool": "edit_file"},
+        {"tool": "diff_file"},
+        {"tool": "bash"},
+        {"tool": "open_preview"},
+        {"tool": "task_agent"}
+      ],
+      "expected_content": ["blue\\s*heron"]
+    },
+    {
+      "id": "attached-file-unnamed",
+      "description": "The prompt refers to 'the attached document' without a filename",
+      "user_prompt": "Hey buddy, can you take a look at the attached markdown document and summarize it for me?",
+      "user_prompts": [
+        "Hey buddy, can you take a look at the attached markdown document and summarize it for me?",
+        "Can you summarize the attached document?",
+        "What are the key points in the file I attached?",
+        "Please summarize the attachment."
+      ],
+      "attachments": [
+        {
+          "filename": "incident-review.md",
+          "mime_type": "text/markdown",
+          "content": "# Incident review: ORCHID-7\n\n## Summary\nOn 2 September the nightly export job wrote duplicate rows into the reporting database for 41 minutes.\n\n## Timeline\n- 02:10 export job starts on the new scheduler\n- 02:14 the old cron entry fires as well; both jobs run\n- 02:51 on-call notices the row count alert and stops the old cron job\n\n## Root cause\nThe cron entry was not removed when the job moved to the new scheduler.\n\n## Follow-ups\n- Delete the legacy cron entry (done)\n- Add an idempotency key to export batches\n- Alert on duplicate batch ids within one hour\n"
+        }
+      ],
+      "setup": {
+        "files": {
+          "README.md": "# Acme portal\n\nCustomer-facing billing portal.\n",
+          "app.py": "from flask import Flask\n\napp = Flask(__name__)\n\n\n@app.get('/health')\ndef health():\n    return {'ok': True}\n"
+        }
+      },
+      "expected_actions": [],
+      "forbidden_actions": [
+        {"tool": "read_file"},
+        {"tool": "search"},
+        {"tool": "write_file"},
+        {"tool": "edit_file"},
+        {"tool": "diff_file"},
+        {"tool": "bash"},
+        {"tool": "open_preview"},
+        {"tool": "task_agent"}
+      ],
+      "expected_content": ["cron"]
+    },
+    {
+      "id": "pasted-text",
+      "description": "A long paste the composer turned into a pasted-text.txt attachment",
+      "user_prompt": "Summarize this for me",
+      "user_prompts": [
+        "Summarize this for me",
+        "Can you summarize the text I pasted?",
+        "tl;dr please",
+        "What is this email asking me to do?"
+      ],
+      "attachments": [
+        {
+          "filename": "pasted-text.txt",
+          "mime_type": "text/plain",
+          "content": "Hi team,\n\nQuick update on the warehouse move. Kestrel Freight confirmed they can take over the Leeds route from 1 December, but only if we sign the revised rate card by Friday. The new rate is 6% higher than the current contract, mostly fuel surcharge.\n\nOptions as I see them:\n1. Sign the revised card and keep the December date.\n2. Push the move to January and renegotiate in the meantime.\n3. Split the route: Kestrel takes the north depots, we keep the south in-house until March.\n\nFinance prefers option 2, operations prefers option 1. I need a decision from you by Thursday so I can reply to Kestrel in time.\n\nThanks,\nMarta\n"
+        }
+      ],
+      "setup": {
+        "files": {
+          "README.md": "# Acme portal\n\nCustomer-facing billing portal.\n",
+          "app.py": "from flask import Flask\n\napp = Flask(__name__)\n\n\n@app.get('/health')\ndef health():\n    return {'ok': True}\n"
+        }
+      },
+      "expected_actions": [],
+      "forbidden_actions": [
+        {"tool": "read_file"},
+        {"tool": "search"},
+        {"tool": "write_file"},
+        {"tool": "edit_file"},
+        {"tool": "diff_file"},
+        {"tool": "bash"},
+        {"tool": "open_preview"},
+        {"tool": "task_agent"}
+      ],
+      "expected_content": ["kestrel"]
+    },
+    {
+      "id": "attached-file-question",
+      "description": "A question only the attached file can answer",
+      "user_prompt": "In launch-checklist.md, who signs off on the rollback plan?",
+      "user_prompts": [
+        "In launch-checklist.md, who signs off on the rollback plan?",
+        "Check launch-checklist.md: who owns the rollback plan sign-off?",
+        "According to launch-checklist.md, who approves the rollback plan?"
+      ],
+      "attachments": [
+        {
+          "filename": "launch-checklist.md",
+          "mime_type": "text/markdown",
+          "content": "# Launch checklist\n\n| Item | Owner | Status |\n| --- | --- | --- |\n| Load test the billing migration | Priya Raman | in progress |\n| Rollback plan sign-off | Tomasz Kowalczyk | pending |\n| Support runbook | Aisha Bello | done |\n| Status page copy | Liam Chen | done |\n| Feature flag defaults reviewed | Priya Raman | pending |\n"
+        }
+      ],
+      "setup": {
+        "files": {
+          "README.md": "# Acme portal\n\nCustomer-facing billing portal.\n",
+          "app.py": "from flask import Flask\n\napp = Flask(__name__)\n\n\n@app.get('/health')\ndef health():\n    return {'ok': True}\n"
+        }
+      },
+      "expected_actions": [],
+      "forbidden_actions": [
+        {"tool": "read_file"},
+        {"tool": "search"},
+        {"tool": "write_file"},
+        {"tool": "edit_file"},
+        {"tool": "diff_file"},
+        {"tool": "bash"},
+        {"tool": "open_preview"},
+        {"tool": "task_agent"}
+      ],
+      "expected_content": ["tomasz|kowalczyk"]
+    },
+    {
+      "id": "attached-code-file",
+      "description": "A question about an attached source file in a code workspace that lacks it",
+      "user_prompt": "In the rate_limiter.py I attached, what is the default burst size?",
+      "user_prompts": [
+        "In the rate_limiter.py I attached, what is the default burst size?",
+        "What burst size does rate_limiter.py use by default?",
+        "Look at rate_limiter.py: what's the default burst?"
+      ],
+      "attachments": [
+        {
+          "filename": "rate_limiter.py",
+          "mime_type": "text/x-python",
+          "content": "\"\"\"Token-bucket rate limiter for the public API.\"\"\"\n\nimport time\n\nDEFAULT_RATE_PER_SECOND = 20\nDEFAULT_BURST = 48\n\n\nclass TokenBucket:\n    def __init__(self, rate: float = DEFAULT_RATE_PER_SECOND, burst: int = DEFAULT_BURST) -> None:\n        self.rate = rate\n        self.capacity = burst\n        self.tokens = float(burst)\n        self.updated = time.monotonic()\n\n    def allow(self) -> bool:\n        now = time.monotonic()\n        self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)\n        self.updated = now\n        if self.tokens >= 1:\n            self.tokens -= 1\n            return True\n        return False\n"
+        }
+      ],
+      "setup": {
+        "files": {
+          "README.md": "# Acme portal\n\nCustomer-facing billing portal.\n",
+          "app.py": "from flask import Flask\n\napp = Flask(__name__)\n\n\n@app.get('/health')\ndef health():\n    return {'ok': True}\n",
+          "api/__init__.py": "",
+          "api/routes.py": "from app import app\n\n\n@app.get('/v1/invoices')\ndef invoices():\n    return []\n"
+        }
+      },
+      "expected_actions": [],
+      "forbidden_actions": [
+        {"tool": "read_file"},
+        {"tool": "search"},
+        {"tool": "write_file"},
+        {"tool": "edit_file"},
+        {"tool": "diff_file"},
+        {"tool": "bash"},
+        {"tool": "open_preview"},
+        {"tool": "task_agent"}
+      ],
+      "expected_content": ["\\b48\\b"]
+    }
+  ]
+}

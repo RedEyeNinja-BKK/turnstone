@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "stable/*"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, "stable/*"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+      - run: pip install pre-commit
+      - run: pre-commit run --all-files
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+      - run: pip install mypy
+      - run: pip install -e ".[all]"
+      - run: mypy turnstone/
+
+  test:
+    runs-on: ubuntu-latest
+    # Stop hung test runs after 45 minutes. Keep the suite within this budget
+    # as it grows; the matrix covers the minimum and newest tested Python versions.
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Node is required by tests/test_renderer_js.py — without
+      # explicit setup, that suite silently skips if the runner
+      # image happens not to ship Node, masking regressions in
+      # the browser-side renderer.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "26"
+      - run: pip install -e ".[test,discord]"
+      # -v lists each test id as it starts (pytest prints the nodeid at
+      # logstart), so a hang names the culprit on the last line instead of
+      # riding the job timeout with only a trail of "..." dots.
+      - run: pytest tests/ -m "not live and not e2e_recovery" --cov=turnstone --cov-report=term-missing --cov-report=xml -v
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+
+  test-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: turnstone_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "26"
+      - run: pip install -e ".[test,discord]"
+      - run: pytest tests/ -m "not live and not e2e_recovery" --storage-backend=postgresql -v
+        env:
+          TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test
+
+  wheel-completeness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+      - run: pip install build
+      - run: python -m build --wheel
+      - name: Check all data files are in wheel
+        run: |
+          SOURCE=$(find turnstone -type f \
+            ! -name '*.py' ! -name '*.pyc' ! -path '*__pycache__*' \
+            | sort)
+          WHEEL=$(python -m zipfile -l dist/*.whl \
+            | awk '{print $1}' \
+            | grep -v '\.py$' | grep -v '\.dist-info' | grep -v '\.pyc' | grep -v '^File$' \
+            | sort)
+
+          # Files intentionally excluded from the wheel (one per line).
+          # The vllm-litellm/ deploy example ships in the repo, not the wheel
+          # (you clone the repo to run it; the package doesn't reference it).
+          ALLOW="
+          turnstone/core/storage/migrations/script.py.mako
+          turnstone/deploy/vllm-litellm/.env.example
+          turnstone/deploy/vllm-litellm/README.md
+          turnstone/deploy/vllm-litellm/docker-compose.yml
+          turnstone/deploy/vllm-litellm/gemma.Dockerfile
+          turnstone/deploy/vllm-litellm/litellm-config.yaml
+          "
+
+          MISSING=$(comm -23 <(echo "$SOURCE") <(echo "$WHEEL") \
+            | grep -vFxf <(echo "$ALLOW" | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' ) || true)
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::Data files in source tree but missing from wheel:"
+            echo "$MISSING"
+            echo ""
+            echo "Add them to [tool.hatch.build.targets.wheel] in pyproject.toml"
+            echo "or to the ALLOW list in this job if intentionally excluded."
+            exit 1
+          fi
+          echo "All source data files present in wheel"
+      - name: Smoke-test entry points from installed wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/turnstone --help
+          /tmp/smoke/bin/turnstone-server --help
+          /tmp/smoke/bin/turnstone-console --help
+          /tmp/smoke/bin/turnstone-admin --help
+          /tmp/smoke/bin/turnstone-channel --help
+          /tmp/smoke/bin/turnstone-doctor --help
+
+  lock-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.7"
+      - run: uv lock --check
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.7"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+      - run: uv sync --frozen --all-extras
+      - run: uv pip install pip-audit
+      - name: Security audit (dependencies)
+        # PYSEC-2025-183 (pyjwt): "weak encryption" — disputed by the
+        # supplier because the key length is chosen by the calling
+        # application, not the library.  Turnstone generates its JWT
+        # signing keys via the standard ``secrets`` module at
+        # operator-controlled strength (see ``turnstone/core/auth.py``),
+        # so the advisory does not apply.  pyjwt 2.12.1 is the current
+        # latest release; no fix version exists.
+        run: >-
+          uv export --no-emit-project --frozen
+          | uv run pip-audit --strict --desc -r /dev/stdin
+          --ignore-vuln PYSEC-2025-183
+
+  security-ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "26"
+      - run: npm ci
+      - run: npm audit --audit-level=moderate

@@ -1,0 +1,74 @@
+# Contributing to Turnstone
+
+Thanks for your interest in contributing! Here's what you need to know.
+
+## Contributor License Agreement
+
+All contributors must agree to the [Contributor License Agreement](CLA.md)
+before their pull request can be merged. When you open your first PR, the CLA
+Assistant bot will ask you to sign by commenting on the PR. This is a one-time
+process.
+
+The CLA allows us to distribute Turnstone under both open-source and commercial
+licenses. Your contributions remain your own — you are granting a license, not
+transferring ownership.
+
+## Getting Started
+
+1. Fork the repository
+2. Create a branch from the appropriate base branch
+3. Make your changes
+4. Run the tests: `pytest`
+5. Open a pull request back to that base branch
+
+## Choosing a Base Branch
+
+Contributions target `main`, including features, refactors, and fixes for user
+escalations. Maintainers backport fixes to supported `stable/X.Y` branches when
+needed. There is no separate `dev` branch.
+
+See [the release process](docs/releasing.md) for the complete branch and
+backport policy.
+
+## Development Setup
+
+Use Python 3.13 or 3.14. CI tests both versions.
+
+```
+python3.13 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[test,dev]"
+```
+
+The `dev` extra installs `ruff` and `mypy`. Before pushing, run:
+
+```
+ruff check .
+ruff format --check .
+mypy turnstone
+pytest
+```
+
+## Guidelines
+
+- Keep pull requests focused — one change per PR
+- Add tests for new functionality
+- Follow existing code style and patterns
+- Treat a failed read (database, config file, network) as an error, never as an empty or default
+  value: writes, deletes and prunes act only on reads that succeeded, and a startup sync stores
+  only what it observed
+- Update documentation if your change affects user-facing behavior
+
+## Reporting Issues
+
+Open an issue at https://github.com/turnstonelabs/turnstone/issues with:
+
+- What you expected to happen
+- What actually happened
+- Steps to reproduce
+- Python version and OS
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the
+project's [Apache License 2.0](LICENSE).

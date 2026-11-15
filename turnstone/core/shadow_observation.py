@@ -1,0 +1,439 @@
+"""Shadow observation contract: typed, advisory, and fail-open.
+
+This module is the sensor's boundary. It produces a `SensorSnapshot` and nothing
+else — no model, provider, route, reasoning effort, tool permission, agent
+selection or Output Guard value is read or written anywhere in this file. That
+is enforced structurally (see `test_shadow_observation.py::test_snapshot_has_no_routing_fields`)
+rather than by convention.
+
+Three properties this is built around:
+
+* **Advisory.** A snapshot is a record. There is no consumer inside Turnstone,
+  and `apply()` does not exist, so there is nothing to call by accident.
+* **Fail open.** Every failure mode — serializer, Switchyard, timeout, invalid
+  response, storage — becomes an *unavailable* observation. Sensing never fails a
+  task.
+* **Honest about absence.** A signal that could not be observed is
+  ``available=False, value=None`` and never a zero or a carried-forward value.
+  In particular ``local_suitability`` is never available from the fallback
+  backend, and observability stays ``unknown`` rather than being enabled because
+  an upstream happens to offer a confidence field.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import socket
+import time
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any
+
+SENSOR_VERSION = "turnstone-sensor-shadow:v1"
+
+#: Version of the bounded projection schema. Recorded on every observation so a
+#: stored record can be interpreted against the projection policy that produced
+#: it. Bump when the *meaning* of a projected field changes.
+PROJECTION_SCHEMA = "turnstone-sensor-projection:v1"
+
+#: Allowed content-minimization modes. ``full`` reproduces the historical
+#: projection; ``sanitized`` strips secrets/paths/e-mails; ``metadata`` sends no
+#: free text at all. The active value is recorded on every observation so the
+#: exposure posture of a measurement is never ambiguous after the fact.
+CONTENT_MODES = ("full", "sanitized", "metadata")
+
+#: Process identity for telemetry. The five-node fleet runs six processes that
+#: append to the same store root; a record with no process attribution cannot
+#: be attributed to the node that observed it. ``TURNSTONE_NODE_ID`` is set by
+#: every unit; the pid disambiguates restarts.
+PROCESS_ID = (
+    f"{os.environ.get('TURNSTONE_NODE_ID') or socket.gethostname()}"
+    f":{os.getpid()}"
+)
+
+#: The one capability this module may name by default. It deliberately knows
+#: nothing about OpenRouter, Span, the HTPC address, Laya, the fallback rule, or
+#: any credential: failover is Switchyard's concern, not the sensor's.
+#:
+#: 2026-10-17 adaptation (Turnstone 1.8.7): the historical lane
+#: ``switchyard-smart-aux-turnstone`` no longer exists in Switchyard's config.
+#: The live decision surface is the registry alias ``tier1-decision``, a
+#: composition lane (smartfree + smartlocal families) whose R1 target is still
+#: ``respan/span-01-lite``. The live port resolves the decision id through the
+#: model registry (see shadow_driver.resolve_decision_id); the historical
+#: constant is replaced by the live alias as the no-registry fallback.
+DECISION_CAPABILITY = "tier1-decision"
+
+#: Backends whose graded answers are BELIEVED. Only backends the five graded
+#: noul questions were qualified against appear here. A leg added to the
+#: composition lane later does not qualify by existing in the config — it
+#: qualifies by a measured five-question qualification run recorded here.
+#:
+#: Measured 2026-10-17: the composition lane's other legs
+#: (``direct-openrouter-mercury-decide-free``, ``direct-htpc-jev-style``)
+#: answer graded noul on the wire but were never qualified for these five
+#: questions; ``direct-htpc-laya`` is not addressable via /v1/decisions at all
+#: (HTTP 404 NotEligible). Unqualified output is recorded unavailable, never
+#: synthesized.
+QUALIFIED_BACKENDS = frozenset({"direct-openrouter-span-01-lite"})
+
+#: Signals requested on every observation. `local_suitability` is absent by
+#: design — the fallback backend is not qualified for it and inferring it is
+#: forbidden — so it is recorded as unavailable rather than asked for.
+REQUESTED_SIGNALS = (
+    "task_complexity",
+    "reasoning_demand",
+    "tool_dependency",
+    "agentic_complexity",
+    "route_sufficiency",
+)
+UNSUPPORTED_ON_FALLBACK = "local_suitability"
+
+#: Fields a snapshot must never carry. Asserted at construction time, so a
+#: future field cannot be added without tripping the guard.
+FORBIDDEN_KEYS = frozenset(
+    {
+        "model",
+        "provider",
+        "route",
+        "reasoning_effort",
+        "reasoning",
+        "target",
+        "llm_client",
+        "temperature",
+        "agent",
+        "tools",
+        "permissions",
+        "escalate",
+        "retry",
+        "output_guard",
+    }
+)
+
+
+class Observability(str, Enum):
+    """How much the backend actually commits to. Never invented."""
+
+    UNKNOWN = "unknown"
+
+
+class Trigger(str, Enum):
+    """Why an observation was taken. Drives cadence and dedupe."""
+
+    INITIAL = "initial_substantive_state"
+    MATERIAL = "material_state_transition"
+    MANUAL = "manual"
+
+
+#: Event kinds that justify a fresh observation. Anything not listed is not
+#: material by definition, which is what makes suppression a whitelist rather
+#: than a judgement call.
+MATERIAL_EVENTS = frozenset(
+    {
+        "operator_instruction",
+        "delegation_result",
+        "tool_failure",
+        "task_agent_failure",
+        "retry_transition",
+        "escalation_transition",
+        "new_evidence",
+        "phase_transition",
+    }
+)
+
+
+@dataclass(frozen=True)
+class Signal:
+    """One typed observation. Absence is explicit, never a zero."""
+
+    name: str
+    available: bool
+    value: float | None
+    backend: str
+    reason: str | None = None
+    primitive: str = "graded"
+    observability: Observability = Observability.UNKNOWN
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["observability"] = self.observability.value
+        return payload
+
+
+@dataclass(frozen=True)
+class SensorSnapshot:
+    """An advisory observation. A record, not a control input."""
+
+    sensor_version: str
+    serializer_version: str
+    trigger: Trigger
+    state_fingerprint: str
+    backend: str
+    fallback_used: bool
+    latency_ms: int
+    timestamp: float
+    #: Umbrella: any field was dropped, for either cause.
+    state_truncated: bool
+    serialized_chars: int
+    serialized_state_tokens: int
+    dropped_field_count: int
+    #: Correlation id minted once per admitted event by the hook. The cadence
+    #: ledger and the observation record carry the same value, so a
+    #: ``sensor_call`` row is provably paired with exactly one observation.
+    event_id: str = ""
+    #: The workstream whose state was observed (per-workstream dedupe key).
+    workstream: str = ""
+    #: Node:pid that produced this record.
+    process_id: str = ""
+    #: Which content-minimization mode produced the projected state.
+    content_mode: str = ""
+    #: What grounded this observation: "text", "text_plus_attachments", or
+    #: "attachments_only". The last one is structural metadata only - the
+    #: backend graded a descriptor, not the document - so it must never be
+    #: counted as a qualified five-signal measurement.
+    content_basis: str = "text"
+    #: Version of the projection schema (see PROJECTION_SCHEMA).
+    projection_schema: str = PROJECTION_SCHEMA
+    #: Dropped because a higher tier was present, or the low-tier reserve had to
+    #: be protected. Policy working as designed; NOT capacity pressure.
+    evicted_by_tier: bool = False
+    #: Dropped because the exact token budget was exhausted. This is the
+    #: capacity-pressure signal and the one worth alerting on.
+    overflowed_budget: bool = False
+    signals: tuple[Signal, ...] = ()
+    reason: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sensor_version": self.sensor_version,
+            "serializer_version": self.serializer_version,
+            "trigger": self.trigger.value,
+            "state_fingerprint": self.state_fingerprint,
+            "backend": self.backend,
+            "fallback_used": self.fallback_used,
+            "latency_ms": self.latency_ms,
+            "timestamp": self.timestamp,
+            "state_reduced": self.state_truncated,
+            "evicted_by_tier": self.evicted_by_tier,
+            "overflowed_budget": self.overflowed_budget,
+            "serialized_chars": self.serialized_chars,
+            "serialized_state_tokens": self.serialized_state_tokens,
+            "dropped_field_count": self.dropped_field_count,
+            "event_id": self.event_id,
+            "workstream": self.workstream,
+            "process_id": self.process_id,
+            "content_mode": self.content_mode,
+            "content_basis": self.content_basis,
+            "projection_schema": self.projection_schema,
+            "signals": [s.to_dict() for s in self.signals],
+            "reason": self.reason,
+            "extra": self.extra,
+        }
+
+
+def state_fingerprint(state: Mapping[str, Any]) -> str:
+    """Deterministic fingerprint over the serializer-relevant state.
+
+    Keyed on normalised name/value pairs only. A timestamp, a counter or any
+    other volatile input would make identical state look new and defeat dedupe,
+    so none is included. Two calls with the same meaningful state must produce
+    the same fingerprint, whatever order the mapping was built in.
+    """
+    normalised = sorted(
+        f"{str(name).strip()}={str(value).strip()}" for name, value in state.items()
+    )
+    return hashlib.sha256("\n".join(normalised).encode()).hexdigest()[:32]
+
+
+def unavailable(
+    *,
+    trigger: Trigger,
+    fingerprint: str,
+    serializer_version: str,
+    reason: str,
+    latency_ms: int = 0,
+    state_truncated: bool = False,
+    serialized_chars: int = 0,
+    serialized_state_tokens: int = 0,
+    dropped_field_count: int = 0,
+    evicted_by_tier: bool = False,
+    overflowed_budget: bool = False,
+    backend: str = "none",
+    fallback_used: bool = False,
+    event_id: str = "",
+    workstream: str = "",
+    process_id: str = "",
+    content_mode: str = "",
+    content_basis: str = "text",
+) -> SensorSnapshot:
+    """The fail-open snapshot. A task must never fail because sensing did.
+
+    Every signal is recorded unavailable with the reason, so a later reader can
+    distinguish "not sensed" from "sensed and found nothing".
+    """
+    signals = tuple(
+        Signal(
+            name=name,
+            available=False,
+            value=None,
+            backend=backend,
+            reason=reason,
+            observability=Observability.UNKNOWN,
+        )
+        for name in REQUESTED_SIGNALS
+    )
+    signals += (
+        Signal(
+            name=UNSUPPORTED_ON_FALLBACK,
+            available=False,
+            value=None,
+            backend=backend,
+            reason="backend_not_qualified_for_signal",
+            observability=Observability.UNKNOWN,
+        ),
+    )
+    return SensorSnapshot(
+        sensor_version=SENSOR_VERSION,
+        serializer_version=serializer_version,
+        trigger=trigger,
+        state_fingerprint=fingerprint,
+        backend=backend,
+        fallback_used=fallback_used,
+        latency_ms=latency_ms,
+        timestamp=time.time(),
+        state_truncated=state_truncated,
+        evicted_by_tier=evicted_by_tier,
+        overflowed_budget=overflowed_budget,
+        serialized_chars=serialized_chars,
+        serialized_state_tokens=serialized_state_tokens,
+        dropped_field_count=dropped_field_count,
+        event_id=event_id,
+        workstream=workstream,
+        process_id=process_id or PROCESS_ID,
+        content_mode=content_mode,
+        content_basis=content_basis,
+        signals=signals,
+        reason=reason,
+    )
+
+
+def build_snapshot(
+    *,
+    trigger: Trigger,
+    fingerprint: str,
+    serializer_version: str,
+    answers: Mapping[str, Any],
+    backend: str,
+    fallback_used: bool,
+    latency_ms: int,
+    state_truncated: bool,
+    serialized_chars: int,
+    serialized_state_tokens: int,
+    dropped_field_count: int,
+    evicted_by_tier: bool = False,
+    overflowed_budget: bool = False,
+    qualified: bool = True,
+    unqualified_raw: dict[str, Any] | None = None,
+    event_id: str = "",
+    workstream: str = "",
+    process_id: str = "",
+    content_mode: str = "",
+    content_basis: str = "text",
+) -> SensorSnapshot:
+    """Build a successful observation from a decision response.
+
+    `local_suitability` is never derived from the other signals, never carried
+    forward, and never proxied. It is recorded unavailable with the fixed
+    reason, so its absence is visible rather than implied.
+
+    ``qualified=False`` marks a response from a backend the five questions were
+    never qualified against. Its readings are kept verbatim in
+    ``unqualified_raw`` (telemetry only) while every signal is recorded
+    UNAVAILABLE with ``backend_not_qualified_for_signal``: a number from an
+    unqualified grader is not a measurement, and reporting it as one would be
+    the same dishonesty as fabricating a value.
+    """
+    signals: list[Signal] = []
+    if qualified:
+        for name in REQUESTED_SIGNALS:
+            raw = answers.get(name)
+            value = None
+            if isinstance(raw, Mapping):
+                for key in ("noul", "score", "value"):
+                    if isinstance(raw.get(key), (int, float)):
+                        value = float(raw[key])
+                        break
+            signals.append(
+                Signal(
+                    name=name,
+                    available=value is not None,
+                    value=value,
+                    backend=backend,
+                    reason=None if value is not None else "signal_absent_from_response",
+                    observability=Observability.UNKNOWN,
+                )
+            )
+    else:
+        for name in REQUESTED_SIGNALS:
+            signals.append(
+                Signal(
+                    name=name,
+                    available=False,
+                    value=None,
+                    backend=backend,
+                    reason="backend_not_qualified_for_signal",
+                    observability=Observability.UNKNOWN,
+                )
+            )
+    signals.append(
+        Signal(
+            name=UNSUPPORTED_ON_FALLBACK,
+            available=False,
+            value=None,
+            backend=backend,
+            reason="backend_not_qualified_for_signal",
+            observability=Observability.UNKNOWN,
+        )
+    )
+    snapshot = SensorSnapshot(
+        sensor_version=SENSOR_VERSION,
+        serializer_version=serializer_version,
+        trigger=trigger,
+        state_fingerprint=fingerprint,
+        backend=backend,
+        fallback_used=fallback_used,
+        latency_ms=latency_ms,
+        timestamp=time.time(),
+        state_truncated=state_truncated,
+        evicted_by_tier=evicted_by_tier,
+        overflowed_budget=overflowed_budget,
+        serialized_chars=serialized_chars,
+        serialized_state_tokens=serialized_state_tokens,
+        dropped_field_count=dropped_field_count,
+        event_id=event_id,
+        workstream=workstream,
+        process_id=process_id or PROCESS_ID,
+        content_mode=content_mode,
+        content_basis=content_basis,
+        signals=tuple(signals),
+        extra=(dict(unqualified_raw) if unqualified_raw else {}),
+    )
+    _assert_advisory(snapshot.to_dict())
+    return snapshot
+
+
+def _assert_advisory(payload: Mapping[str, Any]) -> None:
+    """Refuse to emit anything that looks like a routing control."""
+    blob = json.dumps(payload, default=str).lower()
+    for key in FORBIDDEN_KEYS:
+        if f'"{key}"' in blob:
+            raise ValueError(f"snapshot must not carry routing field {key!r}")
+
+
+def is_material(event: str) -> bool:
+    """Whether an event justifies a fresh observation. Whitelist, not judgement."""
+    return event in MATERIAL_EVENTS

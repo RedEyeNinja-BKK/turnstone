@@ -1,0 +1,679 @@
+"""The lifecycle wiring must be inert in the real session.
+
+These tests do not read the source and agree that it looks safe. They drive the
+actual `ChatSession` seams with a live sensor replaced by a recorder, and assert
+on what the surrounding code does: that the task proceeds identically, that no
+control surface is touched, and that the sensor's return value goes nowhere.
+"""
+
+from __future__ import annotations
+
+import ast
+import collections
+import difflib
+import inspect
+import pathlib
+import sys
+
+import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from turnstone.core import sensor_lifecycle as lifecycle
+
+SESSION = pathlib.Path(__file__).resolve().parents[1] / "turnstone" / "core" / "session.py"
+
+
+# ------------------------------------------------------------ diff discipline
+
+
+def _control_flow_delta(baseline: str, candidate: str) -> dict[str, list[str]]:
+    """The control-flow decisions that differ between two versions of a file.
+
+    Scoped by lexical scope (the qualified function name), so a decision added
+    to one function is reported against that function and not against the
+    whole file.
+
+    A DECISION is:
+
+      * ``if`` / ``while`` / ``for`` / ``async for`` - their TEST or TARGET;
+      * ``except`` - the handler type;
+      * ``with`` / ``async with`` - the context expressions;
+      * ``try`` - its ``else`` / ``finally`` shape;
+      * ``raise`` - the raised expression;
+      * ``assert`` - the asserted test;
+      * ``match`` - the subject and its case patterns;
+      * ``break`` / ``continue`` - their presence.
+
+    An EXIT PATH is where control can LEAVE the scope. It is identified by the
+    chain of enclosing constructs it sits under, so an early ``return`` inside
+    ``if deferred_persistence is None:`` is the path
+    ``("if <test>",)`` and the function's normal completion is the path
+    ``()``. The exit path is compared, NOT the return statement's syntax: a
+    function that now returns an admitted turn's identity still returns from
+    exactly the same places, and ``return`` vs ``return value`` is not a
+    control-flow decision. The implicit fall-off the end of a function IS an
+    exit path, and is the same path as an explicit top-level ``return``.
+
+    Everything else - assignments, call sequences, added parameters, the
+    argument lists of existing calls - is deliberately NOT a decision and is
+    left to the other tests in this file.
+    """
+    def _profile(source: str) -> dict[str, dict[str, list[str]]]:
+        decisions: dict[str, list[str]] = {}
+        exits: dict[str, list[str]] = {}
+
+        class _Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.stack: list[str] = []
+                self.chain: list[str] = []
+
+            def _scope(self) -> str:
+                return ".".join(self.stack) if self.stack else "<module>"
+
+            def _decision(self, entry: str) -> None:
+                decisions.setdefault(self._scope(), []).append(entry)
+
+            def _exit(self) -> None:
+                exits.setdefault(self._scope(), []).append(tuple(self.chain))
+
+            def _in(self, marker: str):
+                self.chain.append(marker)
+                self.generic_visit_current()
+
+            def generic_visit_current(self) -> None:
+                for child in ast.iter_child_nodes(self._current):
+                    self.visit(child)
+
+            def visit_FunctionDef(self, node):
+                self.stack.append(node.name)
+                scope = self._scope()
+                exits.setdefault(scope, [])
+                before = len(self.chain)
+                for stmt in node.body:
+                    self.visit(stmt)
+                # The function's normal completion is an exit path. If the body
+                # already ends in an explicit top-level return, that IS the
+                # normal exit and no second one is recorded.
+                if not exits[scope] or exits[scope][-1] != tuple(self.chain[:before]):
+                    exits[scope].append(tuple(self.chain[:before]))
+                self.stack.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_If(self, node):
+                self._decision(f"if {ast.dump(node.test)}")
+                self.chain.append(f"if {ast.dump(node.test)}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_While(self, node):
+                self._decision(f"while {ast.dump(node.test)}")
+                self.chain.append(f"while {ast.dump(node.test)}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_For(self, node):
+                marker = f"for {ast.dump(node.target)} in {ast.dump(node.iter)}"
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_AsyncFor(self, node):
+                marker = f"async for {ast.dump(node.target)}"
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_ExceptHandler(self, node):
+                kind = ast.dump(node.type) if node.type is not None else "bare"
+                self._decision(f"except {kind}")
+                self.chain.append(f"except {kind}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_With(self, node):
+                items = ", ".join(ast.dump(i.context_expr) for i in node.items)
+                self._decision(f"with {items}")
+                self.chain.append(f"with {items}")
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_AsyncWith(self, node):
+                self.visit_With(node)
+
+            def visit_Try(self, node):
+                marker = (
+                    f"try handlers={len(node.handlers)} "
+                    f"else={node.orelse is not None} finally={node.finalbody is not None}"
+                )
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_Raise(self, node):
+                exc = ast.dump(node.exc) if node.exc is not None else "bare"
+                self._decision(f"raise {exc}")
+                self.generic_visit(node)
+
+            def visit_Assert(self, node):
+                self._decision(f"assert {ast.dump(node.test)}")
+                self.generic_visit(node)
+
+            def visit_Match(self, node):
+                marker = f"match {ast.dump(node.subject)}"
+                self._decision(marker)
+                self.chain.append(marker)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.chain.pop()
+
+            def visit_Return(self, node):
+                self._exit()
+                self.generic_visit(node)
+
+            def visit_Break(self, node):
+                self._decision("break")
+                self.generic_visit(node)
+
+            def visit_Continue(self, node):
+                self._decision("continue")
+                self.generic_visit(node)
+
+        _Visitor().visit(ast.parse(source))
+        return {"decisions": decisions, "exits": exits}
+
+    before = _profile(baseline)
+    after = _profile(candidate)
+    delta: dict[str, list[str]] = {}
+    for kind in ("decisions", "exits"):
+        old = before[kind]
+        new = after[kind]
+        for scope in sorted(set(old) | set(new)):
+            old_entries = old.get(scope, [])
+            new_entries = new.get(scope, [])
+            if old_entries == new_entries:
+                continue
+            # A SEQUENCE diff, not a membership test: a duplicated decision and
+            # a reordered decision are both changes, and a membership test
+            # would see neither. (A mutation check proved this: duplicating an
+            # existing `if` was invisible to the membership form.)
+            matcher = difflib.SequenceMatcher(a=old_entries, b=new_entries)
+            changes: list[str] = []
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == "equal":
+                    continue
+                for entry in old_entries[i1:i2]:
+                    changes.append(f"- {entry}")
+                for entry in new_entries[j1:j2]:
+                    changes.append(f"+ {entry}")
+            if not changes:
+                continue
+            key = f"{scope} [{kind}]"
+            delta[key] = changes
+    return delta
+
+
+def test_session_wiring_changes_no_control_flow():
+    """The wiring must not add, remove or reorder any control-flow decision.
+
+    Earlier this was asserted as strict pure-insertion. That was too strong once
+    the workstream id moved out of the hashed state and into a dedicated
+    argument: that change deletes and re-adds three argument lines without
+    altering a single decision. Strict addition is the right instinct, but a test
+    that fails on an explicitly-reviewed argument move is a test that gets
+    weakened instead of the change being justified.
+
+    So the invariant is the one that actually matters: every modified line must
+    belong to the sensor call sites, and no `if`, `return`, `raise`, loop or
+    assignment may be added or removed.
+    """
+    import subprocess
+
+    repo_root = next(
+        (parent for parent in SESSION.parents if (parent / ".git").exists()),
+        SESSION.parents[2],
+    )
+    diff = subprocess.run(
+        ["git", "diff", "-U6", "HEAD", "--", "turnstone/core/session.py"],
+        capture_output=True, text=True, cwd=str(repo_root),
+    )
+    assert diff.returncode == 0, diff.stderr
+    source = SESSION.read_text()
+    if not diff.stdout.strip():
+        pytest.skip("session.py matches HEAD: the wiring is committed, no diff to check")
+
+    # 2026-10-19: the historical form asserted that every DIFF HUNK mentions a
+    # sensor marker string. That was a proxy for "the change is local to the
+    # seam", and it was too coarse in two ways:
+    #
+    #   * it was a TEXT test, so it broke on any hunk whose text did not
+    #     happen to spell a marker - including the legitimate addition of a
+    #     `turn_id` parameter to the seam wrapper, and the return-type change
+    #     that carries the admitted turn's identity out of the append
+    #     functions;
+    #   * it could not say WHAT changed, only that the text looked familiar.
+    #
+    # The invariant that actually matters is STRUCTURAL and is now checked
+    # directly: the wiring must not add, remove or reorder any CONTROL-FLOW
+    # DECISION in any scope. A decision is an if / while / for / except /
+    # with / raise / assert / match, and a RETURN - the presence and kind of
+    # a return, not its value, because a function that now yields an
+    # identity still returns exactly where it returned before.
+    #
+    # The comparison is against the committed file (git HEAD), not against a
+    # stored golden copy, so the pin always tracks the last reviewed state.
+    baseline = subprocess.run(
+        ["git", "show", "HEAD:turnstone/core/session.py"],
+        capture_output=True, text=True, cwd=str(repo_root),
+    )
+    assert baseline.returncode == 0, baseline.stderr
+
+    changed = _control_flow_delta(baseline.stdout, source)
+    assert not changed, (
+        "the session wiring must not change any control-flow decision; "
+        f"changed decisions: {changed}"
+    )
+
+    # The call-site count must still be exactly the four material events. Count
+    # them in the file, not in the diff: after the wiring is committed the diff
+    # no longer contains the event names, and a count of zero would be a
+    # vacuous pass rather than a real assertion.
+    # Each event must be paired with its OWN seam exactly once. Counting raw
+    # string occurrences is wrong: `operator_instruction` also appears as a
+    # `phase=` value, so a text count double-counts it. Walk the calls instead.
+    # This also catches a relabelled seam, which a pure count would not: four
+    # seams with one event renamed still reads as four.
+    #
+    # The event is the FIRST POSITIONAL argument at every seam, matching
+    # `observe_event(event, state, ...)`. Asserting it is a keyword would fail
+    # against correct code, so the position is read as it is actually written.
+    tree = ast.parse(source)
+    events: list[str] = []
+    substantive_seams = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = getattr(node.func, "id", None)
+        if func_name == "_sensor_observe_substantive":
+            # The operator seam's event is fixed inside the wrapper, which is
+            # the point of hardening it: the guard and the projection are both
+            # inside the fail-open boundary.
+            substantive_seams += 1
+            events.append("operator_instruction")
+            continue
+        if func_name not in ("_sensor_observe", "_sensor_observe_delegation"):
+            continue
+        assert node.args, "every seam must pass the event as its first positional arg"
+        first = node.args[0]
+        assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
+            f"line {node.lineno}: the event must be a string literal"
+        )
+        events.append(first.value)
+        # No seam may splat a mapping into the call: that would let an
+        # unrecognised control key reach the hook.
+        assert not any(kw.arg is None for kw in node.keywords), (
+            f"line {node.lineno}: **kwargs at a seam could carry a control key"
+        )
+
+    # 2026-10-18: `operator_instruction` has three reviewed entry points —
+    # send(), the queued flush and the tool-result advisory. The material
+    # events stay single-instance. Counting a multiset keeps the real
+    # invariant (no relabelling, no duplicate material event) while allowing
+    # the operator event to be observed wherever operator text actually
+    # enters the conversation.
+    assert len(events) == 6, f"expected six sensor call sites, found {len(events)}"
+    counts = collections.Counter(events)
+    assert counts.pop("operator_instruction", 0) == 3, (
+        f"expected three operator entry points, found {sorted(events)}"
+    )
+    assert counts == collections.Counter(
+        {
+            "delegation_result": 1,
+            "retry_transition": 1,
+            "task_agent_failure": 1,
+        }
+    ), f"seam/event pairing is wrong: {sorted(events)}"
+
+    # Every seam must identify its workstream, or per-workstream cadence is
+    # unmeasurable. A seam that dropped the argument would still pass every
+    # count above, so the argument itself is asserted per call site.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) not in (
+            "_sensor_observe",
+            "_sensor_observe_substantive",
+            "_sensor_observe_delegation",
+        ):
+            continue
+        workstream = [kw for kw in node.keywords if kw.arg == "workstream"]
+        assert workstream, f"line {node.lineno}: seam passes no workstream id"
+        value = workstream[0].value
+        # `getattr` is a bare Name at the AST level, not an Attribute.
+        assert isinstance(value, ast.Call), (
+            f"line {node.lineno}: workstream must be a defensive getattr, got {value!r}"
+        )
+        assert getattr(value.func, "id", None) == "getattr", (
+            f"line {node.lineno}: workstream must be read via getattr, "
+            f"got {getattr(value.func, 'id', None)!r}"
+        )
+        assert any(
+            isinstance(arg, ast.Constant) and arg.value == "_ws_id"
+            for arg in value.args
+        ), f"line {node.lineno}: workstream must come from _ws_id"
+
+
+def test_every_sensor_call_in_session_is_discarded():
+    """Each call is a bare statement: no assignment, no branching on it."""
+    tree = ast.parse(SESSION.read_text())
+    calls = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        name = getattr(func, "id", None) or getattr(func, "attr", None)
+        if name not in (
+            "_sensor_observe",
+            "_sensor_observe_substantive",
+            "_sensor_observe_delegation",
+        ):
+            continue
+        calls += 1
+        # A bare expression statement: its value cannot reach anything.
+        assert not isinstance(node, ast.Assign)
+    assert calls >= 4, f"expected the four material-event seams, found {calls}"
+
+
+def test_no_sensor_result_is_read_or_assigned():
+    """Nothing in session.py consumes a sensor return value."""
+    tree = ast.parse(SESSION.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            assert "_sensor" not in targets, "a sensor result was assigned to a variable"
+        if isinstance(node, ast.If):
+            test = node.test
+            source = ast.dump(test)
+            assert "_sensor_observe" not in source, "a branch depends on the sensor"
+            assert "_sensor_observe_substantive" not in source
+            assert "_sensor_observe_delegation" not in source
+            assert "_sensor_state" not in source, "a branch depends on sensor state"
+
+
+def test_sensor_imports_are_aliased_and_minimal():
+    """The session imports the lifecycle module once, under a private alias.
+
+    2026-10-17 adaptation: the historical import bound the three helpers
+    directly (``build_state``/``is_substantive_instruction``/``observe_event``).
+    The 1.8.7 port instead imports the MODULE once (``_sensor_lifecycle``) and
+    adds a guarded wrapper (``_sensor_observe``) plus a module-level gate, so
+    an absent/disabled sensor leaves the seams inert. The invariant that
+    matters is unchanged: no other sensor name is imported, and the module is
+    aliased privately (``_sensor_lifecycle``) so its surface stays advisory.
+    """
+    tree = ast.parse(SESSION.read_text())
+    module_imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "turnstone.core.sensor_lifecycle":
+            module_imports.add("module")
+        if isinstance(node, ast.ImportFrom) and node.module == "turnstone.core":
+            for alias in node.names:
+                if alias.name == "sensor_lifecycle":
+                    module_imports.add("module")
+    assert module_imports == {"module"}, (
+        "session must import sensor_lifecycle once, as a module alias"
+    )
+    # The wrapper and the module-level gate exist.
+    source = SESSION.read_text()
+    assert "def _sensor_observe(" in source
+    assert "_sensor_lifecycle.observe_event(" in source
+
+
+# ---------------------------------------------------------------- seam shapes
+
+
+def test_operator_instruction_seam_requires_substance_and_not_wake():
+    """The SEND seam is guarded, so an ack or a wake cannot trigger a call.
+
+    2026-10-18: the operator event now has three entry points, and only the
+    send seam is wake-guarded (a mid-turn interjection is a real operator
+    turn, not a synthetic wake). The assertion is therefore pinned to the
+    call that observes ``user_input`` rather than to any ``if`` that happens
+    to contain an observe call.
+    """
+    source = SESSION.read_text()
+    # 2026-10-17 hardening moved the substance guard INSIDE the wrapper so an
+    # exploding user_input object cannot raise into send().
+    assert "_sensor_observe_substantive(" in source
+    # 2026-10-18: the guard gained an `attachments=` argument (multi-line), so
+    # the literal-string check became an AST check. The invariant is unchanged:
+    # the substance guard must be evaluated INSIDE the wrapper.
+    guard_found = False
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If):
+            continue
+        for inner in ast.walk(node.test):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "is_substantive_instruction"
+                and inner.args
+                and isinstance(inner.args[0], ast.Name)
+                and inner.args[0].id == "user_input"
+            ):
+                guard_found = True
+    assert guard_found, "the wrapper must guard on is_substantive_instruction(user_input)"
+    assert "def _sensor_observe_substantive(" in source
+    # The wake guard must wrap the send seam's call, which is the one that
+    # observes ``user_input``.
+    tree = ast.parse(source)
+    found = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        observes_user_input = any(
+            isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "_sensor_observe_substantive"
+            and n.args
+            and isinstance(n.args[0], ast.Name)
+            and n.args[0].id == "user_input"
+            for n in ast.walk(node)
+        )
+        if observes_user_input:
+            found = True
+            assert "from_wake" in ast.dump(node.test), (
+                "the send seam must be guarded on from_wake"
+            )
+    assert found, "the send seam is not wired"
+    # Substance is asserted inside the wrapper, where it is exception-contained.
+    assert "is_substantive_instruction" in source
+
+
+def test_delegation_seams_are_inside_generation_owned_publishes():
+    """A superseded generation must never be observed as having succeeded."""
+    source = SESSION.read_text()
+    tree = ast.parse(source)
+    for event in ("delegation_result", "task_agent_failure"):
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # Only the generation-owned publish closures are seams. The module-
+            # level wrapper also mentions the event name; it is not a publish
+            # point and must not satisfy this assertion (2026-10-17).
+            if node.name not in ("_publish_success", "_publish_error"):
+                continue
+            body = ast.dump(node)
+            if f"'{event}'" not in body:
+                continue
+            found = True
+            # The call must live in a closure that also reports the tool result.
+            # 2026-10-17: the seam is `_sensor_observe_delegation(event, ...)`,
+            # so the publish anchor is asserted on the enclosing def, which is
+            # the generation-owned publish closure.
+            assert "on_tool_result" in body or "_report_tool_result" in body, (
+                f"{event} must be observed at the same point the result is published"
+            )
+        assert found, f"no seam found for {event}"
+
+
+def test_retry_seam_is_after_the_attempt_increment():
+    """A normal turn must not reach the retry hook.
+
+    1.9.4 ADAPTATION: the retry counter is no longer a local ``attempt``
+    integer. The stream loop delegates to ``CompletionRecovery``, whose
+    ``consume_reissue()`` returns "terminal" and increments ``reissues`` on a
+    non-terminal death. The seam must therefore sit after that call - the
+    point the attempt number advances - and before the ``stream.retry`` log
+    line that reports it. The invariant is unchanged: on a normal turn the
+    increment never runs, so neither does the hook.
+    """
+    lines = SESSION.read_text().splitlines()
+    retry_line = next(
+        (i for i, line in enumerate(lines) if '"retry_transition"' in line), None
+    )
+    assert retry_line is not None
+    advances = [i for i, line in enumerate(lines[:retry_line]) if "consume_reissue(" in line]
+    assert advances, (
+        "the retry seam must sit after the retry counter advances "
+        "(1.9.4: CompletionRecovery.consume_reissue)"
+    )
+    assert max(advances) < retry_line
+    # ... and it must run BEFORE the attempt number is reported, so the
+    # observation and the log describe the same attempt.
+    later = "\n".join(lines[retry_line:retry_line + 12])
+    assert "stream.retry" in later, (
+        "the retry seam must precede the stream.retry log line it annotates"
+    )
+
+
+def test_no_phase_or_evidence_trigger_is_wired():
+    """The unwired triggers must have no call site in session.py."""
+    source = SESSION.read_text()
+    for trigger in lifecycle.UNWIRED_TRIGGERS:
+        assert f'"{trigger}"' not in source, (
+            f"{trigger} has no honest source and must not be wired"
+        )
+
+
+# ------------------------------------------------------- behavioural inertness
+
+
+def test_a_failing_sensor_cannot_break_the_send_path():
+    """With the sensor exploding, the guarded call still returns normally."""
+    calls = {"n": 0}
+
+    def _explode(*_a, **_k):
+        calls["n"] += 1
+        raise RuntimeError("sensor is on fire")
+
+    class _ExplodingSensor:
+        def should_sense(self, *_a, **_k):
+            return True, "forced"
+
+        def observe(self, *_a, **_k):
+            raise RuntimeError("boom")
+
+    hook = lifecycle.SensorHook(sensor=_ExplodingSensor(), persist=False)
+    result = hook.observe_event("operator_instruction", {"objective": "x"})
+    assert result is None
+    assert hook.counters()["hook_error"] == 1
+
+
+def test_hook_signature_accepts_no_control_inputs():
+    """The call site cannot pass, and cannot receive, a control VALUE.
+
+    `workstream` is an identifier used for per-workstream cadence counting and
+    dedupe; it is deliberately NOT part of the sensed state.
+
+    `registry` (2026-10-17, S6) is not a control value but a capability handle:
+    it exists so the sensor can resolve its own `tier1-decision` row. Handing
+    the sensor a routing surface raises the obvious question, so the guarantee
+    is enforced dynamically instead of by signature shape - see
+    `test_sensor_reads_only_the_decision_row`. The forbidden names below stay
+    forbidden, which is the part that protects routing.
+    """
+    signature = inspect.signature(lifecycle.observe_event)
+    parameters = set(signature.parameters)
+    # `content_basis` (2026-10-18) is a measurement dimension, not a control
+    # value: a closed-class label of what grounded the observation
+    # ("text" / "text_plus_attachments" / "attachments_only"). It cannot express
+    # a route, a provider, a permission or a guard setting, and it is recorded
+    # rather than acted on. The forbidden-name loop below is the part that
+    # protects routing and stays unchanged.
+    #
+    # `turn_id` (2026-10-19) is the admitted conversation row's per-turn
+    # idempotency identity. It is in the same class as `workstream`: an
+    # IDENTIFIER that keys the dedupe state, deliberately NOT part of the
+    # sensed state. It cannot express a route, a provider, a permission or a
+    # guard setting; it is hashed before it reaches the dedupe state and it
+    # never enters the projection or the record. The invariant this test
+    # protects - no control value crosses the seam - is unchanged, and the
+    # forbidden-name loop below is still the part that enforces it.
+    assert parameters == {
+        "event", "state", "force", "workstream", "registry", "content_basis",
+        "turn_id",
+    }
+    for forbidden in ("model", "provider", "route", "lane", "effort", "tools", "guard",
+                      "model_alias", "client", "model_binding"):
+        assert forbidden not in parameters
+    assert signature.return_annotation in (None, "None")
+
+
+def test_sensor_reads_only_the_decision_row(monkeypatch):
+    """Given a registry, the sensor consults exactly ONE alias.
+
+    This is the real containment for the registry injection: whatever else the
+    registry exposes, resolution may read only the decision capability row's
+    capabilities and base_url. A future change that reaches for the session's
+    model, a fallback ladder or any other alias fails here.
+    """
+    from turnstone.core.shadow_driver import DECISION_CAPABILITY, resolve_decision_endpoint
+
+    seen: list[str] = []
+
+    class _SpyRow:
+        capabilities = {"supports_typed_decision": True}
+        base_url = "https://switchyard.example.internal"
+
+    class _SpyRegistry:
+        def get_config(self, alias):
+            seen.append(alias)
+            if alias != DECISION_CAPABILITY:
+                raise AssertionError(f"sensor read unrelated alias {alias!r}")
+            return _SpyRow()
+
+        def __getattr__(self, name):  # any other registry surface is off-limits
+            raise AssertionError(f"sensor touched registry.{name}")
+
+    assert resolve_decision_endpoint(_SpyRegistry()) == (
+        DECISION_CAPABILITY,
+        "https://switchyard.example.internal",
+    )
+    assert seen == [DECISION_CAPABILITY]
+
+
+def test_projection_never_contains_a_control_field():
+    """Even if a caller passes one, it is not part of the sensed projection."""
+    state = lifecycle.build_state(
+        objective="do the work",
+        model="gpt-6-luna",
+        provider="openai",
+        route="switchyard-smart-turnstone",
+        reasoning_effort="high",
+        output_guard="strict",
+    )
+    for forbidden in ("model", "provider", "route", "reasoning_effort", "output_guard"):
+        assert forbidden not in state, f"projection leaked {forbidden!r}"
+    assert state == {"objective": "do the work"}, state

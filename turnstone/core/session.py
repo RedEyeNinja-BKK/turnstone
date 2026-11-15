@@ -13360,6 +13360,23 @@ class ChatSession:
                 client_send_ids=client_send_ids,
                 wire_part_cache=wire_part_cache,
             )
+            # Advisory shadow sensing on an ACCEPTED user turn. Fires only for a
+            # substantive instruction, never for a wake or an acknowledgement, and
+            # the call cannot raise or return anything into this path. Disabled
+            # by default (sensor_lifecycle.ENABLED) - a no-op until activated.
+            #
+            # The turn is admitted once _initialize_send_generation() has
+            # committed the USER row for this generation. Its identity is that
+            # row's own commit key, recorded at journal time (1.9.4 does not
+            # return the key from _append_user_turn).
+            if not from_wake:
+                _sensor_observe_substantive(
+                    user_input,
+                    workstream=getattr(self, "_ws_id", ""),
+                    registry=getattr(self, "_registry", None),
+                    attachments=attachments,
+                    turn_id=_sensor_turn_identity(self, my_generation),
+                )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
             # can mutate history.  The old code's first in-try act was the loop-top
             # _check_cancelled(my_generation); the new pre-send layer sits ahead of
@@ -14394,6 +14411,23 @@ class ChatSession:
                             deferred_persistence=durable,
                             **meta,
                         )
+                        # Advisory shadow sensing for a user_interjection published
+                        # as its own system turn. The send seam never sees this text
+                        # (there is no new send() call), so without this seam the
+                        # operator's mid-turn interjection would go unmeasured.
+                        # Guarded on the source: guard findings and nudges drained
+                        # by the same loop are not operator instructions. meta
+                        # carries the operator's RAW words; the wrapper applies the
+                        # substance guard and fail-open containment.
+                        if source == "user_interjection":
+                            _sensor_observe_substantive(
+                                meta.get("message", ""),
+                                workstream=getattr(self, "_ws_id", ""),
+                                registry=getattr(self, "_registry", None),
+                                turn_id=_sensor_turn_identity(
+                                    self, self._generation
+                                ),
+                            )
                     # Seam 2: fold approval feedback into one trailing USER
                     # turn. Queued interjections present at admission ride the
                     # system advisory seam immediately above; later arrivals
@@ -15717,6 +15751,21 @@ class ChatSession:
                         type(provider_failure.__cause__).__name__
                         if provider_failure.__cause__
                         else type(provider_failure).__name__
+                    )
+                    # Advisory shadow sensing on a REAL retry: placed after
+                    # the cause is computed, so a normal turn never reaches it.
+                    # The attempt number is deliberately NOT part of the
+                    # projection - a volatile field would defeat dedupe.
+                    # Disabled by default.
+                    _sensor_observe(
+                        "retry_transition",
+                        {
+                            "objective": cause,
+                            "phase": "retry",
+                            "blocker": cause,
+                        },
+                        workstream=getattr(self, "_ws_id", ""),
+                        registry=getattr(self, "_registry", None),
                     )
                     log.warning(
                         "stream.retry",
@@ -19217,6 +19266,19 @@ class ChatSession:
             (),
             deferred_persistence=deferred_persistence,
             client_send_ids=self._client_send_ids_from_queued(matched),
+        )
+        # Advisory shadow sensing on operator text that reached the
+        # conversation WITHOUT a fresh send(): a mid-turn interjection is
+        # drained into a real USER row here and the send loop simply
+        # continues. Observed on ``content`` - prefix plus rendered queued
+        # items - because a turn that folded two messages in is ONE unit of
+        # work, not two. The substance guard, enabled gate and exception
+        # containment all live inside the wrapper.
+        _sensor_observe_substantive(
+            content,
+            workstream=getattr(self, "_ws_id", ""),
+            registry=getattr(self, "_registry", None),
+            turn_id=_sensor_turn_identity(self, self._generation),
         )
         return True
 
@@ -28098,6 +28160,16 @@ class ChatSession:
                 # this result, or no snapshot plus this result — never a
                 # synthetic active reading after the terminal replay.
                 self._clear_agent_transients(call_id, generation=origin_generation)
+                # Advisory shadow sensing on a PUBLISHED delegation result.
+                # Inside the generation-owned success publish, so only a live
+                # generation is observed. Cannot raise; result is discarded.
+                _sensor_observe_delegation(
+                    "delegation_result",
+                    item,
+                    result,
+                    workstream=getattr(self, "_ws_id", ""),
+                    registry=getattr(self, "_registry", None),
+                )
                 self._report_tool_result(call_id, "task_agent", result)
 
             if not self._publish_for_generation(
@@ -28176,6 +28248,16 @@ class ChatSession:
 
             def _publish_error() -> None:
                 self._clear_agent_transients(call_id, generation=origin_generation)
+                # Advisory shadow sensing on a PUBLISHED delegation failure.
+                # Inside the generation-owned publish, so a superseded
+                # generation never reaches it. Cannot raise; result discarded.
+                _sensor_observe_delegation(
+                    "task_agent_failure",
+                    item,
+                    msg,
+                    workstream=getattr(self, "_ws_id", ""),
+                    registry=getattr(self, "_registry", None),
+                )
                 self._report_tool_result(call_id, "task_agent", msg, is_error=True)
 
             self._publish_for_generation(

@@ -213,7 +213,12 @@ def _sdk_variable_credentials(variables: dict[str, str]) -> dict[str, str]:
 
 
 def create_client(
-    provider_name: str, *, base_url: str, api_key: str, workspace_id: str = ""
+    provider_name: str,
+    *,
+    base_url: str,
+    api_key: str,
+    workspace_id: str = "",
+    endpoint_bound_bearer: bool = False,
 ) -> Any:
     """Create an SDK client for the given provider.
 
@@ -234,6 +239,13 @@ def create_client(
     lanes; an organization-level key in a multi-workspace organization is
     refused by the API without it.  Ignored for every other provider — the
     console refuses to store it there.
+
+    *endpoint_bound_bearer* says the credential this client will carry was
+    issued for one exact endpoint (a direct-account OAuth grant), so a redirect
+    must not be able to carry it elsewhere. It pins ``follow_redirects=False``
+    on the OpenAI-family client, mirroring the rule the Anthropic arm already
+    applies when it sends an API key. Defaults to ``False``: every other lane
+    keeps the SDK's own redirect behaviour, byte for byte.
     """
     resolved_key: str | None = api_key if api_key else None
     if provider_name in ("openai", "openai-compatible", "google", "xai"):
@@ -260,7 +272,11 @@ def create_client(
         if resolved_key is None and local_without_key:
             resolved_key = LOCAL_PLACEHOLDER_API_KEY
         openai_key = resolved_key or _sdk_variable_credentials(_OPENAI_SDK_VARIABLES).get("api_key")
-        http_client = shutdown_on_close(DefaultHttpxClient())
+        http_client = shutdown_on_close(
+            DefaultHttpxClient(follow_redirects=False)
+            if endpoint_bound_bearer
+            else DefaultHttpxClient()
+        )
         if base_url:
             return OpenAI(base_url=base_url, api_key=openai_key, http_client=http_client)
         return OpenAI(api_key=openai_key, http_client=http_client)

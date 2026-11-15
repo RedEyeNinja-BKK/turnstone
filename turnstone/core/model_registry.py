@@ -70,7 +70,9 @@ def _deferred_close_actions(actions: list[Callable[[], None]]) -> Iterator[None]
                 log.warning("rerank.deferred_close_failed", exc_info=True)
 
 
-MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"})
+MODEL_AUTH_MODES = frozenset(
+    {"static", "entra_obo", "entra_app", "rfc8693_obo", "openai_oauth"}
+)
 
 # One bound for the backend-auth text columns (obo_audience, obo_scopes),
 # shared with the console write path's cleaner so the two layers cannot
@@ -144,6 +146,18 @@ MODEL_AUTH_MODE_PROFILES: Mapping[str, str] = MappingProxyType(
         "rfc8693_obo": "rfc8693",
     }
 )
+#: Dynamic modes whose credential comes from a LOCAL rotating-token store
+#: instead of an OIDC token-exchange exchange leg.
+#:
+#: These are deliberately excluded from :data:`MODEL_AUTH_MODE_PROFILES`: that
+#: map pairs a mode with an ``OBO_GRANT_PROFILES`` mint leg
+#: (``entra``/``rfc8693``), and a direct-account OAuth refresh is not an Entra
+#: exchange - inventing a leg for it would put a non-OBO credential in the OBO
+#: cache, keyed and invalidated under rules that do not describe it. The
+#: invariant enforced by test is therefore "every dynamic mode that is NOT
+#: direct-OAuth names a real mint leg", which is the strongest true statement.
+DIRECT_OAUTH_MODEL_AUTH_MODES = frozenset({"openai_oauth"})
+
 
 
 def _is_dynamic_auth_mode(mode: str) -> bool:
@@ -213,15 +227,23 @@ class DynamicAuthKeyError(RuntimeError):
 def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) -> str:
     """The dynamic-auth key requirement, shared by every install/swap site.
 
-    One derivation so no two sites can drift: a registry carrying
-    dynamic-auth aliases must not become live on a host whose token store is
-    absent, or every mint fails per-call while the operator sees nothing.
-    Used by the swap chokepoint in :meth:`ModelRegistry.reload` and by the
-    console's first-install bootstrap paths. Returns ``""`` when permitted,
-    else the refusal message. Token-store presence is process-constant, so a
-    refusal here is stable until restart.
+    One derivation so no two sites can drift: a registry carrying dynamic-auth
+    aliases that mint through the MCP token store must not become live on a host
+    whose token store is absent, or every mint fails per-call while the operator
+    sees nothing. Used by the swap chokepoint in :meth:`ModelRegistry.reload` and
+    by the console's first-install bootstrap paths. Returns ``""`` when
+    permitted, else the refusal message. Token-store presence is
+    process-constant, so a refusal here is stable until restart.
+
+    Direct-OAuth aliases are excluded: their credential is a local file store,
+    so they neither need nor use the MCP cipher. Including them would make a
+    direct-OAuth-only deployment refuse to install a row -- or abort at boot --
+    for a key it never touches.
     """
-    if not any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in models.values()):
+    if not any(
+        _is_dynamic_auth_mode(cfg.auth_mode) and cfg.auth_mode not in DIRECT_OAUTH_MODEL_AUTH_MODES
+        for cfg in models.values()
+    ):
         return ""
     if oauth_context(app_state).token_store is not None:
         return ""
@@ -715,12 +737,24 @@ class ModelRegistry:
             if not client_key and _is_dynamic_auth_mode(cfg.auth_mode):
                 client_key = "backend-auth-placeholder-unused"
             try:
-                self._clients[alias] = create_client(
-                    cfg.provider,
-                    base_url=cfg.base_url,
-                    api_key=client_key,
-                    workspace_id=_anthropic_workspace_id_of(cfg),
-                )
+                client_kwargs: dict[str, Any] = {
+                    "base_url": cfg.base_url,
+                    "api_key": client_key,
+                    "workspace_id": _anthropic_workspace_id_of(cfg),
+                }
+                if cfg.auth_mode in DIRECT_OAUTH_MODEL_AUTH_MODES:
+                    # A direct-OAuth bearer is issued for ONE exact endpoint.
+                    # The OpenAI SDK follows redirects by default, which would
+                    # let a response move that credential to a host the grant
+                    # never authorized; pin the transport. 1.9.4 has no
+                    # ``follow_redirects`` knob, so the pin is requested by
+                    # reason (``endpoint_bound_bearer``) and applied only to
+                    # the OpenAI-family client. Every other lane passes
+                    # exactly the arguments it passed before -- the key is
+                    # omitted, not set to False -- so nothing about their
+                    # construction changes.
+                    client_kwargs["endpoint_bound_bearer"] = True
+                self._clients[alias] = create_client(cfg.provider, **client_kwargs)
             except ValueError as exc:
                 # create_client's own misconfig errors already carry
                 # remediation text — keep the message verbatim, add the
@@ -866,6 +900,25 @@ class ModelRegistry:
     def has_dynamic_auth(self) -> bool:
         """Return whether any alias needs a runtime-minted backend credential."""
         return any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in self._models.values())
+
+    def has_token_store_dynamic_auth(self) -> bool:
+        """Whether any alias mints through the MCP-encrypted token store.
+
+        The boot and swap guards exist because a mint PERSISTS encrypted cache
+        rows, so the host must have the MCP token-encryption key before such a
+        registry becomes live. A direct-OAuth row does not use that cipher at
+        all -- it reads a coordinated file store -- so a deployment whose only
+        dynamic rows are direct-OAuth must not be forced to configure an MCP
+        key (or abort at boot) for machinery it never touches.
+
+        Every key/store guard reads THIS accessor; :meth:`has_dynamic_auth`
+        remains the raw "mints at runtime" fact.
+        """
+        return any(
+            _is_dynamic_auth_mode(cfg.auth_mode)
+            and cfg.auth_mode not in DIRECT_OAUTH_MODEL_AUTH_MODES
+            for cfg in self._models.values()
+        )
 
     def list_aliases(self) -> list[str]:
         """Return all registered model aliases."""

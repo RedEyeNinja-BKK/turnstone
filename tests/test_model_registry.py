@@ -6118,12 +6118,28 @@ def test_model_auth_mode_profile_map_matches_mint_legs() -> None:
     """
     from turnstone.core.oauth.grants import OBO_GRANT_PROFILES
 
-    # Every dynamic mode names its required profile — a mode missing here is
-    # never posture-approvable and never mints, which is fail-closed but
-    # must be a deliberate state, not an oversight.
-    assert set(mr_module.MODEL_AUTH_MODE_PROFILES) == set(mr_module.DYNAMIC_MODEL_AUTH_MODES)
+    # Every dynamic mode that EXCHANGES an OIDC grant names its required
+    # profile — a mode missing here is never posture-approvable and never
+    # mints, which is fail-closed but must be a deliberate state, not an
+    # oversight.
+    #
+    # A DIRECT-OAUTH mode is excluded by construction: its credential is a
+    # locally stored rotating refresh token, not an exchange-leg mint, so it
+    # has no profile to name. Pairing it with one would put a non-OBO
+    # credential in the OBO cache, keyed and invalidated under rules that do
+    # not describe it. The strongest true statement is therefore set equality
+    # over the dynamic modes MINUS the direct-OAuth set.
+    exchange_modes = set(mr_module.DYNAMIC_MODEL_AUTH_MODES) - set(
+        mr_module.DIRECT_OAUTH_MODEL_AUTH_MODES
+    )
+    assert set(mr_module.MODEL_AUTH_MODE_PROFILES) == exchange_modes
     # And every named profile has a real mint leg.
     assert set(mr_module.MODEL_AUTH_MODE_PROFILES.values()) <= OBO_GRANT_PROFILES
+    # The direct-OAuth set must be a genuine, non-empty part of the dynamic
+    # set, or the exclusion above would pass on an empty premise.
+    assert mr_module.DIRECT_OAUTH_MODEL_AUTH_MODES
+    assert mr_module.DIRECT_OAUTH_MODEL_AUTH_MODES <= mr_module.DYNAMIC_MODEL_AUTH_MODES
+    assert not (mr_module.DIRECT_OAUTH_MODEL_AUTH_MODES & set(mr_module.MODEL_AUTH_MODE_PROFILES))
 
 
 def test_auth_mode_classification_sets_are_subsets_of_dynamic() -> None:

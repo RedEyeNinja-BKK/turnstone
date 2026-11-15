@@ -89,6 +89,7 @@ from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_oauth import MEMO_EVICTION_WINDOW_S, get_model_token_client
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
+    DIRECT_OAUTH_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
     MAX_MODEL_CONCURRENCY,
     MODEL_AUTH_MODE_PROFILES,
@@ -14183,6 +14184,32 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     )
 
 
+def _direct_oauth_endpoint_error(auth_mode: str, provider: str, base_url: str) -> JSONResponse | None:
+    """Refuse a direct-OAuth row that would aim the credential off-endpoint.
+
+    The runtime dispatch seam (``model_backend_auth._require_direct_oauth_binding``)
+    is authoritative and re-checks every call, so a DB-direct insert or a
+    later edit cannot bypass it. This mirror exists so the write path refuses
+    the row up front, with an actionable 400, instead of accepting a
+    definition that can only fail at serve time.
+
+    One shared predicate, two call sites by design: normalisation drift here
+    must not be able to disagree with what the wire check accepts.
+    """
+    if auth_mode not in DIRECT_OAUTH_MODEL_AUTH_MODES:
+        return None
+    from turnstone.core.model_backend_auth import direct_oauth_endpoint_problem
+
+    problem = direct_oauth_endpoint_problem(provider, base_url)
+    if problem is None:
+        return None
+    return JSONResponse(
+        {"error": f"auth_mode {auth_mode!r} requires a bound endpoint: {problem}"},
+        status_code=400,
+    )
+
+
+
 def _validate_dynamic_model_auth(
     request: Request,
     *,
@@ -14253,6 +14280,16 @@ def _validate_dynamic_model_auth(
         return None
     # Validate against the same shared grant registry as the MCP validator.
     from turnstone.core.oauth.grants import OBO_GRANT_PROFILES
+
+    # A DIRECT-OAUTH mode does not exchange an OIDC grant for a delegated
+    # token: its credential is a locally stored rotating refresh token, so the
+    # OIDC and OBO-posture checks below do not describe it. Requiring them
+    # would accept the mode in the registry and then refuse every write with
+    # "single sign-on is not set up" - a half-installed feature. The audience
+    # allow-list check above still applies, because the audience IS the OAuth
+    # resource.
+    if auth_mode in DIRECT_OAUTH_MODEL_AUTH_MODES:
+        return None
 
     # Check ORDER mirrors the MCP sibling: token store first, then
     # OIDC-configured, then profile semantics — so a no-SSO host is told
@@ -15351,6 +15388,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     )
     if dynamic_auth_error is not None:
         return dynamic_auth_error
+    endpoint_error = _direct_oauth_endpoint_error(auth_mode, provider, base_url)
+    if endpoint_error is not None:
+        return endpoint_error
 
     # Read before the write: the cluster's first chat model becomes its stored
     # default (#1359).
@@ -15711,6 +15751,19 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         )
         if dynamic_auth_error is not None:
             return dynamic_auth_error
+
+    # Endpoint binding is enforced on the POST-merge row whenever it is (or
+    # becomes) direct-OAuth, independent of which field this request touched:
+    # re-pointing an armed row is exactly the edit that must not slip through.
+    # A row left in an unbound state by a DB-direct write is refused here until
+    # it is repaired, matching what the dispatch seam would do at serve time.
+    endpoint_error = _direct_oauth_endpoint_error(
+        gate.eff_auth_mode,
+        str(updates.get("provider", existing.get("provider", "openai")) or ""),
+        str(updates.get("base_url", existing.get("base_url", "")) or ""),
+    )
+    if endpoint_error is not None:
+        return endpoint_error
 
     # A model a fail-closed routing setting names can't be renamed or disabled
     # out from under it (#1359). Disabling the last enabled model is allowed:

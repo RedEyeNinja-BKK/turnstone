@@ -107,6 +107,161 @@ from turnstone.core.images import flatten_image
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.judge import JudgeCancelReason, _pin_judge_cancel
 from turnstone.core.log import get_logger
+# Advisory shadow sensing (disabled by default; see sensor_lifecycle.ENABLED).
+# The guarded import keeps the seams inert even if the modules are absent; the
+# module-level ENABLED gate keeps a present-but-disabled sensor free.
+try:
+    from turnstone.core import sensor_lifecycle as _sensor_lifecycle
+except Exception:  # noqa: BLE001 - an absent sensor must never block the session
+    _sensor_lifecycle = None
+
+
+def _sensor_observe(
+    event: str, state: dict, *, workstream: str = "", registry: object = None
+) -> None:
+    """Advisory shadow-sensing seam. Cannot raise; discards the result.
+
+    ``registry`` is the calling session's own model registry. It is passed on
+    every event so the sensor can resolve the ``tier1-decision`` row; nothing
+    about it is stored in the sensor module. Omitting it yields an explicitly
+    unresolved (silent) sensor, never a guessed endpoint.
+    """
+    if _sensor_lifecycle is None:
+        return
+    try:
+        _sensor_lifecycle.observe_event(
+            event, state, workstream=workstream, registry=registry
+        )
+    except Exception:  # noqa: BLE001 - a sensor must never fail a task
+        pass
+
+
+def _sensor_observe_delegation(
+    event: str,
+    item: object,
+    result: object,
+    *,
+    workstream: str = "",
+    registry: object = None,
+) -> None:
+    """The delegation seams, wholly inside the fail-open boundary.
+
+    State construction happens HERE, inside the guarded block: an exploding
+    mapping or an object whose ``__str__`` raises must not escape into the
+    generation-owned publish and fail the delegation path.
+    """
+    if _sensor_lifecycle is None:
+        return
+    try:
+        if isinstance(item, dict):
+            objective = item.get("prompt", "")
+        else:
+            objective = str(item)
+        if event == "delegation_result":
+            state = {"objective": objective, "phase": "delegation", "history": result}
+        else:
+            state = {
+                "objective": objective,
+                "phase": "delegation",
+                "blocker": str(result),
+            }
+        _sensor_lifecycle.observe_event(
+            event, state, workstream=workstream, registry=registry
+        )
+    except Exception:  # noqa: BLE001 - a sensor must never fail a task
+        pass
+
+
+def _sensor_observe_substantive(
+    user_input: object,
+    *,
+    workstream: str = "",
+    registry: object = None,
+    attachments: object = None,
+    turn_id: str = "",
+) -> None:
+    """The operator_instruction seam, wholly inside the fail-open boundary.
+
+    The substance check AND the state construction AND the observe call all
+    sit inside one guarded block: an input object that raises on str/len/iter
+    must cost the task nothing.
+
+    An operator turn can carry its real instruction in an attachment while the
+    visible text is just ``"."``. The turn is judged on text OR attachments,
+    and the projection gains a bounded structural descriptor. No attachment
+    body, excerpt, filename, path, mime type or attachment id is ever placed in
+    the state.
+
+    ``turn_id`` is the admitted conversation row's commit key. It keys the
+    sensor's dedupe state and nothing else.
+    """
+    if _sensor_lifecycle is None:
+        return
+    try:
+        # A disabled sensor must cost NOTHING. The attachment substance test
+        # decodes document bytes, so it is gated here as well as inside
+        # observe_event.
+        if not _sensor_lifecycle.ENABLED:
+            return
+        if not _sensor_lifecycle.is_substantive_instruction(
+            user_input, attachments=attachments
+        ):
+            return
+        state = {
+            "objective": user_input,
+            "phase": "operator_instruction",
+        }
+        basis = "text"
+        if attachments:
+            projection = _sensor_lifecycle.attachment_projection(
+                attachments, user_input=user_input
+            )
+            rendered = _sensor_lifecycle.render_attachment_state(projection)
+            if rendered:
+                state["attachments"] = rendered
+                basis = str(projection.get("basis") or "text")
+        _sensor_lifecycle.observe_event(
+            "operator_instruction",
+            state,
+            workstream=workstream,
+            registry=registry,
+            content_basis=basis,
+            turn_id=turn_id,
+        )
+    except Exception:  # noqa: BLE001 - a sensor must never fail a task
+        pass
+
+
+
+# Per-admission turn identity for the sensor's dedupe state.
+#
+# The identity must be the DURABLE row's ``commit_key``: the measurement path
+# joins a sensor event to the conversation STORE, so an identity that only
+# existed in memory would be unjoinable.
+#
+# 1.8.7 returned that key from ``_append_user_turn()``. In 1.9.4 the method
+# mints the key, stamps it onto a deepcopy held briefly in
+# ``_pending_conversation_commits``, and then reconciles that entry away -- so
+# reading the pending map at the seam is racy (it is usually already popped).
+# The reliable source is the ``_commit_key`` stamped on the message dict that
+# ``_journal_conversation_row_locked`` receives: that IS the key of the row this
+# admission just created. This port records it in ``_sensor_last_commit_key``
+# at that single, well-defined point (see the patch below) and reads it here.
+#
+# Falls back to a salted digest only if no key was recorded (an exotic path), so
+# two such turns never collide.
+def _sensor_turn_identity(session: object, generation: object) -> str:
+    import hashlib as _hashlib
+
+    try:
+        key = getattr(session, "_sensor_last_commit_key", None)
+        if key:
+            return key
+    except Exception:  # noqa: BLE001 - never let identity resolution raise
+        pass
+    ws = getattr(session, "_ws_id", "")
+    salt = "\x00".join((str(ws), str(generation), "no-commit-key"))
+    return _hashlib.sha256(salt.encode("utf-8", "replace")).hexdigest()
 from turnstone.core.lowering import (
     SHUTDOWN_OUTCOME_CLAUSE,
     TIMEOUT_OUTCOME_CLAUSE,
@@ -11405,6 +11560,11 @@ class ChatSession:
         event_id: int | None,
     ) -> _PendingConversationCommit:
         """Admit one immutable row while the history handoff lock is held."""
+        # Record the admitted row's commit key for the advisory sensor's
+        # dedupe identity. 1.9.4 does not return this key from
+        # _append_user_turn(), and the pending map entry is reconciled away, so
+        # this is the one stable point where the seam can read it.
+        self._sensor_last_commit_key = commit_key
         pending_message = copy.deepcopy(message)
         pending_message["_commit_key"] = commit_key
         pending_message["_event_id"] = event_id

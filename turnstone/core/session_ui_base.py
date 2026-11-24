@@ -2574,6 +2574,23 @@ class SessionUIBase:
         auto_deferred: list[Callable[[], None]] = []
         blanket_active = self.auto_approve or unattended
 
+        # -- Start intent inference, if a verdict still has a consumer ----------
+        # ``_evaluate_intent(defer_llm=True)`` published this batch's heuristics
+        # and stamped the generation but spent nothing: a batch resolution rule
+        # is only known here, after policy, "Always" grants and the blanket
+        # flag have run.  Calls those rules settled can never consult a verdict,
+        # so inference for them was paid for and thrown away (the next turn
+        # superseded the daemon mid-flight).  Start the daemon now for the calls
+        # that remain — the ones a Smart Approvals wait or a person will judge —
+        # and retire the generation when nothing remains.  Batches from callers
+        # that do not defer carry no stamp and take the historical path.
+        judge_dispatch = next(
+            (it["_judge_dispatch"] for it in items if "_judge_dispatch" in it),
+            None,
+        )
+        if judge_dispatch is not None:
+            judge_dispatch([] if (blanket_active or not pending) else pending)
+
         # -- Smart Approvals (judge.smart_approvals) -----------------------------
         # Last automatic gate before the human prompt, after the explicit operator-configured ones
         # (policy / "Always" / blanket): wait briefly for the async LLM intent verdict and

@@ -6210,6 +6210,15 @@ class ChatSession:
             self._judge_shutdown = True
             live_judges = list(self._judge_cancel_events)
             current_judge_event = self._judge_cancel_event
+            # A generation prepared but never dispatched has no daemon to run
+            # its done callback, so nothing else would ever remove it.  Retire
+            # those in the same critical section that refuses new ones;
+            # otherwise each settled batch leaves an entry in the registry for
+            # the life of the process.
+            for ev in live_judges:
+                if getattr(ev, "_judge_dispatched", True):
+                    continue
+                self._judge_cancel_events.discard(ev)
         if current_judge_event is not None:
             _pin_judge_cancel(current_judge_event, JudgeCancelReason.SESSION_CLOSED)
             current_judge_event.set()
@@ -17737,11 +17746,24 @@ class ChatSession:
         agent_gate: bool = False,
         principal_id: str | None = None,
         cancel_ref: StreamAbortRef | None = None,
+        defer_llm: bool = False,
     ) -> threading.Event | None:
         """Run intent validation on pending approval items.
 
         Attaches heuristic verdicts to items immediately.  Spawns the
-        async LLM judge that delivers final verdicts via UI callback.
+        async LLM judge that delivers final verdicts via UI callback,
+        unless ``defer_llm`` hands the start to the approval gate.
+
+        ``defer_llm`` exists because a batch's approval disposition is not
+        known when the batch is prepared: a policy ``allow`` rule, a per-tool
+        "Always" grant or the blanket flag settles the whole batch inside
+        ``approve_tools`` without any verdict being consulted, and the next
+        turn then supersedes the daemon before it answers.  In that flow the
+        inference is spent and discarded.  Deferring publishes the generation
+        and its heuristics as usual, stamps each item with a one-shot
+        dispatcher, and lets the gate start inference for the items still
+        undecided — the only ones whose verdict a Smart Approvals wait or a
+        person can consume.  A batch that settles locally never dispatches.
 
         Returns a cancel event that, when set, tells the daemon judge
         thread to abandon remaining work (each undone item degrades to
@@ -18256,14 +18278,69 @@ class ChatSession:
         if owner_cancel_witness.aborted:
             _on_done()
             raise GenerationCancelled()
+        # One batch identity for both halves: the heuristic rows written here and
+        # the verdicts the daemon delivers later must name the same batch.
+        intent_batch_id = uuid.uuid4().hex
+        messages_snapshot = dicts_from_turns(convo)
+        heuristics_by_item: dict[int, Any] = {}
+        dispatch_state = {"done": False}
+
+        def _dispatch_judge(remaining: list[dict[str, Any]] | None = None) -> None:
+            """Start the LLM daemon for the items that still need a decision."""
+            if dispatch_state["done"]:
+                return
+            dispatch_state["done"] = True
+            subset = (
+                pending
+                if remaining is None
+                else [
+                    it
+                    for it in pending
+                    if any(it is rem for rem in remaining) and id(it) in heuristics_by_item
+                ]
+            )
+            if not subset:
+                # Nothing is left to judge: every call was settled by the
+                # operator's own rules, so no verdict can be consulted.  Retire
+                # the generation rather than leaving an event that the next
+                # batch would pin ``superseded_batch`` on and ``close()`` would
+                # abort a daemon that was never spawned for.
+                if deferred:
+                    self._retire_undispatched_judge(cancel_event)
+                return
+            # Claimed before the spawn, not after: ``close()`` retires events
+            # that were never dispatched, and a generation is dispatched from
+            # the moment the daemon may exist.  A spawn failure still hands the
+            # done callback back below, which removes the entry.
+            cancel_event._judge_dispatched = True
+            try:
+                judge.dispatch(
+                    subset,
+                    messages_snapshot,
+                    [heuristics_by_item[id(it)] for it in subset],
+                    _on_verdict,
+                    cancel_event,
+                    _on_done,
+                    _resolve_judge_backend_auth,
+                    intent_batch_id,
+                )
+            except Exception:
+                # No daemon owns the done callback on a spawn failure; keep the
+                # close-time registry exact, as the synchronous path does.
+                _on_done()
+                raise
+
+        deferred = bool(defer_llm and base_ui is not None)
         try:
             heuristic_verdicts = judge.evaluate(
                 pending,
-                dicts_from_turns(convo),  # snapshot — daemon thread must not see mutations
+                messages_snapshot,  # snapshot — daemon thread must not see mutations
                 callback=_on_verdict,
                 cancel_event=cancel_event,
                 done_callback=_on_done,
                 backend_auth_resolver=_resolve_judge_backend_auth,
+                batch_id=intent_batch_id,
+                defer=deferred,
             )
         except Exception:
             # A synchronous failure happens before the daemon owns its done
@@ -18276,8 +18353,29 @@ class ChatSession:
         # Attach heuristic verdicts to items for the approval UI
         for item, verdict in zip(pending, heuristic_verdicts, strict=True):
             item["_heuristic_verdict"] = verdict.to_dict()
+            heuristics_by_item[id(item)] = verdict
+
+        if deferred:
+            for item in pending:
+                item["_judge_dispatch"] = _dispatch_judge
+            cancel_event._judge_dispatched = False
+        else:
+            cancel_event._judge_dispatched = True
 
         return cancel_event
+
+    def _retire_undispatched_judge(self, cancel_event: threading.Event) -> None:
+        """Retire a generation whose batch settled before it was dispatched.
+
+        No daemon exists to deliver verdicts or run its done callback, so the
+        event must leave the live set and the session slot.  Otherwise the next
+        batch would pin ``superseded_batch`` on a generation that never started
+        and ``close()`` would abort a daemon that was never spawned.
+        """
+        with self._judge_events_lock:
+            self._judge_cancel_events.discard(cancel_event)
+            if self._judge_cancel_event is cancel_event:
+                self._judge_cancel_event = None
 
     def _evaluate_output(
         self,
@@ -19742,6 +19840,7 @@ class ChatSession:
                 items,
                 principal_id=execution_principal,
                 cancel_ref=StreamAbortRef(execution_cancel_event),
+                defer_llm=True,
             )
         except GenerationCancelled:
             _stage_unstarted_tool_calls()
@@ -19804,7 +19903,12 @@ class ChatSession:
             # unconditional supersede-set at the top of the next batch and
             # by ``close()``.
             jc_live = self._judge_cfg
-            if judge_cancel and jc_live and jc_live.cancel_on_approval:
+            if (
+                judge_cancel
+                and jc_live
+                and jc_live.cancel_on_approval
+                and getattr(judge_cancel, "_judge_dispatched", True)
+            ):
                 _pin_judge_cancel(judge_cancel, JudgeCancelReason.APPROVAL_GATE)
                 judge_cancel.set()
         # The post-gate state transition and denial advisory are one owner
@@ -27768,6 +27872,7 @@ class ChatSession:
                             agent_gate=True,
                             principal_id=agent_principal,
                             cancel_ref=cancel_scope.cancel_ref,
+                            defer_llm=True,
                         )
                         cancel_scope.check()
                         self._push_smart_approval_config([prepared])
@@ -27784,7 +27889,12 @@ class ChatSession:
                             # leaves the daemon to finish for the audit
                             # trail (bounded to this one call).
                             jc_live = self._judge_cfg
-                            if agent_judge_cancel and jc_live and jc_live.cancel_on_approval:
+                            if (
+                                agent_judge_cancel
+                                and jc_live
+                                and jc_live.cancel_on_approval
+                                and getattr(agent_judge_cancel, "_judge_dispatched", True)
+                            ):
                                 _pin_judge_cancel(
                                     agent_judge_cancel, JudgeCancelReason.APPROVAL_GATE
                                 )

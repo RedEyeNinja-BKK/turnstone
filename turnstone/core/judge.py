@@ -267,6 +267,13 @@ class JudgeCancelReason(Enum):
     DEADLINE = "deadline"
     PROVIDER_ERROR = "provider_error"
     WORKER_INIT = "worker_init"
+    #: The evaluation ran but produced no parseable verdict: the model returned
+    #: nothing, or text ``_parse_verdict`` could not read.  Distinct from
+    #: ``PROVIDER_ERROR`` (the call itself failed) and from the caller's own
+    #: cancels, so a batch that was never superseded does not read as
+    #: ``unclassified``.  The source cannot tell an empty answer from an
+    #: unreadable one at this seam, so both stay one honest class.
+    MISSING_VERDICT = "missing_verdict"
     UNKNOWN = "unknown"
 
     @classmethod
@@ -307,7 +314,11 @@ class JudgeCancelReason(Enum):
         or a bounded deadline, all of which the judge is designed to absorb
         without surfacing as a failure.
         """
-        return self not in (JudgeCancelReason.PROVIDER_ERROR, JudgeCancelReason.UNKNOWN)
+        return self not in (
+            JudgeCancelReason.PROVIDER_ERROR,
+            JudgeCancelReason.MISSING_VERDICT,
+            JudgeCancelReason.UNKNOWN,
+        )
 
 
 def _normalise_reason(reason: JudgeCancelReason | str) -> str:
@@ -1616,6 +1627,9 @@ class IntentJudge:
         cancel_event: threading.Event | None = None,
         done_callback: Callable[[], None] | None = None,
         backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+        *,
+        batch_id: str | None = None,
+        defer: bool = False,
     ) -> list[IntentVerdict]:
         """Evaluate tool calls. Returns heuristic verdicts immediately.
 
@@ -1671,10 +1685,44 @@ class IntentJudge:
 
         # One identity per batch: lets audit consumers join a verdict to the
         # batch that was superseded (or aborted) instead of inferring it from
-        # timestamps.
-        batch_id = uuid.uuid4().hex
+        # timestamps.  A deferring caller passes the identity it published to
+        # the cancel-event slot so both halves name the same batch.
+        batch_id = batch_id or uuid.uuid4().hex
 
         # Spawn daemon thread for LLM judge
+        if not defer:
+            self.dispatch(
+                items,
+                messages,
+                heuristic_verdicts,
+                callback,
+                cancel_event,
+                done_callback,
+                backend_auth_resolver,
+                batch_id,
+            )
+
+        return heuristic_verdicts
+
+    def dispatch(
+        self,
+        items: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        heuristic_verdicts: list[IntentVerdict],
+        callback: Callable[[IntentVerdict], None],
+        cancel_event: threading.Event | None = None,
+        done_callback: Callable[[], None] | None = None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+        batch_id: str = "",
+    ) -> None:
+        """Start the LLM daemon for an already-evaluated batch.
+
+        Split out from :meth:`evaluate` so a caller can compute the heuristic
+        verdicts first (the approval card and the auto-approval audit rows need
+        them) and start inference only once it knows a verdict can still be
+        consumed.  ``items`` and ``heuristic_verdicts`` must correspond
+        element-by-element; the daemon zips them positionally.
+        """
         thread = threading.Thread(
             target=self._run_judge,
             args=(
@@ -1862,7 +1910,7 @@ class IntentJudge:
                                                 fallback_reason = ""
                                             else:
                                                 fallback_reason = (
-                                                    "LLM judge did not return a verdict"
+                                                    JudgeCancelReason.MISSING_VERDICT
                                                 )
                                         else:
                                             fallback_reason = reason

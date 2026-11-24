@@ -6210,6 +6210,15 @@ class ChatSession:
             self._judge_shutdown = True
             live_judges = list(self._judge_cancel_events)
             current_judge_event = self._judge_cancel_event
+            # A generation prepared but never dispatched has no daemon to run
+            # its done callback, so nothing else would ever remove it.  Retire
+            # those in the same critical section that refuses new ones;
+            # otherwise each settled batch leaves an entry in the registry for
+            # the life of the process.
+            for ev in live_judges:
+                if getattr(ev, "_judge_dispatched", True):
+                    continue
+                self._judge_cancel_events.discard(ev)
         if current_judge_event is not None:
             _pin_judge_cancel(current_judge_event, JudgeCancelReason.SESSION_CLOSED)
             current_judge_event.set()
@@ -18299,6 +18308,11 @@ class ChatSession:
                 if deferred:
                     self._retire_undispatched_judge(cancel_event)
                 return
+            # Claimed before the spawn, not after: ``close()`` retires events
+            # that were never dispatched, and a generation is dispatched from
+            # the moment the daemon may exist.  A spawn failure still hands the
+            # done callback back below, which removes the entry.
+            cancel_event._judge_dispatched = True
             try:
                 judge.dispatch(
                     subset,

@@ -15151,6 +15151,56 @@ class ChatSession:
 
     # -- Rewind / retry -------------------------------------------------------
 
+    def _preserve_split_index(self, split: int) -> int:
+        """Move a summarize/preserve split out of the middle of a tool transaction.
+
+        A history window may start at any message index, but a *tool* window may
+        not: a result kept without its assistant call is rejected by every strict
+        provider (``400 No tool call found for tool output``) and invites a
+        permissive one to answer from context the model never produced.  The same
+        holds in the other direction — a call summarized away whose results are
+        kept verbatim.
+
+        A transaction is one assistant turn declaring ``tool_calls`` plus every
+        ``tool`` turn answering those ids, with operator-context ``system`` turns
+        looked through (they ride between a call and its result on the native
+        path).  When *split* falls strictly inside such a block, the split moves
+        back to the declaring turn, so the whole block — parallel siblings
+        included, because they share the declaring turn — crosses the boundary
+        together.  A call with no result yet is unfinished: its results will be
+        appended after the compaction, so it must not be summarized away either.
+
+        Moving the split back can lengthen the preserved tail past a budget; that
+        is deliberate.  Losing a live transaction is not a recoverable outcome,
+        and the caller's budget accounting recomputes from the resulting lists.
+        Identity when no transaction straddles the split.
+        """
+        messages = self.messages
+        total = len(messages)
+        split = max(0, min(split, total))
+        if split in (0, total):
+            return split
+        results_by_id: dict[str, list[int]] = {}
+        for index, turn in enumerate(messages):
+            call_id = turn.tool_call_id
+            if call_id:
+                results_by_id.setdefault(call_id, []).append(index)
+        moved = True
+        while moved and split > 0:
+            moved = False
+            for index, turn in enumerate(messages[:split]):
+                for call in turn.tool_calls:
+                    answers = results_by_id.get(call.id, ())
+                    # Unfinished (no results yet) or answered on the kept side:
+                    # either way the declaring turn belongs to the kept side.
+                    if not answers or max(answers) >= split:
+                        split = index
+                        moved = True
+                        break
+                if moved:
+                    break
+        return split
+
     def _find_turn_boundaries(self) -> list[int]:
         """Return indices of real user messages in self.messages (turn starts).
 
@@ -16976,8 +17026,18 @@ class ChatSession:
         # the just-sent user turn on the pre-send path — so compacting them away
         # can't orphan a tool result or drop the current question.  Re-appended
         # after the summary, below.
-        preserved = self.messages[-preserve_tail:] if preserve_tail > 0 else []
-        to_summarize = self.messages[:-preserve_tail] if preserve_tail > 0 else self.messages
+        #
+        # The requested count is a starting point, not the boundary: a cut that
+        # lands inside a tool transaction is moved back to its start, because a
+        # summarized call with a kept result (or a kept call whose results were
+        # summarized) is a malformed history every strict provider rejects.
+        split_index = (
+            self._preserve_split_index(len(self.messages) - preserve_tail)
+            if preserve_tail > 0
+            else len(self.messages)
+        )
+        preserved = self.messages[split_index:]
+        to_summarize = self.messages[:split_index]
 
         # Continuation hint: re-inject the user's last REAL message ONLY when it is
         # being summarized away.  When preserve_tail keeps it verbatim (the pre-send
